@@ -308,31 +308,13 @@ impl Pair {
         .0
     }
     fn new(bytes: &[u8]) -> Self {
-        Self::with_legacy(bytes, false)
-    }
-    fn with_legacy(bytes: &[u8], legacy: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let repo = tkfs::core::id();
         let mut a = store(&dir.path().join("a"), &repo);
         let mut b = store(&dir.path().join("b"), &repo);
         let ap = LocalContent::open(&a.root).unwrap();
         let bp = LocalContent::open(&b.root).unwrap();
-        let (reference, root) = if legacy {
-            let entry = a.create("file", "file").unwrap();
-            a.write_revision(&entry.id, entry.revisions.get("content").cloned(), bytes)
-                .unwrap();
-            (
-                "legacy-test".into(),
-                FileContentRef::new(
-                    tkfs::model::content::ContentKind::Legacy,
-                    Digest::bytes(bytes),
-                    bytes.len() as u64,
-                )
-                .unwrap(),
-            )
-        } else {
-            publish(&mut a, &ap, bytes)
-        };
+        let (reference, root) = publish(&mut a, &ap, bytes);
         b.receive(
             Bundle {
                 repo: repo.clone(),
@@ -636,7 +618,7 @@ fn native_closed_offer_cleanup_is_bounded_during_connection_churn_and_drains_que
     }
     let _reset = Reset;
     let bytes = vec![117; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let receiver = LegacyPushReceiver::new(&p);
     let hash = p.root.digest.to_string();
     let mut config = FaultConfig::new("worker.rpc.objects.release", FaultAction::Hang);
@@ -759,7 +741,7 @@ fn native_closed_session_cannot_publish_an_offer_after_its_close_cleanup_ran() {
     }
     let _reset = Reset;
     let bytes = vec![119; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let receiver = LegacyPushReceiver::new(&p);
     let conn = receiver.dial();
     let hash = p.root.digest.to_string();
@@ -855,7 +837,7 @@ fn native_closed_push_drains_its_admitted_prefix_and_releases_its_exact_lease() 
     }
     let _reset = Reset;
     let bytes = vec![121; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let receiver = LegacyPushReceiver::new(&p);
     let conn = receiver.dial();
     let hash = p.root.digest.to_string();
@@ -960,7 +942,7 @@ fn native_legacy_push_reconnect_admits_before_old_release_and_late_cleanup_canno
         }
     }
     let bytes = vec![101; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let receiver = LegacyPushReceiver::new(&p);
     let old = receiver.dial();
     let hash = p.root.digest.to_string();
@@ -1024,7 +1006,7 @@ fn native_late_push_offer_reply_cannot_replace_a_newer_offer_on_the_same_session
         }
     }
     let bytes = vec![102; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let receiver = LegacyPushReceiver::new(&p);
     let conn = receiver.dial();
     let mut config = FaultConfig::new("inbound.objects.before_offer_publish", FaultAction::Hang);
@@ -1088,7 +1070,7 @@ fn native_late_push_offer_reply_cannot_replace_a_newer_offer_on_the_same_session
 fn native_inbound_push_pool_resize_fences_an_old_still_open_session() {
     use tkfs::model::protocol::objects::ObjectsWantsReply;
     let bytes = vec![103; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let receiver = LegacyPushReceiver::new(&p);
     let old = receiver.dial();
     let hash = p.root.digest.to_string();
@@ -1176,7 +1158,7 @@ fn native_push_backoff_is_fenced_at_mutation_after_a_superseding_transfer_comple
     }
     let bytes = vec![104; 150_000];
     let wrong = vec![105; bytes.len()];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let receiver = LegacyPushReceiver::new(&p);
     let old = receiver.dial();
     let hash = p.root.digest.to_string();
@@ -1247,7 +1229,7 @@ fn native_local_failure_cannot_recreate_sql_retry_after_a_replacement_push_compl
     }
     let _reset = Reset;
     let bytes = vec![141; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let receiver = LegacyPushReceiver::new(&p);
     let old = receiver.dial();
     let hash = p.root.digest.to_string();
@@ -1853,8 +1835,25 @@ fn automatic_typed_dispatch(force_receipt_contention: bool) {
     let mut available = false;
     let mut recovered = 0;
     let mut contended = false;
+    // Retain bounded diagnostics before another successful class clears last_error.
+    let mut observed_errors = Vec::new();
+    let mut observe_errors = |view: &content_dispatch::DispatchView| {
+        for error in view
+            .errors
+            .iter()
+            .filter(|(_, wire)| wire.class.counts_as_failure())
+        {
+            let detail = format!("{error:?}");
+            if observed_errors.len() < 16 && !observed_errors.contains(&detail) {
+                observed_errors.push(detail);
+            }
+        }
+    };
     if force_receipt_contention {
         while fault::fired() == 0 && Instant::now() < until {
+            if let Some(view) = content_dispatch::view(&p.dest) {
+                observe_errors(&view);
+            }
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(fault::fired(), 1);
@@ -1876,6 +1875,7 @@ fn automatic_typed_dispatch(force_receipt_contention: bool) {
         }
         while Instant::now() < until {
             let view = content_dispatch::view(&p.dest).unwrap();
+            observe_errors(&view);
             if view.running == 0 && view.retried[1] > 0 {
                 contended = true;
                 break;
@@ -1902,6 +1902,7 @@ fn automatic_typed_dispatch(force_receipt_contention: bool) {
             thread::sleep(Duration::from_millis(5));
             continue;
         };
+        observe_errors(&view);
         // This in-process RPC fixture does not spawn worker maintenance.
         // Drive its same bounded recovery component while no frame is running.
         // CAS publication can precede a BUSY receipt-index write; callback
@@ -1953,7 +1954,7 @@ fn automatic_typed_dispatch(force_receipt_contention: bool) {
         );
         assert_eq!(
             view.failed, [0; 3],
-            "SQLite readiness counted as a failure: {view:?}"
+            "SQLite readiness counted as a failure: {view:?}; observed errors: {observed_errors:?}"
         );
     }
     assert!(view.peak_queue <= 4);
@@ -2363,7 +2364,7 @@ fn legacy_reconnect(new_count: u32, scenario: &str) {
         }
     }
     let bytes = vec![73; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     // Ensure the injected stall is the actual nonempty file, rather than
     // its empty historical revision.
     runtime::objects_rpc::dispatch(
@@ -2508,7 +2509,7 @@ fn native_timed_out_release_cannot_release_or_hold_the_next_pull_round() {
     }
     let _reset = Reset;
     let bytes = vec![121; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let conn = session::dial_loopback(
         &p.b.endpoint.address,
         p.b.endpoint.token.as_deref(),
@@ -2658,7 +2659,7 @@ fn native_download_rounds_use_fresh_ids_and_resume_without_an_idle_interval() {
     }
     let _reset = Reset;
     let bytes = vec![122; 300_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     runtime::objects_rpc::dispatch(
         &p.b.ctx,
         "objects.write",
@@ -2752,7 +2753,7 @@ fn native_cancelled_foreground_verdict_cannot_back_off_a_replacement_copy() {
     }
     let _reset = Reset;
     let bytes = vec![137; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let hash = p.root.digest.to_string();
     runtime::objects_rpc::dispatch(
         &p.b.ctx,
@@ -2893,7 +2894,7 @@ fn native_catalog_withdrawal_cancels_a_legacy_verdict_without_closing_its_lane()
     }
     let _reset = Reset;
     let bytes = vec![129; 150_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let hash = p.root.digest.to_string();
     runtime::objects_rpc::dispatch(
         &p.b.ctx,
@@ -3121,9 +3122,7 @@ fn native_legacy_streams_share_global_capacity_and_leave_foreground_service() {
         }
     }
     let _reset = Reset;
-    let background: Vec<_> = (0..6)
-        .map(|i| Pair::with_legacy(&vec![150 + i; 300_000], true))
-        .collect();
+    let background: Vec<_> = (0..6).map(|i| Pair::new(&vec![150 + i; 300_000])).collect();
     for p in &background {
         runtime::objects_rpc::dispatch(
             &p.b.ctx,
@@ -3306,7 +3305,7 @@ fn native_empty_legacy_pull_finishes_only_after_its_actual_local_write() {
         }
     }
     let _reset = Reset;
-    let mut p = Pair::with_legacy(&[], true);
+    let mut p = Pair::new(&[]);
     let events = Arc::new(Events::default());
     Arc::get_mut(&mut p.dest).unwrap().status = events.clone();
     let token = Cancel::new();
@@ -3419,7 +3418,7 @@ fn native_legacy_drain_with_race(credit: bool, race: bool, family: bool) {
             self.0.lock().unwrap().push(event);
         }
     }
-    let mut p = Pair::with_legacy(&bytes, true);
+    let mut p = Pair::new(&bytes);
     let events = Arc::new(Events::default());
     Arc::get_mut(&mut p.dest).unwrap().status = events.clone();
     let hash = p.root.digest.to_string();
@@ -3604,7 +3603,7 @@ fn native_legacy_stream_budget_survives_stream_end_and_cancel_until_worker_write
     let _reset = Reset;
     // Include canonical empty data: zero payload still owns an actual write.
     for bytes in [vec![], vec![127; 16000]] {
-        let p = Pair::with_legacy(&bytes, true);
+        let p = Pair::new(&bytes);
         if !bytes.is_empty() {
             runtime::objects_rpc::dispatch(
                 &p.b.ctx,
@@ -3686,7 +3685,7 @@ fn native_partial_foreground_receipt_preserves_source_history_until_whole_file_v
     }
     let _reset = Reset;
     let bytes = vec![139; wire::LEGACY_BYTES * 2 + 17];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let hash = p.root.digest.to_string();
     runtime::objects_rpc::dispatch(
         &p.b.ctx,
@@ -3809,7 +3808,7 @@ fn native_legacy_offers_check_deadline_disconnect_and_shutdown_before_late_grant
         for operation in ["objects.want", wire::LEGACY_PREPARE] {
             for phase in ["entry", "grant"] {
                 for stop in ["deadline", "disconnect", "shutdown"] {
-                    let p = Pair::with_legacy(&vec![131; 100_000], true);
+                    let p = Pair::new(&vec![131; 100_000]);
                     let hash = p.root.digest.to_string();
                     let probe =
                         Store::open_secondary(&p.b.ctx.root, &p.b.ctx.repo, &p.b.ctx.device)
@@ -3994,10 +3993,10 @@ fn legacy_foreground_admits_within_250ms_behind_two_other_repositories_without_a
             fault::configure(None);
         }
     }
-    let a = Pair::with_legacy(&vec![81; 150_000], true);
-    let b = Pair::with_legacy(&vec![82; 150_000], true);
+    let a = Pair::new(&vec![81; 150_000]);
+    let b = Pair::new(&vec![82; 150_000]);
     let c_bytes = vec![83; 1024 * 1024 + 23];
-    let c = Pair::with_legacy(&c_bytes, true);
+    let c = Pair::new(&c_bytes);
     let fresh = Worker::new(store(
         &c._dir.path().join("fresh-destination"),
         &c.scope.repo,
@@ -4224,7 +4223,7 @@ fn legacy_source_credit_is_exact_single_use_and_retained_through_an_active_ack()
         }
     }
     let bytes = vec![91; 300_000];
-    let p = Pair::with_legacy(&bytes, true);
+    let p = Pair::new(&bytes);
     let request = ObjectsPull {
         repo: p.scope.repo.clone(),
         sender: p.scope.sender.clone(),
@@ -5755,6 +5754,158 @@ fn adapter_range_read_fetches_real_peer_data_without_an_unrelated_source_chunk()
         "WAVE6_MOUNT_DEMAND {}",
         serde_json::json!({"scenario":"real_peer_adapter_range", "bytes":out.len(),"admission_ms":admission_ms,"admission_bound_ms":250,"unrelated_chunk_absent_at_source":true,"real_kernel_mount":false})
     );
+}
+
+#[test]
+fn control_preview_fetches_only_its_referenced_range_over_real_peer_sessions() {
+    let (p, bytes) = partial_source();
+    let client = p.b.client();
+    let reader = client.clone();
+    let reference = p.reference.clone();
+    let read = thread::spawn(move || {
+        reader.call(
+            "preview-content",
+            serde_json::json!({"reference":reference}),
+            Duration::from_secs(5),
+        )
+    });
+    let demand = wait_for_mounted_demand(&p).demand;
+    assert_eq!(demand.reference, p.reference);
+    assert_eq!(
+        demand.range,
+        tkfs::model::workspace::ByteRange {
+            offset: 0,
+            len: 65_536
+        }
+    );
+    let cancel = Cancel::new();
+    let registration = tkfs::orchestrator::content_dispatch::register(
+        &p.dest,
+        p.peer(&p.dest),
+        LANE,
+        p.conn.clone(),
+        &cancel,
+    )
+    .unwrap();
+    let preview = read.join().unwrap().unwrap();
+    assert_eq!(preview["size"], bytes.len() as u64);
+    assert_eq!(preview["truncated"], true);
+    assert_eq!(preview["text"], "Binary content; text preview unavailable");
+    let mut out = vec![0; 65_536];
+    p.bp.read_range(&p.bp.pin(&p.root).unwrap(), 0, &mut out, &context())
+        .unwrap();
+    assert_eq!(out, bytes[..65_536]);
+    assert!(
+        p.bp.read_range(
+            &p.bp.pin(&p.root).unwrap(),
+            131_072,
+            &mut [0; 1],
+            &context()
+        )
+        .is_err()
+    );
+    assert!(
+        runtime::content_rpc::state(&p.b.ctx)
+            .unwrap()
+            .scheduler
+            .snapshots(p.bp.identity(), &p.scope.repo)
+            .is_empty()
+    );
+    cancel.cancel();
+    drop(registration);
+    client.close();
+}
+
+#[test]
+fn explicit_control_range_prefetch_drains_over_real_peer_sessions_and_releases_its_owner() {
+    let (p, bytes) = partial_source();
+    let client = p.b.client();
+    let queued = client
+        .call(
+            "request-content",
+            serde_json::json!({"reference":p.reference,"offset":65_536,"len":65_536}),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(queued["queued"], true);
+    let demand = wait_for_mounted_demand(&p).demand;
+    assert_eq!(
+        demand.range,
+        tkfs::model::workspace::ByteRange {
+            offset: 65_536,
+            len: 65_536
+        }
+    );
+    let cancel = Cancel::new();
+    let registration = tkfs::orchestrator::content_dispatch::register(
+        &p.dest,
+        p.peer(&p.dest),
+        LANE,
+        p.conn.clone(),
+        &cancel,
+    )
+    .unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut out = vec![0; 65_536];
+    loop {
+        if p.bp
+            .read_range(&p.bp.pin(&p.root).unwrap(), 65_536, &mut out, &context())
+            .is_ok()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "explicit range prefetch did not complete"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(out, bytes[65_536..131_072]);
+    loop {
+        runtime::content_rpc::reap(&p.b.ctx);
+        if runtime::content_rpc::state(&p.b.ctx)
+            .unwrap()
+            .scheduler
+            .snapshots(p.bp.identity(), &p.scope.repo)
+            .is_empty()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "completed prefetch retained its waiter"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        runtime::content_rpc::state(&p.b.ctx)
+            .unwrap()
+            .scheduler
+            .snapshots(p.bp.identity(), &p.scope.repo)
+            .is_empty()
+    );
+    assert_eq!(
+        client
+            .call(
+                "cancel-content-request",
+                serde_json::json!({"token":queued["token"]}),
+                Duration::from_secs(2)
+            )
+            .unwrap()["cancelled"],
+        false
+    );
+    assert!(
+        p.bp.read_range(
+            &p.bp.pin(&p.root).unwrap(),
+            131_072,
+            &mut [0; 1],
+            &context()
+        )
+        .is_err()
+    );
+    cancel.cancel();
+    drop(registration);
+    client.close();
 }
 
 #[test]

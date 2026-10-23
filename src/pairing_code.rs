@@ -8,8 +8,7 @@ pub struct Verifier {
     pub salt: String,
     pub hash: String,
 }
-/// `hash` is HMAC-key-equivalent to the pairing code (REVAMP_PLAN §11.15,
-/// invariant 21), so `Debug` never prints it (CCR-WP0.4-2, applied by WP0.INT).
+/// `hash` is an application credential, so `Debug` never prints it.
 impl std::fmt::Debug for Verifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Verifier")
@@ -32,13 +31,13 @@ impl Verifier {
         hex::encode(Self::derive_key(salt, code))
     }
     pub fn verify(&self, code: &str) -> bool {
-        crate::util::hmac::ct_eq(
+        crate::util::secret::ct_eq(
             Self::digest(&self.salt, code).as_bytes(),
             self.hash.as_bytes(),
         )
     }
-    /// The 32-byte HMAC key a dialer derives from the server's `salt` and its
-    /// pairing code (§6.2 handshake step 3). It is the raw digest whose hex
+    /// The 32-byte credential a dialer derives from the server's `salt` and its
+    /// pairing code. It is the raw digest whose hex
     /// form is [`Verifier::hash`], so it equals [`Verifier::key`] exactly when
     /// the code is right. The code itself never crosses the wire.
     pub fn derive_key(salt: &str, code: &str) -> [u8; 32] {
@@ -49,7 +48,7 @@ impl Verifier {
         digest.update(code.as_bytes());
         digest.finalize().into()
     }
-    /// The 32-byte HMAC key of this verifier: [`Verifier::hash`] decoded.
+    /// The 32-byte credential of this verifier: [`Verifier::hash`] decoded.
     ///
     /// A malformed stored hash (not 64 hex digits) yields a key that no
     /// pairing code derives (it uses a different domain-separation prefix),

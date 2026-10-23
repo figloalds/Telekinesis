@@ -150,7 +150,26 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        // A failed test assertion can poison Engine. Stop/wake its actors
+        // directly in that case; entering the production poison handler from
+        // an unwinding destructor would hide the original failure in an abort.
+        let until = Instant::now() + Duration::from_secs(5);
+        while !self.engine.is_poisoned() && !self.ctx.stopping.load(Ordering::SeqCst) {
+            match self.server.stop(tkfs::model::ipc::StopMode::Force) {
+                Ok(_) => return,
+                Err(error)
+                    if format!("{error:#}").starts_with("WORKER_BUSY")
+                        && Instant::now() < until =>
+                {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(_) => break,
+            }
+        }
         self.ctx.stopping.store(true, Ordering::SeqCst);
+        if let Ok(address) = self.info.address.trim_start_matches("ws://").parse() {
+            let _ = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1));
+        }
     }
 }
 
@@ -538,12 +557,15 @@ fn published_exchange_is_never_busy_while_the_activator_runs() {
     assert!(w.status()["activation"]["activated"].as_u64().unwrap() >= 600);
 }
 
-/// A verified read handle is not re-referenced (so not re-hashed on its next
-/// read) when an activation changes other entities; an activation that
-/// changes its content re-references it once (fixes the old receive path,
-/// which re-referenced every clean session on every receive).
+/// Unrelated activation preserves the current immutable selection and pin;
+/// changing the open file replaces that selection exactly once.
 #[test]
 fn verified_read_handle_survives_unrelated_activation() {
+    use tkfs::{
+        content::{LocalContent, ReadContext},
+        runtime::{content::ContentWait, content_reads},
+        util::Cancel,
+    };
     let mut p = pair(2);
     let kept = p.a.create("kept.txt", "file").unwrap();
     let first =
@@ -557,19 +579,42 @@ fn verified_read_handle_survives_unrelated_activation() {
         let mut b = Store::open_existing(&p.state).unwrap();
         sync_into(&p.a, &mut b, &p.allowed).unwrap();
     }
+    let native = LocalContent::open(&p.state).unwrap();
+    let context = ReadContext {
+        deadline: Instant::now() + Duration::from_secs(30),
+        cancel: Cancel::new(),
+    };
+    let reference = native
+        .import(&mut b"kept bytes".as_slice(), 10, &context)
+        .unwrap();
+    assert_eq!(
+        Store::open_existing(&p.state)
+            .unwrap()
+            .lookup("kept.txt")
+            .unwrap()
+            .content_ref,
+        Some(reference)
+    );
     let w = Worker::start(&p.state, true);
     let handle = lock_engine(&w.engine)
         .open("kept.txt", None, false)
         .unwrap()
         .0;
-    runtime::prepare_content(&w.engine, handle, Duration::from_secs(10)).unwrap();
-    let verified = |w: &Worker| {
-        let e = lock_engine(&w.engine);
-        e.session(handle).unwrap().bytes.reference().is_none()
-    };
-    assert!(verified(&w), "prepare_content verified the bytes");
+    let wait = ContentWait::fixed(Duration::from_secs(10));
+    content_reads::prepare_open(&w.engine, handle, wait).unwrap();
+    let selection = lock_engine(&w.engine)
+        .session(handle)
+        .unwrap()
+        .bytes
+        .content_selection()
+        .unwrap();
+    assert_eq!(
+        content_reads::read_mount_vec(&w.engine, handle, 0, 100, wait)
+            .unwrap()
+            .unwrap(),
+        b"kept bytes"
+    );
     let reloads = w.server.vitals().session_reloads();
-    // Unrelated remote changes.
     for i in 0..3 {
         p.a.create(&format!("other-{i}.txt"), "file").unwrap();
     }
@@ -583,22 +628,30 @@ fn verified_read_handle_survives_unrelated_activation() {
     w.stage(&p.events_after(&known), &p.allowed);
     w.wait_drained(Duration::from_secs(60));
     assert!(lock_engine(&w.engine).store.lookup("other-2.txt").is_ok());
-    assert!(
-        verified(&w),
-        "an unrelated activation kept the verified bytes"
-    );
+    assert!(Arc::ptr_eq(
+        &selection,
+        &lock_engine(&w.engine)
+            .session(handle)
+            .unwrap()
+            .bytes
+            .content_selection()
+            .unwrap()
+    ));
     assert_eq!(w.server.vitals().session_reloads(), reloads);
-    // A remote edit of the open file: its session follows (once).
+    assert_eq!(
+        content_reads::read_mount_vec(&w.engine, handle, 0, 100, wait)
+            .unwrap()
+            .unwrap(),
+        b"kept bytes"
+    );
     let entry = p.a.lookup("kept.txt").unwrap();
     let second =
-        p.a.write_revision(&entry.id, Some(first.clone()), b"edited remotely")
+        p.a.write_revision(&entry.id, Some(first), b"edited remotely")
             .unwrap();
-    w.ctx
-        .sync_stores
-        .checkout()
-        .unwrap()
-        .put_object(b"edited remotely")
+    let reference = native
+        .import(&mut b"edited remotely".as_slice(), 15, &context)
         .unwrap();
+    assert_eq!(p.a.lookup("kept.txt").unwrap().content_ref, Some(reference));
     let known = w
         .ctx
         .sync_stores
@@ -609,13 +662,22 @@ fn verified_read_handle_survives_unrelated_activation() {
     w.stage(&p.events_after(&known), &p.allowed);
     w.wait_drained(Duration::from_secs(60));
     assert_eq!(w.server.vitals().session_reloads(), reloads + 1);
-    let e = lock_engine(&w.engine);
-    let session = e.session(handle).unwrap();
-    assert_eq!(session.content_base.as_deref(), Some(second.as_str()));
-    assert!(
-        session.bytes.reference().is_some(),
-        "re-referenced: verified on its next read"
+    {
+        let e = lock_engine(&w.engine);
+        let session = e.session(handle).unwrap();
+        assert_eq!(session.content_base.as_deref(), Some(second.as_str()));
+        assert!(!Arc::ptr_eq(
+            &selection,
+            &session.bytes.content_selection().unwrap()
+        ));
+    }
+    assert_eq!(
+        content_reads::read_mount_vec(&w.engine, handle, 0, 100, wait)
+            .unwrap()
+            .unwrap(),
+        b"edited remotely"
     );
+    runtime::engine::close_handle(&w.engine, handle).unwrap();
 }
 
 /// CCR-WP1.6-3 (legacy compatibility kept): `incoming_pending` still counts

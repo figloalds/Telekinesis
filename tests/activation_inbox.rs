@@ -19,7 +19,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use support::{causal_sort, copy_legacy_worker, devices, invalid_kind_changes, staged_inbox};
+use support::{causal_sort, devices, invalid_kind_changes, staged_inbox};
 use tkfs::{
     core::{
         Bundle, Change, Entry, Event, Projection, ROOT, Store,
@@ -691,29 +691,10 @@ fn causal_cycles_are_quarantined_not_pending() {
     assert!(b.events().unwrap().is_empty());
 }
 
-/// Rows written by an older binary (`state` NULL) are classified on open and
-/// drained; a legacy quarantine of a transient failure is retried.
+/// Current recovery may enqueue unclassified rows; classification and transient
+/// retry remain independent of any prior-store schema upgrade.
 #[test]
-fn legacy_rows_are_classified_and_drained() {
-    let fx = copy_legacy_worker();
-    let m = fx.manifest.clone();
-    let s = Store::open_existing(&fx.state).unwrap();
-    let counts = s.inbox_counts().unwrap();
-    assert_eq!(counts.unclassified, 0);
-    assert_eq!(counts.total(), m["incoming"]["total"].as_u64().unwrap());
-    assert_eq!(counts.waiting, m["incoming"]["waiting"].as_u64().unwrap());
-    assert_eq!(
-        counts.quarantined + counts.blocked,
-        m["incoming"]["quarantined"].as_u64().unwrap()
-    );
-    assert_eq!(counts.pending_active(), counts.waiting);
-    assert_eq!(
-        s.status().unwrap()["incoming_quarantined"],
-        m["incoming"]["quarantined"]
-    );
-    assert!(!s.missing_parents(10).unwrap().is_empty());
-    assert!(!s.quarantined(10).unwrap().is_empty());
-    drop(s);
+fn current_unclassified_rows_are_classified_and_drained() {
     // NULL rows inserted while the store is open drain on the next slice.
     let dir = tempfile::tempdir().unwrap();
     let mut s = Store::open(dir.path(), Some(&id())).unwrap();
@@ -730,7 +711,7 @@ fn legacy_rows_are_classified_and_drained() {
     }
     assert_eq!(activated, ids);
     assert_eq!(s.inbox_counts().unwrap().total(), 0);
-    // A legacy row quarantined for a transient failure is retried on open.
+    // A current recovery row with a transient failure is retried on open.
     let author = tempfile::tempdir().unwrap();
     let mut a = Store::open(author.path(), Some(&s.repo)).unwrap();
     let mut allowed: BTreeSet<String> = s.events().unwrap().into_iter().map(|e| e.device).collect();
@@ -752,7 +733,7 @@ fn legacy_rows_are_classified_and_drained() {
     let mut s = Store::open_existing(&root).unwrap();
     assert!(s.lookup("transient.txt").is_ok());
     assert_eq!(s.inbox_counts().unwrap().total(), 0);
-    assert_oracle_empty(&mut s, "after legacy drain");
+    assert_oracle_empty(&mut s, "after current recovery drain");
 }
 
 /// A receiver `b` and the causally sorted remote creates of the nested

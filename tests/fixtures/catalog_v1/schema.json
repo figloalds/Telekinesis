@@ -1,0 +1,54 @@
+{
+  "application_id": 1414218579,
+  "version": 1,
+  "schema_sql_sha256": "4fa4f34507836e9806e8a052b5b53129293375209b48603862da7ad4d6901945",
+  "objects": [
+    {
+      "type": "table",
+      "name": "folder_intents",
+      "table": "folder_intents",
+      "sql": "CREATE TABLE folder_intents(state TEXT PRIMARY KEY,sync_enabled INTEGER NOT NULL,mount_enabled INTEGER NOT NULL,updated_ms INTEGER NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "mount_gates",
+      "table": "mount_gates",
+      "sql": "CREATE TABLE mount_gates(state TEXT PRIMARY KEY,source_installation TEXT,source_endpoint TEXT NOT NULL,created_ms INTEGER NOT NULL,override_ms INTEGER,satisfied_ms INTEGER)"
+    },
+    {
+      "type": "table",
+      "name": "peer_credentials",
+      "table": "peer_credentials",
+      "sql": "CREATE TABLE peer_credentials(installation TEXT NOT NULL,side TEXT NOT NULL,secret_hash TEXT NOT NULL,created_ms INTEGER NOT NULL,revoked_ms INTEGER,PRIMARY KEY(installation,side))"
+    },
+    {
+      "type": "table",
+      "name": "peer_meta",
+      "table": "peer_meta",
+      "sql": "CREATE TABLE peer_meta(installation TEXT PRIMARY KEY,last_seen_ms INTEGER,display_name TEXT,incompatible TEXT,revoked_ms INTEGER)"
+    },
+    {
+      "type": "table",
+      "name": "peers",
+      "table": "peers",
+      "sql": "CREATE TABLE peers(endpoint TEXT PRIMARY KEY,code TEXT NOT NULL,installation TEXT NOT NULL,connections INTEGER NOT NULL,revision TEXT NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "projects",
+      "table": "projects",
+      "sql": "CREATE TABLE projects(state TEXT PRIMARY KEY,label TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,device TEXT NOT NULL,directory TEXT NOT NULL,mount TEXT,desired INTEGER NOT NULL)"
+    },
+    {
+      "type": "table",
+      "name": "settings",
+      "table": "settings",
+      "sql": "CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL)"
+    }
+  ],
+  "required_seed_keys": [
+    "installation",
+    "objects_incarnation",
+    "verifier_generation"
+  ]
+}

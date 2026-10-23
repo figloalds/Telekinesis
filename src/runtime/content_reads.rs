@@ -134,11 +134,9 @@ impl WaitingRange<'_> {
             granted && root == *self.selection.reference(),
             "INVALID_DEMAND_SCOPE"
         );
-        if root.kind == crate::model::content::ContentKind::Legacy
-            || !self.retry_sql(&captured, || {
-                store.content_reference_authorized(&reference, generation)
-            })?
-        {
+        if !self.retry_sql(&captured, || {
+            store.content_reference_authorized(&reference, generation)
+        })? {
             self.retry_sql(&captured, || store.observe_content_unavailable(key))?;
             return Err(initial);
         }

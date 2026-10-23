@@ -407,7 +407,10 @@ fn corrupt_or_exhausted_incarnations_fail_closed_instead_of_reusing_an_old_epoch
     let c = Catalog::open(&cfg).unwrap();
     assert!(c.close());
     drop(c);
-    for text in ["corrupt".to_owned(), u64::MAX.to_string()] {
+    for (text, expected) in [
+        ("corrupt".to_owned(), "INVALID_CATALOG"),
+        (u64::MAX.to_string(), "CATALOG_UNAVAILABLE"),
+    ] {
         let db = rusqlite::Connection::open(cfg.data_directory.join("folders.sqlite")).unwrap();
         db.execute(
             "UPDATE settings SET value=?1 WHERE key='objects_incarnation'",
@@ -416,7 +419,7 @@ fn corrupt_or_exhausted_incarnations_fail_closed_instead_of_reusing_an_old_epoch
         .unwrap();
         drop(db);
         let error = Catalog::open(&cfg).expect_err("invalid epoch must prevent startup");
-        assert_eq!(tkfs::model::errors::code_of(&error), "CATALOG_UNAVAILABLE");
+        assert_eq!(tkfs::model::errors::code_of(&error), expected);
         let db = rusqlite::Connection::open(cfg.data_directory.join("folders.sqlite")).unwrap();
         assert_eq!(
             db.query_row(

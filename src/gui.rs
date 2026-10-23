@@ -1130,7 +1130,7 @@ fn on_folder_reply(ui: &AppWindow, st: &mut State, state: &str, payload: &Value,
             ui.set_conflict_preview("Select a conflict to review its alternatives.".into());
             st.details = value;
         }
-        Some("preview-object") => ui.set_conflict_preview(
+        Some("preview-content") => ui.set_conflict_preview(
             format!(
                 "{} bytes{}\n\n{}",
                 value["size"],
@@ -1498,7 +1498,8 @@ fn wire(ui: &AppWindow) {
                 "Loading the preview",
                 folder_op(
                     &state,
-                    json!({"op": "preview-object", "object": v["value"]}),
+                    json!({"op":"preview-content","reference":tkfs::core::admission::reference_id(
+                        v["revision"].as_str().unwrap_or_default(), c["entity"].as_str().unwrap_or_default())}),
                 ),
             );
         } else {

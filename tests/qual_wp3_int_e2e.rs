@@ -430,44 +430,39 @@ fn v2_peer_fails_closed() {
     s.finish();
 }
 
-/// The 6298d0b legacy data directory upgrades in place, then syncs with a new node.
+/// Current catalog/store restart retains the identities needed for two-peer sync.
 #[test]
 #[ignore = "WP3.INT"]
-fn legacy_fixture_upgrade_then_sync() {
-    let mut s = Scenario::new(FILE, "legacy_fixture_upgrade_then_sync");
-    let fx = copy_legacy_datadir();
-    let manifest = fx.manifest.clone();
-    let legacy = Node::adopt_root(fx.root, NodeConfig::default());
-    let folder = manifest["folders"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|f| f["file"].is_string())
-        .cloned()
-        .unwrap();
-    let state = folder["state"].as_str().unwrap().to_owned();
-    legacy.wait_for("legacy folder running", Duration::from_secs(120), || {
-        legacy
+fn current_restart_then_sync() {
+    let mut s = Scenario::new(FILE, "current_restart_then_sync");
+    let mut source = Node::new();
+    let folder = source.create("Current restart", true);
+    let state = state_id(&folder);
+    write_file(&folder, "before.txt", b"before restart");
+    let installation = source.installation();
+    source.restart();
+    source.wait_for("current folder running", Duration::from_secs(120), || {
+        source
             .try_inspect(&state)
             .is_ok_and(|p| p["running"] == true)
     });
-    let source = legacy.inspect(&state);
+    assert_eq!(source.installation(), installation);
     let fresh = Node::new();
-    fresh.pair(&legacy, &legacy.code());
+    fresh.pair(&source, &source.code());
     s.measure_from_now();
-    let received = fresh.receive(&legacy, &source);
-    let name = folder["file"].as_str().unwrap();
-    let content = folder["content"].as_str().unwrap();
+    let received = fresh.receive(&source, &source.inspect(&state));
     let synced = wait_until(s.remaining(), || {
-        has_hash(&received, name, content) && complete(&received, 1)
+        has_file(&received, "before.txt", b"before restart") && complete(&received, 1)
     });
     s.metric("sync_ms", s.started.elapsed().as_secs_f64() * 1000.0, "ms");
-    s.check(synced, "legacy content reaches the new node");
-    write_file(&received, "back.txt", b"back to the upgraded node");
-    let back = wait_until(Duration::from_secs(60), || {
-        has_file(&source, "back.txt", b"back to the upgraded node")
-    });
-    s.check(back, "the upgraded node receives new content");
+    s.check(synced, "current restart content reaches the new node");
+    write_file(&received, "back.txt", b"back after restart");
+    s.check(
+        wait_until(Duration::from_secs(60), || {
+            has_file(&folder, "back.txt", b"back after restart")
+        }),
+        "current restarted node receives new content",
+    );
     s.finish();
 }
 

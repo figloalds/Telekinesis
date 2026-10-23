@@ -263,15 +263,10 @@ fn epoch_tip_and_cursors_cover_committed_shared_events_only() {
     assert_eq!(epoch.len(), 32);
     assert!(epoch.bytes().all(|b| b.is_ascii_hexdigit()));
     assert_eq!(a.feed_tip().unwrap(), 0);
-    let stamp: String =
-        a.db.query_row(
-            "SELECT value FROM config WHERE key='schema:sharing'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    // 2 since WP3.1 (CCR-WP2.5-4 added `feed_remaining`).
-    assert_eq!(stamp, "2");
+    let version: i64 =
+        a.db.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+    assert_eq!(version, 3);
 
     a.create("one", "file").unwrap();
     let tip = a.feed_tip().unwrap();
@@ -655,7 +650,7 @@ fn feed_journal_follows_the_journal() {
     assert_eq!(shared_rows, expected(&a));
     assert_eq!(shared_rows.len(), shared(&a).len());
     assert_eq!(a.feed_tip().unwrap(), shared_rows.last().unwrap().0);
-    // A store whose schema predates `feed_journal`: built when opened.
+    // A lost current derived feed index is rebuilt from the accepted sequence.
     a.db.execute_batch(
         "DROP TRIGGER feed_journal_insert; DROP TRIGGER feed_journal_update;
         DROP TRIGGER feed_journal_delete; DROP TRIGGER feed_journal_branch; DROP TABLE feed_journal;",

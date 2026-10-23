@@ -167,12 +167,35 @@ fn lost_receipt_index_write_recovers_from_durable_verified_evidence() {
     let (mut b, bp) = store(&temp.path().join("b"));
     let (reference, root) = publish(&mut a, &ap, "file", b"received content");
     metadata(&a, &mut b);
+    let key = ObjectKey::root(&root);
+    // Fresh creation also admitted the canonical empty revision. Verify its
+    // existing local bytes before isolating the failed receipt for this root.
+    for item in b.content_candidates(256, false).unwrap() {
+        if item.edge.key != key {
+            assert_eq!(item.edge.len, 0);
+            assert_eq!(
+                item.edge.key,
+                ObjectKey {
+                    kind: ObjectKind::Bytes,
+                    digest: tkfs::model::content::Digest::bytes(&[]),
+                }
+            );
+            b.verify_content_edge(&bp, &item, &context()).unwrap();
+        }
+    }
+    assert_eq!(
+        b.content_candidates(256, false)
+            .unwrap()
+            .into_iter()
+            .map(|item| item.edge.key)
+            .collect::<Vec<_>>(),
+        vec![key]
+    );
     b.db.execute_batch(
         "CREATE TEMP TRIGGER reject_receipt BEFORE INSERT ON content_public_receipts
         BEGIN SELECT RAISE(ABORT,'lost receipt index write'); END",
     )
     .unwrap();
-    let key = ObjectKey::root(&root);
     assert!(transfer((&a, &ap), (&mut b, &bp), &reference, key).is_err());
     let edge = b.content_edge(&reference, 1, key).unwrap();
     b.verify_content_edge(&bp, &edge, &context()).unwrap();
@@ -775,21 +798,14 @@ fn an_unchanged_manifest_subtree_is_not_reexpanded_for_a_small_revision() {
 }
 
 #[test]
-fn legacy_whole_files_stay_readable_without_entering_the_chunk_frame_engine() {
-    use tkfs::model::content::{ContentKind, Digest};
+fn retired_descriptor_cannot_enter_metadata_or_chunk_jobs() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut a, ap) = store(temp.path());
-    let entry = a.create("legacy", "file").unwrap();
-    let bytes = vec![9; 70_000];
-    let root = FileContentRef::new(
-        ContentKind::Legacy,
-        Digest::bytes(&bytes),
-        bytes.len() as u64,
-    )
-    .unwrap();
-    std::fs::write(a.root.join("objects").join(root.digest.to_string()), &bytes).unwrap();
-    let event = a.event(
-        &a.branch(&a.active).unwrap(),
+    let (mut store, _) = store(temp.path());
+    let entry = store.create("file", "file").unwrap();
+    let before = store.events().unwrap();
+    let admission = store.content_admission_page(0, 256).unwrap();
+    let event = store.event(
+        &store.branch(&store.active).unwrap(),
         vec![Change {
             entity: entry.id.clone(),
             field: "content".into(),
@@ -799,24 +815,17 @@ fn legacy_whole_files_stay_readable_without_entering_the_chunk_frame_engine() {
                 .cloned()
                 .into_iter()
                 .collect(),
-            value: serde_json::json!(root),
+            value: serde_json::json!({
+                "kind":"legacy", "format":0, "algorithm":"sha256",
+                "digest":tkfs::model::content::Digest::bytes(b"retired").to_string(),
+                "total_len":70000
+            }),
         }],
     );
-    let reference = reference_id(&event.id, &entry.id);
-    a.commit(event, true).unwrap();
-    while a.consume_content_admission("objects-v1", 256).unwrap() != 0 {}
-    assert!(a.content_candidates(256, false).unwrap().is_empty());
-    let mut out = [0; 17];
-    ap.read_range(&ap.pin(&root).unwrap(), 65_530, &mut out, &context())
-        .unwrap();
-    assert_eq!(out, [9; 17]);
-    let error = a
-        .read_content_frame(&ap, &reference, ObjectKey::root(&root), &context())
-        .unwrap_err();
-    assert_eq!(
-        tkfs::model::errors::code_of(&error),
-        "UNSUPPORTED_CONTENT_KIND"
-    );
+    assert!(store.commit(event, true).is_err());
+    assert_eq!(store.events().unwrap(), before);
+    assert_eq!(store.entry(&entry.id).unwrap(), entry);
+    assert_eq!(store.content_admission_page(0, 256).unwrap(), admission);
 }
 
 #[test]

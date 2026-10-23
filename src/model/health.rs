@@ -178,6 +178,7 @@ pub struct ActivationCounters {
 /// Local content completeness (the `content.complete` claim of invariant 30).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentCounters {
+    /// Distinct descriptors in the active live file view, not physical chunks.
     pub current_objects: u64,
     pub current_available: u64,
     pub current_missing: u64,
@@ -185,12 +186,13 @@ pub struct ContentCounters {
     pub shared_objects: u64,
     pub shared_available: u64,
     pub shared_missing_bytes: u64,
-    /// Objects with a partial spool.
+    /// Active repository transfer reservations, sampled by the worker.
     pub downloading: u64,
+    /// Current frames are installed atomically; unverified spools are not progress.
     pub partial_bytes: u64,
-    /// Objects in the local demand queue.
+    /// Unsatisfied live repository range waiters, sampled by the worker.
     pub requested: u64,
-    /// Every object referenced by shared events is available.
+    /// Every granted shared descriptor is readable with public provenance.
     pub complete: bool,
 }
 

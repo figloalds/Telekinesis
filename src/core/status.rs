@@ -1,12 +1,11 @@
 //! Status and content summaries of one store.
 //!
-//! `content_counters` is one SQL pass over the object indexes plus one walk of
-//! the active projection. Physical presence comes from one cached listing of
-//! `objects/` (`Store::presence`), never from a `stat` per object, so objects
-//! deleted behind the store's back still show as missing. The result is cached
-//! until the database (`total_changes`, `PRAGMA data_version`), the active
-//! branch or the listing changes; spools, demand and item details are read
-//! fresh on every call.
+//! Content summaries follow current direct/manifest descriptors and verified
+//! graph indexes, with cached listings of `objects/` and `manifests-v1/`.
+//! They never read or hash file bytes. Physical presence without verified
+//! adjacency is reported as indexing, and received shared roots require public
+//! receipts independently of locally readable deduplicated bytes. The cache
+//! follows database changes, branch and both directory listing generations.
 //!
 //! The legacy status (`Store::status`, WP2.3 task 9) is built from three
 //! parts that the worker's status cell (`worker::status_cell`) also reads
@@ -26,11 +25,12 @@
 //! inbox state machine's own accounting (§4.4) is added beside them:
 //! `incoming_active` (`pending_active`: ready + waiting + retry +
 //! unclassified), `incoming_blocked`, and the typed `inbox` counts.
-use super::objects::{CORRUPT, Presence};
+mod content;
+use super::objects::Presence;
 use super::*;
 use crate::model::health::{ContentCounters, InboxCounts, JournalCounters};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     time::{Duration, Instant},
 };
 
@@ -113,7 +113,7 @@ struct ChangeKey {
 pub const CONTENT_ITEMS: usize = 20;
 /// A cached scan is recomputed at least this often. Its key already holds
 /// every input (the database as this connection sees it, the active branch,
-/// the `objects/` listing, which is re-taken when the directory changes), so
+/// both content listings, re-taken when their directories change), so
 /// this is only a safety net: 10 minutes (it was 60 s, which made every idle
 /// folder rescan all its objects each minute, about 0.3 s of CPU at 10K
 /// objects; CCR-WP4.2-5, WP4.INT).
@@ -124,8 +124,8 @@ pub(crate) struct ContentCache {
     key: ContentKey,
     at: Instant,
     counters: ContentCounters,
-    /// `(object, path)` of the first `CONTENT_ITEMS` missing current entries.
-    missing: Vec<(String, String)>,
+    /// Typed details of the first `CONTENT_ITEMS` unavailable current entries.
+    missing: Vec<Value>,
 }
 #[derive(PartialEq, Eq)]
 struct ContentKey {
@@ -134,6 +134,7 @@ struct ContentKey {
     transactional: bool,
     branch: String,
     presence: u64,
+    manifests: u64,
 }
 
 impl Store {
@@ -151,7 +152,8 @@ impl Store {
     pub fn content_report(&self) -> Result<(ContentCounters, Value)> {
         let (counters, items) = self.content_scan(CONTENT_ITEMS)?;
         let legacy = json!({"items":items,"current_objects":counters.current_objects,"current_available":counters.current_available,
-            "current_missing":counters.current_missing,"shared_objects":counters.shared_objects,
+            "current_missing":counters.current_missing,"current_missing_bytes":counters.current_missing_bytes,
+            "shared_missing_bytes":counters.shared_missing_bytes,"shared_objects":counters.shared_objects,
             "shared_available":counters.shared_available,"downloading":counters.downloading,
             "partial_bytes":counters.partial_bytes,"complete":counters.complete,
             "requested":counters.requested});
@@ -346,12 +348,14 @@ impl Store {
     }
     fn content_scan(&self, items: usize) -> Result<(ContentCounters, Vec<Value>)> {
         let presence = self.presence()?;
+        let manifests = self.content_presence("manifests-v1")?;
         let key = ContentKey {
             changes: self.db.total_changes(),
             data_version: self.data_version()?,
             transactional: !self.db.is_autocommit(),
             branch: self.active.clone(),
             presence: presence.generation,
+            manifests: manifests.generation,
         };
         let cached = self
             .caches
@@ -359,126 +363,26 @@ impl Store {
             .content
             .borrow()
             .as_ref()
-            .filter(|cache| cache.key == key && cache.at.elapsed() < CONTENT_CACHE_TTL)
+            .filter(|cache| {
+                !key.transactional && cache.key == key && cache.at.elapsed() < CONTENT_CACHE_TTL
+            })
             .map(|cache| (cache.counters, cache.missing.clone()));
-        let (mut counters, missing) = match cached {
+        let (counters, missing) = match cached {
             Some(cached) => cached,
             None => {
-                let (counters, missing) = self.scan_content(&presence)?;
-                *self.caches.objects.content.borrow_mut() = Some(ContentCache {
-                    key,
-                    at: Instant::now(),
-                    counters,
-                    missing: missing.clone(),
-                });
+                let (counters, missing) = self.scan_content(&presence, &manifests)?;
+                if !key.transactional {
+                    *self.caches.objects.content.borrow_mut() = Some(ContentCache {
+                        key,
+                        at: Instant::now(),
+                        counters,
+                        missing: missing.clone(),
+                    });
+                }
                 (counters, missing)
             }
         };
-        // Only spools of objects still wanted are downloads in progress: one
-        // whose staged event was quarantined or removed waits for the next
-        // open to be dropped (`reconcile_spools`; WP3.INT re-review).
-        let mut partial = self.partial_objects()?;
-        partial.retain(|object, _| self.object_wanted(object).unwrap_or(true));
-        counters.downloading = partial.len() as u64;
-        counters.partial_bytes = partial.values().sum();
-        counters.requested = self.wanted_objects()?.len() as u64;
-        let mut listed = Vec::with_capacity(missing.len().min(items));
-        for (object, path) in missing.into_iter().take(items) {
-            let mut state = self.object_state(&object)?;
-            state["path"] = json!(path);
-            listed.push(state);
-        }
-        Ok((counters, listed))
-    }
-    /// The uncached scan: shared and current counters, and the first missing
-    /// current entries. Available means installed with a consistent size and
-    /// not known corrupt.
-    fn scan_content(
-        &self,
-        presence: &Presence,
-    ) -> Result<(ContentCounters, Vec<(String, String)>)> {
-        let mut counters = ContentCounters::default();
-        let view = self.view(&self.active)?;
-        let current: HashSet<&str> = view
-            .projection
-            .entries
-            .values()
-            .filter(|e| e.alive)
-            .filter_map(|e| e.content.as_deref())
-            .collect();
-        // `(available, size)` of every current object, filled from the pass below.
-        let mut current_state: HashMap<&str, (bool, Option<i64>)> =
-            HashMap::with_capacity(current.len());
-        let mut statement = self.db.prepare_cached(
-            "SELECT e.hash,e.shared,z.size,a.state,
-                EXISTS(SELECT 1 FROM published_objects p WHERE p.hash=e.hash)
-                OR EXISTS(SELECT 1 FROM received_shared_objects r WHERE r.hash=e.hash)
-             FROM (SELECT hash,max(shared) AS shared FROM event_objects GROUP BY hash) e
-             LEFT JOIN object_sizes z ON z.hash=e.hash
-             LEFT JOIN object_availability a ON a.hash=e.hash",
-        )?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            let object = row.get_ref(0)?.as_str()?;
-            let shared: bool = row.get(1)?;
-            let size: Option<i64> = row.get(2)?;
-            let corrupt = row.get::<_, Option<i64>>(3)? == Some(CORRUPT);
-            let available = !corrupt && presence.has(object, size);
-            if shared {
-                counters.shared_objects += 1;
-                if available && row.get::<_, bool>(4)? {
-                    counters.shared_available += 1;
-                } else {
-                    counters.shared_missing_bytes += size.map_or(0, |s| s.max(0) as u64);
-                }
-            }
-            if let Some(object) = current.get(object) {
-                current_state.insert(object, (available, size));
-            }
-        }
-        drop(rows);
-        drop(statement);
-        counters.complete = counters.shared_available == counters.shared_objects;
-        let mut available = HashSet::with_capacity(current.len());
-        for object in &current {
-            let (present, size) = match current_state.get(object) {
-                Some(&state) => state,
-                // Not referenced by any committed event (never expected).
-                None => (self.object_available(object), None),
-            };
-            if present {
-                available.insert(*object);
-            } else {
-                counters.current_missing_bytes += size.map_or(0, |s| s.max(0) as u64);
-            }
-        }
-        counters.current_objects = current.len() as u64;
-        counters.current_available = available.len() as u64;
-        counters.current_missing = counters.current_objects - counters.current_available;
-        let missing = view
-            .projection
-            .entries
-            .values()
-            .filter(|e| e.alive)
-            .filter_map(|e| e.content.as_deref().map(|object| (e, object)))
-            .filter(|(_, object)| !available.contains(object))
-            .take(CONTENT_ITEMS)
-            .map(|(entry, object)| {
-                let mut path = vec![entry.name.clone()];
-                let mut parent = &entry.parent;
-                let mut seen = BTreeSet::new();
-                while parent != ROOT && seen.insert(parent.clone()) {
-                    let Some(e) = view.projection.entries.get(parent) else {
-                        break;
-                    };
-                    path.push(e.name.clone());
-                    parent = &e.parent;
-                }
-                path.reverse();
-                (object.to_owned(), path.join("/"))
-            })
-            .collect();
-        Ok((counters, missing))
+        Ok((counters, missing.into_iter().take(items).collect()))
     }
     pub fn outgoing_unacknowledged(&self) -> Result<i64> {
         Ok(self.db.query_row(

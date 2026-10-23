@@ -1,5 +1,10 @@
 # Telekinesis (tkfs): root-cause map for slow/stuck sync, coupling, failure spread and missing UI status
 
+Historical analysis: the security proposals here are not current requirements.
+The 2026-10-22 [personal-use authority scope](AUTHORITY_SCOPE.md) supersedes
+broader hostile-user defenses, custom authentication and token/ACL prescriptions.
+DVFS authority, integrity, resource bounds and filesystem correctness still apply.
+
 This map covers the current working tree: 18 modified files, plus the untracked `src/bulk_sync.rs` and `src/wire.rs`. I modified no files. Line numbers refer to the working tree.
 
 ---

@@ -819,41 +819,6 @@ fn startup_truncates_spools_to_durable() {
 }
 
 #[test]
-fn legacy_spool_is_adopted_once() {
-    let legacy = copy_legacy_worker();
-    let partial = &legacy.manifest["partial"];
-    let hash = partial["hash"].as_str().unwrap().to_owned();
-    let offset = partial["offset"].as_u64().unwrap();
-    let total = partial["total"].as_u64().unwrap();
-    assert_eq!(spool_len(&legacy.state, &hash), Some(offset));
-    let store = Store::open_existing(&legacy.state).unwrap();
-    // The legacy code fsynced every append: its file length is durable.
-    assert_eq!(
-        store.spool_state(&hash).unwrap(),
-        Some(tkfs::core::transfer::SpoolState {
-            durable: offset,
-            total: Some(total)
-        })
-    );
-    assert_eq!(spool_len(&legacy.state, &hash), Some(offset));
-    // The partial object is wanted, from the adopted offset.
-    let item = store
-        .want_objects(LaneSpec::new(0, 1), 256, u64::MAX, &no_leases)
-        .unwrap()
-        .into_iter()
-        .find(|i| i.hash == hash)
-        .expect("the fixture's partial object is wanted");
-    assert_eq!((item.offset, item.size), (offset, total));
-    drop(store);
-    // Once: a later row-less spool is not adopted.
-    let other = "ab".repeat(32);
-    fs::write(legacy.state.join("incoming-objects").join(&other), b"junk").unwrap();
-    let store = Store::open_existing(&legacy.state).unwrap();
-    assert_eq!(spool_len(&legacy.state, &other), None);
-    assert_eq!(store.spool_state(&hash).unwrap().unwrap().durable, offset);
-}
-
-#[test]
 fn legacy_receive_path_keeps_spool_state() {
     let p = pair(|a| {
         large_object_in(a, "obj.bin", 3 * MIB, 9).unwrap();

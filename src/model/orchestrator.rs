@@ -193,7 +193,7 @@ pub trait CatalogApi: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CredentialSide {
     /// A dialer enrolled this credential with us; the inbound server
-    /// verifies its `peer-hmac-v1` sessions with it.
+    /// checks its application credential against it.
     Inbound,
     /// We enrolled this credential with an acceptor; our lanes present it.
     Outbound,
@@ -321,7 +321,7 @@ pub struct CatalogSnapshot {
     pub installation: String,
     pub folders: Vec<FolderRecord>,
     pub peers: Vec<PeerRecord>,
-    /// Salted pairing verifier; HMAC-key-equivalent to the code (§11.15).
+    /// Salted application pairing verifier.
     pub verifier: Option<Verifier>,
     pub verifier_generation: u64,
     /// Keyed by folder state.
@@ -454,7 +454,7 @@ pub enum CatalogCmd {
     OverrideGate {
         state: String,
     },
-    /// Deletes both `initial_sync` and `mount_gates` rows (after `Attached`).
+    /// Deletes the canonical `mount_gates` row (after `Attached`).
     ClearGate {
         state: String,
     },

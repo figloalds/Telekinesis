@@ -12,31 +12,6 @@ struct Witness {
     ancestors: Vec<ContentEdge>,
 }
 
-pub(super) fn schema(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS content_object_jobs(
-        kind INTEGER NOT NULL,digest TEXT NOT NULL,verified INTEGER NOT NULL DEFAULT 0,
-        expanded INTEGER NOT NULL DEFAULT 0,retry_at_ms INTEGER NOT NULL DEFAULT 0,error TEXT,
-        witness TEXT NOT NULL,PRIMARY KEY(kind,digest));
-        CREATE INDEX IF NOT EXISTS content_jobs_missing ON content_object_jobs(verified,retry_at_ms,kind,digest);
-        CREATE INDEX IF NOT EXISTS content_jobs_pages ON content_object_jobs(kind,expanded,retry_at_ms,digest);
-        CREATE TABLE IF NOT EXISTS content_manifest_edges(
-        parent TEXT NOT NULL,ordinal INTEGER NOT NULL,kind INTEGER NOT NULL,digest TEXT NOT NULL,
-        len INTEGER NOT NULL,level INTEGER NOT NULL,PRIMARY KEY(parent,ordinal));
-        CREATE TABLE IF NOT EXISTS content_page_aliases(
-        id INTEGER PRIMARY KEY,kind INTEGER NOT NULL,digest TEXT NOT NULL,reference TEXT NOT NULL,
-        generation INTEGER NOT NULL,offset INTEGER NOT NULL,
-        UNIQUE(kind,digest,reference,generation,offset));
-        CREATE INDEX IF NOT EXISTS content_alias_page ON content_page_aliases(kind,digest,id);
-        CREATE TABLE IF NOT EXISTS content_alias_cursor(kind INTEGER NOT NULL,digest TEXT NOT NULL,
-        before_id INTEGER NOT NULL,PRIMARY KEY(kind,digest));
-        CREATE INDEX IF NOT EXISTS content_jobs_scan ON content_object_jobs(verified,kind,digest);
-        CREATE INDEX IF NOT EXISTS content_jobs_structure_scan ON content_object_jobs(kind,expanded,digest);
-        CREATE TABLE IF NOT EXISTS content_transfer_cursor(source TEXT NOT NULL,lane_index INTEGER NOT NULL,
-        lane_count INTEGER NOT NULL,kind INTEGER NOT NULL,after_digest TEXT NOT NULL,
-        PRIMARY KEY(source,lane_index,lane_count,kind));")?;
-    Ok(())
-}
-
 fn alias(db: &Connection, item: &AdmittedEdge) -> Result<()> {
     db.execute(
         "INSERT OR IGNORE INTO content_page_aliases(kind,digest,reference,generation,offset)
@@ -85,12 +60,6 @@ pub(super) fn seed(
     generation: u64,
     root: &FileContentRef,
 ) -> Result<()> {
-    // Whole-file transfers retain their existing streaming protocol and IDs.
-    // They must never enter a 64 KiB chunk job or be classified as corrupt for
-    // exceeding the new frame's bound.
-    if root.kind == ContentKind::Legacy {
-        return Ok(());
-    }
     // An outbox replay must not replace a newer root witness with an old grant.
     let valid: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM content_root_metadata
@@ -498,7 +467,6 @@ impl Store {
     ) -> Result<Vec<AdmittedEdge>> {
         let (generation, root, granted) = self.content_root(reference)?;
         ensure!(granted, "UNAUTHORIZED_OBJECT");
-        ensure!(root.kind != ContentKind::Legacy, "UNSUPPORTED_CONTENT_KIND");
         range.validate(root.total_len)?;
         ensure!(
             range.len <= crate::model::workspace::limits::READ_BYTES as u64,
@@ -514,9 +482,7 @@ impl Store {
         };
         let mut items = vec![];
         for node_level in (-1..=top).rev() {
-            let span = if root.kind == ContentKind::Legacy {
-                root.total_len
-            } else if node_level < 0 {
+            let span = if node_level < 0 {
                 CHUNK_SIZE
             } else {
                 ManifestNode::child_capacity(node_level as u8)? * 256

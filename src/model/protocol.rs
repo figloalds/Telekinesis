@@ -23,11 +23,6 @@ pub const UPGRADE_V3: &str = "3";
 pub const UPGRADE_LOOPBACK: &str = "3-loopback";
 /// Local token header (WP4.1).
 pub const TOKEN_HEADER: &str = "X-Tkfs-Token";
-/// The per-peer authentication scheme's name in `ClientHello.features` and
-/// `ServerHello.features` (WP4.1; CCR-WP4.1-2, applied by WP4.INT).
-pub const PEER_HMAC_V1: &str = "peer-hmac-v1";
-/// Domain-separation prefix of the authentication transcript `T` (§6.2).
-pub const AUTH_CONTEXT: &str = "tkfs-peer-auth-v3";
 /// Text JSON reply a v3 server sends to a legacy (v2) client before closing.
 pub const LEGACY_NEEDS_UPGRADE_REPLY: &str = r#"{"ok":false,"error":"PEER_NEEDS_UPGRADE: remote runs tkfs peer protocol 3; upgrade this orchestrator"}"#;
 
@@ -264,8 +259,6 @@ pub mod frame {
     pub const GOAWAY_GRACE: Duration = Duration::from_secs(5);
     /// Per resolved address when dialing.
     pub const DIAL_ATTEMPT: Duration = Duration::from_secs(3);
-    /// Client nonce / server nonce length in bytes (hex-encoded on the wire).
-    pub const NONCE_BYTES: usize = 32;
 
     /// `GOAWAY` codes sent instead of `HELLO_ACK` or `AUTH_OK`.
     pub const GOAWAY_HANDSHAKE_CODES: &[&str] = &[
@@ -361,8 +354,6 @@ pub mod frame {
         pub pool: u32,
         /// Session uuid.
         pub session: String,
-        /// 32 random bytes, hex.
-        pub client_nonce: String,
         #[serde(default)]
         pub features: Vec<String>,
     }
@@ -396,25 +387,31 @@ pub mod frame {
         pub lane: Option<LaneSpec>,
         /// Verifier salt; the client derives the key with it.
         pub salt: String,
-        /// 32 random bytes, hex.
-        pub server_nonce: String,
         pub verifier_generation: u64,
         #[serde(default)]
         pub features: Vec<String>,
         pub limits: Limits,
     }
 
-    /// `AUTH` header: `proof = hex(HMAC-SHA256(K, "client" ‖ T))`.
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    /// Application credential carried by the selected TLS/WSS or VPN channel.
+    #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Auth {
-        pub proof: String,
+        pub credential: String,
+        #[serde(default)]
+        pub peer: bool,
     }
-
-    /// `AUTH_OK` header: `server_proof = hex(HMAC-SHA256(K, "server" ‖ T))`.
+    impl std::fmt::Debug for Auth {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Auth")
+                .field("credential", &"<redacted>")
+                .field("peer", &self.peer)
+                .finish()
+        }
+    }
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    pub struct AuthOk {
-        pub server_proof: String,
-    }
+    #[serde(deny_unknown_fields)]
+    pub struct AuthOk {}
 
     /// `REQUEST` header. Only clients originate requests; ids are allocated by
     /// the client. With `MORE`, the body continues in CHUNK frames and `total`

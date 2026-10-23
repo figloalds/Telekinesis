@@ -3,17 +3,10 @@ use serde_json::json;
 use std::fs::OpenOptions;
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
-use std::{
-    collections::BTreeSet,
-    fs,
-    io::{Read, Seek, SeekFrom},
-};
-use tkfs::{
-    backend::{DirectoryBackend, ObjectBackend},
-    core::*,
-    runtime::Engine,
-    staging::Staged,
-};
+use std::{collections::BTreeSet, fs};
+use tkfs::{backend::DirectoryBackend, core::*, runtime::Engine};
+#[path = "support/export.rs"]
+mod export;
 
 #[cfg(windows)]
 #[test]
@@ -123,60 +116,113 @@ fn volume_flush_retires_recovered_closed_sessions_before_checkout() {
 }
 
 #[test]
-fn large_random_access_file_is_disk_staged_durable_and_exportable() {
+fn large_current_random_access_file_is_durable_and_exportable() {
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    use tkfs::runtime::{
+        self,
+        content::ContentWait,
+        content_reads,
+        content_writes::{self, NativeWrites},
+    };
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::new(Store::open(dir.path(), Some("availability")).unwrap());
-    let (handle, _) = engine.open("large", Some("file"), true).unwrap();
+    let shared = Arc::new(Mutex::new(Engine::new(
+        Store::initialize(dir.path(), "availability", &id()).unwrap(),
+    )));
+    let writes = NativeWrites::install(&shared, &export::context()).unwrap();
+    let wait = ContentWait::fixed(Duration::from_secs(60));
+    let (handle, _) = content_writes::create(
+        &shared,
+        "large",
+        content_writes::CreateOptions {
+            writable: true,
+            ..Default::default()
+        },
+        wait,
+    )
+    .unwrap()
+    .unwrap();
     let block = vec![0x61; 1024 * 1024];
     for i in 0..20 {
-        engine
-            .write(handle, i * block.len() as u64, &block, false, false)
-            .unwrap();
+        assert_eq!(
+            content_writes::write(
+                &shared,
+                handle,
+                i * block.len() as u64,
+                &block,
+                false,
+                false,
+                wait
+            )
+            .unwrap(),
+            Some(block.len())
+        );
     }
-    assert!(matches!(
-        engine.session(handle).unwrap().bytes,
-        Staged::Disk { .. }
-    ));
-    engine
-        .write(handle, 5 * 1024 * 1024, b"patched", false, false)
-        .unwrap();
-    engine.truncate(handle, 18 * 1024 * 1024, false).unwrap();
-    engine
-        .write(handle, 19 * 1024 * 1024, b"tail", false, false)
-        .unwrap();
-    engine.close(handle).unwrap();
-    engine.quiet().unwrap();
-    drop(engine);
-    let mut store = Store::open_existing(dir.path()).unwrap();
-    let object = store.lookup("large").unwrap().content.unwrap();
-    assert!(
-        store
-            .read_object(&object)
-            .unwrap_err()
-            .to_string()
-            .contains("OBJECT_REQUIRES_STREAMING")
+    content_writes::write(
+        &shared,
+        handle,
+        5 * 1024 * 1024,
+        b"patched",
+        false,
+        false,
+        wait,
+    )
+    .unwrap();
+    content_writes::truncate(&shared, handle, 18 * 1024 * 1024, false, wait).unwrap();
+    content_writes::write(
+        &shared,
+        handle,
+        19 * 1024 * 1024,
+        b"tail",
+        false,
+        false,
+        wait,
+    )
+    .unwrap();
+    assert_eq!(
+        content_reads::read_mount_vec(&shared, handle, 18 * 1024 * 1024, 7, wait)
+            .unwrap()
+            .unwrap(),
+        [0; 7]
     );
-    let mut file = store.open_object(&object).unwrap();
-    assert_eq!(file.metadata().unwrap().len(), 19 * 1024 * 1024 + 4);
-    let mut bytes = [0; 7];
-    file.seek(SeekFrom::Start(5 * 1024 * 1024)).unwrap();
-    file.read_exact(&mut bytes).unwrap();
-    assert_eq!(&bytes, b"patched");
-    file.seek(SeekFrom::Start(18 * 1024 * 1024)).unwrap();
-    file.read_exact(&mut bytes).unwrap();
-    assert_eq!(bytes, [0; 7]);
+    runtime::engine::close_handle(&shared, handle).unwrap();
+    runtime::lock_engine(&shared).quiet().unwrap();
+    writes.shutdown(&export::context()).unwrap();
+    drop(writes);
+    drop(shared);
+    let mut store = Store::open_existing(dir.path()).unwrap();
+    let reference = store.lookup("large").unwrap().content_ref.unwrap();
+    assert_eq!(reference.total_len, 19 * 1024 * 1024 + 4);
+    let provider = tkfs::content::LocalContent::open(dir.path()).unwrap();
+    assert_eq!(
+        export::read(&provider, &reference, 5 * 1024 * 1024, 7),
+        b"patched"
+    );
+    assert_eq!(
+        export::read(&provider, &reference, 18 * 1024 * 1024, 7),
+        [0; 7]
+    );
     let checkpoint = store.checkpoint("large preserved").unwrap();
     let restored = store.restore(&checkpoint, "restored").unwrap();
     store.checkout(&restored.id).unwrap();
-    assert_eq!(store.lookup("large").unwrap().content, Some(object.clone()));
+    assert_eq!(
+        store.lookup("large").unwrap().content_ref,
+        Some(reference.clone())
+    );
     let bucket = tempfile::tempdir().unwrap();
     let backend = DirectoryBackend::new(bucket.path()).unwrap();
-    store.export_shared_objects(&backend).unwrap();
-    assert_eq!(
-        fs::metadata(bucket.path().join(&object)).unwrap().len(),
-        19 * 1024 * 1024 + 4
-    );
-    assert!(backend.get_verified(&object).is_err());
+    let report = store.export_shared_objects(&backend).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let (_, copy) = export::restore(&backend, &report, target.path());
+    let actual = export::read(&copy, &reference, 0, reference.total_len as usize);
+    let mut expected = vec![0x61; 18 * 1024 * 1024];
+    expected[5 * 1024 * 1024..5 * 1024 * 1024 + 7].copy_from_slice(b"patched");
+    expected.resize(19 * 1024 * 1024, 0);
+    expected.extend_from_slice(b"tail");
+    assert_eq!(actual, expected);
+    assert!(store.verify_derived_state().unwrap().is_empty());
 }
 
 #[test]

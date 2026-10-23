@@ -6,10 +6,7 @@
 //! catalog takes the `FAULTS` lock: shared by default, exclusive while a test
 //! has a catalog fault point armed. The wake-up latency tests also take it
 //! exclusively, so no catalog test competes with them for the CPU.
-mod support;
-
 use rusqlite::{Connection, OptionalExtension};
-use serde_json::Value;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -20,7 +17,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use support::{Node, NodeConfig, copy_legacy_datadir, legacy};
+
 use tkfs::{
     core::id,
     model::{
@@ -31,7 +28,7 @@ use tkfs::{
         },
     },
     orchestrator::{
-        Config, Network, Project,
+        Config, Network,
         catalog::{self, Catalog, validate_mount_path},
         published::PublishedCatalog,
     },
@@ -166,9 +163,9 @@ fn raw(config: &Config) -> Connection {
     Connection::open(db_path(config)).unwrap()
 }
 
-fn raw_initial_sync(config: &Config) -> Vec<(String, String)> {
+fn raw_gates(config: &Config) -> Vec<(String, String)> {
     raw(config)
-        .prepare("SELECT state,endpoint FROM initial_sync ORDER BY state")
+        .prepare("SELECT state,source_endpoint FROM mount_gates ORDER BY state")
         .unwrap()
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap()
@@ -193,270 +190,6 @@ fn raw_count(config: &Config, table: &str, state: &str) -> i64 {
             |r| r.get(0),
         )
         .unwrap()
-}
-
-/// The legacy `Supervisor` view of a data directory: `projects()`, and the
-/// List and Peers replies of the legacy `manage()` (no workers are started).
-fn legacy_view(config: &Config) -> (Vec<Project>, Value, Value) {
-    let supervisor = Supervisor::open(config.clone()).unwrap();
-    let projects = supervisor.projects().unwrap();
-    let list = supervisor.list().unwrap();
-    let peers = supervisor.peers_reply().unwrap();
-    (projects, list, peers)
-}
-
-use legacy_oracle::Supervisor;
-
-/// The 6298d0b daemon's view of a data directory, the oracle of the
-/// downgrade and mount-path tests below.
-///
-/// WP2.INT deleted the legacy `Supervisor` (`src/orchestrator/supervisor.rs`,
-/// `catalog_db.rs` and the legacy `api::manage`, REVAMP_PLAN §14 WP2.INT
-/// task 1), which these tests used as the oracle. This module ports, with the
-/// same SQL and the same JSON shapes, exactly the parts they exercised: `open`
-/// (the lock, the schema, the installation), `projects`, the List, Inspect and
-/// Peers replies of a daemon with no worker and no lane running (the oracle
-/// never started one), and the legacy `ConfigureMount` with its
-/// `mount_path` rule.
-mod legacy_oracle {
-    use anyhow::{Context, Result, ensure};
-    use rusqlite::{Connection, OptionalExtension, params};
-    use serde_json::{Value, json};
-    use std::{
-        fs::{self, File},
-        path::{Path, PathBuf},
-    };
-    use tkfs::{
-        core::id,
-        orchestrator::{Config, Project, lock},
-    };
-
-    struct Peer {
-        endpoint: String,
-        installation: String,
-        connections: usize,
-    }
-    impl Peer {
-        fn pool_size(&self) -> usize {
-            self.connections.max(2)
-        }
-    }
-
-    fn lane_role(lane: usize) -> &'static str {
-        if lane == 0 { "control" } else { "bulk" }
-    }
-
-    pub struct Supervisor {
-        config: Config,
-        db: Connection,
-        installation: String,
-        _lock: File,
-    }
-
-    impl Supervisor {
-        pub fn open(config: Config) -> Result<Self> {
-            fs::create_dir_all(&config.data_directory)?;
-            fs::create_dir_all(&config.default_mount_directory)?;
-            let lock = lock(&config.data_directory.join("orchestrator.lock"))?;
-            let db = Connection::open(config.data_directory.join("folders.sqlite"))?;
-            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-                CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS projects(state TEXT PRIMARY KEY,label TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,device TEXT NOT NULL,directory TEXT NOT NULL,mount TEXT,desired INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS peers(endpoint TEXT PRIMARY KEY,code TEXT NOT NULL,installation TEXT NOT NULL,connections INTEGER NOT NULL,revision TEXT NOT NULL);")?;
-            db.execute_batch(
-                "CREATE TABLE IF NOT EXISTS initial_sync(state TEXT PRIMARY KEY,endpoint TEXT NOT NULL);",
-            )?;
-            db.execute(
-                "INSERT OR IGNORE INTO settings VALUES('installation',?)",
-                [id()],
-            )?;
-            let installation = db.query_row(
-                "SELECT value FROM settings WHERE key='installation'",
-                [],
-                |r| r.get(0),
-            )?;
-            Ok(Self {
-                config,
-                db,
-                installation,
-                _lock: lock,
-            })
-        }
-
-        pub fn projects(&self) -> Result<Vec<Project>> {
-            Ok(self
-                .db
-                .prepare("SELECT state,label,repo,device,directory,mount,desired FROM projects ORDER BY label,state")?
-                .query_map([], |r| {
-                    Ok(Project {
-                        state: r.get(0)?,
-                        label: r.get(1)?,
-                        repo: r.get(2)?,
-                        device: r.get(3)?,
-                        directory: PathBuf::from(r.get::<_, String>(4)?),
-                        mount: r.get::<_, Option<String>>(5)?.map(PathBuf::from),
-                        desired_running: r.get(6)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?)
-        }
-
-        fn project(&self, state: &str) -> Result<Project> {
-            self.projects()?
-                .into_iter()
-                .find(|p| p.state == state)
-                .context("FOLDER_NOT_FOUND")
-        }
-
-        fn peers(&self) -> Result<Vec<Peer>> {
-            Ok(self
-                .db
-                .prepare("SELECT endpoint,code,installation,connections,revision FROM peers ORDER BY endpoint")?
-                .query_map([], |r| {
-                    Ok(Peer {
-                        endpoint: r.get(0)?,
-                        installation: r.get(2)?,
-                        connections: r.get(3)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?)
-        }
-
-        fn initial_peer(&self, state: &str) -> Result<Option<String>> {
-            Ok(self
-                .db
-                .query_row(
-                    "SELECT endpoint FROM initial_sync WHERE state=?",
-                    [state],
-                    |r| r.get(0),
-                )
-                .optional()?)
-        }
-
-        /// `Supervisor::inspect` with no worker and no link: every worker
-        /// and lane member at its "not running" value.
-        fn inspect(&self, state: &str) -> Result<Value> {
-            let project = self.project(state)?;
-            let mut value = json!(project);
-            let initial_peer = self.initial_peer(state)?;
-            value["running"] = json!(false);
-            value["starting"] = json!(false);
-            value["mounted"] = json!(false);
-            value["initial_sync_pending"] = json!(initial_peer.is_some());
-            value["startup_phase"] = Value::Null;
-            let mut sync = Vec::new();
-            for peer in self.peers()? {
-                let lanes: Vec<Value> = (0..peer.pool_size())
-                    .map(|lane| {
-                        json!({
-                            "lane": lane,
-                            "role": lane_role(lane),
-                            "connected": false,
-                            "transport": Value::Null,
-                            "parallel_bulk": false,
-                            "error": Value::Null,
-                            "repository": Value::Null,
-                        })
-                    })
-                    .collect();
-                sync.push(json!({
-                    "endpoint": peer.endpoint,
-                    "connected": false,
-                    "remote_available": Value::Null,
-                    "error": Value::Null,
-                    "metadata": Value::Null,
-                    "lanes": lanes,
-                }));
-            }
-            value["sync"] = Value::Array(sync);
-            value["error"] = Value::Null;
-            value["publication_error"] = Value::Null;
-            Ok(value)
-        }
-
-        /// The legacy `Action::List` reply.
-        pub fn list(&self) -> Result<Value> {
-            let folders = self
-                .projects()?
-                .iter()
-                .map(|p| self.inspect(&p.state))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(json!({"installation": self.installation, "folders": folders}))
-        }
-
-        /// The legacy `Action::Peers` reply: every lane a default
-        /// `LinkStatus` plus its role.
-        pub fn peers_reply(&self) -> Result<Value> {
-            let mut peers = Vec::new();
-            for p in self.peers()? {
-                let lanes: Vec<Value> = (0..p.pool_size())
-                    .map(|lane| {
-                        json!({
-                            "connected": false,
-                            "exchanges": 0,
-                            "last_success_ms": Value::Null,
-                            "error": Value::Null,
-                            "transport": Value::Null,
-                            "parallel_bulk": false,
-                            "repositories": {},
-                            "role": lane_role(lane),
-                        })
-                    })
-                    .collect();
-                peers.push(json!({
-                    "endpoint": p.endpoint,
-                    "installation": p.installation,
-                    "connections": p.pool_size(),
-                    "configured_connections": p.connections,
-                    "reserved_connections": 1,
-                    "lanes": lanes,
-                }));
-            }
-            Ok(Value::Array(peers))
-        }
-
-        /// The legacy `Action::ConfigureMount` (no worker running).
-        pub fn configure_mount(&self, state: &str, mount: Option<PathBuf>) -> Result<Value> {
-            let p = self.project(state)?;
-            let mount = if mount == p.mount {
-                mount
-            } else {
-                mount
-                    .map(|requested| self.mount_path(&p.directory, &requested))
-                    .transpose()?
-            };
-            self.db.execute(
-                "UPDATE projects SET mount=? WHERE state=?",
-                params![mount.map(|p| p.to_string_lossy().into_owned()), state],
-            )?;
-            self.inspect(state)
-        }
-
-        fn mount_path(&self, directory: &Path, requested: &Path) -> Result<PathBuf> {
-            let path = std::path::absolute(requested)?;
-            let parent = path.parent().context("MOUNT_PARENT_REQUIRED")?;
-            fs::create_dir_all(parent)?;
-            let path =
-                fs::canonicalize(parent)?.join(path.file_name().context("FOLDER_MOUNT_REQUIRED")?);
-            let data = fs::canonicalize(&self.config.data_directory)?;
-            ensure!(
-                !path.starts_with(&data)
-                    && !data.starts_with(&path)
-                    && !directory.starts_with(&path),
-                "MOUNT_OVERLAPS_DATA"
-            );
-            ensure!(!path.exists(), "MOUNT_PATH_MUST_NOT_EXIST");
-            for p in self.projects()? {
-                if let Some(other) = p.mount {
-                    ensure!(
-                        !path.starts_with(&other) && !other.starts_with(&path),
-                        "MOUNT_OVERLAPS_FOLDER"
-                    );
-                }
-            }
-            Ok(path)
-        }
-    }
 }
 
 /// Applies commands and checks that the generation moves by exactly one per
@@ -520,285 +253,64 @@ fn assert_fast(name: &str, limit: Duration, mut measure: impl FnMut() -> Duratio
 }
 
 // ---------------------------------------------------------------------------
-// Legacy data directory and downgrade safety
+// Fresh current catalog restart
 
 #[test]
-fn legacy_datadir_opens_equal_to_the_legacy_supervisor_view() {
+fn current_catalog_restart_preserves_records_gates_verifier_and_credentials() {
     let _faults = shared();
-    let fx = copy_legacy_datadir();
-    let config = Config::load(&fx.config).unwrap();
-    let (projects, list, peers) = legacy_view(&config);
-    let initial_sync = raw_initial_sync(&config);
-    let pairing = raw_setting(&config, "pairing").expect("fixture has a verifier");
-    let raw_peers: Vec<(String, String, String)> = raw(&config)
-        .prepare("SELECT endpoint,code,revision FROM peers ORDER BY endpoint")
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap();
-    assert_eq!(
-        raw_setting(&config, "catalog_schema"),
-        None,
-        "fresh fixture"
-    );
-
-    let catalog = Catalog::open(&config).unwrap();
-    let snap = catalog.snapshot();
-    assert_eq!(snap.generation, 1);
-    assert_eq!(snap.installation, list["installation"].as_str().unwrap());
-    assert_eq!(
-        snap.installation,
-        fx.manifest["installation"].as_str().unwrap()
-    );
-
-    // projects: same rows, same order (label, state), default intents.
-    assert_eq!(snap.folders.len(), projects.len());
-    assert_eq!(snap.folders.len(), 3);
-    for (record, project) in snap.folders.iter().zip(&projects) {
-        assert_eq!(record.state, project.state);
-        assert_eq!(record.label, project.label);
-        assert_eq!(record.repo, project.repo);
-        assert_eq!(record.device, project.device);
-        assert_eq!(record.directory, project.directory);
-        assert_eq!(record.mount, project.mount);
-        assert_eq!(record.desired_running, project.desired_running);
-        assert!(record.sync_enabled && record.mount_enabled, "{record:?}");
-    }
-
-    // initial_sync: one gate per pending folder, backfilled into mount_gates
-    // with the source installation resolved through peers.
-    let pending: Vec<&str> = list["folders"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|f| f["initial_sync_pending"] == true)
-        .map(|f| f["state"].as_str().unwrap())
-        .collect();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(
-        snap.gates.keys().map(String::as_str).collect::<Vec<_>>(),
-        pending
-    );
-    assert_eq!(initial_sync.len(), 1);
-    for (state, endpoint) in &initial_sync {
-        let gate = &snap.gates[state];
-        assert_eq!(&gate.state, state);
-        assert_eq!(&gate.source_endpoint, endpoint);
-        assert_eq!(gate.source_endpoint, legacy::DEAD_PEER_ENDPOINT);
-        assert_eq!(
-            gate.source_installation.as_deref(),
-            fx.manifest["peers"][0]["installation"].as_str()
-        );
-        assert_eq!(gate.override_ms, None);
-        assert!(gate.created_ms > 0);
-    }
-
-    // peers: the legacy Peers reply plus the stored code and revision.
-    let peers = peers.as_array().unwrap();
-    assert_eq!(snap.peers.len(), peers.len());
-    for ((record, shown), (endpoint, code, revision)) in
-        snap.peers.iter().zip(peers).zip(&raw_peers)
-    {
-        assert_eq!(record.endpoint, shown["endpoint"].as_str().unwrap());
-        assert_eq!(record.installation, shown["installation"].as_str().unwrap());
-        assert_eq!(
-            u64::from(record.connections),
-            shown["configured_connections"].as_u64().unwrap()
-        );
-        assert_eq!(&record.endpoint, endpoint);
-        assert_eq!(&record.code, code);
-        assert_eq!(&record.revision, revision);
-    }
-
-    // verifier: the legacy `settings.pairing` value, first generation.
-    let verifier: Verifier = serde_json::from_str(&pairing).unwrap();
-    assert_eq!(snap.verifier.as_ref(), Some(&verifier));
-    assert_eq!(snap.verifier_generation, 1);
-    assert!(snap.peer_meta.is_empty());
-    assert_eq!(raw_setting(&config, "catalog_schema").as_deref(), Some("1"));
-    assert_eq!(
-        raw_setting(&config, "verifier_generation").as_deref(),
-        Some("1")
-    );
-
-    // Downgrade: after the migration the legacy view is unchanged.
-    drop(catalog);
-    let (projects_after, list_after, peers_after) = legacy_view(&config);
-    assert_eq!(list_after, list);
-    assert_eq!(peers_after, Value::Array(peers.clone()));
-    assert_eq!(
-        serde_json::to_value(&projects_after).unwrap(),
-        serde_json::to_value(&projects).unwrap()
-    );
-
-    // A second open is a no-op migration with the same content.
-    let catalog = Catalog::open(&config).unwrap();
-    assert_same_content(&catalog.snapshot(), &snap);
-}
-
-#[test]
-fn downgrade_legacy_daemon_creates_pairs_and_rotates_on_a_migrated_catalog() {
-    let _faults = shared();
-    let fx = copy_legacy_datadir();
-    let config = Config::load(&fx.config).unwrap();
-    let legacy_peer = fx.manifest["peers"][0]["installation"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-
-    // The new code writes every side table.
-    let catalog = Catalog::open(&config).unwrap();
-    let mut gated = folder(&config, "Catalog gated");
-    gated.desired_running = false;
-    gated.sync_enabled = false;
-    gated.mount = Some(
-        validate_mount_path(
-            &catalog.snapshot(),
-            &config.data_directory,
-            &gated.directory,
-            &config.default_mount_directory.join("Catalog gated"),
-        )
-        .unwrap(),
-    );
+    let env = env();
+    let catalog = Catalog::open(&env.config).unwrap();
+    let installation = catalog.snapshot().installation.clone();
     catalog
-        .apply(create(&gated, Some(gate_from(legacy::DEAD_PEER_ENDPOINT))))
+        .apply(CatalogCmd::UpsertPeer {
+            record: peer("ws://source:1", "source"),
+        })
+        .unwrap();
+    let mut record = folder(&env.config, "Current gated");
+    record.mount = Some(env.config.default_mount_directory.join("Current gated"));
+    record.desired_running = false;
+    record.sync_enabled = false;
+    catalog
+        .apply(create(&record, Some(gate_from("ws://source:1"))))
         .unwrap();
     catalog
         .apply(CatalogCmd::OverrideGate {
-            state: gated.state.clone(),
+            state: record.state.clone(),
         })
         .unwrap();
+    // Removing the mount does not discard a pending gate. The controller
+    // clears it after satisfaction/override; a stopped folder must retain it.
+    catalog
+        .apply(CatalogCmd::SetMount {
+            state: record.state.clone(),
+            mount: None,
+        })
+        .unwrap();
+    record.mount = None;
     catalog
         .apply(CatalogCmd::SetVerifier {
             verifier: Verifier::generate().1,
         })
         .unwrap();
     catalog
-        .apply(CatalogCmd::RecordPeerSeen {
-            installation: legacy_peer.clone(),
-            at_ms: 5,
-            display_name: Some("legacy peer".into()),
-            incompatible: None,
-        })
+        .enroll("source", CredentialSide::Inbound, [7; 32])
+        .unwrap();
+    catalog
+        .enroll("source", CredentialSide::Outbound, [8; 32])
         .unwrap();
     let before = catalog.snapshot();
-    assert_eq!(before.verifier_generation, 2);
-    assert_eq!(raw_initial_sync(&config).len(), 2);
+    let credentials = catalog.credentials();
+    let incarnation = catalog.lease_incarnation();
+    assert!(catalog.close());
     drop(catalog);
-
-    // A downgraded daemon (the legacy Supervisor of this build) runs on it.
-    let mut a = Node::adopt_root(fx.root, NodeConfig::default());
-    let list = a.list();
-    let row = list["folders"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|f| f["state"] == gated.state.as_str())
-        .unwrap_or_else(|| panic!("legacy List misses the new folder: {list}"));
-    assert_eq!(row["initial_sync_pending"], true, "{row}");
-    assert_eq!(row["desired_running"], false, "{row}");
-    assert_eq!(list["folders"].as_array().unwrap().len(), 4);
-    // Legacy create(): the positional `projects` INSERT.
-    let created = a.create("Downgrade local", true);
-    let created_state = created["state"].as_str().unwrap().to_owned();
-    // Legacy Pair: the positional `peers` upsert.
-    let b = Node::new();
-    let code = b.code();
-    let paired = a.pair(&b, &code);
-    assert_eq!(paired["installation"], b.installation().as_str());
-    // Legacy ResetPairingCode: the `settings.pairing` upsert.
-    a.code();
-    a.stop();
-
-    // Upgrade again: everything the legacy daemon wrote is in the snapshot.
-    let catalog = Catalog::open(&config).unwrap();
-    let snap = catalog.snapshot();
-    let local = snap.folder(&created_state).expect("legacy-created folder");
-    assert_eq!(local.label, "Downgrade local");
-    assert!(local.desired_running && local.sync_enabled && local.mount_enabled);
-    assert_eq!(local.mount, None);
-    assert!(!snap.gates.contains_key(&created_state));
-    let kept = snap.folder(&gated.state).unwrap();
-    assert_eq!(kept, &gated);
-    assert_eq!(snap.gates[&gated.state], before.gates[&gated.state]);
-    let paired = snap.peer_by_endpoint(&b.endpoint()).expect("legacy pair");
-    assert_eq!(paired.installation, b.installation());
-    assert_eq!(paired.code, code);
-    assert_eq!(paired.connections, 3);
-    assert!(!paired.revision.is_empty());
-    assert_eq!(snap.peers.len(), 2);
-    // The legacy rotation is a new verifier generation.
-    assert_ne!(snap.verifier, before.verifier);
-    assert_eq!(snap.verifier_generation, before.verifier_generation + 1);
-    assert_eq!(
-        snap.peer_meta[&legacy_peer].display_name.as_deref(),
-        Some("legacy peer")
-    );
-}
-
-#[test]
-fn gate_changes_made_while_downgraded_are_reconciled_on_open() {
-    let _faults = shared();
-    let env = env();
-    let config = &env.config;
-    let catalog = Catalog::open(config).unwrap();
-    catalog
-        .apply(CatalogCmd::UpsertPeer {
-            record: peer("ws://source:1", "inst-source"),
-        })
-        .unwrap();
-    let mounts = fs::canonicalize(&config.default_mount_directory).unwrap();
-    let mut satisfied = folder(config, "Satisfied");
-    satisfied.mount = Some(mounts.join("Satisfied"));
-    let mut received = folder(config, "Received");
-    received.mount = Some(mounts.join("Received"));
-    catalog
-        .apply(create(&satisfied, Some(gate_from("ws://source:1"))))
-        .unwrap();
-    catalog.apply(create(&received, None)).unwrap();
-    catalog
-        .apply(CatalogCmd::SetVerifier {
-            verifier: Verifier::generate().1,
-        })
-        .unwrap();
-    let before = catalog.snapshot();
-    assert_eq!(before.verifier_generation, 1);
-    assert!(before.gates.contains_key(&satisfied.state));
-    drop(catalog);
-
-    // What a downgraded binary does, with its own SQL: its gate rule is
-    // satisfied (`delete_initial_sync`), it receives a mounted folder
-    // (`insert_initial_sync_tx`), and the user rotates the code.
-    let db = raw(config);
-    db.execute("DELETE FROM initial_sync WHERE state=?", [&satisfied.state])
-        .unwrap();
-    db.execute(
-        "INSERT INTO initial_sync VALUES(?,?)",
-        [&received.state, "ws://source:1"],
-    )
-    .unwrap();
-    let rotated = Verifier::generate().1;
-    db.execute(
-        "INSERT INTO settings VALUES('pairing',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [serde_json::to_string(&rotated).unwrap()],
-    )
-    .unwrap();
-    drop(db);
-
-    let catalog = Catalog::open(config).unwrap();
-    let snap = catalog.snapshot();
-    assert!(!snap.gates.contains_key(&satisfied.state), "pruned");
-    let gate = &snap.gates[&received.state];
-    assert_eq!(gate.source_endpoint, "ws://source:1");
-    assert_eq!(gate.source_installation.as_deref(), Some("inst-source"));
-    assert_eq!(snap.verifier.as_ref(), Some(&rotated));
-    assert_eq!(snap.verifier_generation, 2);
-    assert_eq!(raw_count(config, "mount_gates", &satisfied.state), 0);
-    // Reopening again changes nothing.
-    drop(catalog);
-    let catalog = Catalog::open(config).unwrap();
-    assert_same_content(&catalog.snapshot(), &snap);
+    let reopened = Catalog::open(&env.config).unwrap();
+    assert_same_content(&reopened.snapshot(), &before);
+    assert_eq!(reopened.snapshot().installation, installation);
+    assert_eq!(reopened.snapshot().folder(&record.state), Some(&record));
+    assert_eq!(*reopened.credentials(), *credentials);
+    assert_eq!(reopened.lease_incarnation(), incarnation + 1);
+    assert_eq!(raw_setting(&env.config, "catalog_schema"), None);
+    assert_eq!(raw_setting(&env.config, "credentials_generation"), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -878,7 +390,7 @@ fn every_command_bumps_the_generation_exactly_once_per_change() {
     assert_eq!(gate.source_endpoint, "ws://a:1");
     assert!(gate.created_ms > 0 && gate.override_ms.is_none());
     assert_eq!(
-        raw_initial_sync(config),
+        raw_gates(config),
         vec![(gated.state.clone(), "ws://a:1".to_owned())]
     );
     let mut headless = folder(config, "Headless");
@@ -1006,7 +518,7 @@ fn every_command_bumps_the_generation_exactly_once_per_change() {
         "FOLDER_NOT_FOUND",
     );
 
-    // RetargetGate moves both markers.
+    // RetargetGate moves the canonical gate.
     let snap = steps.changed(CatalogCmd::RetargetGate {
         state: gated.state.clone(),
         source_installation: None,
@@ -1017,7 +529,7 @@ fn every_command_bumps_the_generation_exactly_once_per_change() {
     assert_eq!(gate.source_endpoint, "ws://b:2");
     assert_eq!(gate.override_ms, Some(overridden));
     assert_eq!(
-        raw_initial_sync(config),
+        raw_gates(config),
         vec![(gated.state.clone(), "ws://b:2".to_owned())]
     );
     steps.fails(
@@ -1029,12 +541,11 @@ fn every_command_bumps_the_generation_exactly_once_per_change() {
         "INVALID_REQUEST",
     );
 
-    // ClearGate deletes both markers.
+    // ClearGate deletes the canonical gate.
     let snap = steps.changed(CatalogCmd::ClearGate {
         state: gated.state.clone(),
     });
     assert!(snap.gates.is_empty());
-    assert_eq!(raw_count(config, "initial_sync", &gated.state), 0);
     assert_eq!(raw_count(config, "mount_gates", &gated.state), 0);
     steps.unchanged(CatalogCmd::ClearGate {
         state: gated.state.clone(),
@@ -1324,7 +835,7 @@ fn a_panicking_command_errors_and_the_next_one_succeeds() {
         assert_eq!(error.code, "FAULT_INJECTED");
         assert_eq!(code_of(&error.clone().into_anyhow()), "FAULT_INJECTED");
         assert_eq!(catalog.snapshot().generation, generation);
-        for table in ["projects", "folder_intents", "initial_sync", "mount_gates"] {
+        for table in ["projects", "folder_intents", "mount_gates"] {
             assert_eq!(raw_count(config, table, &gated.state), 0, "{table}");
         }
         let snap = catalog
@@ -1374,19 +885,18 @@ fn a_dead_catalog_thread_answers_unavailable_and_keeps_the_last_snapshot() {
     drop(catalog);
     assert_owned(&env.config);
     drop(other);
-    drop(Supervisor::open(env.config.clone()).unwrap());
+    drop(Catalog::open(&env.config).unwrap());
     let catalog = Catalog::open(&env.config).unwrap();
     assert_same_content(&catalog.snapshot(), &last);
 }
 
-/// A second `Catalog::open` and the legacy `Supervisor::open` both fail with
+/// A second catalog and a direct lock attempt both fail with
 /// `ALREADY_RUNNING…`: the data directory has an owner (invariant 23).
 fn assert_owned(config: &Config) {
     let error = Catalog::open(config).unwrap_err();
     assert!(code_of(&error).starts_with("ALREADY_RUNNING"), "{error:#}");
-    let Err(error) = Supervisor::open(config.clone()) else {
-        panic!("the legacy supervisor opened a data directory the catalog owns");
-    };
+    let error =
+        tkfs::orchestrator::lock(&config.data_directory.join("orchestrator.lock")).unwrap_err();
     assert!(code_of(&error).starts_with("ALREADY_RUNNING"), "{error:#}");
 }
 
@@ -1454,7 +964,7 @@ fn close_reports_a_wedged_thread_until_it_exits() {
     assert!(snap.folder(&record.state).is_some());
     assert!(catalog.close(), "stays true once the thread has exited");
     // And `true` meant it: the directory is free while the handle lives on.
-    drop(Supervisor::open(config.clone()).unwrap());
+    drop(Catalog::open(config).unwrap());
     let reopened = Catalog::open(config).unwrap();
     assert_same_content(&reopened.snapshot(), &snap);
     assert!(Arc::ptr_eq(&catalog.snapshot(), &snap));
@@ -1539,9 +1049,9 @@ fn one_catalog_owns_a_data_directory() {
         .unwrap_err();
     assert_eq!(error.code, "CATALOG_UNAVAILABLE");
     assert!(Arc::ptr_eq(&catalog.snapshot(), &last));
-    let supervisor = Supervisor::open(env.config.clone()).unwrap();
-    assert_eq!(supervisor.projects().unwrap().len(), 1);
-    drop(supervisor);
+    let reopened = Catalog::open(&env.config).unwrap();
+    assert_eq!(reopened.snapshot().folders.len(), 1);
+    drop(reopened);
     drop(catalog);
     let catalog = Catalog::open(&env.config).unwrap();
     assert_same_content(&catalog.snapshot(), &last);
@@ -1561,7 +1071,7 @@ struct Layout {
 /// A data directory with folders A (`mounts/A`), B (`mounts/y/B`, parent not
 /// created) and the target T (`mounts/T` when `own_mount`), plus an existing
 /// directory and file under `mounts`. The catalog is closed afterwards so the
-/// legacy supervisor can open the same directory.
+/// current catalog can reopen the same directory.
 fn layout(own_mount: bool) -> Layout {
     let Env { root, config } = env();
     let catalog = Catalog::open(&config).unwrap();
@@ -1590,16 +1100,6 @@ fn layout(own_mount: bool) -> Layout {
     }
 }
 
-/// The legacy rule, through the legacy `ConfigureMount` (which calls
-/// `Supervisor::mount_path` for a changed mount): the stored path or the code.
-fn legacy_mount_path(layout: &Layout, requested: &Path) -> Result<PathBuf, String> {
-    let supervisor = Supervisor::open(layout.config.clone()).unwrap();
-    supervisor
-        .configure_mount(&layout.target.state, Some(requested.to_path_buf()))
-        .map(|inspect| PathBuf::from(inspect["mount"].as_str().unwrap()))
-        .map_err(|error| code_of(&error))
-}
-
 type Requested = fn(&Layout) -> PathBuf;
 
 /// One fixture case: the requested path, whether the target folder has its
@@ -1614,7 +1114,7 @@ fn case(
 }
 
 #[test]
-fn validate_mount_path_matches_the_legacy_mount_path() {
+fn validate_mount_path_covers_current_path_rules() {
     let _faults = shared();
     let cases = vec![
         case(
@@ -1743,8 +1243,15 @@ fn validate_mount_path_matches_the_legacy_mount_path() {
             );
             error.code
         });
-        let legacy = legacy_mount_path(&layout, &requested);
-        assert_eq!(ours, legacy, "{name}: {requested:?}");
+        if let Ok(path) = &ours {
+            assert_eq!(
+                path,
+                &fs::canonicalize(requested.parent().unwrap())
+                    .unwrap()
+                    .join(requested.file_name().unwrap()),
+                "{name}: exact canonical target"
+            );
+        }
         match expected {
             None => assert!(ours.is_ok(), "{name}: {ours:?}"),
             Some(code) => assert_eq!(ours.as_ref().unwrap_err(), code, "{name}"),

@@ -17,6 +17,20 @@ use tkfs::{
         fault::{self, FaultAction, FaultConfig},
     },
 };
+#[path = "content_mount_writes/create.rs"]
+mod create;
+#[path = "content_mount_writes/deletion.rs"]
+mod deletion;
+#[path = "content_mount_writes/directory.rs"]
+mod directory;
+#[path = "content_mount_writes/directory_changes.rs"]
+mod directory_changes;
+#[path = "content_mount_writes/directory_kernel.rs"]
+mod directory_kernel;
+#[path = "content_mount_writes/replacement.rs"]
+mod replacement;
+#[path = "content_mount_writes/unlink.rs"]
+mod unlink;
 fn context() -> ReadContext {
     ReadContext {
         deadline: Instant::now() + Duration::from_secs(30),
@@ -130,14 +144,98 @@ impl Fixture {
     }
 }
 #[test]
-fn native_write_conversion_is_explicit_and_not_enabled_for_ordinary_repositories() {
+fn current_native_service_needs_no_marker_and_reuses_only_a_running_executor() {
     let dir = tempfile::tempdir().unwrap();
     let shared = Arc::new(Mutex::new(Engine::new(
         Store::initialize(dir.path(), "ordinary", &id()).unwrap(),
     )));
+    let first = NativeWrites::install(&shared, &context()).unwrap();
+    let second = NativeWrites::install(&shared, &context()).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    first.shutdown(&context()).unwrap();
     error(
         NativeWrites::install(&shared, &context()),
-        "PEER_NEEDS_UPGRADE",
+        "CONTENT_CANCELLED",
+    );
+}
+
+#[test]
+fn native_writer_uses_each_mutating_handles_time_mask_and_flush_keeps_the_write_clock() {
+    let f = Fixture::new();
+    let a = f.open(true);
+    let b = f.open(true);
+    let original = tkfs::runtime::lock_engine(&f.shared)
+        .session(a)
+        .unwrap()
+        .entry
+        .basic_info();
+    tkfs::runtime::lock_engine(&f.shared)
+        .handles
+        .get_mut(&a)
+        .unwrap()
+        .time_update_disabled = 2;
+    content_writes::write(&f.shared, a, 13, b"first", false, false, wait()).unwrap();
+    let first = tkfs::runtime::lock_engine(&f.shared)
+        .session(a)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert_eq!(first.write_time, original.write_time);
+    assert_eq!(f.publications(), 0);
+    content_writes::flush(&f.shared, a, wait()).unwrap();
+    assert_eq!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .store
+            .lookup("file")
+            .unwrap()
+            .basic_info(),
+        first
+    );
+    std::thread::sleep(Duration::from_millis(10));
+    content_writes::write(&f.shared, b, 20, b"second", false, false, wait()).unwrap();
+    let second = tkfs::runtime::lock_engine(&f.shared)
+        .session(b)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert!(second.write_time > first.write_time);
+    std::thread::sleep(Duration::from_millis(20));
+    content_writes::flush(&f.shared, b, wait()).unwrap();
+    assert_eq!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .store
+            .lookup("file")
+            .unwrap()
+            .basic_info(),
+        second
+    );
+    std::thread::sleep(Duration::from_millis(10));
+    content_writes::write(&f.shared, a, 30, b"third", false, false, wait()).unwrap();
+    let third = tkfs::runtime::lock_engine(&f.shared)
+        .session(a)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert_eq!(third.write_time, second.write_time);
+    assert!(third.change_time > second.change_time);
+    content_writes::flush(&f.shared, a, wait()).unwrap();
+    assert_eq!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .store
+            .lookup("file")
+            .unwrap()
+            .basic_info(),
+        third
+    );
+    assert_eq!(third.creation_time, original.creation_time);
+    assert_eq!(third.access_time, original.access_time);
+    f.close(a);
+    f.close(b);
+    f.oracle();
+    f.stop();
+    println!(
+        "WAVE6_NATIVE_TIMES {}",
+        serde_json::json!({"scenario":"writer_masks_and_mutation_clock","handles":2,"mutations":3,"per_handle_mask":true,"local_visibility_before_flush":true,"flush_time_not_used":true,"adapter_setter_exercised":false})
     );
 }
 #[test]
@@ -312,6 +410,58 @@ fn mutable_read_reserves_adapter_capacity_before_waiting_for_a_started_write() {
     f.stop();
 }
 #[test]
+fn private_native_read_finishes_while_its_full_checkpoint_is_stalled() {
+    let f = Fixture::new();
+    let writer = f.open(true);
+    let reader = f.open(false);
+    content_writes::write(&f.shared, writer, 13, b"changed", false, false, wait()).unwrap();
+    let reset = arm(
+        "content.write.before_checkpoint_commit",
+        FaultAction::Hang,
+        1500,
+    );
+    let shared = f.shared.clone();
+    let saving = std::thread::spawn(move || content_writes::flush(&shared, writer, wait()));
+    fired();
+    let began = Instant::now();
+    let read = content_reads::read_mount_vec(
+        &f.shared,
+        reader,
+        13,
+        7,
+        ContentWait::fixed(Duration::from_millis(500)),
+    );
+    let elapsed = began.elapsed();
+    let still_checkpointing = !saving.is_finished();
+    let publications_when_read_finished = f.publications();
+    let flushed = saving.join().unwrap();
+    drop(reset);
+    flushed.unwrap();
+    assert_eq!(
+        read.expect("a private reader must not wait for FULL checkpoint I/O")
+            .unwrap(),
+        b"changed"
+    );
+    assert!(still_checkpointing);
+    assert_eq!(publications_when_read_finished, 0);
+    assert!(elapsed < Duration::from_millis(300), "{elapsed:?}");
+    println!(
+        "WAVE6_PRIVATE_READER {}",
+        serde_json::json!({
+            "scenario":"native_same_file", "read_ms":elapsed.as_secs_f64()*1000.0,
+            "bound_ms":300, "deadline_ms":500, "checkpoint_stall_ms":1500,
+            "writer_still_checkpointing":still_checkpointing, "private_bytes_equal":true,
+            "publications_when_read_finished":publications_when_read_finished,
+            "real_full_wal_transaction":true, "physical_disk_stall":false
+        })
+    );
+    assert_eq!(f.publications(), 1);
+    f.close(writer);
+    f.close(reader);
+    f.oracle();
+    f.stop();
+}
+#[test]
 fn two_writers_and_a_reader_share_private_bytes_and_flush_publishes_one_revision() {
     let f = Fixture::new();
     let h = f.open(true);
@@ -351,6 +501,768 @@ fn two_writers_and_a_reader_share_private_bytes_and_flush_publishes_one_revision
     assert_eq!(f.publications(), 1);
     f.oracle();
     f.stop();
+}
+#[test]
+fn read_only_native_cleanup_and_close_keep_other_writers_buffered_but_fsync_saves() {
+    let f = Fixture::new();
+    let writer = f.open(true);
+    content_writes::write(&f.shared, writer, 13, b"private", false, false, wait()).unwrap();
+    let reader = f.open(false);
+    let reset = arm(
+        "content.write.before_checkpoint_commit",
+        FaultAction::Fail,
+        0,
+    );
+    tkfs::runtime::engine::save_handle_on_cleanup(&f.shared, reader).unwrap();
+    tkfs::runtime::lock_engine(&f.shared)
+        .cleanup_unsaved(reader)
+        .unwrap();
+    f.close(reader);
+    assert_eq!(fault::fired(), 0, "read-only close must not checkpoint");
+    assert_eq!(f.publications(), 0);
+    assert!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .session(writer)
+            .unwrap()
+            .dirty
+    );
+    drop(reset);
+    let reader = f.open(false);
+    tkfs::runtime::engine::save_handle(&f.shared, reader).unwrap();
+    assert_eq!(
+        f.publications(),
+        1,
+        "explicit fsync remains a durability point"
+    );
+    assert!(
+        !tkfs::runtime::lock_engine(&f.shared)
+            .session(writer)
+            .unwrap()
+            .dirty
+    );
+    f.close(reader);
+    f.close(writer);
+    f.oracle();
+    f.stop();
+}
+#[test]
+fn read_only_close_does_not_publish_a_saved_revision_while_its_writer_remains_open() {
+    let f = Fixture::new();
+    let writer = f.open(true);
+    content_writes::write(&f.shared, writer, 13, b"private", false, false, wait()).unwrap();
+    content_writes::retain_dirty(&f.shared, &context()).unwrap();
+    let reader = f.open(false);
+    f.close(reader);
+    assert_eq!(
+        f.publications(),
+        0,
+        "a metadata checkpoint is not permission to publish the active writer's buffer"
+    );
+    assert!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .session(writer)
+            .unwrap()
+            .dirty
+    );
+    f.close(writer);
+    assert_eq!(f.publications(), 1);
+    f.oracle();
+    f.stop();
+}
+#[test]
+fn read_only_cleanup_rechecks_checkpoint_state_after_a_started_native_write() {
+    let f = Fixture::new();
+    let writer = f.open(true);
+    let reader = f.open(false);
+    let reset = arm("content.native.before_write", FaultAction::Hang, 500);
+    let shared = f.shared.clone();
+    let writing = std::thread::spawn(move || {
+        content_writes::write(&shared, writer, 0, b"private", false, false, wait())
+    });
+    fired();
+    let shared = f.shared.clone();
+    let (done, completed) = std::sync::mpsc::channel();
+    let closing = std::thread::spawn(move || {
+        let saved = tkfs::runtime::engine::save_handle_on_cleanup(&shared, reader);
+        done.send(()).unwrap();
+        saved
+    });
+    assert!(matches!(
+        completed.recv_timeout(Duration::from_millis(50)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    writing.join().unwrap().unwrap();
+    closing.join().unwrap().unwrap();
+    drop(reset);
+    assert_eq!(f.publications(), 0);
+    assert!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .session(writer)
+            .unwrap()
+            .dirty
+    );
+    f.close(reader);
+    assert_eq!(f.publications(), 0);
+    f.close(writer);
+    assert_eq!(f.publications(), 1);
+    f.oracle();
+    f.stop();
+}
+#[test]
+fn activation_refreshes_native_fields_without_losing_the_private_mutation_clocks() {
+    let f = Fixture::new();
+    let h = f.open(true);
+    let before = tkfs::runtime::lock_engine(&f.shared)
+        .session(h)
+        .unwrap()
+        .entry
+        .basic_info();
+    std::thread::sleep(Duration::from_millis(20));
+    content_writes::write(&f.shared, h, 13, b"private", false, false, wait()).unwrap();
+    let private = tkfs::runtime::lock_engine(&f.shared)
+        .session(h)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert!(private.write_time > before.write_time);
+    {
+        let mut e = tkfs::runtime::lock_engine(&f.shared);
+        let entity = e.session(h).unwrap().entry.id.clone();
+        let mut basic = before;
+        basic.posix_mode = Some(0o640);
+        basic.access_time = basic.access_time.saturating_sub(10_000_000);
+        let change = e
+            .store
+            .current_change(&entity, "basic", serde_json::json!(basic))
+            .unwrap();
+        let event = e
+            .store
+            .event(&e.store.branch(&e.store.active).unwrap(), vec![change]);
+        let event_id = event.id.clone();
+        e.store.commit(event, false).unwrap();
+        e.after_activation(&tkfs::runtime::engine::ActivatedDelta {
+            ids: vec![event_id],
+            entities: [entity].into_iter().collect(),
+            ..Default::default()
+        });
+        let visible = e.session(h).unwrap().entry.basic_info();
+        assert_eq!(
+            [visible.write_time, visible.change_time],
+            [private.write_time, private.change_time]
+        );
+        assert_eq!(visible.posix_mode, Some(0o640));
+        assert_eq!(visible.access_time, basic.access_time);
+        assert!(e.session(h).unwrap().dirty);
+    }
+    assert_eq!(f.publications(), 0);
+    f.close(h);
+    f.oracle();
+    f.stop();
+}
+#[test]
+fn native_basic_setter_preserves_selected_bytes_and_uses_each_handles_disable_and_reset_flags() {
+    let f = Fixture::new();
+    let a = f.open(true);
+    let b = f.open(true);
+    content_writes::write(&f.shared, a, 0, b"first", false, false, wait()).unwrap();
+    let reset = arm("content.executor.before_prepare", FaultAction::Fail, 0);
+    error(
+        content_writes::flush(&f.shared, a, wait()),
+        "FAULT_INJECTED",
+    );
+    drop(reset);
+    content_writes::write(&f.shared, a, 13, b"newer", false, false, wait()).unwrap();
+    let write_time = tkfs::core::filetime(tkfs::util::time::now_ms() - 5000);
+    let change_time = tkfs::core::filetime(tkfs::util::time::now_ms() - 4000);
+    assert!(
+        content_writes::set_basic(&f.shared, a, 0x80, [0, 0, write_time, change_time], wait())
+            .unwrap()
+    );
+    assert_eq!(f.publications(), 0);
+    let basic = tkfs::runtime::lock_engine(&f.shared)
+        .session(a)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert_eq!(
+        [basic.write_time, basic.change_time],
+        [write_time, change_time]
+    );
+    assert_eq!(basic.attributes, 0x80);
+    let reader = f.open(false);
+    f.close(reader);
+    assert_eq!(f.publications(), 0);
+    let reset = arm(
+        "content.write.before_checkpoint_commit",
+        FaultAction::Fail,
+        0,
+    );
+    assert!(
+        content_writes::set_basic(&f.shared, a, u32::MAX, [0, 0, u64::MAX, u64::MAX], wait())
+            .unwrap()
+    );
+    assert_eq!(
+        fault::fired(),
+        0,
+        "mask-only setter must not checkpoint bytes"
+    );
+    drop(reset);
+    content_writes::write(&f.shared, a, 30, b"held", false, false, wait()).unwrap();
+    let held = tkfs::runtime::lock_engine(&f.shared)
+        .session(a)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert_eq!(
+        [held.write_time, held.change_time],
+        [write_time, change_time]
+    );
+    content_writes::write(&f.shared, b, 40, b"other", false, false, wait()).unwrap();
+    let other = tkfs::runtime::lock_engine(&f.shared)
+        .session(b)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert!(other.write_time > write_time && other.change_time > change_time);
+    content_writes::write(&f.shared, a, 50, b"still", false, false, wait()).unwrap();
+    let held = tkfs::runtime::lock_engine(&f.shared)
+        .session(a)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert_eq!(
+        [held.write_time, held.change_time],
+        [other.write_time, other.change_time]
+    );
+    assert!(
+        content_writes::set_basic(
+            &f.shared,
+            a,
+            u32::MAX,
+            [0, 0, u64::MAX - 1, u64::MAX - 1],
+            wait()
+        )
+        .unwrap()
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    content_writes::write(&f.shared, a, 60, b"reset", false, false, wait()).unwrap();
+    let reset_basic = tkfs::runtime::lock_engine(&f.shared)
+        .session(a)
+        .unwrap()
+        .entry
+        .basic_info();
+    assert!(
+        reset_basic.write_time > other.write_time && reset_basic.change_time > other.change_time
+    );
+    content_writes::flush(&f.shared, a, wait()).unwrap();
+    assert_eq!(f.publications(), 1);
+    assert_eq!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .store
+            .lookup("file")
+            .unwrap()
+            .basic_info(),
+        reset_basic
+    );
+    f.close(a);
+    f.close(b);
+    f.oracle();
+    f.stop();
+}
+#[test]
+fn native_basic_setter_recovers_a_lost_reply_but_does_not_retry_an_uncommitted_request() {
+    for point in ["content.save.before_basic", "content.save.basic_committed"] {
+        let f = Fixture::new();
+        let h = f.open(true);
+        content_writes::write(&f.shared, h, 0, b"private", false, false, wait()).unwrap();
+        let reset = arm(point, FaultAction::Fail, 0);
+        let result =
+            content_writes::set_basic(&f.shared, h, 0x80, [0, 0, u64::MAX, u64::MAX], wait());
+        drop(reset);
+        let committed = point.ends_with("committed");
+        if committed {
+            assert!(result.unwrap());
+        } else {
+            error(result, "FAULT_INJECTED");
+        }
+        let e = tkfs::runtime::lock_engine(&f.shared);
+        assert_eq!(
+            e.handles[&h].time_update_disabled,
+            if committed { 6 } else { 0 }
+        );
+        assert_eq!(
+            e.store
+                .db
+                .query_row(
+                    "SELECT count(*) FROM content_save_metadata_changes",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            u64::from(committed)
+        );
+        drop(e);
+        assert_eq!(f.publications(), 0);
+        content_writes::write(&f.shared, h, 13, b"later", false, false, wait()).unwrap();
+        f.close(h);
+        assert_eq!(f.publications(), 1);
+        f.oracle();
+        f.stop();
+    }
+}
+#[test]
+fn committed_native_metadata_is_reconciled_before_a_write_after_the_reply_deadline() {
+    let f = Fixture::new();
+    let h = f.open(true);
+    content_writes::write(&f.shared, h, 0, b"private", false, false, wait()).unwrap();
+    let before = tkfs::runtime::lock_engine(&f.shared)
+        .session(h)
+        .unwrap()
+        .entry
+        .basic_info();
+    let reset = arm("content.save.basic_committed", FaultAction::Hang, 1500);
+    let result = content_writes::set_basic(
+        &f.shared,
+        h,
+        1,
+        [
+            0,
+            0,
+            u64::MAX,
+            tkfs::core::filetime(tkfs::util::time::now_ms() - 5000),
+        ],
+        ContentWait::fixed(Duration::from_secs(1)),
+    );
+    assert_eq!(
+        fault::fired(),
+        1,
+        "the metadata commit must precede the deadline failure"
+    );
+    drop(reset);
+    error(result, "CONTENT_DEADLINE");
+    assert_eq!(f.publications(), 0);
+    content_writes::write(&f.shared, h, 13, b"later", false, false, wait()).unwrap();
+    let e = tkfs::runtime::lock_engine(&f.shared);
+    assert_eq!(e.handles[&h].time_update_disabled, 2);
+    assert_eq!(
+        e.session(h).unwrap().entry.basic_info().write_time,
+        before.write_time,
+        "the committed handle policy must be applied before the next byte mutation"
+    );
+    assert_eq!(e.session(h).unwrap().entry.basic_info().attributes, 0x21);
+    assert_eq!(
+        e.store
+            .db
+            .query_row(
+                "SELECT count(*) FROM content_save_metadata_changes",
+                [],
+                |r| r.get::<_, u64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    drop(e);
+    f.close(h);
+    assert_eq!(f.publications(), 1);
+    f.oracle();
+    f.stop();
+}
+#[test]
+fn native_basic_setter_adopts_a_committed_save_without_publishing_newer_private_bytes() {
+    let f = Fixture::new();
+    let h = f.open(true);
+    content_writes::write(&f.shared, h, 0, b"first", false, false, wait()).unwrap();
+    let reset = arm("content.executor.published", FaultAction::Fail, 0);
+    error(
+        content_writes::flush(&f.shared, h, wait()),
+        "FAULT_INJECTED",
+    );
+    drop(reset);
+    assert_eq!(f.publications(), 1);
+    content_writes::write(&f.shared, h, 13, b"newer", false, false, wait()).unwrap();
+    let time = tkfs::core::filetime(tkfs::util::time::now_ms() - 5000);
+    assert!(content_writes::set_basic(&f.shared, h, 0x80, [0, 0, time, 0], wait()).unwrap());
+    assert_eq!(
+        f.publications(),
+        1,
+        "metadata may adopt the old receipt, not publish the newer bytes"
+    );
+    assert_eq!(f.bytes(h, 18)[13..18], *b"newer");
+    let e = tkfs::runtime::lock_engine(&f.shared);
+    assert_eq!(e.session(h).unwrap().entry.basic_info().write_time, time);
+    assert_eq!(
+        e.session(h).unwrap().content_base,
+        e.store
+            .lookup("file")
+            .unwrap()
+            .revisions
+            .get("content")
+            .cloned()
+    );
+    drop(e);
+    content_writes::flush(&f.shared, h, wait()).unwrap();
+    assert_eq!(f.publications(), 2);
+    assert_eq!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .store
+            .lookup("file")
+            .unwrap()
+            .basic_info()
+            .write_time,
+        time
+    );
+    f.close(h);
+    f.oracle();
+    f.stop();
+}
+#[test]
+fn native_rename_prepares_a_closed_source_without_hydrating_its_missing_bytes() {
+    rename_immutable_source(false);
+}
+#[test]
+fn native_rename_prepares_a_readonly_source_without_publishing_file_bytes() {
+    rename_immutable_source(true);
+}
+fn rename_immutable_source(readonly: bool) {
+    let f = Fixture::new();
+    let before = tkfs::runtime::lock_engine(&f.shared)
+        .store
+        .lookup("file")
+        .unwrap();
+    let reader = readonly.then(|| f.open(false));
+    let chunk = f
+        .dir
+        .path()
+        .join("objects")
+        .join(tkfs::model::content::Digest::bytes(&f.data[..CHUNK_SIZE as usize]).to_string());
+    std::fs::remove_file(&chunk).unwrap();
+    assert!(content_writes::rename(&f.shared, &before.id, "renamed", false, wait()).unwrap());
+    assert!(!chunk.exists(), "metadata rename must not hydrate bytes");
+    assert_eq!(f.publications(), 0);
+    {
+        let e = tkfs::runtime::lock_engine(&f.shared);
+        assert!(e.store.lookup("file").is_err());
+        let after = e.store.lookup("renamed").unwrap();
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.content_ref, before.content_ref);
+        assert_eq!(
+            after.revisions.get("content"),
+            before.revisions.get("content")
+        );
+        assert_eq!(e.handles.len(), usize::from(readonly));
+        assert_eq!(e.sessions.len(), usize::from(readonly));
+        if let Some(handle) = reader {
+            assert_eq!(e.handle_entry(handle).unwrap().name, "renamed");
+            assert!(!e.handles[&handle].writable);
+            assert!(!e.session(handle).unwrap().dirty);
+        }
+        assert_eq!(
+            e.store
+                .db
+                .query_row("SELECT count(*) FROM pending_saves", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    std::fs::write(&chunk, &f.data[..CHUNK_SIZE as usize]).unwrap();
+    let handle = reader.unwrap_or_else(|| {
+        let h = tkfs::runtime::lock_engine(&f.shared)
+            .open("renamed", None, false)
+            .unwrap()
+            .0;
+        content_reads::prepare_open(&f.shared, h, wait()).unwrap();
+        h
+    });
+    assert_eq!(f.bytes(handle, f.data.len()), f.data);
+    f.close(handle);
+    assert_eq!(f.publications(), 0);
+    f.oracle();
+    f.stop();
+}
+
+#[test]
+fn native_rename_reconciles_a_committed_reply_and_does_not_repeat_an_uncommitted_move() {
+    for point in [
+        "content.save.before_rename",
+        "content.save.rename_committed",
+    ] {
+        let f = Fixture::new();
+        let h = f.open(true);
+        let entity = tkfs::runtime::lock_engine(&f.shared)
+            .session(h)
+            .unwrap()
+            .entry
+            .id
+            .clone();
+        content_writes::write(&f.shared, h, 13, b"changed", false, false, wait()).unwrap();
+        let reset = arm(point, FaultAction::Fail, 0);
+        let result = content_writes::rename(&f.shared, &entity, "renamed", false, wait());
+        assert_eq!(fault::fired(), 1);
+        drop(reset);
+        let committed = point == "content.save.rename_committed";
+        if committed {
+            assert!(result.unwrap());
+        } else {
+            error(result, "FAULT_INJECTED");
+        }
+        content_writes::write(&f.shared, h, 20, b"later", false, false, wait()).unwrap();
+        let e = tkfs::runtime::lock_engine(&f.shared);
+        assert_eq!(
+            e.session(h).unwrap().entry.name,
+            if committed { "renamed" } else { "file" }
+        );
+        assert_eq!(
+            e.store
+                .lookup(if committed { "renamed" } else { "file" })
+                .unwrap()
+                .id,
+            entity
+        );
+        assert_eq!(
+            e.store
+                .db
+                .query_row(
+                    "SELECT count(*) FROM content_save_namespace_changes",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            u64::from(committed)
+        );
+        drop(e);
+        assert_eq!(f.publications(), 0);
+        assert_eq!(&f.bytes(h, 25)[13..25], b"changedlater");
+        f.close(h);
+        assert_eq!(f.publications(), 1);
+        f.oracle();
+        f.stop();
+    }
+}
+
+#[test]
+fn native_rename_committed_after_reply_expiry_is_observed_before_the_next_write() {
+    let f = Fixture::new();
+    let h = f.open(true);
+    let entity = tkfs::runtime::lock_engine(&f.shared)
+        .session(h)
+        .unwrap()
+        .entry
+        .id
+        .clone();
+    content_writes::write(&f.shared, h, 13, b"changed", false, false, wait()).unwrap();
+    let reset = arm("content.save.rename_committed", FaultAction::Hang, 1500);
+    let result = content_writes::rename(
+        &f.shared,
+        &entity,
+        "renamed",
+        false,
+        ContentWait::fixed(Duration::from_secs(1)),
+    );
+    assert_eq!(fault::fired(), 1);
+    drop(reset);
+    error(result, "CONTENT_DEADLINE");
+    content_writes::write(&f.shared, h, 20, b"later", false, false, wait()).unwrap();
+    assert_eq!(
+        tkfs::runtime::lock_engine(&f.shared)
+            .session(h)
+            .unwrap()
+            .entry
+            .name,
+        "renamed"
+    );
+    assert_eq!(&f.bytes(h, 25)[13..25], b"changedlater");
+    assert_eq!(f.publications(), 0);
+    f.close(h);
+    assert_eq!(f.publications(), 1);
+    f.oracle();
+    f.stop();
+}
+
+#[test]
+fn native_rename_adopts_a_committed_save_without_publishing_newer_private_bytes() {
+    let f = Fixture::new();
+    let h = f.open(true);
+    let entity = tkfs::runtime::lock_engine(&f.shared)
+        .session(h)
+        .unwrap()
+        .entry
+        .id
+        .clone();
+    content_writes::write(&f.shared, h, 0, b"first", false, false, wait()).unwrap();
+    let reset = arm("content.executor.published", FaultAction::Fail, 0);
+    error(
+        content_writes::flush(&f.shared, h, wait()),
+        "FAULT_INJECTED",
+    );
+    drop(reset);
+    assert_eq!(f.publications(), 1);
+    content_writes::write(&f.shared, h, 13, b"newer", false, false, wait()).unwrap();
+    assert!(content_writes::rename(&f.shared, &entity, "renamed", false, wait()).unwrap());
+    assert_eq!(f.publications(), 1);
+    assert_eq!(f.bytes(h, 18)[13..18], *b"newer");
+    let e = tkfs::runtime::lock_engine(&f.shared);
+    assert_eq!(e.session(h).unwrap().entry.name, "renamed");
+    assert_eq!(
+        e.session(h).unwrap().content_base,
+        e.store
+            .lookup("renamed")
+            .unwrap()
+            .revisions
+            .get("content")
+            .cloned()
+    );
+    drop(e);
+    f.close(h);
+    assert_eq!(f.publications(), 2);
+    f.oracle();
+    f.stop();
+}
+
+#[test]
+fn failed_native_rename_does_not_run_after_the_colliding_destination_is_removed() {
+    for replace in [false, true] {
+        let f = Fixture::new();
+        let h = f.open(true);
+        let (entity, target) = {
+            let mut e = tkfs::runtime::lock_engine(&f.shared);
+            (
+                e.session(h).unwrap().entry.id.clone(),
+                e.store
+                    .create("renamed", if replace { "directory" } else { "file" })
+                    .unwrap()
+                    .id,
+            )
+        };
+        content_writes::write(&f.shared, h, 13, b"changed", false, false, wait()).unwrap();
+        error(
+            content_writes::rename(&f.shared, &entity, "renamed", replace, wait()),
+            "NAME_COLLISION",
+        );
+        tkfs::runtime::lock_engine(&f.shared)
+            .store
+            .delete(&target)
+            .unwrap();
+        content_writes::write(&f.shared, h, 20, b"later", false, false, wait()).unwrap();
+        let e = tkfs::runtime::lock_engine(&f.shared);
+        assert_eq!(e.session(h).unwrap().entry.name, "file");
+        assert_eq!(e.store.lookup("file").unwrap().id, entity);
+        assert!(e.store.lookup("renamed").is_err());
+        assert_eq!(
+            e.store
+                .db
+                .query_row(
+                    "SELECT count(*) FROM content_save_namespace_changes",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        drop(e);
+        assert_eq!(&f.bytes(h, 25)[13..25], b"changedlater");
+        f.close(h);
+        assert_eq!(f.publications(), 1);
+        f.oracle();
+        f.stop();
+    }
+}
+
+#[test]
+fn native_rename_reserves_adapter_capacity_before_waiting_for_the_file_gate() {
+    static SLOTS: tkfs::runtime::content::WaitSlots = tkfs::runtime::content::WaitSlots::new(1);
+    let f = Fixture::new();
+    let h = f.open(true);
+    let entity = tkfs::runtime::lock_engine(&f.shared)
+        .session(h)
+        .unwrap()
+        .entry
+        .id
+        .clone();
+    content_writes::write(&f.shared, h, 13, b"changed", false, false, wait()).unwrap();
+    let reset = arm("content.save.before_rename", FaultAction::Hang, 350);
+    let shared = f.shared.clone();
+    let source = entity.clone();
+    let admitted = ContentWait {
+        slots: Some(&SLOTS),
+        ..wait()
+    };
+    let moving = std::thread::spawn(move || {
+        content_writes::rename(&shared, &source, "renamed", false, admitted)
+    });
+    fired();
+    assert_eq!(SLOTS.used(), 1);
+    let began = Instant::now();
+    error(
+        content_writes::rename(&f.shared, &entity, "other", false, admitted),
+        "CONTENT_RESOURCE_LIMIT",
+    );
+    assert!(began.elapsed() < Duration::from_millis(100));
+    assert!(moving.join().unwrap().unwrap());
+    drop(reset);
+    assert_eq!(SLOTS.used(), 0);
+    let e = tkfs::runtime::lock_engine(&f.shared);
+    assert_eq!(e.store.lookup("renamed").unwrap().id, entity);
+    assert!(e.store.lookup("other").is_err());
+    drop(e);
+    assert_eq!(f.publications(), 0);
+    f.close(h);
+    assert_eq!(f.publications(), 1);
+    f.oracle();
+    f.stop();
+}
+
+#[test]
+fn native_time_masks_preserve_earlier_buffered_clocks_before_one_fsync() {
+    for mask in [2, 4, 6] {
+        let f = Fixture::new();
+        let automatic = f.open(true);
+        let disabled = f.open(true);
+        tkfs::runtime::lock_engine(&f.shared)
+            .handles
+            .get_mut(&disabled)
+            .unwrap()
+            .time_update_disabled = mask;
+        std::thread::sleep(Duration::from_millis(20));
+        content_writes::write(&f.shared, automatic, 13, b"first", false, false, wait()).unwrap();
+        let first = tkfs::runtime::lock_engine(&f.shared)
+            .session(automatic)
+            .unwrap()
+            .entry
+            .basic_info();
+        std::thread::sleep(Duration::from_millis(20));
+        content_writes::write(&f.shared, disabled, 30, b"second", false, false, wait()).unwrap();
+        let buffered = tkfs::runtime::lock_engine(&f.shared)
+            .session(automatic)
+            .unwrap()
+            .entry
+            .basic_info();
+        if mask & 2 != 0 {
+            assert_eq!(buffered.write_time, first.write_time);
+        } else {
+            assert!(buffered.write_time > first.write_time);
+        }
+        if mask & 4 != 0 {
+            assert_eq!(buffered.change_time, first.change_time);
+        } else {
+            assert!(buffered.change_time > first.change_time);
+        }
+        assert_eq!(f.publications(), 0);
+        content_writes::flush(&f.shared, disabled, wait()).unwrap();
+        assert_eq!(
+            tkfs::runtime::lock_engine(&f.shared)
+                .store
+                .lookup("file")
+                .unwrap()
+                .basic_info(),
+            buffered,
+            "one fsync must preserve both buffered clocks across per-handle masks"
+        );
+        f.close(automatic);
+        f.close(disabled);
+        f.oracle();
+        f.stop();
+    }
 }
 #[test]
 fn full_chunk_overwrite_does_not_hydrate_the_missing_base_and_close_is_durable() {
@@ -661,7 +1573,75 @@ fn native_close_crash_child() {
         .unwrap()
         .0;
     content_reads::prepare_open(&shared, h, wait()).unwrap();
+    if std::env::var_os("TKFS_NATIVE_BASIC_CHILD").is_some() {
+        content_writes::write(&shared, h, 0, b"metadata-private", false, false, wait()).unwrap();
+        content_writes::retain_dirty(&shared, &context()).unwrap();
+        let journal = tkfs::content::write::WriteJournal::open(&root).unwrap();
+        let saved = journal
+            .pending(None, 64, &context())
+            .unwrap()
+            .pop()
+            .unwrap();
+        let mut store = Store::open_existing(&root).unwrap();
+        let mut basic = store.entry(&saved.intent.base.entity).unwrap().basic_info();
+        basic.write_time = tkfs::core::filetime(tkfs::util::time::now_ms() - 2000);
+        basic.change_time = tkfs::core::filetime(tkfs::util::time::now_ms() - 1000);
+        basic.posix_mode = Some(0o640);
+        basic.attributes = 0x80;
+        std::fs::write(
+            root.join("basic-oracle.json"),
+            serde_json::to_vec(&basic).unwrap(),
+        )
+        .unwrap();
+        store
+            .apply_content_checkpoint_basic(
+                &saved.intent,
+                uuid::Uuid::new_v4(),
+                Some(&saved),
+                tkfs::core::content_saves::ContentBasicUpdate {
+                    write_time: Some(basic.write_time),
+                    change_time: Some(basic.change_time),
+                    posix_mode: basic.posix_mode,
+                    attributes: Some(basic.attributes),
+                    ..Default::default()
+                },
+                &context(),
+            )
+            .unwrap();
+        panic!("metadata commit boundary did not exit");
+    }
+    let clock_mask = std::env::var("TKFS_NATIVE_CLOSE_CLOCKS")
+        .ok()
+        .map(|mask| mask.parse::<u8>().unwrap());
+    if clock_mask.is_some() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     content_writes::write(&shared, h, 0, b"durable-child", false, false, wait()).unwrap();
+    if let Some(mask) = clock_mask {
+        let other = tkfs::runtime::lock_engine(&shared)
+            .open("file", None, true)
+            .unwrap()
+            .0;
+        content_reads::prepare_open(&shared, other, wait()).unwrap();
+        tkfs::runtime::lock_engine(&shared)
+            .handles
+            .get_mut(&other)
+            .unwrap()
+            .time_update_disabled = mask;
+        std::thread::sleep(Duration::from_millis(20));
+        content_writes::write(&shared, other, 30, b"after", false, false, wait()).unwrap();
+        let basic = tkfs::runtime::lock_engine(&shared)
+            .session(other)
+            .unwrap()
+            .entry
+            .basic_info();
+        std::fs::write(
+            root.join("clock-oracle.json"),
+            serde_json::to_vec(&basic).unwrap(),
+        )
+        .unwrap();
+        tkfs::runtime::engine::close_handle(&shared, other).unwrap();
+    }
     tkfs::runtime::engine::close_handle(&shared, h).unwrap();
     panic!("crash boundary did not exit");
 }
@@ -732,8 +1712,178 @@ fn process_exit_during_native_close_restores_saved_and_replays_publication_once(
     }
 }
 #[test]
+fn saved_native_clock_pairs_survive_process_exit_before_publication_and_reopen() {
+    for mask in [2, 4, 6] {
+        let f = Fixture::new();
+        f.stop();
+        let Fixture {
+            shared,
+            writes,
+            native,
+            dir,
+            mut data,
+        } = f;
+        drop(shared);
+        drop(writes);
+        drop(native);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "native_close_crash_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("TKFS_NATIVE_CLOSE_CHILD", dir.path())
+            .env("TKFS_NATIVE_CLOSE_CLOCKS", mask.to_string())
+            .env("TKFS_FAULT_POINT", "content.executor.before_prepare")
+            .env("TKFS_FAULT_ACTION", "exit")
+            .env("TKFS_FAULT_COUNT", "1")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(86),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected: tkfs::core::BasicInfo =
+            serde_json::from_slice(&std::fs::read(dir.path().join("clock-oracle.json")).unwrap())
+                .unwrap();
+        let shared = Arc::new(Mutex::new(Engine::new(
+            Store::open_existing(dir.path()).unwrap(),
+        )));
+        let writes = NativeWrites::install(&shared, &context()).unwrap();
+        let h = tkfs::runtime::lock_engine(&shared)
+            .open("file", None, false)
+            .unwrap()
+            .0;
+        assert_eq!(
+            tkfs::runtime::lock_engine(&shared)
+                .session(h)
+                .unwrap()
+                .entry
+                .basic_info(),
+            expected,
+            "recovered cache must use the exact Saved clock pair"
+        );
+        data[..13].copy_from_slice(b"durable-child");
+        data[30..35].copy_from_slice(b"after");
+        assert_eq!(
+            content_reads::read_mount_vec(&shared, h, 0, data.len(), wait())
+                .unwrap()
+                .unwrap(),
+            data
+        );
+        tkfs::runtime::engine::close_handle(&shared, h).unwrap();
+        let mut e = tkfs::runtime::lock_engine(&shared);
+        assert_eq!(e.store.lookup("file").unwrap().basic_info(), expected);
+        assert_eq!(
+            e.store
+                .db
+                .query_row("SELECT count(*) FROM content_save_history", [], |r| r
+                    .get::<_, usize>(0))
+                .unwrap(),
+            1
+        );
+        assert!(e.store.verify_derived_state().unwrap().is_empty());
+        drop(e);
+        writes.shutdown(&context()).unwrap();
+    }
+}
+#[test]
+fn owned_metadata_after_saved_survives_process_exit_and_native_recovery() {
+    let f = Fixture::new();
+    f.stop();
+    let Fixture {
+        shared,
+        writes,
+        native,
+        dir,
+        mut data,
+    } = f;
+    drop(shared);
+    drop(writes);
+    drop(native);
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "native_close_crash_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("TKFS_NATIVE_CLOSE_CHILD", dir.path())
+        .env("TKFS_NATIVE_BASIC_CHILD", "1")
+        .env("TKFS_FAULT_POINT", "content.save.basic_committed")
+        .env("TKFS_FAULT_ACTION", "exit")
+        .env("TKFS_FAULT_COUNT", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(86),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected: tkfs::core::BasicInfo =
+        serde_json::from_slice(&std::fs::read(dir.path().join("basic-oracle.json")).unwrap())
+            .unwrap();
+    let store = Store::open_existing(dir.path()).unwrap();
+    assert_eq!(
+        store
+            .db
+            .query_row("SELECT count(*) FROM content_save_history", [], |r| r
+                .get::<_, u64>(0))
+            .unwrap(),
+        0
+    );
+    let shared = Arc::new(Mutex::new(Engine::new(store)));
+    let writes = NativeWrites::install(&shared, &context()).unwrap();
+    let h = tkfs::runtime::lock_engine(&shared)
+        .open("file", None, false)
+        .unwrap()
+        .0;
+    assert_eq!(
+        tkfs::runtime::lock_engine(&shared)
+            .session(h)
+            .unwrap()
+            .entry
+            .basic_info(),
+        expected
+    );
+    data[..16].copy_from_slice(b"metadata-private");
+    assert_eq!(
+        content_reads::read_mount_vec(&shared, h, 0, data.len(), wait())
+            .unwrap()
+            .unwrap(),
+        data
+    );
+    tkfs::runtime::engine::close_handle(&shared, h).unwrap();
+    let mut e = tkfs::runtime::lock_engine(&shared);
+    assert_eq!(e.store.lookup("file").unwrap().basic_info(), expected);
+    assert_eq!(
+        e.store
+            .db
+            .query_row("SELECT count(*) FROM content_save_history", [], |r| r
+                .get::<_, u64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(e.store.verify_derived_state().unwrap().is_empty());
+    drop(e);
+    writes.shutdown(&context()).unwrap();
+}
+#[test]
 #[ignore = "explicit isolated actual WinFsp/FUSE native COW writes, never a user mount"]
 fn isolated_kernel_mount_writes_truncates_flushes_and_reopens_native_content() {
+    native_kernel_write_scenario(false);
+}
+#[cfg(windows)]
+#[test]
+#[ignore = "unresolved WinFsp 2.1 strips -1 before SetBasicInfo; explicit failing compatibility probe"]
+fn isolated_kernel_windows_time_policy_requires_an_observable_driver_contract() {
+    native_kernel_write_scenario(true);
+}
+fn native_kernel_write_scenario(time_policy_probe: bool) {
     use std::io::{Read, Seek, SeekFrom, Write};
     if let Some(root) = std::env::var_os("TKFS_NATIVE_KERNEL_CHILD") {
         let root = std::path::PathBuf::from(root);
@@ -752,14 +1902,294 @@ fn isolated_kernel_mount_writes_truncates_flushes_and_reopens_native_content() {
         }
         let mounted = Mounted;
         let path = point.join("file");
+        let before_open = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            before_open.len(),
+            3 * CHUNK_SIZE,
+            "typed descriptor size before open"
+        );
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
         file.seek(SeekFrom::Start(13)).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
         file.write_all(b"mounted").unwrap();
+        let cached_write_time = {
+            let e = tkfs::runtime::lock_engine(&shared);
+            let entry = e.store.lookup("file").unwrap();
+            let session = e.sessions.get(&entry.id).unwrap();
+            assert!(
+                session.dirty,
+                "metadata check must precede content publication"
+            );
+            session.entry.basic_info().write_time
+        };
+        let expected_ms = cached_write_time.saturating_sub(tkfs::core::FILETIME_EPOCH) / 10_000;
+        let path_ms = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let handle_ms = file
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert_eq!(path_ms, expected_ms, "dirty path timestamp before fsync");
+        assert_eq!(
+            handle_ms, expected_ms,
+            "dirty handle timestamp before fsync"
+        );
+        let reader = std::fs::File::open(&path).unwrap();
+        assert_eq!(reader.metadata().unwrap().len(), 3 * CHUNK_SIZE);
+        drop(reader);
+        {
+            let e = tkfs::runtime::lock_engine(&shared);
+            let entity = e.store.lookup("file").unwrap().id;
+            assert!(
+                e.sessions[&entity].dirty,
+                "metadata reads must not publish the writer's buffer"
+            );
+            let publications: u64 = e
+                .store
+                .db
+                .query_row("SELECT count(*) FROM content_save_history", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                publications, 0,
+                "metadata reads must not checkpoint/publish unrelated dirty bytes"
+            );
+        }
+        let explicit_ms = tkfs::util::time::now_ms() - 5000;
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(explicit_ms)),
+        )
+        .unwrap();
+        for metadata in [file.metadata().unwrap(), std::fs::metadata(&path).unwrap()] {
+            assert_eq!(
+                metadata
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                explicit_ms,
+                "native set-basic must be visible before fsync"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            assert_eq!(
+                file.metadata()
+                    .unwrap()
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+                explicit_ms,
+                "chmod must retain the explicit write-time of the same byte revision"
+            );
+        }
+        #[cfg(windows)]
+        if time_policy_probe {
+            use std::os::windows::io::AsRawHandle;
+            // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_file_basic_information
+            #[repr(C)]
+            struct Basic {
+                times: [u64; 4],
+                attributes: u32,
+            }
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn SetFileInformationByHandle(
+                    handle: *mut std::ffi::c_void,
+                    class: u32,
+                    info: *const std::ffi::c_void,
+                    size: u32,
+                ) -> i32;
+            }
+            let native_handle = file.as_raw_handle();
+            let policy = |value: u64| {
+                let basic = Basic {
+                    times: [0, 0, value, value],
+                    attributes: 0,
+                };
+                let result = unsafe {
+                    SetFileInformationByHandle(
+                        native_handle,
+                        0,
+                        (&basic as *const Basic).cast(),
+                        std::mem::size_of::<Basic>() as u32,
+                    )
+                };
+                assert_ne!(
+                    result,
+                    0,
+                    "Win32 time policy: {}",
+                    std::io::Error::last_os_error()
+                );
+            };
+            let (held, metadata_events) = {
+                let e = tkfs::runtime::lock_engine(&shared);
+                let entity = e.store.lookup("file").unwrap().id;
+                (
+                    e.sessions[&entity].entry.basic_info(),
+                    e.store
+                        .db
+                        .query_row(
+                            "SELECT count(*) FROM content_save_metadata_changes",
+                            [],
+                            |r| r.get::<_, u64>(0),
+                        )
+                        .unwrap(),
+                )
+            };
+            policy(u64::MAX);
+            std::thread::sleep(Duration::from_millis(20));
+            file.seek(SeekFrom::Start(13)).unwrap();
+            file.write_all(b"mounted").unwrap();
+            {
+                let e = tkfs::runtime::lock_engine(&shared);
+                let entity = e.store.lookup("file").unwrap().id;
+                let basic = e.sessions[&entity].entry.basic_info();
+                assert_eq!(
+                    [basic.write_time, basic.change_time],
+                    [held.write_time, held.change_time]
+                );
+                assert!(
+                    e.handles.values().any(|h| h.entity == entity
+                        && h.writable
+                        && h.time_update_disabled & 6 == 6)
+                );
+            }
+            policy(u64::MAX - 1);
+            std::thread::sleep(Duration::from_millis(20));
+            file.seek(SeekFrom::Start(13)).unwrap();
+            file.write_all(b"mounted").unwrap();
+            {
+                let e = tkfs::runtime::lock_engine(&shared);
+                let entity = e.store.lookup("file").unwrap().id;
+                let basic = e.sessions[&entity].entry.basic_info();
+                assert!(basic.write_time > held.write_time && basic.change_time > held.change_time);
+                assert_eq!(
+                    e.store
+                        .db
+                        .query_row(
+                            "SELECT count(*) FROM content_save_metadata_changes",
+                            [],
+                            |r| r.get::<_, u64>(0)
+                        )
+                        .unwrap(),
+                    metadata_events,
+                    "Win32 mask-only calls must not commit metadata events"
+                );
+            }
+        }
+        {
+            let e = tkfs::runtime::lock_engine(&shared);
+            let entity = e.store.lookup("file").unwrap().id;
+            assert!(e.sessions[&entity].dirty);
+            if !time_policy_probe {
+                assert_eq!(
+                    e.sessions[&entity].entry.basic_info().write_time,
+                    tkfs::core::filetime(explicit_ms)
+                );
+            }
+            assert_eq!(
+                e.store
+                    .db
+                    .query_row("SELECT count(*) FROM content_save_history", [], |r| r
+                        .get::<_, u64>(0))
+                    .unwrap(),
+                0,
+                "native metadata changes and their stat queries must not publish the active writer's bytes"
+            );
+        }
+        let moved = point.join("renamed-file");
+        let rename_file = {
+            let e = tkfs::runtime::lock_engine(&shared);
+            let entity = e.store.lookup("file").unwrap().id;
+            match &e.sessions[&entity].bytes {
+                tkfs::staging::Staged::Cow(file) => file.clone(),
+                _ => panic!("expected the native private file"),
+            }
+        };
+        std::fs::rename(&path, &moved).unwrap();
+        assert!(!path.exists());
+        assert_eq!(std::fs::metadata(&moved).unwrap().len(), 3 * CHUNK_SIZE);
+        let moved_bytes = std::fs::read(&moved).unwrap();
+        assert_eq!(&moved_bytes[13..20], b"mounted");
+        std::fs::rename(&moved, &path).unwrap();
+        assert!(!moved.exists());
+        {
+            let e = tkfs::runtime::lock_engine(&shared);
+            let entity = e.store.lookup("file").unwrap().id;
+            match &e.sessions[&entity].bytes {
+                tkfs::staging::Staged::Cow(file) => {
+                    assert!(Arc::ptr_eq(file, &rename_file));
+                    assert_eq!(file.operation(), rename_file.operation());
+                }
+                _ => panic!("rename replaced the native private file"),
+            }
+            assert_eq!(
+                e.store
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM content_save_namespace_changes",
+                        [],
+                        |r| r.get::<_, u64>(0)
+                    )
+                    .unwrap(),
+                2
+            );
+        }
+        assert_eq!(
+            tkfs::runtime::lock_engine(&shared)
+                .store
+                .db
+                .query_row("SELECT count(*) FROM content_save_history", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0,
+            "renaming an open native file must not publish its buffered bytes"
+        );
+        let checkpoint_probe = arm("content.write.before_checkpoint", FaultAction::Fail, 0);
         file.set_len(70001).unwrap();
+        assert_eq!(
+            fault::fired(),
+            0,
+            "truncate through an open handle must stay buffered until fsync/close"
+        );
+        drop(checkpoint_probe);
+        {
+            let e = tkfs::runtime::lock_engine(&shared);
+            assert_eq!(
+                e.store
+                    .db
+                    .query_row("SELECT count(*) FROM content_save_history", [], |r| r
+                        .get::<_, u64>(0))
+                    .unwrap(),
+                0,
+                "truncate must not publish the active writer's buffered bytes"
+            );
+        }
         file.seek(SeekFrom::End(0)).unwrap();
         file.write_all(b"TAIL").unwrap();
         file.sync_all().unwrap();
@@ -780,7 +2210,7 @@ fn isolated_kernel_mount_writes_truncates_flushes_and_reopens_native_content() {
         let reference = e.store.lookup("file").unwrap().content_ref.unwrap();
         assert_eq!(reference.total_len, 70005);
         assert!(e.store.verify_derived_state().unwrap().is_empty());
-        let result = serde_json::json!({"platform":std::env::consts::OS,"real_kernel_mount":true,"native_cow":true,"bytes":70005,"write_bytes":11,"truncate":true,"explicit_fsync":true,"reopen_equal":true,"activation":"isolated fixture only"});
+        let result = serde_json::json!({"platform":std::env::consts::OS,"real_kernel_mount":true,"native_cow":true,"bytes":70005,"write_bytes":if time_policy_probe {25} else {11},"truncate":true,"truncate_without_full_checkpoint":true,"truncate_without_byte_publication":true,"explicit_fsync":true,"reopen_equal":true,"descriptor_len_before_open":true,"dirty_path_and_handle_clock":true,"metadata_reads_do_not_publish":true,"read_only_close_does_not_publish":true,"native_set_basic":true,"metadata_visible_before_fsync":true,"metadata_setter_does_not_publish_bytes":true,"native_posix_mode":cfg!(target_os="linux"),"native_windows_time_flags":time_policy_probe,"native_rename_open_handle":true,"rename_read_new_path_private_bytes":true,"rename_without_byte_publication":true,"write_after_rename":true,"activation":"isolated fixture only"});
         std::fs::write(
             root.join("native-kernel-result.json"),
             serde_json::to_vec(&result).unwrap(),
@@ -803,7 +2233,11 @@ fn isolated_kernel_mount_writes_truncates_flushes_and_reopens_native_content() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "isolated_kernel_mount_writes_truncates_flushes_and_reopens_native_content",
+            if time_policy_probe {
+                "isolated_kernel_windows_time_policy_requires_an_observable_driver_contract"
+            } else {
+                "isolated_kernel_mount_writes_truncates_flushes_and_reopens_native_content"
+            },
             "--ignored",
             "--nocapture",
         ])

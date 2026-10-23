@@ -28,8 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 use support::{
-    Control, Node, NodeConfig, WorkerProc, batched, causal_sort, clone_replica, copy_legacy_worker,
-    devices, has_file, kill_pid, linear_history, retry_busy, state_id, tail, try_rpc, wait_until,
+    Control, Node, NodeConfig, WorkerProc, batched, causal_sort, clone_replica, devices, has_file,
+    kill_pid, linear_history, retry_busy, state_id, tail, try_rpc, wait_until,
 };
 use tkfs::{
     core::{Bundle, Store, id},
@@ -524,10 +524,30 @@ fn status(worker: &WorkerProc) -> Value {
 
 #[test]
 fn revalidate_requeues_quarantined_rows_and_reactivates_them() {
-    // The 6298d0b worker fixture: an INVALID_KIND row and its quarantined
-    // descendant, plus two rows waiting for a parent that never arrives.
-    let legacy = copy_legacy_worker();
-    let mut worker = WorkerProc::spawn(&legacy.state, &[], &[]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path(), None).unwrap();
+    let branch = store.branch(&store.active).unwrap();
+    let bad = store.event(&branch, support::invalid_kind_changes("invalid"));
+    let mut child = store.event(&branch, support::invalid_kind_changes("descendant"));
+    child.dependencies = vec![bad.id.clone()];
+    let allowed = BTreeSet::from([store.device.clone()]);
+    store
+        .receive(
+            Bundle {
+                repo: store.repo.clone(),
+                branches: vec![],
+                events: vec![bad, child],
+                objects: Default::default(),
+            },
+            &allowed,
+        )
+        .unwrap();
+    assert_eq!(
+        store.inbox_counts().unwrap().quarantined + store.inbox_counts().unwrap().blocked,
+        2
+    );
+    drop(store);
+    let mut worker = WorkerProc::spawn(dir.path(), &[], &[]).unwrap();
     worker.wait_ready(Duration::from_secs(60)).unwrap();
     assert_eq!(status(&worker)["incoming_quarantined"], 2);
 
@@ -552,8 +572,7 @@ fn revalidate_requeues_quarantined_rows_and_reactivates_them() {
         2,
         "the re-queued rows were activated (and refused) at once"
     );
-    // The fixture's pending save keeps a graceful stop refused (BUSY_VIEW)
-    // until its recovery commits; a force stop persists it and exits.
+    // Revalidation is qualified on a fresh current-format worker.
     worker.rpc(json!({"op":"stop","mode":"force"})).unwrap();
     assert!(worker.wait_exit(Duration::from_secs(15)).is_some());
 }

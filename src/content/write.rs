@@ -7,7 +7,7 @@ use super::{
     overlay_map::{MapKind, MapRoot, MapValue, MapWalk, MapWork, OverlayMap},
 };
 use crate::model::{
-    content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef, MAX_FILE_SIZE},
+    content::{CHUNK_SIZE, Digest, FileContentRef, MAX_FILE_SIZE},
     workspace::{ByteRange, FileRevision, limits},
 };
 use anyhow::{Context, Result, ensure};
@@ -28,8 +28,11 @@ const MASK: usize = CHUNK_SIZE as usize / 8;
 pub const PATCH_BYTES: usize = CHUNK_SIZE as usize + MASK;
 const RECORD_BYTES: usize = 4096;
 const APPLICATION_ID: i64 = 0x544b5753;
-const JOURNAL_VERSION: i64 = 4;
+const JOURNAL_VERSION: i64 = 7;
 
+mod format;
+mod namespace;
+mod readers;
 mod retention;
 pub use retention::{
     RETAINED_READ_LIMIT, RecoveryRoot, RecoveryRootsCursor, RecoveryRootsFence, RecoveryRootsPage,
@@ -163,7 +166,6 @@ impl EditSource for MutationSource<'_> {
                 None,
                 from,
                 &mut out[(from - offset) as usize..(until - offset) as usize],
-                None,
                 false,
                 BaseRead::Local,
                 context,
@@ -205,6 +207,67 @@ pub struct SaveCheckpoint {
     pub patch_count: u64,
     pub patch_map: Digest,
     roots: OverlayRoots,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_times: Option<NativeWriteTimes>,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamespaceAdoption {
+    previous: Digest,
+    from_owner: Uuid,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct NativeTimePolicy {
+    pub disabled: u8,
+    pub prior: [u64; 2],
+}
+/// Exact resulting clocks for one byte revision, including disabled fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeWriteTimes {
+    pub disabled: u8,
+    pub modified_ms: u64,
+    pub write_time: u64,
+    pub change_time: u64,
+}
+impl NativeWriteTimes {
+    fn new(disabled: u8, prior: [u64; 2]) -> Self {
+        let modified_ms = crate::util::time::now_ms();
+        let time = crate::core::filetime(modified_ms);
+        Self {
+            disabled,
+            modified_ms,
+            write_time: if disabled & 2 == 0 { time } else { prior[0] },
+            change_time: if disabled & 4 == 0 { time } else { prior[1] },
+        }
+    }
+    fn valid(self) -> bool {
+        self.disabled & !6 == 0
+            && self.modified_ms <= (i64::MAX as u64 - crate::core::FILETIME_EPOCH) / 10_000
+            && self.write_time <= i64::MAX as u64
+            && self.change_time <= i64::MAX as u64
+    }
+}
+/// A coherent cached observation; not durability or ownership authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeBasicState {
+    pub times: Option<NativeWriteTimes>,
+    /// Last byte revision, excluding owner-fence increments during recovery.
+    pub sequence: u64,
+    pub has_changes: bool,
+}
+impl NativeBasicState {
+    fn from_working(working: &Working, saved: Option<&SaveCheckpoint>) -> Self {
+        Self {
+            times: working.native_times,
+            sequence: if working.dirty {
+                working.sequence
+            } else {
+                saved.map_or(working.sequence, |cp| cp.sequence)
+            },
+            has_changes: working.dirty || saved.is_some_and(SaveCheckpoint::needs_publication),
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,6 +298,12 @@ impl OverlayRoots {
     }
 }
 impl SaveCheckpoint {
+    pub fn time_update_disabled(&self) -> Option<u8> {
+        self.native_times.map(|times| times.disabled)
+    }
+    pub fn native_times(&self) -> Option<NativeWriteTimes> {
+        self.native_times
+    }
     /// A rebased baseline remains recoverable but does not publish a new edit.
     pub fn needs_publication(&self) -> bool {
         self.sequence > self.roots.floor
@@ -245,6 +314,7 @@ impl SaveCheckpoint {
             .validate(self.intent.operation, self.sequence, self.length)?;
         ensure!(
             self.sequence > 0
+                && self.native_times.is_none_or(NativeWriteTimes::valid)
                 && self.length <= MAX_FILE_SIZE
                 && self.base_visible_len <= self.length
                 && self.base_visible_len <= self.intent.base.content.total_len,
@@ -271,6 +341,10 @@ struct Working {
     roots: OverlayRoots,
     pending: MapRoot,
     adoption: Option<Adoption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_times: Option<NativeWriteTimes>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace: Option<NamespaceAdoption>,
 }
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -288,6 +362,7 @@ impl Working {
             .validate(self.intent.operation, MapKind::Patches)?;
         ensure!(
             self.length <= MAX_FILE_SIZE
+                && self.native_times.is_none_or(NativeWriteTimes::valid)
                 && self.base_visible_len <= self.length
                 && self.base_visible_len <= self.intent.base.content.total_len,
             "CORRUPT_WRITE_JOURNAL"
@@ -308,6 +383,12 @@ impl Working {
                     && !adoption.archive.is_nil()
                     && adoption.previous != Digest([0; 32])
                     && self.roots.floor > 0,
+                "CORRUPT_WRITE_JOURNAL"
+            );
+        }
+        if let Some(namespace) = &self.namespace {
+            ensure!(
+                namespace.previous != Digest([0; 32]) && namespace.from_owner != self.owner,
                 "CORRUPT_WRITE_JOURNAL"
             );
         }
@@ -826,12 +907,21 @@ fn read_overlay_chunk(
     context.check()
 }
 
+fn pending_count(db: &Connection) -> Result<usize> {
+    Ok(
+        db.query_row("SELECT count(*) FROM sessions WHERE publish=1", [], |r| {
+            r.get(0)
+        })?,
+    )
+}
+
 /// One private journal per worker. Share its Arc among sessions. No metadata
 /// engine lock may be held by its caller. The existing worker store lock must
 /// exclude another worker process opening this journal for the same store.
 pub struct WriteJournal {
     root: PathBuf,
     db: Mutex<Connection>,
+    readers: readers::Readers,
     maintenance_cursor: Mutex<Option<ReclaimCursor>>,
     identity: Uuid,
     reclamation_error: Mutex<Option<String>>,
@@ -839,6 +929,7 @@ pub struct WriteJournal {
     retained_readers: Mutex<std::collections::BTreeMap<Uuid, usize>>,
     staging: AtomicUsize,
     checkpoint_work: Mutex<CheckpointWork>,
+    pending_count: AtomicUsize,
 }
 /// Logical committed FULL checkpoint transactions and dirty sessions advanced.
 /// These counters exclude adoption/metadata commits and physical I/O.
@@ -985,22 +1076,21 @@ impl WriteJournal {
     pub fn open(root: &Path) -> Result<Arc<Self>> {
         ensure!(root.is_dir(), "CONTENT_STORE_NOT_INITIALIZED");
         let root = root.canonicalize()?;
-        let db = Connection::open(root.join("write-sessions-v1.sqlite"))?;
+        let path = root.join("write-sessions-v1.sqlite");
+        // Refuse an existing unsupported database through a read-only handle
+        // before opening a writer, changing WAL mode or configuring recovery.
+        if path.exists() {
+            format::standalone_header(&path)?;
+            let check =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            format::inspect(&check)?;
+        }
+        let db = Connection::open(&path)?;
         db.busy_timeout(Duration::ZERO)?;
-        let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-        let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        let tables: usize = db.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table'",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(
-            (app == APPLICATION_ID && version == JOURNAL_VERSION)
-                || (app == 0 && version == 0 && tables == 0),
-            "WRITE_JOURNAL_NEEDS_UPGRADE"
-        );
+        let layout = format::inspect(&db)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA cache_size=-1536; PRAGMA temp_store=FILE; PRAGMA wal_autocheckpoint=512; PRAGMA journal_size_limit=8388608;")?;
-        if app == 0 {
+        if layout == format::Layout::Fresh {
+            crate::util::fault::trigger("content.write.before_initialize")?;
             db.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE inventory(id INTEGER PRIMARY KEY CHECK(id=0),record BLOB NOT NULL);
                 CREATE TABLE sessions(id TEXT PRIMARY KEY,working BLOB NOT NULL,saved BLOB,dirty INTEGER NOT NULL CHECK(dirty IN (0,1)),queued INTEGER NOT NULL CHECK(queued>=0),publish INTEGER NOT NULL CHECK(publish IN (0,1)),seal BLOB NOT NULL CHECK(length(seal)=32));
@@ -1010,7 +1100,7 @@ impl WriteJournal {
                 CREATE INDEX dirty_sessions ON sessions(id) WHERE dirty=1;
                 CREATE TABLE payloads(hash TEXT PRIMARY KEY,data BLOB NOT NULL CHECK(length(data)=73728));
                 CREATE TABLE gc_marks(hash TEXT PRIMARY KEY,epoch TEXT NOT NULL) WITHOUT ROWID;
-                PRAGMA application_id=1414223699; PRAGMA user_version=4;")?;
+                PRAGMA application_id=1414223699; PRAGMA user_version=7;")?;
             OverlayMap::ensure_schema(&db)?;
             db.execute(
                 "INSERT INTO inventory VALUES(0,?)",
@@ -1019,15 +1109,19 @@ impl WriteJournal {
                     xor: Digest([0; 32]),
                 })?],
             )?;
+            crate::util::fault::trigger("content.write.schema_initialized")?;
             db.execute_batch("COMMIT")?;
             crate::core::objects::sync_dir(&root)?;
+            crate::util::fault::trigger("content.write.initialized")?;
         }
         inventory(&db)?;
         db.execute_batch("CREATE TEMP TABLE gc_node_marks(hash BLOB PRIMARY KEY CHECK(length(hash)=32),epoch TEXT NOT NULL) WITHOUT ROWID; PRAGMA temp.cache_size=-512;")?;
         db.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        let pending_count = pending_count(&db)?;
         Ok(Arc::new(Self {
             root,
             db: Mutex::new(db),
+            readers: readers::Readers::default(),
             maintenance_cursor: Mutex::new(None),
             identity: Uuid::new_v4(),
             reclamation_error: Mutex::new(None),
@@ -1035,7 +1129,13 @@ impl WriteJournal {
             retained_readers: Mutex::new(std::collections::BTreeMap::new()),
             staging: AtomicUsize::new(0),
             checkpoint_work: Mutex::new(CheckpointWork::default()),
+            pending_count: AtomicUsize::new(pending_count),
         }))
+    }
+    /// Outstanding durable Saved revisions on this worker's journal. Updated
+    /// only after commits; heartbeat readers require no SQLite or journal lock.
+    pub fn pending_count(&self) -> usize {
+        self.pending_count.load(Ordering::Acquire)
     }
     fn lock(&self, context: &ReadContext) -> Result<JournalDb<'_>> {
         loop {
@@ -1078,6 +1178,8 @@ impl WriteJournal {
             owner: Uuid::new_v4(),
             sequence: 0,
             dirty: false,
+            native_times: None,
+            namespace: None,
         };
         let mut db = self.lock(context)?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1092,8 +1194,9 @@ impl WriteJournal {
             base,
             operation: working.intent.operation,
             visible_len: AtomicU64::new(working.length),
+            visible_basic: Mutex::new(NativeBasicState::from_working(&working, None)),
+            visible_sequence: AtomicU64::new(working.sequence),
             owner: working.owner,
-            converted_base: Mutex::new(None),
             adoption_work: None,
         })
     }
@@ -1157,6 +1260,8 @@ impl WriteJournal {
             roots: checkpoint.roots.clone(),
             pending: MapRoot::empty(operation, MapKind::Patches),
             adoption: None,
+            native_times: checkpoint.native_times,
+            namespace: None,
         };
         persist(&tx, &working, Some(&checkpoint), false)?;
         tx.commit()?;
@@ -1169,9 +1274,29 @@ impl WriteJournal {
             operation,
             owner: working.owner,
             visible_len: AtomicU64::new(working.length),
-            converted_base: Mutex::new(None),
+            visible_basic: Mutex::new(NativeBasicState::from_working(&working, Some(&checkpoint))),
+            visible_sequence: AtomicU64::new(working.sequence),
             adoption_work: None,
         })
+    }
+    /// A freshly captured clean operation can have only Working. Inspect its
+    /// sealed authority before recovery decides whether promised Saved exists.
+    /// This never promotes, adopts or discards uncheckpointed Working bytes.
+    pub fn has_saved_checkpoint(&self, intent: &SaveIntent, context: &ReadContext) -> Result<bool> {
+        context.check()?;
+        intent.validate()?;
+        let db = self.lock(context)?;
+        let (working, saved) = state(&db, intent.operation)?;
+        ensure!(
+            working.intent.base.workspace == intent.base.workspace
+                && working.intent.base.entity == intent.base.entity
+                && working.intent.branch == intent.branch,
+            "CONTENT_SAVE_INTENT_MISMATCH"
+        );
+        if saved.is_none() {
+            ensure!(working.intent == *intent, "STALE_WRITE_SESSION");
+        }
+        Ok(saved.is_some())
     }
     fn needs_checkpoint(db: &Connection, working: &Working, additional: usize) -> Result<bool> {
         let (chunks, dirty): (usize, usize) = db.query_row(
@@ -1311,6 +1436,7 @@ impl WriteJournal {
                     patch_count: w.roots.patches.entries(),
                     patch_map: w.roots.patches.digest(),
                     roots: w.roots.clone(),
+                    native_times: w.native_times,
                 };
                 w.dirty = false;
                 w.pending = MapRoot::empty(op, MapKind::Patches);
@@ -1332,7 +1458,9 @@ impl WriteJournal {
                 .unwrap_or_default();
             crate::util::fault::trigger("content.write.before_checkpoint_commit")?;
             context.check()?;
+            let pending = pending_count(&tx)?;
             tx.commit()?;
+            self.pending_count.store(pending, Ordering::Release);
             let mut work = crate::util::lock::lock(&self.checkpoint_work);
             work.commits = work.commits.saturating_add(1);
             work.sessions = work.sessions.saturating_add(dirty_count as u64);
@@ -1681,9 +1809,10 @@ pub struct WriteSession {
     provider: Arc<dyn ContentProvider>,
     base: PinnedContent,
     visible_len: AtomicU64,
+    visible_basic: Mutex<NativeBasicState>,
+    visible_sequence: AtomicU64,
     operation: Uuid,
     owner: Uuid,
-    converted_base: Mutex<Option<PinnedContent>>,
     adoption_work: Option<AdoptionWork>,
 }
 /// Staging map work only; excludes preflight root checks, SQLite headers,
@@ -1702,7 +1831,6 @@ pub struct PreparedSave {
     checkpoint: SaveCheckpoint,
     owner: Uuid,
     content: PinnedContent,
-    _converted_base: Option<PinnedContent>,
 }
 impl std::fmt::Debug for PreparedSave {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1726,7 +1854,6 @@ impl PreparedSave {
 struct CheckpointEdit<'a> {
     session: &'a WriteSession,
     checkpoint: &'a SaveCheckpoint,
-    converted: Option<(&'a dyn ContentProvider, &'a PinnedContent)>,
 }
 impl EditSource for CheckpointEdit<'_> {
     fn check(&self, context: &ReadContext) -> Result<()> {
@@ -1763,7 +1890,6 @@ impl EditSource for CheckpointEdit<'_> {
             Some(self.checkpoint),
             offset,
             out,
-            self.converted,
             false,
             BaseRead::Local,
             context,
@@ -1802,98 +1928,45 @@ impl WriteSession {
             all_changes,
             limits: preflight.limits,
         };
-        if selection.working.intent.base.content.kind == ContentKind::Legacy {
-            // A first legacy conversion may require a whole-file verification.
-            // Full replacement and truncation to zero need none of its bytes.
-            if self.legacy_base_needed(&selection, context)? {
-                preflight.target.read_range(
-                    &preflight
-                        .target
-                        .pin(&selection.working.intent.base.content)?,
-                    0,
-                    &mut [0; 1],
-                    context,
-                )?;
-            }
-        } else {
-            let mut source = MutationSource {
-                session: self,
-                selection: &selection,
-            };
-            loop {
-                match preflight.target.preflight(
-                    &selection.working.intent.base.content,
-                    length,
-                    &mut source,
-                    context,
-                ) {
-                    Ok(()) => break,
-                    Err(error) => {
-                        let Some(mut range) = LocalContent::rebuild_range(&error) else {
-                            return Err(error);
-                        };
-                        range.len = range.len.min(
-                            selection
-                                .working
-                                .intent
-                                .base
-                                .content
-                                .total_len
-                                .saturating_sub(range.offset),
-                        );
-                        // The visitor and all its buffers/guards have returned.
-                        self.recover_base(
-                            &selection.working.intent,
-                            range,
-                            error,
-                            preflight.limits,
-                            context,
-                        )?;
-                        self.validate_mutation(&selection, context)?;
-                    }
+        let mut source = MutationSource {
+            session: self,
+            selection: &selection,
+        };
+        loop {
+            match preflight.target.preflight(
+                &selection.working.intent.base.content,
+                length,
+                &mut source,
+                context,
+            ) {
+                Ok(()) => break,
+                Err(error) => {
+                    let Some(mut range) = LocalContent::rebuild_range(&error) else {
+                        return Err(error);
+                    };
+                    range.len = range.len.min(
+                        selection
+                            .working
+                            .intent
+                            .base
+                            .content
+                            .total_len
+                            .saturating_sub(range.offset),
+                    );
+                    // The visitor and all its buffers/guards have returned.
+                    self.recover_base(
+                        &selection.working.intent,
+                        range,
+                        error,
+                        preflight.limits,
+                        context,
+                    )?;
+                    self.validate_mutation(&selection, context)?;
                 }
             }
         }
         self.validate_mutation(&selection, context)?;
         Ok(selection)
-    }
-    fn legacy_base_needed(
-        &self,
-        selection: &MutationSelection,
-        context: &ReadContext,
-    ) -> Result<bool> {
-        let mut from = 0;
-        let incoming = selection.overwrite;
-        let incoming_end = incoming.end()?;
-        while from < selection.base_visible_len {
-            selection.check(context)?;
-            let index = from / CHUNK_SIZE;
-            let until = selection.base_visible_len.min((index + 1) * CHUNK_SIZE);
-            if incoming.len > 0 && incoming.offset <= from && incoming_end >= until {
-                from = until;
-                continue;
-            }
-            let patch = {
-                let db = self.journal.lock(context)?;
-                let current = self.owned(&db)?.0;
-                ensure!(current == selection.working, "STALE_WRITE_CHECKPOINT");
-                overlay(&db, &current, None, index, context)?
-            };
-            for position in from..until {
-                if incoming.len > 0 && position >= incoming.offset && position < incoming_end {
-                    continue;
-                }
-                let at = (position - index * CHUNK_SIZE) as usize;
-                if patch.as_ref().is_none_or(|(meta, bytes)| {
-                    at >= meta.valid || bytes[CHUNK_SIZE as usize + at / 8] & (1 << (at % 8)) == 0
-                }) {
-                    return Ok(true);
-                }
-            }
-            from = until;
-        }
-        self.validate_mutation(selection, context)?;
-        Ok(false)
     }
     pub(crate) fn with_base_wait(mut self, wait: Arc<dyn BaseWait>) -> Self {
         self.base_wait = Some(wait);
@@ -1989,7 +2062,7 @@ impl WriteSession {
                 );
                 work.replay = true;
                 context.check()?;
-                return Ok(self.adopted_handle(w.owner, w.length, handoff, provider, work));
+                return Ok(self.adopted_handle(&w, saved.as_ref(), handoff, provider, work));
             }
             ensure!(w.intent == parent.intent, "STALE_WRITE_SESSION");
             let saved = saved.context("STALE_WRITE_CHECKPOINT")?;
@@ -2084,6 +2157,7 @@ impl WriteSession {
             patch_count: saved_roots.patches.entries(),
             patch_map: saved_roots.patches.digest(),
             roots: saved_roots,
+            native_times: saved.native_times,
         };
         let mut db = self.journal.lock(context)?;
         db.execute_batch("PRAGMA synchronous=FULL")?;
@@ -2110,7 +2184,9 @@ impl WriteSession {
             persist(&tx, &next, Some(&next_saved), false)?;
             crate::util::fault::trigger("content.write.adoption_written")?;
             context.check()?;
+            let pending = pending_count(&tx)?;
             tx.commit()?;
+            self.journal.pending_count.store(pending, Ordering::Release);
             Ok(())
         })();
         db.progress_handler(0, None::<fn() -> bool>);
@@ -2121,12 +2197,12 @@ impl WriteSession {
         normal?;
         crate::util::fault::trigger("content.write.adopted")?;
         context.check()?;
-        Ok(self.adopted_handle(next.owner, next.length, handoff, provider, work))
+        Ok(self.adopted_handle(&next, Some(&next_saved), handoff, provider, work))
     }
     fn adopted_handle(
         &self,
-        owner: Uuid,
-        length: u64,
+        working: &Working,
+        saved: Option<&SaveCheckpoint>,
         handoff: &crate::core::content_saves::SaveContinuation,
         provider: Arc<dyn ContentProvider>,
         work: AdoptionWork,
@@ -2136,10 +2212,11 @@ impl WriteSession {
             base_wait: self.base_wait.clone(),
             provider,
             base: handoff.base_pin().clone(),
-            visible_len: AtomicU64::new(length),
+            visible_len: AtomicU64::new(working.length),
+            visible_basic: Mutex::new(NativeBasicState::from_working(working, saved)),
+            visible_sequence: AtomicU64::new(working.sequence),
             operation: self.operation,
-            owner,
-            converted_base: Mutex::new(None),
+            owner: working.owner,
             adoption_work: Some(work),
         }
     }
@@ -2150,6 +2227,12 @@ impl WriteSession {
     /// Byte operations still validate the durable owner and sequence.
     pub(crate) fn visible_len(&self) -> u64 {
         self.visible_len.load(Ordering::Acquire)
+    }
+    pub fn native_basic_state(&self) -> NativeBasicState {
+        *crate::util::lock::lock(&self.visible_basic)
+    }
+    pub(crate) fn visible_sequence(&self) -> u64 {
+        self.visible_sequence.load(Ordering::Acquire)
     }
     pub fn intent(&self, context: &ReadContext) -> Result<SaveIntent> {
         let db = self.journal.lock(context)?;
@@ -2176,70 +2259,6 @@ impl WriteSession {
         ensure!(checkpoint.needs_publication(), "STALE_WRITE_CHECKPOINT");
         verify_saved(&db, checkpoint, context)
     }
-    fn needs_base(&self, checkpoint: &SaveCheckpoint, context: &ReadContext) -> Result<bool> {
-        let mut offset = 0;
-        while offset < checkpoint.base_visible_len {
-            context.check()?;
-            let db = self.journal.lock(context)?;
-            self.selected(&db, checkpoint)?;
-            let Some(c) = chunk_meta(
-                &db,
-                checkpoint.roots.patches,
-                self.operation,
-                offset / CHUNK_SIZE,
-                checkpoint.roots.floor,
-                context,
-            )?
-            else {
-                return Ok(true);
-            };
-            let count = (checkpoint.base_visible_len - offset).min(CHUNK_SIZE) as usize;
-            if c.valid < count {
-                return Ok(true);
-            }
-            let bytes = payload(&db, &c)?;
-            if (0..count).any(|i| bytes[CHUNK_SIZE as usize + i / 8] & (1 << (i % 8)) == 0) {
-                return Ok(true);
-            }
-            offset += count as u64;
-        }
-        self.selected(&*self.journal.lock(context)?, checkpoint)?;
-        context.check()?;
-        Ok(false)
-    }
-    fn convert_base(
-        &self,
-        target: &LocalContent,
-        checkpoint: &SaveCheckpoint,
-        context: &ReadContext,
-    ) -> Result<PinnedContent> {
-        loop {
-            context.check()?;
-            self.selected(&*self.journal.lock(context)?, checkpoint)?;
-            match self.converted_base.try_lock() {
-                Ok(mut cached) => {
-                    if let Some(pin) = cached
-                        .as_ref()
-                        .filter(|p| p.provider() == target.identity())
-                    {
-                        return Ok(pin.clone());
-                    }
-                    self.selected(&*self.journal.lock(context)?, checkpoint)?;
-                    let pin =
-                        target.convert_legacy(&checkpoint.intent.base.content, context, &|| {
-                            self.selected(&*self.journal.lock(context)?, checkpoint)
-                        })?;
-                    *cached = Some(pin.clone());
-                    context.check()?;
-                    return Ok(pin);
-                }
-                Err(TryLockError::Poisoned(_)) => anyhow::bail!("WRITE_CONVERSION_POISONED"),
-                Err(TryLockError::WouldBlock) => {
-                    context.cancel.sleep(Duration::from_millis(5));
-                }
-            }
-        }
-    }
     /// Construct canonical objects without publishing a revision. Intact
     /// subtrees may remain unhydrated. The object engine supplies missing
     /// structural pages; their absence never requests a whole-base copy here.
@@ -2250,28 +2269,17 @@ impl WriteSession {
         context: &ReadContext,
     ) -> Result<PreparedSave> {
         self.verified_selection(checkpoint, context)?;
-        let legacy = checkpoint.intent.base.content.kind == ContentKind::Legacy;
-        // Conversion must precede the builder's buffer permit: nested save
-        // permits could deadlock two simultaneous legacy preparations.
-        let converted = if legacy && self.needs_base(checkpoint, context)? {
-            Some(self.convert_base(target, checkpoint, context)?)
-        } else {
-            None
-        };
-        let base = if legacy {
-            converted.as_ref().map(PinnedContent::reference)
-        } else {
-            Some(&checkpoint.intent.base.content)
-        };
         let content = {
             let mut source = CheckpointEdit {
                 session: self,
                 checkpoint,
-                converted: converted
-                    .as_ref()
-                    .map(|p| (target as &dyn ContentProvider, p)),
             };
-            target.rebuild(base, checkpoint.length, &mut source, context)?
+            target.rebuild(
+                Some(&checkpoint.intent.base.content),
+                checkpoint.length,
+                &mut source,
+                context,
+            )?
         };
         self.verified_selection(checkpoint, context)?;
         let pin = target.pin(&content)?;
@@ -2280,7 +2288,6 @@ impl WriteSession {
             checkpoint: checkpoint.clone(),
             owner: self.owner,
             content: pin,
-            _converted_base: converted,
         })
     }
     /// Read-only preparation validation; metadata publication still requires
@@ -2291,14 +2298,40 @@ impl WriteSession {
         context.check()
     }
     pub fn len(&self, context: &ReadContext) -> Result<u64> {
-        let length = self.owned(&*self.journal.lock(context)?)?.0.length;
-        context.check()?;
-        Ok(length)
+        self.journal
+            .read_snapshot(context, |db| Ok(self.owned(db)?.0.length))
     }
     pub fn is_empty(&self, context: &ReadContext) -> Result<bool> {
         Ok(self.len(context)? == 0)
     }
     pub fn write_at(&self, offset: u64, bytes: &[u8], context: &ReadContext) -> Result<()> {
+        self.write_at_policy(offset, bytes, None, context)
+    }
+    /// The mask belongs to the handle that performs this byte mutation. It is
+    /// sealed with the bytes at the existing NORMAL/FULL boundaries.
+    pub fn write_at_with_times(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+        disabled: u8,
+        prior: [u64; 2],
+        context: &ReadContext,
+    ) -> Result<()> {
+        self.write_at_policy(offset, bytes, Some((disabled, prior)), context)
+    }
+    fn write_at_policy(
+        &self,
+        offset: u64,
+        bytes: &[u8],
+        disabled: Option<(u8, [u64; 2])>,
+        context: &ReadContext,
+    ) -> Result<()> {
+        ensure!(
+            disabled.is_none_or(
+                |(mask, prior)| mask & !6 == 0 && prior.iter().all(|t| *t <= i64::MAX as u64)
+            ),
+            "INVALID_TIMESTAMP_POLICY"
+        );
         ensure!(bytes.len() <= limits::READ_BYTES, "CONTENT_BUFFER_LIMIT");
         let end = offset
             .checked_add(bytes.len() as u64)
@@ -2329,6 +2362,7 @@ impl WriteSession {
             }
             let mut collect = false;
             w.advance()?;
+            w.native_times = disabled.map(|(mask, prior)| NativeWriteTimes::new(mask, prior));
             for index in first..=last {
                 context.check()?;
                 let prior = chunk_meta(&tx, w.pending, self.operation, index, 0, context)?;
@@ -2363,6 +2397,9 @@ impl WriteSession {
             context.check()?;
             tx.commit()?;
             self.visible_len.store(w.length, Ordering::Release);
+            *crate::util::lock::lock(&self.visible_basic) =
+                NativeBasicState::from_working(&w, saved.as_ref());
+            self.visible_sequence.store(w.sequence, Ordering::Release);
             drop(db);
             crate::util::fault::trigger("content.write.buffered")?;
             if collect {
@@ -2372,6 +2409,29 @@ impl WriteSession {
         }
     }
     pub fn set_len(&self, length: u64, context: &ReadContext) -> Result<()> {
+        self.set_len_policy(length, None, context)
+    }
+    pub fn set_len_with_times(
+        &self,
+        length: u64,
+        disabled: u8,
+        prior: [u64; 2],
+        context: &ReadContext,
+    ) -> Result<()> {
+        self.set_len_policy(length, Some((disabled, prior)), context)
+    }
+    fn set_len_policy(
+        &self,
+        length: u64,
+        disabled: Option<(u8, [u64; 2])>,
+        context: &ReadContext,
+    ) -> Result<()> {
+        ensure!(
+            disabled.is_none_or(
+                |(mask, prior)| mask & !6 == 0 && prior.iter().all(|t| *t <= i64::MAX as u64)
+            ),
+            "INVALID_TIMESTAMP_POLICY"
+        );
         ensure!(length <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
         loop {
             let mut db = self.journal.lock(context)?;
@@ -2408,6 +2468,7 @@ impl WriteSession {
                 continue;
             }
             w.advance()?;
+            w.native_times = disabled.map(|(mask, prior)| NativeWriteTimes::new(mask, prior));
             if length < w.length {
                 let patches = map(&tx, self.operation, MapKind::Patches);
                 let mut work = MapWork::default();
@@ -2459,6 +2520,9 @@ impl WriteSession {
             context.check()?;
             tx.commit()?;
             self.visible_len.store(length, Ordering::Release);
+            *crate::util::lock::lock(&self.visible_basic) =
+                NativeBasicState::from_working(&w, saved.as_ref());
+            self.visible_sequence.store(w.sequence, Ordering::Release);
             return context.check();
         }
     }
@@ -2501,7 +2565,6 @@ impl WriteSession {
             selected,
             offset,
             out,
-            None,
             true,
             BaseRead::Waiting(None),
             context,
@@ -2514,42 +2577,34 @@ impl WriteSession {
         limits: Option<BaseWaitLimits>,
         context: &ReadContext,
     ) -> Result<()> {
-        self.read_using(
-            None,
-            offset,
-            out,
-            None,
-            true,
-            BaseRead::Waiting(limits),
-            context,
-        )
+        self.read_using(None, offset, out, true, BaseRead::Waiting(limits), context)
     }
-    #[allow(clippy::too_many_arguments)]
     fn read_using(
         &self,
         selected: Option<&SaveCheckpoint>,
         offset: u64,
         out: &mut [u8],
-        base_override: Option<(&dyn ContentProvider, &PinnedContent)>,
         verify_map: bool,
         recovery: BaseRead,
         context: &ReadContext,
     ) -> Result<()> {
         ensure!(out.len() <= limits::READ_BYTES, "CONTENT_BUFFER_LIMIT");
-        let (w, saved) = self.owned(&*self.journal.lock(context)?)?;
+        let (w, saved) = self.journal.read_snapshot(context, |db| self.owned(db))?;
         if let Some(c) = selected {
             ensure!(saved.as_ref() == Some(c), "STALE_WRITE_CHECKPOINT");
         }
         if verify_map {
-            let db = self.journal.lock(context)?;
-            let current = self.owned(&db)?;
-            ensure!(current.0.sequence == w.sequence, "STALE_WRITE_CHECKPOINT");
-            if let Some(c) = selected {
-                self.selected(&db, c)?;
-                verify_saved(&db, c, context)?;
-            } else {
-                verify_maps(&db, &current.0, current.1.as_ref(), context)?;
-            }
+            self.journal.read_snapshot(context, |db| {
+                let current = self.owned(db)?;
+                ensure!(current.0.sequence == w.sequence, "STALE_WRITE_CHECKPOINT");
+                if let Some(c) = selected {
+                    self.selected(db, c)?;
+                    verify_saved(db, c, context)?;
+                } else {
+                    verify_maps(db, &current.0, current.1.as_ref(), context)?;
+                }
+                Ok(())
+            })?;
         }
         let length = selected.map_or(w.length, |c| c.length);
         let base_len = selected.map_or(w.base_visible_len, |c| c.base_visible_len);
@@ -2573,18 +2628,16 @@ impl WriteSession {
             context.check()?;
             let index = from / CHUNK_SIZE;
             let until = end.min((index + 1) * CHUNK_SIZE);
-            let patch = {
-                let db = self.journal.lock(context)?;
-                let current = self.owned(&db)?;
+            let patch = self.journal.read_snapshot(context, |db| {
+                let current = self.owned(db)?;
                 fresh(&current)?;
-                overlay(&db, &current.0, selected, index, context)?
-            };
+                overlay(db, &current.0, selected, index, context)
+            })?;
             let target = &mut out[(from - offset) as usize..(until - offset) as usize];
-            let (provider, pin) = base_override.unwrap_or((&*self.provider, &self.base));
             loop {
                 match read_overlay_chunk(
-                    provider,
-                    pin,
+                    &*self.provider,
+                    &self.base,
                     base_len,
                     from,
                     target,
@@ -2592,9 +2645,7 @@ impl WriteSession {
                     context,
                 ) {
                     Ok(()) => break,
-                    Err(error)
-                        if base_override.is_none() && matches!(recovery, BaseRead::Waiting(_)) =>
-                    {
+                    Err(error) if matches!(recovery, BaseRead::Waiting(_)) => {
                         let BaseRead::Waiting(limits) = recovery else {
                             unreachable!()
                         };
@@ -2608,25 +2659,26 @@ impl WriteSession {
                             limits,
                             context,
                         )?;
-                        fresh(&self.owned(&*self.journal.lock(context)?)?)?;
+                        self.journal
+                            .read_snapshot(context, |db| fresh(&self.owned(db)?))?;
                     }
                     Err(error) => return Err(error),
                 }
             }
             from = until;
         }
-        {
-            let db = self.journal.lock(context)?;
-            let current = self.owned(&db)?;
+        self.journal.read_snapshot(context, |db| {
+            let current = self.owned(db)?;
             fresh(&current)?;
             if verify_map {
                 if let Some(c) = selected {
-                    verify_saved(&db, c, context)?;
+                    verify_saved(db, c, context)?;
                 } else {
-                    verify_maps(&db, &current.0, current.1.as_ref(), context)?;
+                    verify_maps(db, &current.0, current.1.as_ref(), context)?;
                 }
             }
-        }
+            Ok(())
+        })?;
         context.check()
     }
 }
@@ -2634,7 +2686,10 @@ impl WriteSession {
 #[cfg(test)]
 mod root_journal_tests {
     use super::*;
-    use crate::{model::workspace::WorkspaceId, util::Cancel};
+    use crate::{
+        model::{content::ContentKind, workspace::WorkspaceId},
+        util::Cancel,
+    };
     use std::time::Instant;
 
     fn context() -> ReadContext {
@@ -2644,7 +2699,7 @@ mod root_journal_tests {
         }
     }
     #[test]
-    fn legacy_mutation_preflight_uses_private_replacement_when_original_is_absent() {
+    fn direct_mutation_preflight_uses_private_replacement_when_original_is_absent() {
         let dir = tempfile::tempdir().unwrap();
         let native = Arc::new(LocalContent::open(dir.path()).unwrap());
         let original = Digest::bytes(&[199; 32]);
@@ -2660,7 +2715,7 @@ mod root_journal_tests {
                 },
                 entity: "file".into(),
                 generation: 1,
-                content: FileContentRef::new(ContentKind::Legacy, original, 32).unwrap(),
+                content: FileContentRef::new(ContentKind::Direct, original, 32).unwrap(),
             },
         };
         let session = WriteJournal::open(dir.path())
@@ -2884,6 +2939,7 @@ mod root_journal_tests {
                         patch_count: entries,
                         patch_map: w.roots.patches.digest(),
                         roots: w.roots.clone(),
+                        native_times: w.native_times,
                     };
                     remember_checkpoint(&tx, &saved).unwrap();
                     persist(&tx, &w, Some(&saved), false).unwrap();
@@ -2895,7 +2951,6 @@ mod root_journal_tests {
                     checkpoint: parent.clone(),
                     owner: session.owner,
                     content: local.pin(&canonical).unwrap(),
-                    _converted_base: None,
                 };
                 store
                     .select_content_checkpoint(&parent, &context())
@@ -3101,6 +3156,7 @@ mod root_journal_tests {
                     patch_count: entries,
                     patch_map: w.roots.patches.digest(),
                     roots: w.roots.clone(),
+                    native_times: w.native_times,
                 };
                 persist(&tx, &w, Some(&saved), false).unwrap();
                 tx.commit().unwrap();

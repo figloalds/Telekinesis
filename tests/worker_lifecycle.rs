@@ -29,7 +29,6 @@ use tkfs::{
     core::{Store, id},
     model::ipc::{HelloReply, ReadyLine, StopMode, StopReply, WorkerHeartbeat, WorkerRecord},
     runtime::{self, Engine, Shared},
-    util::fault::{self, FaultAction, FaultConfig},
     worker::{self, record},
     ws,
 };
@@ -55,18 +54,68 @@ fn keys(value: &Value) -> Vec<String> {
     keys
 }
 
-fn pending_saves(state: &Path) -> i64 {
-    Connection::open(state.join("metadata.sqlite"))
-        .unwrap()
-        .query_row("SELECT count(*) FROM pending_saves", [], |r| r.get(0))
-        .unwrap_or(0)
+fn context() -> tkfs::content::ReadContext {
+    tkfs::content::ReadContext {
+        deadline: Instant::now() + Duration::from_secs(30),
+        cancel: tkfs::util::Cancel::new(),
+    }
 }
-
-/// Committed content of `path` in a stopped worker's store.
+fn pending_saves(state: &Path) -> usize {
+    let journal = tkfs::content::write::WriteJournal::open(state).unwrap();
+    let mut count = 0;
+    let mut after = None;
+    loop {
+        let page = journal.pending(after, 64, &context()).unwrap();
+        if page.is_empty() {
+            return count;
+        }
+        after = page.last().map(|save| save.intent.operation);
+        count += page.iter().filter(|save| save.needs_publication()).count();
+    }
+}
+/// Seed current native Saved checkpoints without publishing or closing handles.
+fn seed_saved(state: &Path, files: &[(&str, &[u8])]) {
+    use tkfs::runtime::{
+        content::ContentWait,
+        content_writes::{self, NativeWrites},
+    };
+    let shared = Arc::new(Mutex::new(Engine::new(
+        Store::open_existing(state).unwrap(),
+    )));
+    let writes = NativeWrites::install(&shared, &context()).unwrap();
+    let wait = || ContentWait::fixed(Duration::from_secs(30));
+    for (path, bytes) in files {
+        let (handle, _) = content_writes::create(
+            &shared,
+            path,
+            content_writes::CreateOptions {
+                writable: true,
+                ..Default::default()
+            },
+            wait(),
+        )
+        .unwrap()
+        .unwrap();
+        content_writes::write(&shared, handle, 0, bytes, false, false, wait()).unwrap();
+    }
+    assert_eq!(
+        content_writes::retain_dirty(&shared, &context()).unwrap(),
+        files.len()
+    );
+    writes.shutdown(&context()).unwrap();
+}
+/// Committed current content, read through its typed descriptor and pin.
 fn committed(state: &Path, path: &str) -> Vec<u8> {
+    use tkfs::content::ContentProvider;
     let store = Store::open_existing(state).unwrap();
-    let entry = store.lookup(path).unwrap();
-    store.read_object(&entry.content.unwrap()).unwrap()
+    let reference = store.lookup(path).unwrap().content_ref.unwrap();
+    let provider = tkfs::content::LocalContent::open(state).unwrap();
+    let pin = provider.pin(&reference).unwrap();
+    let mut bytes = vec![0; usize::try_from(reference.total_len).unwrap()];
+    provider
+        .read_range(&pin, 0, &mut bytes, &context())
+        .unwrap();
+    bytes
 }
 
 fn remote_error(result: anyhow::Result<Value>) -> String {
@@ -522,12 +571,7 @@ fn rpc_after_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let state = new_state(dir.path());
     let saved = b"bytes retained before a crash".to_vec();
-    {
-        let mut engine = Engine::new(Store::open_existing(&state).unwrap());
-        let (h, _) = engine.open("retained.txt", Some("file"), true).unwrap();
-        engine.write(h, 0, &saved, false, false).unwrap();
-        assert_eq!(engine.retain_all_dirty().unwrap(), 1);
-    }
+    seed_saved(&state, &[("retained.txt", &saved)]);
     assert_eq!(pending_saves(&state), 1);
     let mut worker = WorkerProc::spawn(
         &state,
@@ -1106,171 +1150,241 @@ fn wait_released(engine: &Shared) {
     );
 }
 
-/// Invariant 8 guard (§10), in process and without a mount: a graceful stop
-/// with an open dirty session is refused (`BUSY_VIEW`, the worker stays up);
-/// a force stop fences new opens, writes the `pending_saves` row and stops;
-/// after a "crash" the recovered engine commits the bytes.
+fn native_wait() -> tkfs::runtime::content::ContentWait {
+    tkfs::runtime::content::ContentWait::fixed(Duration::from_secs(30))
+}
+struct NativeRunning {
+    shared: Shared,
+    server: Option<runtime::RpcServer>,
+    writes: Arc<runtime::content_writes::NativeWrites>,
+}
+impl NativeRunning {
+    fn new(root: &Path) -> Self {
+        let shared = shared(root);
+        let ctx = worker::build_ctx(shared.clone(), root, false, None);
+        let server = runtime::server::start_rpc_server(ctx).unwrap();
+        server.publish(None).unwrap();
+        let writes = runtime::content_writes::NativeWrites::install(&shared, &context()).unwrap();
+        Self {
+            shared,
+            server: Some(server),
+            writes,
+        }
+    }
+    fn server(&self) -> &runtime::RpcServer {
+        self.server.as_ref().unwrap()
+    }
+    fn create(&self, path: &str) -> (u64, tkfs::core::Entry) {
+        runtime::content_writes::create(
+            &self.shared,
+            path,
+            runtime::content_writes::CreateOptions {
+                writable: true,
+                ..Default::default()
+            },
+            native_wait(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+    fn open(&self, path: &str) -> (u64, tkfs::core::Entry) {
+        let opened = runtime::lock_engine(&self.shared)
+            .open(path, None, true)
+            .unwrap();
+        runtime::content_reads::prepare_open(&self.shared, opened.0, native_wait()).unwrap();
+        opened
+    }
+    fn write(&self, handle: u64, bytes: &[u8]) {
+        assert_eq!(
+            runtime::content_writes::write(
+                &self.shared,
+                handle,
+                0,
+                bytes,
+                false,
+                false,
+                native_wait()
+            )
+            .unwrap(),
+            Some(bytes.len())
+        );
+    }
+    fn flush(&self, handle: u64) -> anyhow::Result<()> {
+        assert!(runtime::content_writes::flush(
+            &self.shared,
+            handle,
+            native_wait()
+        )?);
+        Ok(())
+    }
+    fn close(&self, handle: u64) {
+        runtime::engine::close_handle(&self.shared, handle).unwrap();
+    }
+    fn stop(&self, mode: StopMode) -> tkfs::model::ipc::StopReply {
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.server().stop(mode) {
+                Ok(reply) => return reply,
+                Err(error)
+                    if format!("{error:#}").starts_with("WORKER_BUSY")
+                        && Instant::now() < until =>
+                {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("{error:#}"),
+            }
+        }
+    }
+}
+impl Drop for NativeRunning {
+    fn drop(&mut self) {
+        if let Some(server) = self.server.take() {
+            let mut failure = None;
+            if !server.ctx().stopping.load(Ordering::SeqCst) {
+                let until = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match server.stop(StopMode::Force) {
+                        Ok(_) => break,
+                        Err(error)
+                            if format!("{error:#}").starts_with("WORKER_BUSY")
+                                && Instant::now() < until =>
+                        {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(error) => {
+                            failure = Some(format!("native fixture stop: {error:#}"));
+                            server.ctx().stopping.store(true, Ordering::SeqCst);
+                            if let Ok(address) = server
+                                .discovery()
+                                .address
+                                .trim_start_matches("ws://")
+                                .parse::<SocketAddr>()
+                            {
+                                let _ =
+                                    TcpStream::connect_timeout(&address, Duration::from_secs(1));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Err(error) = self.writes.shutdown(&context()) {
+                failure.get_or_insert_with(|| format!("native fixture drain: {error:#}"));
+            }
+            drop(server);
+            let until = Instant::now() + Duration::from_secs(5);
+            while Arc::strong_count(&self.shared) > 1 && Instant::now() < until {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if !thread::panicking() {
+                assert!(failure.is_none(), "{failure:?}");
+                assert_eq!(
+                    Arc::strong_count(&self.shared),
+                    1,
+                    "fixture worker threads did not exit"
+                );
+            }
+        }
+    }
+}
+struct SaveFaults {
+    metadata: Connection,
+    private: Connection,
+}
+impl SaveFaults {
+    fn new(root: &Path) -> Self {
+        Self {
+            metadata: Connection::open(root.join("metadata.sqlite")).unwrap(),
+            private: Connection::open(root.join("write-sessions-v1.sqlite")).unwrap(),
+        }
+    }
+}
+impl Drop for SaveFaults {
+    fn drop(&mut self) {
+        let _ = self.metadata.execute_batch(
+            "DROP TRIGGER IF EXISTS lifecycle_refuse; DROP TRIGGER IF EXISTS lifecycle_orphan;",
+        );
+        let _ = self
+            .private
+            .execute_batch("DROP TRIGGER IF EXISTS lifecycle_retain_refused;");
+    }
+}
+
+/// Force stop checkpoints current private bytes without publishing a revision;
+/// restart exposes those bytes and the current coordinator commits them.
 #[test]
 fn force_stop_persists_dirty() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let info = runtime::start_rpc(engine.clone(), dir.path(), None).unwrap();
-    let bytes = b"unsaved in-process bytes".to_vec();
-    let entity = {
-        let mut e = runtime::lock_engine(&engine);
-        let (h, entry) = e.open("open.txt", Some("file"), true).unwrap();
-        e.write(h, 0, &bytes, false, false).unwrap();
-        entry.id
-    };
+    let worker = NativeRunning::new(dir.path());
+    let info = worker.server().discovery().clone();
+    let bytes = b"unsaved in-process bytes";
+    let (handle, entry) = worker.create("open.txt");
+    worker.write(handle, bytes);
     let refused = remote_error(call(&info, json!({"op":"stop"})));
     assert_eq!(
         refused,
         "BUSY_VIEW: 1 open contexts, 1 unsaved files; healthy"
     );
-    let stopping = runtime::lock_engine(&engine).stopping.clone();
-    assert!(!stopping.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!worker.server().ctx().stopping.load(Ordering::SeqCst));
     assert!(call(&info, json!({"op":"status"})).is_ok());
-
-    let stopped = call(&info, json!({"op":"stop","mode":"force"})).unwrap();
     assert_eq!(
-        stopped,
+        call(&info, json!({"op":"stop","mode":"force"})).unwrap(),
         json!({"stopped":true,"persisted_dirty":1,"detached":false})
     );
-    assert!(stopping.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(pending_saves(dir.path()), 1);
     {
-        let e = runtime::lock_engine(&engine);
-        assert!(e.switching, "force stop fences new opens");
-        assert!(e.sessions[&entity].dirty, "retained, not committed");
-        let rows: i64 = e
-            .store
-            .db
-            .query_row("SELECT count(*) FROM pending_saves", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows, 1);
-        assert_eq!(e.vitals.pending_saves(), 1);
+        let engine = runtime::lock_engine(&worker.shared);
+        assert!(engine.switching);
+        assert!(engine.sessions[&entry.id].dirty);
+        assert_eq!(engine.vitals.pending_saves(), 1);
+        assert_eq!(
+            engine
+                .store
+                .db
+                .query_row("SELECT count(*) FROM pending_saves", [], |r| r
+                    .get::<_, usize>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            engine
+                .store
+                .entry(&entry.id)
+                .unwrap()
+                .content_ref
+                .unwrap()
+                .total_len,
+            0
+        );
     }
-    // The listener closes once the stop is answered.
     wait_for("listener closed", Duration::from_secs(10), || {
         call(&info, json!({"op":"hello"})).is_err()
     });
-    wait_released(&engine);
-    drop(engine);
-    let mut recovered = Engine::new(Store::open_existing(dir.path()).unwrap());
-    assert_eq!(recovered.sessions[&entity].bytes, &bytes);
-    recovered.retry_pending().unwrap();
-    recovered.quiet().unwrap();
-    let entry = recovered.store.lookup("open.txt").unwrap();
+    drop(worker);
+    let worker = NativeRunning::new(dir.path());
+    let (handle, _) = worker.open("open.txt");
     assert_eq!(
-        recovered
-            .store
-            .read_object(&entry.content.unwrap())
-            .unwrap(),
+        runtime::content_reads::read_mount_vec(
+            &worker.shared,
+            handle,
+            0,
+            bytes.len(),
+            native_wait()
+        )
+        .unwrap()
+        .unwrap(),
         bytes
     );
+    worker.flush(handle).unwrap();
+    worker.close(handle);
+    runtime::lock_engine(&worker.shared).quiet().unwrap();
+    assert_eq!(committed(dir.path(), "open.txt"), bytes);
+    assert_eq!(worker.server().vitals().pending_saves(), 0);
 }
 
-/// The poison hook never commits what the panicked request left half done:
-/// it rolls the open transaction back, or, when that `ROLLBACK` fails
-/// (`engine.poison_rollback`), replaces the connection (closing it discards
-/// the transaction); then it retains every dirty session. One test, because
-/// it is the only user of that process-wide fault point.
-#[test]
-fn poison_hook_never_commits_the_open_transaction_and_retains_dirty_sessions() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::new(Store::open(dir.path(), Some("worker-lifecycle")).unwrap());
-    let (h, entry) = engine.open("dirty.txt", Some("file"), true).unwrap();
-    engine.write(h, 0, b"dirty", false, false).unwrap();
-    // A request that panicked mid-transaction left it open, with savepoints.
-    engine
-        .store
-        .db
-        .execute_batch(
-            "BEGIN IMMEDIATE; SAVEPOINT control_request; \
-             CREATE TABLE wp1_4_probe(x INTEGER); INSERT INTO wp1_4_probe VALUES(1); \
-             SAVEPOINT staged_save;",
-        )
-        .unwrap();
-    assert!(!engine.store.db.is_autocommit());
-    assert_eq!(engine.persist_after_poison().unwrap(), 1);
-    assert!(engine.store.db.is_autocommit());
-    // Another connection sees the retained row (committed on its own) and
-    // none of the rolled-back request.
-    let other = Connection::open(dir.path().join("metadata.sqlite")).unwrap();
-    let rows: Vec<String> = other
-        .prepare("SELECT entity FROM pending_saves")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(rows, vec![entry.id.clone()]);
-    let probe: i64 = other
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='wp1_4_probe'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(probe, 0);
-    // From autocommit the hook is just `retain_all_dirty`.
-    assert_eq!(engine.persist_after_poison().unwrap(), 1);
-
-    // The ROLLBACK fails: the connection is replaced, never committed.
-    let (h2, second) = engine.open("second.txt", Some("file"), true).unwrap();
-    engine.write(h2, 0, b"second", false, false).unwrap();
-    engine
-        .store
-        .db
-        .execute_batch(
-            "PRAGMA cache_size=1234; BEGIN IMMEDIATE; SAVEPOINT control_request; \
-             CREATE TABLE wp1_4_half_done(x INTEGER); INSERT INTO wp1_4_half_done VALUES(1);",
-        )
-        .unwrap();
-    fault::configure(Some(FaultConfig {
-        count: Some(1),
-        ..FaultConfig::new("engine.poison_rollback", FaultAction::Fail)
-    }));
-    let retained = engine.persist_after_poison();
-    fault::configure(None);
-    assert_eq!(retained.unwrap(), 2);
-    let cache_size: i64 = engine
-        .store
-        .db
-        .query_row("PRAGMA cache_size", [], |r| r.get(0))
-        .unwrap();
-    assert_ne!(cache_size, 1234, "the connection was replaced");
-    assert!(engine.store.db.is_autocommit());
-    let mut rows: Vec<String> = other
-        .prepare("SELECT entity FROM pending_saves")
-        .unwrap()
-        .query_map([], |r| r.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    rows.sort();
-    let mut expected = vec![entry.id.clone(), second.id.clone()];
-    expected.sort();
-    assert_eq!(rows, expected);
-    let half_done: i64 = other
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE name='wp1_4_half_done'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(half_done, 0, "the half-done transaction was discarded");
-    // The fresh connection serves the engine: both sessions commit.
-    engine.close(h).unwrap();
-    engine.close(h2).unwrap();
-    engine.retry_pending().unwrap();
-    engine.quiet().unwrap();
-    assert_eq!(engine.vitals.pending_saves(), 0);
-    let entry = engine.store.lookup("second.txt").unwrap();
-    assert_eq!(
-        engine.store.read_object(&entry.content.unwrap()).unwrap(),
-        b"second"
-    );
-}
+// Poison rollback/replacement and current Saved recovery are exercised through
+// the actual off-lock fatal helper in runtime::exit's unit tests, plus the
+// existing process-level poison-exit parent above. No standalone save hook.
 
 #[test]
 fn poisoned_engine_panics_under_the_test_policy() {
@@ -1302,25 +1416,26 @@ fn poisoned_engine_panics_under_the_test_policy() {
 #[test]
 fn tracked_engine_lock_feeds_gauges_vitals_and_the_heartbeat() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let ctx = worker::build_ctx(engine.clone(), dir.path(), false, None);
-    let server = runtime::server::start_rpc_server(ctx.clone()).unwrap();
+    let worker = NativeRunning::new(dir.path());
+    let engine = &worker.shared;
+    let ctx = worker.server().ctx().clone();
+    let (handle, _) = worker.create("vital.txt");
+    worker.write(handle, b"vital");
     {
-        let mut e = runtime::lock_engine_tracked(&engine);
-        let (h, _) = e.open("vital.txt", Some("file"), true).unwrap();
-        e.write(h, 0, b"vital", false, false).unwrap();
+        let _engine = runtime::lock_engine_tracked(engine);
         thread::sleep(Duration::from_millis(40));
         assert!(ctx.gauges.snapshot().current_hold_ms >= 40);
     }
     let gauges = ctx.gauges.snapshot();
-    assert!(gauges.holds >= 1, "{gauges:?}");
-    assert!(gauges.longest_hold_ms >= 40, "{gauges:?}");
-    assert_eq!(gauges.current_hold_ms, 0, "{gauges:?}");
-    assert_eq!(server.vitals().open_handles(), 1);
-    assert_eq!(server.vitals().unflushed_files(), 1);
-    // A waiter is counted while another thread holds the engine.
+    assert!(
+        gauges.holds >= 1 && gauges.longest_hold_ms >= 40,
+        "{gauges:?}"
+    );
+    assert_eq!(gauges.current_hold_ms, 0);
+    assert_eq!(worker.server().vitals().open_handles(), 1);
+    assert_eq!(worker.server().vitals().unflushed_files(), 1);
     let holder = engine.clone();
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (held_tx, held_rx) = mpsc::channel();
     let hold = thread::spawn(move || {
         let _guard = runtime::lock_engine_tracked(&holder);
         held_tx.send(()).unwrap();
@@ -1336,175 +1451,193 @@ fn tracked_engine_lock_feeds_gauges_vitals_and_the_heartbeat() {
     hold.join().unwrap();
     waiter.join().unwrap();
     assert!(ctx.gauges.snapshot().wait_p99_ms >= 100);
-    // The heartbeat reads all of it without the engine lock.
-    let blocker = runtime::lock_engine(&engine);
-    let heartbeat = worker::heartbeat::beat(&ctx, server.vitals());
+    let blocker = runtime::lock_engine(engine);
+    let heartbeat = worker::heartbeat::beat(&ctx, worker.server().vitals());
     drop(blocker);
     assert_eq!(heartbeat.instance, ctx.instance);
     assert_eq!(heartbeat.open_handles, 1);
     assert_eq!(heartbeat.unflushed_files, 1);
     assert_eq!(heartbeat.pending_saves, 0);
     assert!(heartbeat.engine.holds >= 2);
-    let next = worker::heartbeat::beat(&ctx, server.vitals());
-    assert_eq!(next.seq, heartbeat.seq + 1);
-    server.stop(tkfs::model::ipc::StopMode::Force).unwrap();
     assert_eq!(
-        worker::heartbeat::beat(&ctx, server.vitals()).pending_saves,
+        worker::heartbeat::beat(&ctx, worker.server().vitals()).seq,
+        heartbeat.seq + 1
+    );
+    worker.stop(StopMode::Force);
+    let db = Connection::open(dir.path().join("write-sessions-v1.sqlite")).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let blocker = runtime::lock_engine(engine);
+    let began = Instant::now();
+    assert_eq!(
+        worker::heartbeat::beat(&ctx, worker.server().vitals()).pending_saves,
         1
     );
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "heartbeat waited for a private-journal or Engine lock"
+    );
+    drop(blocker);
+    db.execute_batch("ROLLBACK").unwrap();
 }
 
-/// CCR-WP0.INT-5: committing a retained save (`pending_saves` row present)
-/// takes SQLite's writer slot before it reads, so another connection holding
-/// the slot makes it wait instead of failing with `SQLITE_BUSY`.
+/// Current publication waits for SQLite's writer slot outside Engine.
 #[test]
 fn retained_save_commit_waits_for_another_writer_instead_of_failing() {
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::new(Store::open(dir.path(), Some("worker-lifecycle")).unwrap());
-    let (h, _) = engine.open("contended.txt", Some("file"), true).unwrap();
-    engine.write(h, 0, b"version one", false, false).unwrap();
-    engine.close(h).unwrap();
-    let (h, entry) = engine.open("contended.txt", None, true).unwrap();
-    engine.write(h, 0, b"version two!", false, false).unwrap();
-    assert_eq!(engine.retain_all_dirty().unwrap(), 1);
+    let worker = NativeRunning::new(dir.path());
+    let (handle, _) = worker.create("contended.txt");
+    worker.write(handle, b"version one");
+    worker.flush(handle).unwrap();
+    worker.close(handle);
+    let (handle, entry) = worker.open("contended.txt");
+    worker.write(handle, b"version two!");
+    assert_eq!(
+        runtime::content_writes::retain_dirty(&worker.shared, &context()).unwrap(),
+        1
+    );
+    assert_eq!(worker.server().vitals().pending_saves(), 1);
     let other = Connection::open(dir.path().join("metadata.sqlite")).unwrap();
-    other
-        .execute_batch("CREATE TABLE wp1_4_writer(x INTEGER NOT NULL)")
-        .unwrap();
-    other
-        .execute_batch("BEGIN IMMEDIATE; INSERT INTO wp1_4_writer VALUES(1)")
-        .unwrap();
+    other.execute_batch("CREATE TABLE lifecycle_writer(x INTEGER); BEGIN IMMEDIATE; INSERT INTO lifecycle_writer VALUES(1)").unwrap();
     let hold = Duration::from_millis(300);
     let writer = thread::spawn(move || {
         thread::sleep(hold);
         other.execute_batch("COMMIT").unwrap();
         other
     });
-    let started = Instant::now();
-    let flushed = engine.flush(h);
-    let waited = started.elapsed();
+    let began = Instant::now();
+    let result = worker.flush(handle);
+    let waited = began.elapsed();
     let other = writer.join().unwrap();
-    flushed.expect("the save waits for the writer slot");
-    assert!(
-        waited >= hold / 2,
-        "the writer slot was contended: {waited:?}"
-    );
-    assert!(engine.store.db.is_autocommit());
-    assert!(engine.health.is_none(), "{:?}", engine.health);
-    assert!(!engine.sessions[&entry.id].dirty);
-    let rows: i64 = other
-        .query_row("SELECT count(*) FROM pending_saves", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(rows, 0, "the save and the row removal committed together");
-    assert_eq!(engine.vitals.pending_saves(), 0);
-    let probe: i64 = other
-        .query_row("SELECT count(*) FROM wp1_4_writer", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(probe, 1);
-    engine.close(h).unwrap();
-    let entry = engine.store.lookup("contended.txt").unwrap();
+    result.expect("current publication waits for the writer slot");
+    assert!(waited >= hold / 2, "{waited:?}");
+    {
+        let engine = runtime::lock_engine(&worker.shared);
+        assert!(engine.store.db.is_autocommit());
+        assert!(engine.health.is_none());
+        assert!(!engine.sessions[&entry.id].dirty);
+    }
+    assert_eq!(pending_saves(dir.path()), 0);
+    assert_eq!(worker.server().vitals().pending_saves(), 0);
     assert_eq!(
-        engine.store.read_object(&entry.content.unwrap()).unwrap(),
-        b"version two!"
+        other
+            .query_row("SELECT count(*) FROM lifecycle_writer", [], |r| r
+                .get::<_, usize>(0))
+            .unwrap(),
+        1
     );
+    worker.close(handle);
+    assert_eq!(committed(dir.path(), "contended.txt"), b"version two!");
 }
 
-/// A failed commit of a retained save rolls the whole save back (bytes and
-/// row removal) and keeps the row.
+/// A publication failure rolls back metadata/admission while preserving the
+/// already durable current Saved checkpoint for a later retry.
 #[test]
 fn failed_retained_save_commit_rolls_back_and_keeps_the_row() {
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::new(Store::open(dir.path(), Some("worker-lifecycle")).unwrap());
-    let (h, entry) = engine.open("refused.txt", Some("file"), true).unwrap();
-    engine
-        .write(h, 0, b"never committed", false, false)
-        .unwrap();
-    assert_eq!(engine.retain_all_dirty().unwrap(), 1);
-    engine
+    let worker = NativeRunning::new(dir.path());
+    let (handle, entry) = worker.create("refused.txt");
+    worker.write(handle, b"never committed");
+    assert_eq!(
+        runtime::content_writes::retain_dirty(&worker.shared, &context()).unwrap(),
+        1
+    );
+    let before = runtime::lock_engine(&worker.shared).store.events().unwrap();
+    let admissions = runtime::lock_engine(&worker.shared)
         .store
-        .db
-        .execute_batch(
-            "CREATE TRIGGER wp1_4_refuse BEFORE DELETE ON pending_saves \
-             BEGIN SELECT RAISE(ABORT, 'refused by test'); END;",
-        )
+        .content_admission_page(0, 64)
         .unwrap();
-    let error = engine.flush(h).unwrap_err();
+    let faults = SaveFaults::new(dir.path());
+    faults.metadata.execute_batch("CREATE TRIGGER lifecycle_refuse BEFORE INSERT ON content_save_history BEGIN SELECT RAISE(ABORT,'refused by test'); END").unwrap();
+    let error = worker.flush(handle).unwrap_err();
     assert!(
         format!("{error:#}").contains("refused by test"),
         "{error:#}"
     );
-    assert!(engine.store.db.is_autocommit());
-    assert!(engine.sessions[&entry.id].dirty);
-    let committed = engine.store.lookup("refused.txt").unwrap().content;
-    assert!(
-        committed.is_none_or(|object| engine.store.read_object(&object).unwrap().is_empty()),
-        "the write rolled back with the row removal"
-    );
-    engine
-        .store
-        .db
-        .execute_batch("DROP TRIGGER wp1_4_refuse")
-        .unwrap();
-    engine.flush(h).unwrap();
-    engine.close(h).unwrap();
-    engine.quiet().unwrap();
+    {
+        let engine = runtime::lock_engine(&worker.shared);
+        assert!(engine.store.db.is_autocommit());
+        assert!(engine.sessions[&entry.id].dirty);
+        assert_eq!(engine.store.events().unwrap(), before);
+        assert_eq!(
+            engine.store.content_admission_page(0, 64).unwrap(),
+            admissions
+        );
+    }
+    assert!(committed(dir.path(), "refused.txt").is_empty());
+    assert_eq!(pending_saves(dir.path()), 1);
+    assert_eq!(worker.server().vitals().pending_saves(), 1);
+    drop(faults);
+    worker.flush(handle).unwrap();
+    worker.close(handle);
+    runtime::lock_engine(&worker.shared).quiet().unwrap();
+    assert_eq!(committed(dir.path(), "refused.txt"), b"never committed");
+    assert_eq!(worker.server().vitals().pending_saves(), 0);
 }
 
-/// The `pending_saves` gauge is counted once the save's transaction is
-/// resolved. Here the commit fails (a deferred foreign key violation leaves
-/// the transaction open, without the row) and re-retaining the session fails
-/// too: the gauge still shows the row the rollback kept.
+/// A failed deferred-FK metadata COMMIT and then a failed private checkpoint
+/// must leave the previous durable Saved counted, even with newer buffered edits.
 #[test]
 fn failed_commit_then_failed_retain_keeps_the_pending_saves_gauge() {
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::new(Store::open(dir.path(), Some("worker-lifecycle")).unwrap());
-    let (h, entry) = engine.open("gauged.txt", Some("file"), true).unwrap();
-    engine.write(h, 0, b"retained", false, false).unwrap();
-    assert_eq!(engine.retain_all_dirty().unwrap(), 1);
-    assert_eq!(engine.vitals.pending_saves(), 1);
-    engine
-        .store
-        .db
-        .execute_batch(
-            "CREATE TABLE wp1_4_parent(id INTEGER PRIMARY KEY);
-             CREATE TABLE wp1_4_child(parent INTEGER REFERENCES wp1_4_parent(id)
-                 DEFERRABLE INITIALLY DEFERRED);
-             CREATE TRIGGER wp1_4_orphan AFTER DELETE ON pending_saves
-                 BEGIN INSERT INTO wp1_4_child VALUES(42); END;
-             CREATE TRIGGER wp1_4_refuse_insert BEFORE INSERT ON pending_saves
-                 BEGIN SELECT RAISE(ABORT, 'retain refused by test'); END;
-             CREATE TRIGGER wp1_4_refuse_update BEFORE UPDATE ON pending_saves
-                 BEGIN SELECT RAISE(ABORT, 'retain refused by test'); END;",
-        )
-        .unwrap();
-    let error = format!("{:#}", engine.flush(h).unwrap_err());
-    assert!(error.contains("PENDING_SAVE_PERSIST_FAILED"), "{error}");
-    assert!(error.contains("retain refused by test"), "{error}");
-    assert!(engine.store.db.is_autocommit());
-    let rows: i64 = engine
-        .store
-        .db
-        .query_row("SELECT count(*) FROM pending_saves", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(rows, 1, "the rollback kept the row");
+    let worker = NativeRunning::new(dir.path());
+    let (handle, entry) = worker.create("gauged.txt");
+    worker.write(handle, b"retained");
     assert_eq!(
-        engine.vitals.pending_saves(),
-        1,
-        "counted after the rollback"
+        runtime::content_writes::retain_dirty(&worker.shared, &context()).unwrap(),
+        1
     );
-    assert!(engine.sessions[&entry.id].dirty);
-    engine
-        .store
-        .db
-        .execute_batch(
-            "DROP TRIGGER wp1_4_orphan; DROP TRIGGER wp1_4_refuse_insert; \
-             DROP TRIGGER wp1_4_refuse_update;",
-        )
+    let saved = tkfs::content::write::WriteJournal::open(dir.path())
+        .unwrap()
+        .pending(None, 64, &context())
         .unwrap();
-    engine.flush(h).unwrap();
-    assert_eq!(engine.vitals.pending_saves(), 0);
-    engine.close(h).unwrap();
-    engine.quiet().unwrap();
+    assert_eq!(worker.server().vitals().pending_saves(), 1);
+    let faults = SaveFaults::new(dir.path());
+    faults.metadata.execute_batch("CREATE TABLE lifecycle_parent(id INTEGER PRIMARY KEY);
+        CREATE TABLE lifecycle_child(parent INTEGER REFERENCES lifecycle_parent(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER lifecycle_orphan AFTER INSERT ON content_save_history BEGIN INSERT INTO lifecycle_child VALUES(42); END;").unwrap();
+    let error = worker.flush(handle).unwrap_err();
+    assert!(format!("{error:#}").contains("FOREIGN KEY"), "{error:#}");
+    assert_eq!(
+        faults
+            .metadata
+            .query_row("SELECT count(*) FROM lifecycle_child", [], |r| r
+                .get::<_, usize>(0))
+            .unwrap(),
+        0
+    );
+    assert!(committed(dir.path(), "gauged.txt").is_empty());
+    worker.write(handle, b"newest!!");
+    faults.private.execute_batch("CREATE TRIGGER lifecycle_retain_refused BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT,'retain refused by test'); END").unwrap();
+    let error = runtime::content_writes::retain_dirty(&worker.shared, &context()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("retain refused by test"),
+        "{error:#}"
+    );
+    assert_eq!(
+        tkfs::content::write::WriteJournal::open(dir.path())
+            .unwrap()
+            .pending(None, 64, &context())
+            .unwrap(),
+        saved
+    );
+    assert_eq!(worker.server().vitals().pending_saves(), 1);
+    {
+        let engine = runtime::lock_engine(&worker.shared);
+        assert!(engine.store.db.is_autocommit());
+        assert!(engine.sessions[&entry.id].dirty);
+    }
+    assert_eq!(
+        runtime::content_reads::read_mount_vec(&worker.shared, handle, 0, 8, native_wait())
+            .unwrap()
+            .unwrap(),
+        b"newest!!"
+    );
+    drop(faults);
+    worker.flush(handle).unwrap();
+    assert_eq!(worker.server().vitals().pending_saves(), 0);
+    worker.close(handle);
+    runtime::lock_engine(&worker.shared).quiet().unwrap();
+    assert_eq!(committed(dir.path(), "gauged.txt"), b"newest!!");
 }
 
 /// The main thread's stops (idle exit, signals) never wait for the engine: a
@@ -1651,24 +1784,27 @@ fn backfill_reports_progress() {
     let dir = tempfile::tempdir().unwrap();
     let state = new_state(dir.path());
     let saves = 4;
-    {
-        let mut engine = Engine::new(Store::open_existing(&state).unwrap());
-        for index in 0..saves {
-            let (h, _) = engine
-                .open(&format!("backfill-{index}.txt"), Some("file"), true)
-                .unwrap();
-            engine
-                .write(h, 0, format!("bytes {index}").as_bytes(), false, false)
-                .unwrap();
-        }
-        assert_eq!(engine.retain_all_dirty().unwrap(), saves);
-    }
+    let files: Vec<_> = (0..saves)
+        .map(|index| {
+            (
+                format!("backfill-{index}.txt"),
+                format!("bytes {index}").into_bytes(),
+            )
+        })
+        .collect();
+    seed_saved(
+        &state,
+        &files
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>(),
+    );
     let mut worker = TimedWorker::spawn(
         dir.path(),
         &state,
         &[],
         &[
-            ("TKFS_FAULT_POINT", "engine.recover_pending"),
+            ("TKFS_FAULT_POINT", "content.write.recover_saved"),
             ("TKFS_FAULT_ACTION", "hang"),
             ("TKFS_FAULT_MS", "600"),
         ],
@@ -1686,7 +1822,7 @@ fn backfill_reports_progress() {
     let (recovering_at, recovering) = lines
         .iter()
         .find(|(_, line)| {
-            line["phase"] == "recovering pending saves"
+            line["phase"] == "recovering native saves"
                 && line["startup_progress"].as_u64() >= Some(2)
         })
         .unwrap_or_else(|| panic!("no progress during recovery: {lines:?}"));

@@ -19,17 +19,14 @@ pub struct AdmittedEdge {
 
 mod graph;
 
-pub(super) fn ensure_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("SAVEPOINT content_objects_schema;
-        CREATE TABLE IF NOT EXISTS content_public_receipts(kind INTEGER NOT NULL,digest TEXT NOT NULL,
-            PRIMARY KEY(kind,digest));
-        CREATE TABLE IF NOT EXISTS content_source_backoff(kind INTEGER NOT NULL,digest TEXT NOT NULL,
-            source TEXT NOT NULL,attempts INTEGER NOT NULL,retry_at_ms INTEGER NOT NULL,
-            PRIMARY KEY(kind,digest,source));
+/// Current object-graph recovery owns this scan state, independently of schema.
+pub(super) fn reset_reconciliation(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "SAVEPOINT content_graph_recovery;
         INSERT OR REPLACE INTO config VALUES('content:graph_cursor','');
-        DELETE FROM config WHERE key='content:graph_reconciled';")?;
-    graph::schema(db)?;
-    db.execute_batch("RELEASE content_objects_schema;")?;
+        DELETE FROM config WHERE key='content:graph_reconciled';
+        RELEASE content_graph_recovery;",
+    )?;
     Ok(())
 }
 
@@ -232,7 +229,6 @@ impl Store {
             "SELECT generation,publishable,root FROM content_root_metadata WHERE reference=? AND granted=1 AND shared=1",
             [reference], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).optional()?.context("UNAUTHORIZED_OBJECT")?;
         let root = FileContentRef::decode(&root)?;
-        ensure!(root.kind != ContentKind::Legacy, "UNSUPPORTED_CONTENT_KIND");
         let pin = provider.pin(&root)?;
         let key = edge.key;
         let received: bool = self.db.query_row(
@@ -243,12 +239,19 @@ impl Store {
         )?;
         ensure!(publishable || received, "UNAUTHORIZED_OBJECT");
         provider.verify_member_for(&pin, edge, priority, context)?;
-        let bytes = provider.read_blob_for(
-            key,
-            (key.kind == ObjectKind::Bytes).then_some(edge.len),
-            priority,
-            context,
-        )?;
+        // Canonical empty content has no physical payload to fetch. Membership
+        // and disclosure authority above still apply; nonempty gaps never
+        // become implicit zero bytes.
+        let bytes = if key.kind == ObjectKind::Bytes && edge.len == 0 {
+            Vec::new()
+        } else {
+            provider.read_blob_for(
+                key,
+                (key.kind == ObjectKind::Bytes).then_some(edge.len),
+                priority,
+                context,
+            )?
+        };
         validate_blob(edge, &bytes)?;
         ensure!(
             self.content_reference_authorized(reference, generation)?,

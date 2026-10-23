@@ -1,5 +1,10 @@
 # Chunked content foundation and future Git-backed COW workspaces
 
+Scope amendment, 2026-10-22: [personal-use deployment and DVFS authority
+boundaries](../AUTHORITY_SCOPE.md) govern references to existing security
+invariants below. Retain reference scope, storage ownership and filesystem
+correctness; Users, ACLs and duplicate deployment security are out of scope.
+
 Planning update: the user selected the [concrete Wave 6 plan](../WAVE_6_PLAN.md).
 It selects 64 KiB as the initial default and owns implementation scope and gates.
 This document preserves the exploratory reasoning and deferred Git feature;

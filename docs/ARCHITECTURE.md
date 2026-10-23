@@ -1,20 +1,90 @@
 # Architecture
 
+Target scope amendment, 2026-10-22: [personal-use deployment and DVFS authority
+boundaries](revamp/AUTHORITY_SCOPE.md) govern current planning. Users and ACLs
+are not part of the current design. Reuse deployment-provided channel/host
+protection and the selected simple hashed pairing-code model. The current
+implementation removes custom HMAC and enrollment wrapping; stored peer credentials
+and local tokens remain existing application behavior during consolidation. DVFS routing,
+reference scope, generation/ownership and filesystem correctness remain required.
+
 This is the design as implemented. The plan it came from, with the reasons
 for each decision, is `docs/revamp/REVAMP_PLAN.md`; the defects of the
 previous release it removes are mapped in `docs/revamp/ROOT_CAUSES.md`
 (RC1–RC13).
 
-The default repository path below retains legacy content writes. Wave 6 is
-being implemented in isolated stores; its complete scope and current evidence
+The current worker installs/recovers native COW at RPC startup before
+accepting requests, without the former fixture marker. Core creation, direct
+and stream writes and RPC import now emit typed descriptors; prepared content
+stays pinned through metadata publication. Import byte work and its receipt
+fingerprint run outside Engine, with namespace/branch/generation revalidation.
+Standalone Engine/staging, untyped string consumers and duplicate transport
+branches below are still being consolidated. Typed descriptor changes generate
+filesystem notifications even when size, timestamps and basic metadata are
+unchanged; both full and incremental notification paths share this rule. Wave 6's complete scope and current evidence
 are in the [Wave 6 plan](revamp/WAVE_6_PLAN.md) and
 [implementation record](revamp/notes/wp6-progress.md). An internal fixture
-marker is not production activation or a compatibility fence.
+marker is no longer a production activation mechanism or compatibility fence.
 
-## Wave 6 isolated content path (in development)
+The 2026-10-21 greenfield decision changes the target architecture:
+[WP6.G](revamp/WAVE_6_PLAN.md#31-wp6g--greenfield-interlude-in-progress)
+is in progress and will consolidate fresh stores onto the current typed
+content/COW path, removing legacy representations, execution fallbacks and
+prior-version compatibility machinery. The private journal now accepts only
+the selected v7 layout or a genuinely empty database; it initializes directly
+and refuses unsupported standalone headers before SQLite can create sidecars.
+A nonempty WAL is inspected transactionally through read-only SQLite before a
+writer or WAL-mode change, preserving current-format crash recovery. The upgrade chain has been removed.
+Core metadata now directly initializes the single layout in `core/schema.sql`,
+application ID `0x544b4d53`, version 3. G7 adds one authoritative directory-
+disposition table/index; its scoped metadata/kernel proof is recorded separately.
+Header, required identities and schema
+commit atomically. Current damaged authoritative state is refused; only declared
+disposable indexes are reconstructed with restartable current-data scans.
+Secondary handles validate the selected layout without initialization or repair.
+Other routes
+remain in the [removal/replacement inventory](revamp/notes/wp6-greenfield-inventory.md);
+the descriptions below still reflect those existing implementations. Prior-version
+migration and interoperability are no longer release requirements. Current
+durability, authorization, recovery and bounded scheduling remain requirements.
 
-Typed immutable descriptors distinguish legacy whole files, direct content
-and indexed manifests with 64 KiB chunks. `content/local.rs` verifies CAS and
+CCR-WP6.G-21 removes mutation fallback selection from both mounted adapters.
+The installed current service owns ordinary creation, bytes and namespace/basic
+metadata operations; callbacks no longer invoke standalone Engine write/truncate/
+deferred-create/rename behavior. Root/discovery remain explicit virtual cases,
+directories use metadata owners, and shared current savers still own durability
+and close. Current rename also prepares closed/readonly immutable sources using
+a temporary metadata owner without byte hydration. Standalone APIs/staging/tables remain pending removal; this scoped
+adapter change does not close the Wave 6 integration/performance gates.
+
+
+CCR-WP6.G-22 removes deferred creation and its parallel namespace index.
+Files created through the current service already have canonical typed empty
+content before the first byte write; lookup and listing use that Store namespace,
+while dirty size comes from COW. Rename owns source/destination operation handles
+until its metadata gates/commit finish, including when the last user close races
+before those gates. This fixes the retained Linux load scenario's stale-session
+failure and keeps quiet/checkout fenced. There is no first-save creation event, late name
+insertion or TKFS_DEFERRED_CREATE selection. Remaining standalone stage recovery
+cannot introduce an uncommitted file. Memory/Disk/snapshot/pending-save APIs/table
+still await removal; current lifecycle, namespace and recovery owners remain.
+
+
+CCR-WP6.G-23 opens/validates the private journal before directory recovery
+can commit namespace metadata. Both RPC startup and direct attachment preserve
+pending directory dispositions and their canonical metadata when private input
+has an unsupported format. Current recovery still completes before requests
+are accepted; no extra preflight subsystem or format is introduced.
+
+
+## Wave 6 current content path (consolidation in progress)
+
+Typed immutable descriptors contain only direct small-file content or indexed
+manifests with 64 KiB chunks. Binary kind 0 and JSON `legacy` descriptors are
+unsupported. Whole-file provider verification/conversion and write/retained-read
+conversion caches have been removed; current save capture requires an explicit
+typed descriptor. Bare-string metadata/projection consumers and older standalone
+execution/transport routes still require consolidation. `content/local.rs` verifies CAS and
 manifest ranges; provider pins retain immutable lifetimes. Metadata commits
 reference admission changes with their events. The object engine expands
 authenticated manifest edges incrementally and verifies frames independently
@@ -32,14 +102,123 @@ metadata through secondary connections and adopts the continuation on one
 stable `SaveFile`. Receipt replay prevents a lost reply publishing twice.
 Complete root reclamation and production recovery/lifecycle remain unfinished.
 
+Regular-file `Staged` bases now require a typed descriptor. Whole-file CAS
+references, cached whole-file handles, object snapshots and writable-copy
+conversion are removed, including adapter preparation calls. Current native
+mutations fence checkout before off-lock preparation; if no visible byte sequence
+changes, completion restores only the matching operation's prior dirty marker.
+Standalone memory/disk deferred-save APIs still await removal. Generic object-ID
+preview/fetch remains a separate consumer and does not hydrate file handles.
+
+Core metadata now refuses string/scalar/array content registers before public
+nonlocal commit byte expansion, bundle installation/provenance, staging and feed
+acknowledgement. Projection content setters/getters accept only descriptors; the
+temporary old `content` member can encode/decode only null. The selected metadata
+schema/header and valid projection encoding remain unchanged. `visible_size`
+and FUSE attributes use the logical descriptor length without a whole-file
+object-size lookup. Status and folder-details now follow typed descriptors,
+verified graph indexes and separate shared receipt provenance. Their missing
+items carry references and logical missing bytes, with missing/indexing/corrupt
+states. Folder-details reads a secondary SQLite snapshot outside Engine and
+rechecks checkout identity. Local maintenance verifies bounded installed data
+jobs even without peers. GUI preview and explicit control prefetch now resolve
+registered references and verified ranges through the current provider/scheduler.
+They pin their version, honor view/admission fences and do byte work outside
+Engine/SQL transactions. Two control byte calls per worker preserve loopback
+handler capacity; explicit prefetches have a separate process-wide budget of 16.
+Old preview/request hash routes are removed. Generic artifact fetching, old
+standalone/table/transport consumers and full release qualification remain open.
+
+Live private byte reads use up to four read-only WAL connections with short
+snapshots, released before provider/network I/O. Owner/sequence and map/payload
+verification remain active. SaveFile mirrors its session Arc through a separate
+memory-only mutex, so a checkpoint holding file state does not block readers.
+Native reads retain the byte-mutation gate; writes/truncates take that gate
+after ownership, while save/metadata durability work retains ownership alone.
+Controlled FULL-transaction stalls qualify live private reads separately from
+retained-reader acquisition, every adoption/GC race and physical disk/load gates.
+
 Core's scoped `apply_content_save_basic` separately supports an owned metadata
 commit plus an unselected capture rebase, with exact request replay and
 checkpoint-bound time retention. It preserves ordinary stale-save fencing.
-This primitive is not yet wired to native set-basic callbacks; native timestamp
-flags, selected-save handling and namespace continuity remain development work.
+The newer `apply_content_checkpoint_basic` overlays partial fields under the
+Core writer and rebases an unpublished selected save. Native set-basic uses
+this command after a FULL private checkpoint; it publishes metadata without
+publishing the buffered byte revision. Adoption-only executor work can finish
+an already committed revision without checkpointing newer private bytes.
+Failed commands are reconciled by exact read-only receipt lookup. An absent
+receipt never reapplies the failed mutation.
 
-Explicit `NativeWrites::install` before mounting/opening attaches existing
-descriptor files to this pipeline on WinFsp/FUSE. Callbacks share a per-file
+Existing native files now have an owned rename command. A FULL private
+checkpoint anchors buffered bytes; Core commits a location event, exact retry
+receipt and capture/selection rebase without publishing those bytes. The
+operation UUID, file identity and content/alive ancestry stay stable. The owner
+proof exempts only the source entity; an ordinary Core replacement fences the
+replaced writer. The explicit `apply_content_checkpoint_replace` additionally
+binds an exact destination intent/checkpoint and installs its retired successor
+in the same FULL metadata transaction. Its opaque `NamespaceContinuation`
+changes private ownership without publishing or pruning byte maps. Retired
+canonical saves and their successors keep `alive=false`, preserving the removed
+entity's bytes without restoring its name. Runtime replacement orders both
+entity keys and mutation gates, promotes unopened/read-only typed destinations,
+and reconciles each writer's lost reply independently. A bounded reservation of
+the branch/parent/name prevents deferred and immediate creates or legacy adapter
+renames from occupying the destination while checkpoint I/O runs outside Engine.
+Core revalidates the observed directory identity in the writer transaction and
+binds it to the exact receipt. Existing pending creates are observed explicitly.
+
+An unnamed open destination adopts its namespace continuation before later
+writes, saves or metadata changes. Startup installs retired Saved sessions and
+queues background completion without an inline save under Engine; abandoned
+source saves are also retried. Reads can reconcile a lost private-owner reply.
+FUSE retains open inode metadata/setattr, reports nlink0 and returns ENOSYS for
+unsupported STATX before testing namespace liveness. Every attachment now
+initializes/reuses NativeWrites before starting WinFsp/FUSE, including direct
+library attachment without RPC startup. WinFsp's native-content mode argument
+is removed; its POSIX rename/unlink capability and native namespace operation
+guards use the current path on every mounted volume. The
+CCR-WP6.G-5 implements file unlink and delete-on-close with durable per-handle
+dispositions, cancellation and startup recovery before ordinary Saved publication.
+Its scoped Windows/FUSE qualification includes persistent Cleanup failure and
+recovery of both existing-file deletion and new-file delete-on-close. The native
+path remains explicitly selected in fixtures. Cleanup
+of an already retired destination requires Core proof. Actual mount tests cover
+retained destination read/stat/set_times/write/fsync and final durable close.
+This is existing typed-file replacement support; complete namespace support and
+production activation remain unfinished.
+
+Native regular-file creation now commits a typed empty namespace event,
+initial save-owner capture and exact receipt in one FULL Core transaction.
+The runtime reserves parent/name/entity ownership, prepares the private journal
+outside Engine and attaches the native file before acknowledging its open.
+Initial mode/attributes/times belong to that creation event. Writes then use
+buffered private ranges and the established close/fsync path; empty clean close
+publishes no byte revision. Core compares the full initial capture after its
+insertion and again after receipt insertion, including valid sealed substitutions.
+
+The G6 directory-creation path uses the same namespace reservations and a
+pooled FULL metadata writer outside Engine, with an independent sealed directory
+creation receipt. It commits initial mode/attributes with the namespace and
+attaches only metadata to a directory handle. There is no directory byte save or
+content descriptor. WinFsp Create and threaded FUSE MKDIR are wired to it in native
+fixtures; its scoped Windows/FUSE qualification passes, including concurrent
+rename/new-name open/old-name reuse. Other directory mutations, dispositions,
+complete lifetime/remote ordering and the default path remain unfinished.
+The path also replaces the SDK's volume-wide FINE operation guard with
+supported null Enter/Leave guards in explicit native mounts. Rust namespace and
+entity ownership plus Core revalidation serialize semantic mutations; kernel
+per-file serialization remains. The initial 501.89 ms Windows handle-metadata
+control falls to 0.0361 ms under the same 500 ms commit delay. Exact initial
+failures and the scoped proof retain their source/images; named-lookup/cache/load
+and Windows timestamp-policy release gates remain separate and open.
+Actual WinFsp/FUSE creation, close, replacement and manifest creation under a
+new directory passed the scoped integrity-fixed qualification. Exact evidence
+is in [native-create-checks.json](../test-evidence/wave-6/native-create-checks.json).
+This does not establish complete namespace/lifecycle or production activation.
+
+RPC startup and public mount attachment initialize `NativeWrites`; explicit
+installation reuses that active owner. Existing descriptor files attach to
+this pipeline on WinFsp/FUSE. Callbacks share a per-file
 mutation gate outside Engine; metadata length uses an atomic cache. Native
 write/resize preflight verifies the required base paths and surviving bytes
 before applying and acknowledging the mutation. Missing ranges register
@@ -56,8 +235,56 @@ and retains Saved/private bytes for retry. Recovered or headlessly modified
 sessions include their existing dirty paths in the next mutation's preflight.
 Deadline, grant/checkout changes, cancellation and stop preserve private changes.
 
-This path does not yet supply durable native namespace operations, complete
-startup/status/shutdown, production activation/migration, the full retention
+The heartbeat's `pending_saves` also counts current private Saved revisions
+awaiting publication.
+The worker's journal initializes this count from its existing pending index and
+updates an atomic mirror only after checkpoint/adoption commits. Heartbeats
+read that mirror without Engine or SQLite ownership. New buffered edits do not
+create another Saved count; failed commits keep the previous durable count.
+The old standalone table counter remains until that execution route is removed.
+`Engine::persist_after_poison`, which only the old test called, is removed;
+fatal retention uses the shared off-lock helper with rollback/connection repair.
+
+Native byte mutations seal the handle's timestamp mask, mutation milliseconds
+and exact resulting write/change FILETIMEs in private journal v7. A disabled
+field retains its actual prior value, including an earlier buffered mutation.
+Atomic length/sequence mirrors and short memory-only clock caches update visible
+basic info without journal I/O under Engine; fsync uses the recorded clock pair.
+Recovered native sessions seed that cache from Saved. Headless v4/v5 journals
+and exact-clock v6 journals upgrade their header atomically without rewriting
+payloads. The v7 namespace handoff rotates the owner and records lost-reply
+identity while retaining Working/Saved maps, clocks and byte sequence. Native v5 records
+cannot reconstruct every earlier disabled field; the new reader refuses their
+upgrade pending recovery/export with a matching reader.
+Actual old-reader refusal is qualified separately from the still-required
+production compatibility fence. WinFsp op14 and threaded FUSE SETATTR now use
+the native partial-metadata coordinator. Actual kernel `set_times` on both
+platforms and Linux chmod passed focused checks. Real WinFsp disable/reset
+remains failing: WinFsp 2.1 rewrites -1 to zero before its userspace callback,
+erasing the distinction from unchanged. Direct decoder tests do not qualify
+that OS request contract. The explicit failing kernel probe remains required
+before activation; no inference from zero can safely recover the lost request.
+
+FUSE renders typed descriptor length before open and cached native COW basic
+info while a private session exists. Read-only native cleanup/close does not
+checkpoint another handle's buffered writes; it can finish an already FULL
+Saved recovery/failed save when no active writer remains. That decision and
+the save share the mutation gate. Metadata-only temporary FUSE handles release
+without invoking a byte save.
+Explicit fsync and volume flush
+remain durability points; writable native close retains its FULL promise.
+A coherent memory-only observation records the last byte revision separately
+from owner fencing. Recovery/activation combine it with canonical metadata and
+the published/adopted floor, preserving explicit same-revision clocks while
+avoiding stale private clocks after publication. Complete remote ordering and
+all notification/cache surfaces remain unqualified. Native FUSE size changes
+through an open handle now stay buffered until fsync/close. A path-only
+truncate still completes its temporary handle's durable close before success.
+
+This path does not yet supply qualified Windows deletion-intent recovery,
+default typed producers, staging/conversion removal, complete directory namespace and off-lock metadata
+mutation, namespace/lifetime/remote/cache ordering,
+complete startup/status/shutdown, production activation/migration, the full retention
 audit or the Wave 6 build-performance gates. Its exact contracts and remaining
 qualifications are maintained in [WAVE_6_CONTRACTS](revamp/WAVE_6_CONTRACTS.md).
 
@@ -130,13 +357,16 @@ command that has not started is withdrawn (`CATALOG_UNAVAILABLE`), one that is
 running answers `REQUEST_TIMEOUT` (it may still be applied). If the thread
 dies, writes fail and the last snapshot keeps serving reads.
 
-The schema is additive: the tables of the previous release are never altered
-(they have positional `INSERT`s that an older binary still uses); new state
-lives in side tables: `folder_intents` (sync and mount intents), `mount_gates`
-(initial-sync gates, mirrored to the legacy `initial_sync` table so a
-downgraded binary still sees them), `peer_meta`, `peer_credentials`
-(per-peer keys and their revocation) and the `verifier_generation` setting
-(rotations). `folders.sqlite` is owner-only (Unix `0600`).
+The catalog directly initializes one current seven-table layout, application ID
+`0x544b4353`, version 1. It has `settings`, `projects`, `peers`, `folder_intents`,
+`mount_gates`, `peer_meta` and `peer_credentials`. Gates have one durable source;
+there is no older-writer mirror or startup migration. Preflight refuses unsupported
+input before writer/lock/mount-directory creation. Required current identities,
+counters, verifier consistency and folder intents are validated without defaults.
+Fresh schema, identity and header commit atomically. Per-open lease incarnation
+and verifier rotation use checked increments; rotation revokes inbound keys in the
+same transaction. `folders.sqlite` is owner-only (Unix `0600`). CCR-WP6.G-4
+qualification is recorded in the implementation record; other WP6.G routes remain.
 
 ### FolderController
 
@@ -343,14 +573,18 @@ accepting host shows its peers too.
 
 A failure before Ready prints a fatal line and exits 73 (store), 75 (locked),
 78 (configuration) or 70 (internal). Store recovery always finishes before the
-listener opens. A poisoned engine lock (a panic while holding it) saves every
-dirty file, logs, and exits 70; the daemon restarts the worker.
+listener opens. Poison and repeated accept-error exits use one fatal owner.
+It rolls back interrupted metadata, captures dirty native files, releases Engine
+for FULL private checkpoints and reacquires Engine for retained bookkeeping.
+Other normal Engine users wait for exit; a file checkpoint does not wait on an
+adapter gate held by a caller waiting for Engine. The fatal log reports the
+retention outcome and the process exits 70; the daemon restarts the worker.
 
 ### Locks
 
 | Holder | Engine lock? |
 |---|---|
-| filesystem callbacks | short holds only (WP5.2). A save snapshots the file's bytes under the lock, hashes and stores them without it, and commits under it with a base check; the commit does not hash the new object again (the verified set, below). The first write to a file larger than 256 KiB copies it to a staging file without the lock. A read of bytes still downloading waits outside it. Work before the lock honours the mount's fence |
+| filesystem callbacks | current native file reads, changed-chunk preparation and Saved publication run outside Engine. Metadata capture/revalidation uses short holds. A first edit does not copy the whole file into staging. Missing-range reads wait for verified chunks outside Engine and honor the mount's fence. Standalone deferred-save APIs described below still await removal |
 | background savers (WP5.2) | the save's two short phases, after the filesystem callbacks waiting for the engine (at most 20 ms each time) |
 | activator | slices of ≤ 64 events or 25 ms; yields while filesystem callbacks wait |
 | feed RPCs, `objects.*`, `status`, `hello`, `watch` | no: pooled secondary SQLite connections; status from the status cell |
@@ -398,12 +632,13 @@ attach, detach and attach again in the same process.
   conflict), retained, restored and committed like any unsaved file, and
   committed first by anything that would change its name.
   `TKFS_DEFERRED_CREATE=0` turns this off; FUSE creates commit at once.
-- **Reads of content still downloading** register demand and wait while the
-  object's spool grows; they serve only the verified whole object, and fail
-  `CONTENT_UNAVAILABLE` after 60 s without progress, after 240 s in all, or
-  at once when a detach or checkout fences the mount (WinFsp:
-  `STATUS_DEVICE_NOT_READY`; FUSE: `EIO`). At most half the WinFsp
-  dispatcher threads (FUSE: 32 requests) wait at once.
+- **Current file reads** register bounded reference/range demand and wait for
+  verified chunks in that range. Unverified spool growth does not advance the
+  range's stall clock. Defaults are 60 s without range progress and 240 s total;
+  cancellation, deadlines and exhausted capacity end the wait independently.
+  Missing content maps to WinFsp `STATUS_DEVICE_NOT_READY` or FUSE `EIO`.
+  Adapter wait slots bound the number of waiting requests. Generic object-ID
+  preview/fetch still uses the older artifact receiver and awaits consolidation.
 - **FUSE threads.** Reads, writes, fsyncs, flushes and size changes run on
   threads of their own, at most 64 at once; the others wait in line, none is
   refused.
@@ -565,23 +800,22 @@ in CHUNK frames, reassembled up to the op's limit (16 MiB for
 `meta.exchange`); object streams are delivered chunk by chunk. Anything
 malformed closes the connection.
 
-**Handshake and authentication.** HELLO (client nonce, installation, role
-`control|bulk|probe`, lane, features) → HELLO_ACK (verifier salt, server
-nonce, verifier generation, features) → AUTH
-(`HMAC-SHA256(K, "client" ‖ transcript)`) → AUTH_OK
-(`HMAC-SHA256(K, "server" ‖ transcript)`, verified by the client: mutual).
+**Handshake and authentication.** HELLO (installation, role
+`control|bulk|probe`, lane) → HELLO_ACK (verifier salt, verifier generation,
+limits) → AUTH (`credential`, `peer`) → AUTH_OK (empty acknowledgement).
 With the pairing code, `K` is the 32-byte verifier digest: the server stores
-it, the client derives it from the salt and its code. The code never crosses
-the wire, and a replayed proof fails because both nonces change. The dialer
-then checks the server's installation against the catalog
+it, the client derives it from the salt and its code. AUTH sends this reusable
+application credential on the channel protected by standard TLS/WSS or the
+enclosing VPN. There are no application transcript proofs, authentication
+nonces or additional channel ciphers. The dialer checks the server's installation against the catalog
 (`PEER_INSTALLATION_CHANGED`). Socket timeouts (5 s per step) exist only
 during the handshake.
 
 **Per-peer credentials.** After `pair` has authenticated a probe session
 with the code, the dialer sends `peer.enroll` with 32 random bytes `S`; both
 sides store `K_peer = SHA-256("tkfs-peer-secret-v1" ‖ S)` in
-`peer_credentials`. Later sessions offer the scheme `peer-hmac-v1` in
-HELLO's features and run the same mutual proofs keyed by `K_peer`. A missing
+`peer_credentials`. Enrollment carries `S` directly on that protected channel.
+Later sessions send `K_peer` in AUTH with `peer: true`. A missing
 or revoked credential is refused with `GOAWAY{PEER_REVOKED}`. A dialer's
 unpair sends `peer.revoke` first (best effort); the acceptor revokes the
 credential and closes that installation's sessions within 1 s. A rotation
@@ -746,22 +980,27 @@ than 10 MiB. Fields that name codes, secrets or tokens are redacted. The
 the redacted catalog, the ends of the logs and the versions into
 `DATA/diagnostics/<time>/`.
 
-## Storage and migration
+## Storage and current recovery
 
-- `folders.sqlite` and each state's `metadata.sqlite` are only ever extended:
-  new tables (`CREATE TABLE IF NOT EXISTS`, each module stamped
-  `schema:<module>`), and nullable columns only on `incoming_events`, whose
-  writers use named columns. Tables written positionally by older binaries are
-  never altered.
-- Backfills (object references, availability, the feed index) are chunked,
-  resumable and report progress.
+- Each state's `metadata.sqlite` is initialized directly from `core/schema.sql`
+  with application ID `0x544b4d53` and version 3. G5 added authoritative file
+  deletion intents; the G7 candidate adds directory dispositions. Prior layouts
+  are unsupported, without a migration route. There are no old-store module
+  stamps, inbox ALTER chain or branch-constraint migration. Required existing
+  identities and authoritative schema are validated without synthesizing defaults.
+- Missing declared disposable object/feed/journal indexes are rebuilt from current
+  authoritative data with chunked, resumable repair cursors. Accepted sequence,
+  epoch, peer acknowledgements and save receipts remain authoritative.
+- `folders.sqlite` directly initializes its selected seven-table layout. Its
+  separate current-format qualification is recorded in CCR-WP6.G-4.
 - New state tables: `incoming_waits`, `incoming_sources`,
   `object_availability`, `event_objects`, `staged_objects`,
   `object_error_state`, `projection_version`, `feed_journal`, `feed_in`,
   `feed_out`, `feed_needs`, `feed_rejected`, `feed_remaining`, `spool_state`,
   the `journal_epoch` setting.
-- Nothing deletes user data or history; legacy states from `6298d0b` open and
-  upgrade (checked by every integration).
+- Unsupported Core metadata is refused before writable open or journal-mode
+  changes; it is never upgraded or reset. Current-format recovery preserves user
+  data and history. Old-store interoperability is removed release scope.
 
 ## Invariants and their guards
 
@@ -787,7 +1026,7 @@ the redacted catalog, the ends of the logs and the versions into
 | 18 | Control carries no object bytes; bulk never activates or acknowledges | op/role table | `inbound_v3::role_violations_and_route_violations_keep_their_codes`, `objects_v3_lanes::control_carries_no_object_bytes` |
 | 19 | One owner per object per session | lane sharding, worker leases, object locks; a release ends only the releasing lane's own leases and is serialized with that lane's next session | `objects_v3_worker::duplicate_sessions_transfer_once`, `objects_v3_lanes::a_reap_never_ends_the_lease_of_the_lanes_next_session` |
 | 20 | Fail closed against old peers | `X-Tkfs-Sync` both ways | `session_handshake::legacy_both_directions`, `qual_wp3_1_transport` |
-| 21 | Salted verifier; per-peer credentials; rotation invalidates sessions and credentials; no code, secret or token in status, logs or diagnostics | HMAC over the verifier digest or `K_peer`; generation → GOAWAY; rotation and unpair revoke `peer_credentials`; redaction of logs and bundles | `session_handshake`, `status_hub`, `security`, `logging` |
+| 21 | Salted verifier; existing per-peer credentials; rotation invalidates sessions and credentials; no code, secret or token in status, logs or diagnostics | Ordinary credential comparison over TLS/WSS or VPN; generation → GOAWAY; rotation and unpair revoke `peer_credentials`; redaction of logs and bundles | `session_handshake`, `status_hub`, `security`, `logging` |
 | 22 | Bounded input | frame, header, page, need and body limits; pre-auth limits | `session_core::bounds`, `inbound_v3::preauth_flood_keeps_memory_flat` |
 | 23 | One owner per data directory and per state | `orchestrator.lock`, `owner.lock`, verified kills | `folder_controller::adoption_*` |
 | 24 | Recovery before RPC | the listener opens after the store and pending saves | `worker_lifecycle::rpc_after_recovery` |

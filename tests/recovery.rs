@@ -167,6 +167,7 @@ fn local_bucket_adapter_uploads_only_shared_roots_and_verifies_corruption() {
             .unwrap(),
     )
     .unwrap();
+    assert_eq!(manifest["format"], "tkfs-shared-export-2");
     assert!(
         manifest["events"]
             .as_array()

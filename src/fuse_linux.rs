@@ -323,6 +323,10 @@ fn attach_source(path: &Path, source: &str) -> Result<()> {
     }
     let engine = bound()?;
     vacant(path)?;
+    crate::runtime::content_writes::NativeWrites::install(
+        &engine,
+        &crate::runtime::content_writes::default_context(&engine)?,
+    )?;
     std::fs::create_dir(path)?;
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
     let (worker, wake, stopping) = match launch(engine, path, source) {
@@ -631,6 +635,8 @@ fn errno(error: &anyhow::Error) -> i32 {
 struct Filesystem {
     by_inode: BTreeMap<u64, String>,
     by_entity: BTreeMap<String, u64>,
+    directory_inodes: BTreeMap<(String, String), u64>,
+    directory_birth: BTreeMap<u64, String>,
     next_inode: u64,
 }
 impl Filesystem {
@@ -638,6 +644,8 @@ impl Filesystem {
         Self {
             by_inode: BTreeMap::from([(1, ROOT.into()), (2, "control".into())]),
             by_entity: BTreeMap::from([(ROOT.into(), 1), ("control".into(), 2)]),
+            directory_inodes: BTreeMap::new(),
+            directory_birth: BTreeMap::new(),
             next_inode: 3,
         }
     }
@@ -650,6 +658,34 @@ impl Filesystem {
         self.by_entity.insert(entity.into(), inode);
         self.by_inode.insert(inode, entity.into());
         inode
+    }
+    fn entry_inode(&mut self, e: &crate::runtime::Engine, entry: &Entry) -> Result<u64> {
+        if entry.kind != "directory" || entry.id == ROOT {
+            return Ok(self.inode(&entry.id));
+        }
+        let birth = e
+            .handles
+            .values()
+            .find(|h| {
+                h.entity == entry.id
+                    && h.directory_basis.as_ref().is_some_and(|basis| {
+                        basis.revisions.get("alive") == entry.revisions.get("alive")
+                    })
+            })
+            .and_then(|h| h.directory_birth.as_ref())
+            .or_else(|| entry.revisions.get("alive"))
+            .context("FILE_NOT_FOUND: directory existence head")?
+            .clone();
+        let key = (entry.id.clone(), birth.clone());
+        if let Some(inode) = self.directory_inodes.get(&key) {
+            return Ok(*inode);
+        }
+        let inode = self.next_inode;
+        self.next_inode += 1;
+        self.by_inode.insert(inode, entry.id.clone());
+        self.directory_inodes.insert(key, inode);
+        self.directory_birth.insert(inode, birth);
+        Ok(inode)
     }
     fn entry(&self, e: &crate::runtime::Engine, inode: u64) -> Result<Entry> {
         let entity = self.by_inode.get(&inode).context("FILE_NOT_FOUND")?;
@@ -668,7 +704,64 @@ impl Filesystem {
         }
         let entry = e.store.entry(entity)?;
         ensure!(entry.alive, "FILE_NOT_FOUND");
+        if let Some(birth) = self.directory_birth.get(&inode) {
+            ensure!(entry.revisions.get("alive") == Some(birth), "STALE_VIEW");
+        }
         Ok(entry)
+    }
+    /// An open native FD retains its inode after namespace removal. This is
+    /// deliberately used only for attribute operations, never path traversal.
+    fn retained_entry(
+        &self,
+        e: &crate::runtime::Engine,
+        inode: u64,
+        handle: Option<u64>,
+    ) -> Result<Entry> {
+        let entity = self.by_inode.get(&inode).context("FILE_NOT_FOUND")?;
+        if let Some(handle) = handle {
+            ensure!(&e.session(handle)?.entry.id == entity, "INVALID_HANDLE");
+            let entry = e.handle_entry(handle)?;
+            if entry.kind == "directory" {
+                if let Some(birth) = self.directory_birth.get(&inode) {
+                    ensure!(
+                        e.handles[&handle].directory_birth.as_ref() == Some(birth),
+                        "INVALID_HANDLE"
+                    );
+                }
+                return Ok(entry);
+            }
+        }
+        if entity == ROOT || entity == "control" {
+            return self.entry(e, inode);
+        }
+        if let Some(birth) = self.directory_birth.get(&inode) {
+            if let Some((handle, _)) = e
+                .handles
+                .iter()
+                .find(|(_, h)| &h.entity == entity && h.directory_birth.as_ref() == Some(birth))
+            {
+                return e.handle_entry(*handle);
+            }
+            return self.entry(e, inode);
+        }
+        let current = e.store.entry(entity)?;
+        if !current.alive
+            && let Some((handle, _)) = e
+                .handles
+                .iter()
+                .find(|(_, h)| &h.entity == entity && h.directory_basis.is_some())
+        {
+            return e.handle_entry(*handle);
+        }
+        if let Some(session) = e.sessions.get(entity)
+            && session.references > 0
+            && session.bytes.cow_file().is_some()
+        {
+            let mut entry = session.entry.clone();
+            entry.alive = e.store.entry(entity)?.alive;
+            return Ok(entry);
+        }
+        self.entry(e, inode)
     }
     fn path(&self, e: &crate::runtime::Engine, entry: &Entry) -> Result<String> {
         let mut entry = entry.clone();
@@ -698,19 +791,18 @@ impl Filesystem {
         })
     }
     fn attr(&mut self, e: &crate::runtime::Engine, entry: &Entry) -> Result<Vec<u8>> {
-        let inode = self.inode(&entry.id);
-        let basic = entry.basic_info();
+        let inode = self.entry_inode(e, entry)?;
+        let basic = e
+            .sessions
+            .get(&entry.id)
+            .filter(|session| matches!(&session.bytes, crate::staging::Staged::Cow(_)))
+            .map_or_else(|| entry.basic_info(), |session| session.entry.basic_info());
         let size = if entry.id == "control" {
             e.discovery.len() as u64
         } else if let Some(session) = e.sessions.get(&entry.id) {
             session.bytes.len() as u64
         } else {
-            entry
-                .content
-                .as_ref()
-                .map(|v| e.store.object_size(v))
-                .transpose()?
-                .unwrap_or(0)
+            e.visible_size(entry)? as u64
         };
         let mut out = Vec::with_capacity(88);
         push64(&mut out, inode);
@@ -744,7 +836,16 @@ impl Filesystem {
                 libc::S_IFREG
             },
         );
-        push32(&mut out, if entry.kind == "directory" { 2 } else { 1 });
+        push32(
+            &mut out,
+            if !entry.alive {
+                0
+            } else if entry.kind == "directory" {
+                2
+            } else {
+                1
+            },
+        );
         push32(&mut out, unsafe { libc::geteuid() });
         push32(&mut out, unsafe { libc::getegid() });
         push32(&mut out, 0);
@@ -753,7 +854,7 @@ impl Filesystem {
         Ok(out)
     }
     fn entry_out(&mut self, e: &crate::runtime::Engine, entry: &Entry) -> Result<Vec<u8>> {
-        let inode = self.inode(&entry.id);
+        let inode = self.entry_inode(e, entry)?;
         let mut out = vec![];
         push64(&mut out, inode);
         push64(&mut out, e.store.generation + 1);
@@ -772,29 +873,6 @@ impl Filesystem {
         push32(&mut out, if directory { 0 } else { 1 });
         push32(&mut out, 0);
         out
-    }
-    fn set_mode(e: &mut crate::runtime::Engine, entry: &Entry, mode: u32) -> Result<()> {
-        ensure!(mode & 0o7000 == 0, "UNSUPPORTED_POSIX_MODE");
-        if entry.id == ROOT {
-            ensure!(
-                mode & 0o777 == 0o755,
-                "UNSUPPORTED_FS_OPERATION: root metadata"
-            );
-            return Ok(());
-        }
-        ensure!(entry.id != "control", "PERMISSION_DENIED");
-        let mut basic = e.store.entry(&entry.id)?.basic_info();
-        basic.posix_mode = Some(mode & 0o777);
-        basic.attributes = BasicInfo::attributes(
-            &entry.kind,
-            (basic.attributes & !1) | u32::from(mode & 0o222 == 0),
-        )?;
-        basic.change_time = filetime(time());
-        e.store.set_basic(&entry.id, basic)?;
-        if let Some(session) = e.sessions.get_mut(&entry.id) {
-            session.entry = e.store.entry(&entry.id)?;
-        }
-        Ok(())
     }
     fn dispatch(
         &mut self,
@@ -831,6 +909,11 @@ impl Filesystem {
             out.resize(80, 0);
             return Ok(out);
         }
+        // STATX must return ENOSYS before checking namespace liveness, so the
+        // kernel can fall back to GETATTR for an open unlinked inode as well.
+        if op == 52 {
+            bail!("UNSUPPORTED_FUSE_OPCODE: {op}");
+        }
         if [5, 6, 13, 21, 22, 24, 39, 43, 47].contains(&op) {
             bail!("UNSUPPORTED_POSIX_OPERATION: opcode={op}");
         }
@@ -845,7 +928,16 @@ impl Filesystem {
             return Ok(vec![]);
         }
         ensure!(!e.switching, "BUSY_VIEW");
-        let entry = self.entry(e, inode)?;
+        let entry = if op == 3 {
+            let handle = if p.len() >= 16 && u32_at(p, 0)? & 1 != 0 {
+                Some(u64_at(p, 8)?)
+            } else {
+                None
+            };
+            self.retained_entry(e, inode, handle)?
+        } else {
+            self.entry(e, inode)?
+        };
         match op {
             1 => {
                 let child = name(p)?;
@@ -857,171 +949,6 @@ impl Filesystem {
                 self.entry_out(e, &found)
             }
             3 => self.attr_out(e, &entry),
-            4 => {
-                let valid = u32_at(p, 0)?;
-                ensure!(
-                    valid & !SETATTR_SUPPORTED == 0,
-                    "UNSUPPORTED_POSIX_OWNERSHIP"
-                );
-                if valid & 1 != 0 {
-                    Self::set_mode(e, &entry, u32_at(p, 68)?)?;
-                }
-                let mut temporary = None;
-                let h = if valid & (1 << 6) != 0 {
-                    u64_at(p, 8)?
-                } else if valid & (1 << 3) != 0 {
-                    let (h, _) = e.open(&self.path(e, &entry)?, None, true)?;
-                    temporary = Some(h);
-                    h
-                } else {
-                    0
-                };
-                let result = (|| {
-                    if valid & (1 << 3) != 0 {
-                        e.truncate(h, u64_at(p, 16)?, false)?;
-                        e.flush(h)?;
-                    }
-                    if valid
-                        & ((1 << 4)
-                            | (1 << 5)
-                            | (1 << 7)
-                            | (1 << 8)
-                            | (1 << 9)
-                            | (1 << 10)
-                            | (1 << 11))
-                        != 0
-                    {
-                        ensure!(
-                            entry.id != ROOT && entry.id != "control",
-                            "UNSUPPORTED_FS_OPERATION: root/control timestamps"
-                        );
-                        let mut basic = e.store.entry(&entry.id)?.basic_info();
-                        for (bit, nowbit, offset, ns_offset, slot) in [
-                            (1 << 4, 1 << 7, 32, 56, 0),
-                            (1 << 5, 1 << 8, 40, 60, 1),
-                            (1 << 10, 0, 48, 64, 2),
-                        ] {
-                            if valid & (bit | nowbit) != 0 {
-                                let value = if valid & nowbit != 0 {
-                                    filetime(time())
-                                } else {
-                                    let ns = u32_at(p, ns_offset)?;
-                                    ensure!(ns < 1_000_000_000, "INVALID_TIMESTAMP");
-                                    u64_at(p, offset)?
-                                        .checked_mul(10_000_000)
-                                        .and_then(|v| v.checked_add((ns / 100) as u64))
-                                        .and_then(|v| v.checked_add(FILETIME_EPOCH))
-                                        .context("INVALID_TIMESTAMP")?
-                                };
-                                match slot {
-                                    0 => basic.access_time = value,
-                                    1 => basic.write_time = value,
-                                    _ => basic.change_time = value,
-                                }
-                            }
-                        }
-                        e.store.set_basic(&entry.id, basic)?;
-                        if let Some(session) = e.sessions.get_mut(&entry.id) {
-                            session.entry = e.store.entry(&entry.id)?;
-                            if valid & ((1 << 5) | (1 << 8)) != 0 {
-                                session.preserve_times |= 2;
-                            }
-                            if valid & (1 << 10) != 0 {
-                                session.preserve_times |= 4;
-                            }
-                        }
-                    }
-                    Ok(())
-                })();
-                if let Some(h) = temporary {
-                    let close = e.close(h);
-                    result?;
-                    close?;
-                } else {
-                    result?;
-                }
-                self.attr_out(e, &self.entry(e, inode)?)
-            }
-            8 | 9 | 35 => {
-                let (mode, skip, flags) = match op {
-                    8 => (u32_at(p, 0)?, 16, libc::O_RDWR as u32),
-                    9 => (u32_at(p, 0)?, 8, libc::O_RDONLY as u32),
-                    _ => (u32_at(p, 4)?, 16, u32_at(p, 0)?),
-                };
-                ensure!(mode & 0o7000 == 0, "UNSUPPORTED_POSIX_MODE");
-                if op == 8 {
-                    ensure!(
-                        mode & libc::S_IFMT == libc::S_IFREG,
-                        "UNSUPPORTED_POSIX_KIND"
-                    );
-                }
-                let path =
-                    self.child(e, inode, name(p.get(skip..).context("INVALID_PARAMETER")?)?)?;
-                let directory = op == 9;
-                let (h, created) = e.open(
-                    &path,
-                    Some(if directory { "directory" } else { "file" }),
-                    !directory && flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32,
-                )?;
-                let result = (|| {
-                    Self::set_mode(e, &created, mode)?;
-                    let mut out = self.entry_out(e, &e.store.entry(&created.id)?)?;
-                    if op == 35 {
-                        out.extend(Self::open_out(h, false));
-                    }
-                    Ok(out)
-                })();
-                if op != 35 || result.is_err() {
-                    e.close(h)?;
-                }
-                result
-            }
-            10 | 11 => {
-                let path = self.child(e, inode, name(p)?)?;
-                let target = e.store.lookup(&path)?;
-                ensure!(
-                    (op == 11) == (target.kind == "directory"),
-                    if op == 11 {
-                        "NOT_DIRECTORY"
-                    } else {
-                        "IS_DIRECTORY"
-                    }
-                );
-                ensure!(
-                    !e.handles.values().any(|h| h.entity == target.id),
-                    "BUSY_VIEW: unlink open entry"
-                );
-                e.store.delete(&target.id)?;
-                Ok(vec![])
-            }
-            12 | 45 => {
-                let newdir = u64_at(p, 0)?;
-                let flags = if op == 45 { u32_at(p, 8)? } else { 0 };
-                ensure!(flags & !1 == 0, "UNSUPPORTED_RENAME_FLAGS");
-                let names = p
-                    .get(if op == 45 { 16 } else { 8 }..)
-                    .context("INVALID_PARAMETER")?;
-                let old = name(names)?;
-                let new = name(names.get(old.len() + 1..).context("INVALID_PARAMETER")?)?;
-                let source = e.store.lookup(&self.child(e, inode, old)?)?;
-                ensure!(
-                    e.sessions
-                        .get(&source.id)
-                        .is_none_or(|s| s.bytes.cow_file().is_none()),
-                    "UNSUPPORTED_FS_OPERATION: native open-handle rename integration pending"
-                );
-                let target = self.child(e, newdir, new)?;
-                if let Ok(replaced) = e.store.lookup(&target) {
-                    ensure!(
-                        !e.handles
-                            .values()
-                            .any(|h| h.entity == replaced.id && replaced.id != source.id),
-                        "BUSY_VIEW: replace open entry"
-                    );
-                }
-                e.store.rename(&source.id, &target, flags & 1 == 0)?;
-                Ok(vec![])
-            }
             14 | 27 => {
                 let directory = op == 27;
                 ensure!(
@@ -1038,17 +965,13 @@ impl Filesystem {
                     None,
                     !directory && flags & libc::O_ACCMODE as u32 != 0,
                 )?;
-                if flags & libc::O_TRUNC as u32 != 0
-                    && !directory
-                    && !(entry.content_ref.is_some() && e.native_writes.is_some())
-                    && let Err(error) = e.truncate(h, 0, false).and_then(|()| e.flush(h))
-                {
-                    let _ = e.close(h);
-                    return Err(error);
-                }
                 Ok(Self::open_out(h, directory))
             }
             15 => {
+                ensure!(
+                    e.handle_entry(u64_at(p, 0)?)?.id == "control",
+                    "MISSING_CONTENT_DESCRIPTOR"
+                );
                 let session = e.session(u64_at(p, 0)?)?;
                 let size = (u32_at(p, 16)? as usize).min(MAX_IO);
                 let mut out = vec![0; size];
@@ -1058,30 +981,21 @@ impl Filesystem {
                 out.truncate(count);
                 Ok(out)
             }
-            16 => {
-                let size = u32_at(p, 16)? as usize;
-                ensure!(size <= MAX_IO, "INVALID_PARAMETER");
-                let bytes = p.get(40..40 + size).context("INVALID_PARAMETER")?;
-                let count = e.write(
-                    u64_at(p, 0)?,
-                    u64_at(p, 8)?,
-                    bytes,
-                    u32_at(p, 32)? & libc::O_APPEND as u32 != 0,
-                    false,
-                )?;
-                let mut out = vec![];
-                push32(&mut out, count as u32);
-                push32(&mut out, 0);
-                Ok(out)
-            }
-            18 | 29 => {
-                e.close(u64_at(p, 0)?)?;
+            29 => {
+                ensure!(
+                    e.handle_entry(u64_at(p, 0)?)?.kind == "directory",
+                    "NOT_DIRECTORY"
+                );
+                e.release_handle(u64_at(p, 0)?)?;
                 // Qualification hook: a close-path failure after the handle closed.
                 crate::util::fault::fail("fs.close")?;
                 Ok(vec![])
             }
-            20 | 25 | 30 => {
-                e.flush(u64_at(p, 0)?)?;
+            30 => {
+                ensure!(
+                    e.handle_entry(u64_at(p, 0)?)?.kind == "directory",
+                    "NOT_DIRECTORY"
+                );
                 Ok(vec![])
             }
             28 => {
@@ -1099,7 +1013,7 @@ impl Filesystem {
                         break;
                     }
                     let base = out.len();
-                    push64(&mut out, self.inode(&child.id));
+                    push64(&mut out, self.entry_inode(e, &child)?);
                     push64(&mut out, ordinal as u64 + 1);
                     push32(&mut out, name.len() as u32);
                     push32(&mut out, if child.kind == "directory" { 4 } else { 8 });
@@ -1135,17 +1049,24 @@ fn counted(op: u32, error: &anyhow::Error) -> bool {
 /// reads, writes, fsyncs, flushes and size changes, whose work without the
 /// engine lock (a content wait, a writable copy, a save) may take long.
 /// `body` is the request after its header.
-fn runs_threaded(op: u32, body: &[u8]) -> bool {
+fn runs_threaded(op: u32, _body: &[u8]) -> bool {
     [
+        8,
+        9,
+        35,
         14,
         FUSE_READ,
         FUSE_WRITE,
         FUSE_FSYNC,
         FUSE_FLUSH,
         FUSE_RELEASE,
+        10,
+        11,
+        12,
+        45,
     ]
     .contains(&op)
-        || op == FUSE_SETATTR && u32_at(body, 0).is_ok_and(|valid| valid & (1 << 3) != 0)
+        || op == FUSE_SETATTR
 }
 /// Why the dispatch loop stopped.
 enum Exit {
@@ -1264,19 +1185,8 @@ fn serve(mut device: File, engine: Shared, wake: UnixStream) -> Result<Exit> {
                 }
                 _ => {}
             }
-            // An unlink, rmdir or rename: the entry it removes or replaces
-            // is final first (`settle_entity`), and no save of it runs while
-            // the request applies (`lock_settled`). Background saves let the
-            // other requests take the engine first.
-            let target = match op {
-                10 | 11 | 12 | 45 => settle_target(&engine, &fs, op, inode, &p[40..])?,
-                _ => None,
-            };
-            let _foreground = target.is_none().then(crate::runtime::engine::foreground);
-            let mut e = match &target {
-                Some(path) => crate::runtime::engine::lock_settled(&engine, None, Some(path)),
-                None => lock_engine(&engine),
-            };
+            let _foreground = crate::runtime::engine::foreground();
+            let mut e = lock_engine(&engine);
             let result = lock(&fs).dispatch(&mut e, op, inode, &p[40..]);
             e.publish_observation();
             result
@@ -1407,14 +1317,6 @@ fn fenced(engine: &Shared) -> Result<()> {
     ensure!(!lock_engine(engine).switching, "BUSY_VIEW");
     Ok(())
 }
-/// `body` with its `setattr` valid mask replaced by `valid`.
-fn with_valid(body: &[u8], valid: u32) -> Vec<u8> {
-    let mut body = body.to_vec();
-    if body.len() >= 4 {
-        body[..4].copy_from_slice(&valid.to_ne_bytes());
-    }
-    body
-}
 /// One request on a thread of its own (`serve`, [`runs_threaded`]): the work
 /// that needs no engine lock first (waiting for content, the writable copy
 /// of a large file, a save's hashing and copying), then the request under
@@ -1426,14 +1328,158 @@ fn threaded(
     inode: u64,
     body: &[u8],
 ) -> Result<Vec<u8>> {
-    use crate::runtime::{
-        content,
-        engine::{save_handle, save_handle_in_background, write_behind},
-    };
+    use crate::runtime::engine::{save_handle, save_handle_in_background, write_behind};
     // The work before the lock honours the fence as `dispatch` does: a
     // detach or checkout stops every request but the few `dispatch` exempts.
     fenced(engine)?;
+    ensure!(
+        lock_engine(engine).native_writes.is_some(),
+        "CONTENT_STORE_NOT_INITIALIZED"
+    );
     match op {
+        8 | 9 | 35 => {
+            let (mode, flags, skip) = if op == 8 {
+                let mode = u32_at(body, 0)?;
+                ensure!(
+                    mode & libc::S_IFMT == libc::S_IFREG,
+                    "UNSUPPORTED_POSIX_KIND"
+                );
+                (mode, libc::O_RDWR as u32, 16)
+            } else if op == 9 {
+                (u32_at(body, 0)?, libc::O_RDONLY as u32, 8)
+            } else {
+                (u32_at(body, 4)?, u32_at(body, 0)?, 16)
+            };
+            ensure!(mode & 0o7000 == 0, "UNSUPPORTED_POSIX_MODE");
+            let (path, parent) = {
+                let e = lock_engine(engine);
+                let filesystem = lock(fs);
+                (
+                    filesystem.child(
+                        &e,
+                        inode,
+                        name(body.get(skip..).context("INVALID_PARAMETER")?)?,
+                    )?,
+                    filesystem.entry(&e, inode)?.id,
+                )
+            };
+            let create = if op == 9 {
+                crate::runtime::content_writes::create_directory
+            } else {
+                crate::runtime::content_writes::create
+            };
+            let (handle, created) = create(
+                engine,
+                &path,
+                crate::runtime::content_writes::CreateOptions {
+                    writable: flags & libc::O_ACCMODE as u32 != libc::O_RDONLY as u32,
+                    posix_mode: Some(mode & 0o777),
+                    expected_parent: Some(parent),
+                    ..Default::default()
+                },
+                content_wait(),
+            )?
+            .context("CONTENT_STORE_NOT_INITIALIZED")?;
+            {
+                let result = {
+                    let e = lock_engine(engine);
+                    lock(fs).entry_out(&e, &created).map(|mut out| {
+                        if op == 35 {
+                            out.extend(Filesystem::open_out(handle, false));
+                        }
+                        out
+                    })
+                };
+                if op != 35 || result.is_err() {
+                    lock_engine(engine).release_handle(handle)?;
+                }
+                result
+            }
+        }
+        10 | 11 => {
+            let (entity, path) = {
+                let e = lock_engine(engine);
+                let filesystem = lock(fs);
+                let path = filesystem.child(&e, inode, name(body)?)?;
+                let entry = e.store.lookup(&path)?;
+                ensure!(
+                    entry.kind == if op == 11 { "directory" } else { "file" },
+                    if op == 11 {
+                        "NOT_DIRECTORY"
+                    } else {
+                        "IS_DIRECTORY"
+                    }
+                );
+                (
+                    entry.id,
+                    crate::core::content_saves::NamespaceTarget {
+                        path,
+                        parent: entry.parent,
+                    },
+                )
+            };
+            let removed = if op == 11 {
+                crate::runtime::content_writes::remove_directory(
+                    engine,
+                    &entity,
+                    &path,
+                    content_wait(),
+                )?
+            } else {
+                crate::runtime::content_writes::unlink(engine, &entity, &path.path, content_wait())?
+            };
+            ensure!(removed, "CONTENT_STORE_NOT_INITIALIZED");
+            Ok(vec![])
+        }
+        12 | 45 => {
+            let (entity, source, target, replace) = {
+                let e = lock_engine(engine);
+                let filesystem = lock(fs);
+                let newdir = u64_at(body, 0)?;
+                let flags = if op == 45 { u32_at(body, 8)? } else { 0 };
+                ensure!(flags & !1 == 0, "UNSUPPORTED_RENAME_FLAGS");
+                let names = body
+                    .get(if op == 45 { 16 } else { 8 }..)
+                    .context("INVALID_PARAMETER")?;
+                let old = name(names)?;
+                let new = name(names.get(old.len() + 1..).context("INVALID_PARAMETER")?)?;
+                let source = filesystem.child(&e, inode, old)?;
+                let entry = e.store.lookup(&source)?;
+                (
+                    entry.id,
+                    crate::core::content_saves::NamespaceTarget {
+                        path: source,
+                        parent: entry.parent,
+                    },
+                    crate::core::content_saves::NamespaceTarget {
+                        path: filesystem.child(&e, newdir, new)?,
+                        parent: filesystem.entry(&e, newdir)?.id,
+                    },
+                    flags & 1 == 0,
+                )
+            };
+            if crate::runtime::content_writes::rename_directory(
+                engine,
+                &entity,
+                None,
+                Some(&source),
+                &target,
+                replace,
+                content_wait(),
+            )? {
+                return Ok(vec![]);
+            }
+            if crate::runtime::content_writes::rename(
+                engine,
+                &entity,
+                &target.path,
+                replace,
+                content_wait(),
+            )? {
+                return Ok(vec![]);
+            }
+            bail!("PERMISSION_DENIED: root/control rename");
+        }
         14 => {
             let result = {
                 let mut e = lock_engine(engine);
@@ -1448,16 +1494,24 @@ fn threaded(
                 let _ = lock_engine(engine).release_handle(handle);
                 return Err(error);
             }
-            if u32_at(body, 0)? & libc::O_TRUNC as u32 != 0
-                && crate::runtime::content_writes::truncate(
-                    engine,
-                    handle,
-                    0,
-                    false,
-                    content_wait(),
-                )?
-            {
-                save_handle(engine, handle)?;
+            if u32_at(body, 0)? & libc::O_TRUNC as u32 != 0 {
+                let truncated = (|| {
+                    ensure!(
+                        crate::runtime::content_writes::truncate(
+                            engine,
+                            handle,
+                            0,
+                            false,
+                            content_wait(),
+                        )?,
+                        "CONTENT_WRITE_REQUIRES_PRIVATE_SESSION"
+                    );
+                    save_handle(engine, handle)
+                })();
+                if let Err(error) = truncated {
+                    let _ = lock_engine(engine).release_handle(handle);
+                    return Err(error);
+                }
             }
             Ok(result)
         }
@@ -1467,7 +1521,7 @@ fn threaded(
                 let size = u32_at(body, 16)? as usize;
                 ensure!(size <= MAX_IO, "INVALID_PARAMETER");
                 let bytes = body.get(40..40 + size).context("INVALID_PARAMETER")?;
-                if let Some(count) = crate::runtime::content_writes::write(
+                let count = crate::runtime::content_writes::write(
                     engine,
                     handle,
                     u64_at(body, 8)?,
@@ -1475,7 +1529,9 @@ fn threaded(
                     u32_at(body, 32)? & libc::O_APPEND as u32 != 0,
                     false,
                     content_wait(),
-                )? {
+                )?
+                .context("CONTENT_WRITE_REQUIRES_PRIVATE_SESSION")?;
+                {
                     let mut out = Vec::new();
                     push32(&mut out, count as u32);
                     push32(&mut out, 0);
@@ -1493,16 +1549,8 @@ fn threaded(
             {
                 return Ok(bytes);
             }
-            content::prepare_content_waiting(engine, handle, content_wait())?;
-            if op == FUSE_WRITE {
-                content::prepare_writable(engine, handle, None)?;
-            }
             let _foreground = crate::runtime::engine::foreground();
-            let mut e = if op == FUSE_WRITE {
-                crate::runtime::engine::lock_for_write(engine, handle)
-            } else {
-                lock_engine(engine)
-            };
+            let mut e = lock_engine(engine);
             let result = lock(fs).dispatch(&mut e, op, inode, body);
             e.publish_observation();
             result
@@ -1513,15 +1561,9 @@ fn threaded(
         // itself, or waits for that save and saves what came after it).
         FUSE_FSYNC => {
             let handle = u64_at(body, 0)?;
+            lock_engine(engine).session(handle)?;
             save_handle(engine, handle)?;
-            let context = crate::runtime::content_writes::default_context(engine)?;
-            if crate::runtime::content_writes::file(engine, handle, &context)?.is_some() {
-                return Ok(vec![]);
-            }
-            let mut e = lock_engine(engine);
-            let result = lock(fs).dispatch(&mut e, op, inode, body);
-            e.publish_observation();
-            result
+            Ok(vec![])
         }
         // A close(2) of a descriptor: during a burst of closes the save goes
         // on in the background (`write_behind`; with the savers' queue full
@@ -1532,11 +1574,11 @@ fn threaded(
             if write_behind() {
                 save_handle_in_background(engine, handle)?;
             } else {
-                save_handle(engine, handle)?;
+                crate::runtime::engine::save_handle_on_cleanup(engine, handle)?;
             }
             Ok(vec![])
         }
-        FUSE_SETATTR => setattr_size(engine, fs, inode, body),
+        FUSE_SETATTR => setattr_native(engine, fs, inode, body),
         FUSE_RELEASE => {
             crate::runtime::engine::close_handle(engine, u64_at(body, 0)?)?;
             crate::util::fault::fail("fs.close")?;
@@ -1545,97 +1587,169 @@ fn threaded(
         _ => bail!("UNSUPPORTED_FUSE_OPCODE: {op}"),
     }
 }
-/// Settles the entry an unlink or rmdir (`10`, `11`) removes, or a rename
-/// (`12`, `45`) may replace ([`crate::runtime::engine::settle_entity`]), and
-/// returns its path (`None`: the request itself reports a bad name or
-/// parent).
-fn settle_target(
-    engine: &Shared,
-    fs: &Mutex<Filesystem>,
-    op: u32,
-    inode: u64,
-    body: &[u8],
-) -> Result<Option<String>> {
-    let target = {
-        let e = lock_engine(engine);
-        let fs = lock(fs);
-        match op {
-            10 | 11 => fs.child(&e, inode, name(body)?),
-            _ => {
-                let names = body
-                    .get(if op == 45 { 16 } else { 8 }..)
-                    .context("INVALID_PARAMETER")?;
-                let old = name(names)?;
-                let new = name(names.get(old.len() + 1..).context("INVALID_PARAMETER")?)?;
-                fs.child(&e, u64_at(body, 0)?, new)
-            }
-        }
-    };
-    match target {
-        Ok(path) => {
-            crate::runtime::engine::settle_path(engine, &path)?;
-            Ok(Some(path))
-        }
-        // The request itself reports a bad name or parent.
-        Err(_) => Ok(None),
-    }
-}
-/// A `setattr` that changes the size, in the order `dispatch` applies one:
-/// the mode, then the size (truncated under the lock, saved without it),
-/// then the times; the reply is the attributes after all of them.
-fn setattr_size(
+/// Basic-info changes on a native file use the owned metadata coordinator.
+/// Size changes on an open handle remain buffered until fsync/close. A
+/// temporary handle for path-only truncate reaches its close boundary below.
+fn setattr_native(
     engine: &Shared,
     fs: &Mutex<Filesystem>,
     inode: u64,
     body: &[u8],
 ) -> Result<Vec<u8>> {
+    use crate::core::content_saves::ContentBasicUpdate;
     let valid = u32_at(body, 0)?;
-    let size = u64_at(body, 16)?;
-    // The whole request is checked before any part of it applies, as
-    // `dispatch` checks it: an ownership change refuses it unchanged.
     ensure!(
         valid & !SETATTR_SUPPORTED == 0,
         "UNSUPPORTED_POSIX_OWNERSHIP"
     );
+    let mut mode = ContentBasicUpdate::default();
     if valid & 1 != 0 {
-        let mut e = lock_engine(engine);
-        lock(fs).dispatch(&mut e, 4, inode, &with_valid(body, 1))?;
+        let value = u32_at(body, 68)?;
+        ensure!(value & 0o7000 == 0, "UNSUPPORTED_POSIX_MODE");
+        mode.posix_mode = Some(value & 0o777);
+        mode.readonly = Some(value & 0o222 == 0);
+        mode.change_time = Some(filetime(time()));
     }
-    // The handle to truncate through: the request's, else a temporary one.
-    let (handle, temporary) = if valid & (1 << 6) != 0 {
-        (u64_at(body, 8)?, false)
-    } else {
+    let mut times = ContentBasicUpdate::default();
+    for (bit, nowbit, offset, ns_offset, slot) in [
+        (1 << 4, 1 << 7, 32, 56, 0),
+        (1 << 5, 1 << 8, 40, 60, 1),
+        (1 << 10, 0, 48, 64, 2),
+    ] {
+        if valid & (bit | nowbit) != 0 {
+            let value = if valid & nowbit != 0 {
+                filetime(time())
+            } else {
+                let ns = u32_at(body, ns_offset)?;
+                ensure!(ns < 1_000_000_000, "INVALID_TIMESTAMP");
+                u64_at(body, offset)?
+                    .checked_mul(10_000_000)
+                    .and_then(|v| v.checked_add((ns / 100) as u64))
+                    .and_then(|v| v.checked_add(FILETIME_EPOCH))
+                    .context("INVALID_TIMESTAMP")?
+            };
+            match slot {
+                0 => times.access_time = Some(value),
+                1 => times.write_time = Some(value),
+                _ => times.change_time = Some(value),
+            }
+        }
+    }
+    mode.validate()?;
+    times.validate()?;
+    let (handle, temporary) = {
         let mut e = lock_engine(engine);
-        ensure!(!e.switching, "BUSY_VIEW");
-        let fs = lock(fs);
-        let entry = fs.entry(&e, inode)?;
-        let path = fs.path(&e, &entry)?;
-        (e.open(&path, None, true)?.0, true)
+        let mut filesystem = lock(fs);
+        let entry = filesystem.retained_entry(
+            &e,
+            inode,
+            if valid & (1 << 6) != 0 {
+                Some(u64_at(body, 8)?)
+            } else {
+                None
+            },
+        )?;
+        ensure!(e.native_writes.is_some(), "CONTENT_STORE_NOT_INITIALIZED");
+        if entry.id == ROOT || entry.id == "control" {
+            ensure!(
+                entry.id != "control"
+                    || (mode.is_empty() && times.is_empty() && valid & (1 << 3) == 0),
+                "PERMISSION_DENIED"
+            );
+            ensure!(
+                times.is_empty()
+                    && valid & (1 << 3) == 0
+                    && mode.posix_mode.is_none_or(|m| m == 0o755),
+                "UNSUPPORTED_FS_OPERATION: root metadata"
+            );
+            return filesystem.attr_out(&e, &entry);
+        }
+        ensure!(
+            entry.kind == "directory"
+                || entry.content_ref.is_some()
+                || e.sessions
+                    .get(&entry.id)
+                    .is_some_and(|s| s.bytes.cow_file().is_some()),
+            "MISSING_CONTENT_DESCRIPTOR"
+        );
+        ensure!(
+            entry.kind != "directory" || valid & (1 << 3) == 0,
+            "IS_DIRECTORY"
+        );
+        if valid & (1 << 6) != 0 {
+            let handle = u64_at(body, 8)?;
+            ensure!(e.session(handle)?.entry.id == entry.id, "INVALID_HANDLE");
+            (handle, false)
+        } else if !entry.alive {
+            // Linux can issue fd-originated timestamp updates without FATTR_FH.
+            // The retained inode still identifies the same open native entity.
+            let handle = e
+                .handles
+                .iter()
+                .find(|(_, h)| {
+                    h.entity == entry.id
+                        && !h.cleaned
+                        && (valid & (1 << 3) == 0 || h.writable)
+                        && h.directory_basis.as_ref().is_none_or(|basis| {
+                            basis.revisions.get("alive") == entry.revisions.get("alive")
+                        })
+                })
+                .map(|(h, _)| *h)
+                .context("INVALID_HANDLE")?;
+            (handle, false)
+        } else {
+            let path = filesystem.path(&e, &entry)?;
+            (e.open(&path, None, valid & (1 << 3) != 0)?.0, true)
+        }
     };
-    let truncated = (|| {
+    let updated = (|| {
         crate::runtime::content_reads::prepare_open(engine, handle, content_wait())?;
-        if crate::runtime::content_writes::truncate(engine, handle, size, false, content_wait())? {
-            return crate::runtime::engine::save_handle(engine, handle);
+        if !mode.is_empty() {
+            ensure!(
+                crate::runtime::content_writes::update_basic(engine, handle, mode, content_wait())?,
+                "STALE_CONTENT_VIEW"
+            );
         }
-        if size != 0 {
-            crate::runtime::content::prepare_content_waiting(engine, handle, content_wait())?;
+        if valid & (1 << 3) != 0 {
+            ensure!(
+                crate::runtime::content_writes::truncate(
+                    engine,
+                    handle,
+                    u64_at(body, 16)?,
+                    false,
+                    content_wait()
+                )?,
+                "STALE_CONTENT_VIEW"
+            );
         }
-        crate::runtime::content::prepare_writable(engine, handle, Some((size, false)))?;
-        crate::runtime::engine::lock_for_write(engine, handle).truncate(handle, size, false)?;
-        crate::runtime::engine::save_handle(engine, handle)
+        if !times.is_empty() {
+            ensure!(
+                crate::runtime::content_writes::update_basic(
+                    engine,
+                    handle,
+                    times,
+                    content_wait()
+                )?,
+                "STALE_CONTENT_VIEW"
+            );
+        }
+        let e = lock_engine(engine);
+        let mut filesystem = lock(fs);
+        let entry = filesystem.retained_entry(&e, inode, Some(handle))?;
+        filesystem.attr_out(&e, &entry)
     })();
     if temporary {
-        let mut e = lock_engine(engine);
-        match &truncated {
-            Ok(()) => e.close(handle)?,
-            Err(_) => e.release_handle(handle)?,
-        }
+        let closed = if valid & (1 << 3) != 0 {
+            crate::runtime::engine::close_handle(engine, handle)
+        } else {
+            lock_engine(engine).release_handle(handle)
+        };
+        let reply = updated?;
+        closed?;
+        Ok(reply)
+    } else {
+        updated
     }
-    truncated?;
-    let mut e = lock_engine(engine);
-    let result = lock(fs).dispatch(&mut e, 4, inode, &with_valid(body, valid & !(1 | (1 << 3))));
-    e.publish_observation();
-    result
 }
 fn write_reply(
     writer: &std::sync::Mutex<File>,
@@ -1689,7 +1803,14 @@ mod tests {
         assert_eq!((FUSE_FSYNC, FUSE_FLUSH), (20, 25));
         assert_eq!((FUSE_RELEASE, FUSE_RELEASEDIR), (18, 29));
         for op in [
+            8,
+            9,
+            35,
             14,
+            10,
+            11,
+            12,
+            45,
             FUSE_READ,
             FUSE_WRITE,
             FUSE_FSYNC,
@@ -1698,11 +1819,13 @@ mod tests {
         ] {
             assert!(runs_threaded(op, &[0; 64]), "opcode {op}");
         }
-        // A setattr runs threaded only when it changes the size.
+        // Native metadata also checkpoints outside Engine, so all valid
+        // setattr packets use the threaded route.
         let mut setattr = vec![0u8; 88];
-        assert!(!runs_threaded(FUSE_SETATTR, &setattr));
+        assert!(runs_threaded(FUSE_SETATTR, &setattr));
         setattr[..4].copy_from_slice(&(1u32 << 3).to_ne_bytes());
         assert!(runs_threaded(FUSE_SETATTR, &setattr));
+        assert!(runs_threaded(FUSE_SETATTR, &[]));
         // Lookups, directory releases and directory fsyncs stay on dispatch.
         for op in [1, 3, FUSE_RELEASEDIR, 30] {
             assert!(!runs_threaded(op, &[0; 64]), "opcode {op}");
@@ -1759,29 +1882,259 @@ mod tests {
         let state = lock(&threads.state);
         assert_eq!((state.running, state.waiting.len()), (0, 0));
     }
-    #[test]
-    fn a_size_change_with_an_ownership_change_is_refused_before_anything_applies() {
+    fn current_file_fixture(
+        bytes: &[u8],
+    ) -> (
+        tempfile::TempDir,
+        Shared,
+        Entry,
+        Arc<crate::runtime::content_writes::NativeWrites>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        let mut e = crate::runtime::Engine::new(Store::open(dir.path(), None).unwrap());
-        let (h, entry) = e.open("f.txt", Some("file"), true).unwrap();
-        e.write(h, 0, b"keep me", false, false).unwrap();
-        e.close(h).unwrap();
-        let before = e.store.lookup("f.txt").unwrap().content;
-        let engine: Shared = Arc::new(Mutex::new(e));
+        let mut store = Store::initialize(dir.path(), "fuse-current", &crate::core::id()).unwrap();
+        let entry = store.create("f.txt", "file").unwrap();
+        store
+            .write_revision(&entry.id, entry.revisions.get("content").cloned(), bytes)
+            .unwrap();
+        let entry = store.lookup("f.txt").unwrap();
+        let engine = Arc::new(Mutex::new(crate::runtime::Engine::new(store)));
+        let writes = crate::runtime::content_writes::NativeWrites::install(
+            &engine,
+            &crate::runtime::content_writes::default_context(&engine).unwrap(),
+        )
+        .unwrap();
+        (dir, engine, entry, writes)
+    }
+    fn assert_current_bytes(engine: &Shared, expected: &[u8]) {
+        use crate::content::ContentProvider;
+        let e = lock_engine(engine);
+        let reference = e.store.lookup("f.txt").unwrap().content_ref.unwrap();
+        let local = crate::content::LocalContent::open(&e.store.root).unwrap();
+        let pin = local.pin(&reference).unwrap();
+        let mut actual = vec![0; reference.total_len as usize];
+        local
+            .read_range(
+                &pin,
+                0,
+                &mut actual,
+                &crate::content::ReadContext {
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    cancel: crate::util::Cancel::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(actual, expected);
+    }
+    #[test]
+    fn threaded_current_metadata_does_not_truncate_or_open_a_write_handle() {
+        let bytes = b"keep metadata separate from bytes";
+        let (_dir, engine, entry, writes) = current_file_fixture(bytes);
+        let before = entry.content_ref;
         let fs = Mutex::new(Filesystem::new());
         let inode = lock(&fs).inode(&entry.id);
-        // `fuse_setattr_in`: a truncate to 0 (`FATTR_SIZE`) with a uid
-        // (`FATTR_UID`), no file handle.
+        let mut body = vec![0u8; 88];
+        body[..4].copy_from_slice(&1u32.to_ne_bytes());
+        for mode in [0o644u32, 0o444] {
+            body[68..72].copy_from_slice(&mode.to_ne_bytes());
+            threaded(&engine, &fs, FUSE_SETATTR, inode, &body).unwrap();
+            let e = lock_engine(&engine);
+            let after = e.store.lookup("f.txt").unwrap();
+            assert_eq!(after.content_ref, before);
+            assert_eq!(after.basic_info().posix_mode, Some(mode));
+            assert!(e.handles.is_empty() && e.sessions.is_empty());
+            drop(e);
+            assert_current_bytes(&engine, bytes);
+        }
+        writes
+            .shutdown(&crate::runtime::content_writes::default_context(&engine).unwrap())
+            .unwrap();
+    }
+    #[test]
+    fn a_size_change_with_an_ownership_change_is_refused_before_anything_applies() {
+        let (_dir, engine, entry, writes) = current_file_fixture(b"keep me");
+        let before = entry.clone();
+        let fs = Mutex::new(Filesystem::new());
+        let inode = lock(&fs).inode(&entry.id);
         let mut body = vec![0u8; 88];
         body[..4].copy_from_slice(&((1u32 << 3) | (1 << 1)).to_ne_bytes());
-        let error = setattr_size(&engine, &fs, inode, &body).unwrap_err();
+        let error = threaded(&engine, &fs, FUSE_SETATTR, inode, &body).unwrap_err();
         assert!(format!("{error:#}").contains("UNSUPPORTED_POSIX_OWNERSHIP"));
         let e = lock_engine(&engine);
-        assert_eq!(
-            e.store.lookup("f.txt").unwrap().content,
-            before,
-            "nothing was truncated or saved"
-        );
+        let after = e.store.lookup("f.txt").unwrap();
+        assert_eq!(after.content_ref, before.content_ref);
+        assert_eq!(after.basic_info(), before.basic_info());
         assert!(e.handles.is_empty() && e.sessions.is_empty());
+        drop(e);
+        assert_current_bytes(&engine, b"keep me");
+        writes
+            .shutdown(&crate::runtime::content_writes::default_context(&engine).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn virtual_root_and_discovery_keep_their_read_only_callback_semantics() {
+        let (_dir, engine, _, writes) = current_file_fixture(b"ordinary file");
+        let fs = Mutex::new(Filesystem::new());
+        let mut body = vec![0u8; 88];
+        body[..4].copy_from_slice(&1u32.to_ne_bytes());
+        body[68..72].copy_from_slice(&0o755u32.to_ne_bytes());
+        threaded(&engine, &fs, FUSE_SETATTR, 1, &body).unwrap();
+        body[68..72].copy_from_slice(&0o700u32.to_ne_bytes());
+        assert!(threaded(&engine, &fs, FUSE_SETATTR, 1, &body).is_err());
+        assert!(threaded(&engine, &fs, FUSE_SETATTR, 2, &body).is_err());
+        body[..4].copy_from_slice(&(1u32 << 7).to_ne_bytes());
+        assert!(threaded(&engine, &fs, FUSE_SETATTR, 1, &body).is_err());
+        lock_engine(&engine).discovery = b"discovery bytes".to_vec();
+        let opened = threaded(&engine, &fs, 14, 2, &[0; 8]).unwrap();
+        let handle = u64_at(&opened, 0).unwrap();
+        let mut read = vec![0u8; 40];
+        read[..8].copy_from_slice(&handle.to_ne_bytes());
+        read[16..20].copy_from_slice(&64u32.to_ne_bytes());
+        assert_eq!(
+            threaded(&engine, &fs, FUSE_READ, 2, &read).unwrap(),
+            b"discovery bytes"
+        );
+        threaded(&engine, &fs, FUSE_FSYNC, 2, &read).unwrap();
+        threaded(&engine, &fs, FUSE_FLUSH, 2, &read).unwrap();
+        threaded(&engine, &fs, FUSE_RELEASE, 2, &read).unwrap();
+        let error = threaded(&engine, &fs, FUSE_FSYNC, 2, &read).unwrap_err();
+        assert!(format!("{error:#}").contains("INVALID_HANDLE"));
+        let mut truncate = [0u8; 8];
+        truncate[..4].copy_from_slice(&(libc::O_RDWR | libc::O_TRUNC).to_ne_bytes());
+        assert!(threaded(&engine, &fs, 14, 2, &truncate).is_err());
+        let e = lock_engine(&engine);
+        assert!(e.handles.is_empty() && e.sessions.is_empty());
+        drop(e);
+        assert_current_bytes(&engine, b"ordinary file");
+        writes
+            .shutdown(&crate::runtime::content_writes::default_context(&engine).unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn mounted_mutation_never_falls_back_when_current_service_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::initialize(dir.path(), "missing-native", &crate::core::id()).unwrap();
+        let engine = Arc::new(Mutex::new(crate::runtime::Engine::new(store)));
+        let fs = Mutex::new(Filesystem::new());
+        for op in [8, 9, 35, FUSE_WRITE, FUSE_SETATTR, FUSE_FSYNC, FUSE_FLUSH] {
+            let error = threaded(&engine, &fs, op, 1, &[0; 88]).unwrap_err();
+            assert!(format!("{error:#}").contains("CONTENT_STORE_NOT_INITIALIZED"));
+        }
+        let e = lock_engine(&engine);
+        assert!(e.handles.is_empty() && e.sessions.is_empty());
+        assert_eq!(
+            e.store
+                .db
+                .query_row("SELECT count(*) FROM pending_saves", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn directory_inodes_and_handleless_setattr_keep_restored_incarnations_separate() {
+        use crate::core::content_saves::{ContentBasicUpdate, NamespaceTarget};
+        use crate::runtime::{content::ContentWait, content_writes};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::initialize(dir.path(), "fuse-directory-incarnation", &crate::core::id())
+            .unwrap();
+        store
+            .db
+            .execute("INSERT INTO config VALUES('fixture:content_v1','1')", [])
+            .unwrap();
+        let engine = Arc::new(Mutex::new(crate::runtime::Engine::new(store)));
+        let context = crate::content::ReadContext {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            cancel: crate::util::Cancel::new(),
+        };
+        let wait = ContentWait::fixed(std::time::Duration::from_secs(30));
+        let writes = content_writes::NativeWrites::install(&engine, &context).unwrap();
+        let (old, entry) = content_writes::create_directory(
+            &engine,
+            "dir",
+            content_writes::CreateOptions::default(),
+            wait,
+        )
+        .unwrap()
+        .unwrap();
+        let fs = Mutex::new(Filesystem::new());
+        let old_inode = {
+            let e = lock_engine(&engine);
+            let mut fs = lock(&fs);
+            assert!(fs.retained_entry(&e, 1, None).unwrap().kind == "directory");
+            assert_eq!(fs.retained_entry(&e, 2, None).unwrap().id, "control");
+            fs.entry_inode(&e, &entry).unwrap()
+        };
+        content_writes::remove_directory(
+            &engine,
+            &entry.id,
+            &NamespaceTarget {
+                path: "dir".into(),
+                parent: ROOT.into(),
+            },
+            wait,
+        )
+        .unwrap();
+        {
+            let e = lock_engine(&engine);
+            let mut filesystem = lock(&fs);
+            let dead = e.handle_entry(old).unwrap();
+            assert_eq!(filesystem.entry_inode(&e, &dead).unwrap(), old_inode);
+        }
+        let fresh = {
+            let mut e = lock_engine(&engine);
+            let change = e
+                .store
+                .current_change(&entry.id, "alive", serde_json::json!(true))
+                .unwrap();
+            let event = e
+                .store
+                .event(&e.store.branch(&e.store.active).unwrap(), vec![change]);
+            let id = event.id.clone();
+            e.store.commit(event, true).unwrap();
+            let delta = e.activation_delta(&[id], None).unwrap();
+            e.after_activation(&delta);
+            e.open("dir", None, false).unwrap().0
+        };
+        content_writes::update_basic(
+            &engine,
+            fresh,
+            ContentBasicUpdate {
+                write_time: Some(303),
+                ..Default::default()
+            },
+            wait,
+        )
+        .unwrap();
+        let fresh_inode = {
+            let e = lock_engine(&engine);
+            let mut fs = lock(&fs);
+            let fresh = e.handle_entry(fresh).unwrap();
+            let inode = fs.entry_inode(&e, &fresh).unwrap();
+            assert_ne!(inode, old_inode);
+            assert!(!fs.retained_entry(&e, old_inode, None).unwrap().alive);
+            assert!(fs.entry(&e, old_inode).is_err());
+            assert!(fs.entry(&e, inode).unwrap().alive);
+            inode
+        };
+        let mut body = vec![0u8; 88];
+        body[..4].copy_from_slice(&(1u32 << 5).to_ne_bytes());
+        body[40..48].copy_from_slice(&1_600_000_000u64.to_ne_bytes());
+        let error = threaded(&engine, &fs, FUSE_SETATTR, old_inode, &body).unwrap_err();
+        assert!(format!("{error:#}").contains("STALE_CONTENT_DIRECTORY"));
+        threaded(&engine, &fs, FUSE_SETATTR, fresh_inode, &body).unwrap();
+        let e = lock_engine(&engine);
+        assert_eq!(
+            e.handle_entry(fresh).unwrap().basic_info().write_time,
+            FILETIME_EPOCH + 16_000_000_000_000_000
+        );
+        assert!(!e.handle_entry(old).unwrap().alive);
+        assert!(e.store.entry(&entry.id).unwrap().alive);
+        drop(e);
+        lock_engine(&engine).release_handle(old).unwrap();
+        lock_engine(&engine).release_handle(fresh).unwrap();
+        writes.shutdown(&context).unwrap();
     }
 }

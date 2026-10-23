@@ -1,5 +1,12 @@
 # Telekinesis (tkfs) production revamp — final plan
 
+Current scope amendment, 2026-10-22: this Waves 0–5 record is historical.
+[Personal-use deployment and authority scope](AUTHORITY_SCOPE.md) supersedes
+its broader security prescriptions for current work, including custom handshake,
+credential-enrollment and local-user hardening requirements. Retain DVFS's own
+authority and filesystem correctness; do not add Users, ACLs or public-service
+security. Recorded implementations and test outcomes remain unchanged.
+
 Baseline: branch `revamp/production-sync`, commit `6298d0b`. Inputs: `synthesis.md` (RC1–RC13, invariants 1–30, pillars 0/A–F) and `reports.json`. Every claim below that cites a file or line was re-checked against the working tree. Where judges disagreed, the code decided.
 
 This document is the Waves 0–5 source of truth. The selected next wave is

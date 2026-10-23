@@ -21,7 +21,7 @@
 //! verifier and its generation, revocation (`peer_meta.revoked_ms`) and,
 //! since WP4.1, the dialer's per-peer credential (`peer_credentials`, side
 //! `inbound`, through the catalog contract's `CatalogApi::credentials`,
-//! CCR-WP5.4-1): a dialer offering `peer-hmac-v1`
+//! CCR-WP5.4-1): a dialer offering peer-credential
 //! without an active credential is refused `GOAWAY{PEER_REVOKED}`.
 //!
 //! **Per-peer credentials (WP4.1).** Two more peer ops, allowed on any
@@ -29,7 +29,7 @@
 //!
 //! | Op | Handling |
 //! |---|---|
-//! | `peer.enroll` | opens the sealed secret with this verifier's key (`session::auth::open_enrollment`) and stores `K_peer` as the dialer's inbound credential; refused `PEER_REVOKED` on a session that registered before a `peer.revoke` of its installation |
+//! | `peer.enroll` | accepts the enrolled secret on the authenticated session and stores its credential identity as the dialer's inbound credential; refused `PEER_REVOKED` on a session that registered before a `peer.revoke` of its installation |
 //! | `peer.revoke` | revokes the dialer's inbound credential, answers, then sends every session of that installation `GOAWAY{PEER_REVOKED}` and closes those still open after [`REVOKE_CLOSE_GRACE`] (within 1 s) |
 //!
 //! Both write the catalog, so they run on a thread of their own, never on
@@ -42,7 +42,7 @@
 //! A per-installation revocation epoch orders revocations against the
 //! sessions and enrollments they race. `peer.revoke` bumps it before it
 //! revokes the credential and again, under the state lock, when it sends
-//! the sessions away. A `peer-hmac-v1` session whose handshake read the
+//! the sessions away. A peer-credential session whose handshake read the
 //! credential before the revocation is sent away when it registers (the
 //! epoch moved; checked under the state lock like the generation). A
 //! `peer.enroll` that stored its credential while a revocation ran sees the
@@ -508,7 +508,7 @@ struct State {
     /// Set once the server stops: new sessions are told this and go away.
     stopping: Option<ErrorWire>,
     /// Per installation, how many times `peer.revoke` revoked it (WP4.1): a
-    /// `peer-hmac-v1` handshake records the value it started under and is
+    /// peer-credential handshake records the value it started under and is
     /// sent away at registration if it changed meanwhile.
     revocations: BTreeMap<String, u64>,
 }
@@ -891,7 +891,7 @@ impl Inner {
     /// the rotation watcher (and `peer.revoke`) scans under: a session is
     /// either seen by the watcher or sees the new catalog here.
     /// `per_peer_epoch` is the installation's revocation epoch a
-    /// `peer-hmac-v1` handshake started under (WP4.1). Returns the session
+    /// peer-credential handshake started under (WP4.1). Returns the session
     /// id and the installation's revocation epoch at registration (which
     /// `peer.enroll` on this session checks).
     fn register(
@@ -1003,7 +1003,7 @@ impl Inner {
     /// `GOAWAY{PEER_REVOKED}`, and the ones still open after
     /// [`REVOKE_CLOSE_GRACE`] are closed. Bumps the installation's
     /// revocation epoch again first (the credential is revoked by now),
-    /// under the lock `register` checks it under: a `peer-hmac-v1`
+    /// under the lock `register` checks it under: a peer-credential
     /// handshake that read the credential before the revocation is either
     /// registered already (and sent away here) or sees the epoch moved.
     fn revoke_sessions(self: &Arc<Self>, installation: &str) {
@@ -1236,8 +1236,7 @@ struct ConnPolicy {
     policy: CatalogAcceptPolicy,
     inner: Arc<Inner>,
     reserved: AtomicBool,
-    /// The dialer's revocation epoch when its `peer-hmac-v1` handshake first
-    /// read its credential (WP4.1); `None` for a code handshake.
+    /// Capture application revocation state when HELLO is admitted.
     revocation_epoch: Mutex<Option<u64>>,
 }
 
@@ -1276,6 +1275,18 @@ impl AcceptPolicy for ConnPolicy {
     }
 
     fn admit(&self, hello: &ClientHello) -> Result<(), ErrorWire> {
+        let epoch = self
+            .inner
+            .state
+            .lock()
+            .revocations
+            .get(&hello.installation)
+            .copied()
+            .unwrap_or(0);
+        self.revocation_epoch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert(epoch);
         self.policy.admit(hello)?;
         if !self.reserved.load(Ordering::Acquire) {
             self.inner.reserve()?;
@@ -1293,22 +1304,7 @@ impl AcceptPolicy for ConnPolicy {
     }
 
     fn peer_key(&self, installation: &str) -> Result<[u8; 32], ErrorWire> {
-        // The epoch is read before the credential: a revocation between the
-        // two is seen by `register` (the epoch moved) or here (revoked).
-        let epoch = self
-            .inner
-            .state
-            .lock()
-            .revocations
-            .get(installation)
-            .copied()
-            .unwrap_or(0);
-        let key = self.policy.peer_key(installation)?;
-        self.revocation_epoch
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_or_insert(epoch);
-        Ok(key)
+        self.policy.peer_key(installation)
     }
 }
 
@@ -1910,8 +1906,8 @@ pub(crate) fn record_finished(ctx: &Ctx, finished: Finished<'_>) {
     });
 }
 
-/// `peer.enroll` (WP4.1): the dialer's sealed secret, opened with this
-/// verifier's key, becomes its inbound credential `K_peer`. The session must
+/// `peer.enroll`: the secret sent over TLS/WSS or VPN becomes the session
+/// installation's inbound credential. The session must
 /// still be under the current verifier generation (a rotation since the
 /// handshake refuses it, as every request), and no `peer.revoke` of the
 /// installation may have run since the session registered (`epoch`): one
@@ -1936,7 +1932,7 @@ fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, epoch: u64, req: Incomin
         let request: EnrollRequest =
             serde_json::from_value(header).map_err(|error| invalid_request(op, &error))?;
         let snapshot = inner.ctx.catalog.snapshot();
-        let verifier = snapshot.verifier.as_ref().ok_or_else(|| {
+        snapshot.verifier.as_ref().ok_or_else(|| {
             ErrorWire::coded(
                 "PAIRING_CODE_NOT_SET",
                 "this orchestrator has no pairing code",
@@ -1949,12 +1945,7 @@ fn peer_enroll(inner: &Arc<Inner>, peer: &AcceptedPeer, epoch: u64, req: Incomin
         if revoked_since() {
             return Err(revoked_during_session());
         }
-        let secret = peer_auth::open_enrollment(
-            &verifier.key(),
-            &peer.installation,
-            &inner.ctx.installation,
-            &request,
-        )?;
+        let secret = peer_auth::enrollment_secret(&request)?;
         inner.ctx.catalog.apply(CatalogCmd::EnrollCredential {
             installation: peer.installation.clone(),
             side: CredentialSide::Inbound,

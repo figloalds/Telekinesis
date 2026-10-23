@@ -203,7 +203,7 @@ fn upgrade_kind_of(head: &[u8]) -> UpgradeKind {
 const READ_ONLY_CONTROL_OPS: &[&str] = &[
     "status",
     "folder-details",
-    "preview-object",
+    "preview-content",
     "branches",
     "conflicts",
     "history",
@@ -240,9 +240,16 @@ pub fn start_rpc_ctx(ctx: Arc<WorkerCtx>) -> Result<Discovery> {
 
 /// [`start_rpc_ctx`], returning the handle `worker::run` waits on.
 pub fn start_rpc_server(ctx: Arc<WorkerCtx>) -> Result<RpcServer> {
+    register_worker(&ctx);
+    super::content_writes::NativeWrites::install(
+        &ctx.engine,
+        &crate::content::ReadContext {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancel: crate::util::Cancel::new(),
+        },
+    )?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
-    register_worker(&ctx);
     let vitals = lock_engine_tracked(&ctx.engine).vitals.clone();
     // The first status cell: the counters now (no content scan before
     // Ready); the first `status` reply computes the content unless
@@ -524,16 +531,20 @@ impl Core {
     /// this worker's record.
     fn exit_after_accept_errors(&self, consecutive: u32) -> ! {
         let deadline = Instant::now() + EXIT_RETAIN_WAIT;
-        let mut engine = loop {
+        let engine = loop {
             match try_lock_engine(&self.ctx.engine) {
                 Some(engine) => break Some(engine),
                 None if Instant::now() >= deadline => break None,
                 None => thread::sleep(Duration::from_millis(10)),
             }
         };
-        let outcome = engine
-            .as_mut()
-            .map(|engine| catch_unwind(AssertUnwindSafe(|| engine.retain_all_dirty())));
+        if !super::exit::begin() {
+            drop(engine);
+            super::exit::wait();
+        }
+        let retained_state = engine
+            .map(|engine| super::exit::retain(&self.ctx.engine, engine, &super::exit::context()));
+        let outcome = retained_state.as_ref().map(|state| &state.outcome);
         let (retained, error, panicked) = match &outcome {
             Some(Ok(Ok(retained))) => (Some(*retained), None, false),
             Some(Ok(Err(error))) => (None, Some(format!("{error:#}")), false),
@@ -546,7 +557,7 @@ impl Core {
             "retained_dirty": retained,
             "error": error,
             "retain_panicked": panicked,
-            "engine_busy": engine.is_none(),
+            "engine_busy": retained_state.as_ref().is_none_or(|state| state.engine.is_none()),
             "exit_code": crate::model::ipc::EXIT_INTERNAL,
         });
         // Exit while still holding the engine (if taken).
@@ -744,7 +755,28 @@ impl Core {
         // ids key the engine's idempotency receipts.
         let request = json!({"request": crate::core::id(), "payload": payload});
         let mut stop = false;
-        let value = self.route(&request, &mut stop).map_err(wire)?;
+        let value = if matches!(
+            op,
+            "preview-content" | "request-content" | "cancel-content-request"
+        ) {
+            fault::trigger(&format!("worker.rpc.{op}")).map_err(wire)?;
+            let result = super::content_inspection::dispatch(
+                &self.ctx,
+                op,
+                &request["payload"],
+                deadline,
+                cancelled,
+            );
+            if op != "preview-content" {
+                crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
+            }
+            result.map_err(wire)?
+        } else if op == "bucket-export" {
+            fault::trigger("worker.rpc.bucket-export").map_err(wire)?;
+            export_bucket(&self.ctx, &request["payload"], deadline, cancelled).map_err(wire)?
+        } else {
+            self.route(&request, &mut stop).map_err(wire)?
+        };
         let text = serde_json::to_vec(&value).map_err(|error| wire(error.into()))?;
         if text.len() <= INLINE_REPLY {
             Ok((value, vec![]))
@@ -802,8 +834,31 @@ impl Core {
                 crate::bulk_sync::worker_control(&self.bulk, payload)
             }
             op if op.starts_with("published-") => published_rpc(&self.ctx, &self.vitals, payload),
-            "preview-object" | "cat-object" => self.object(op, payload),
-            "bucket-export" => export_bucket(&self.ctx.engine, payload),
+            "preview-content" | "request-content" | "cancel-content-request" => {
+                let result = super::content_inspection::dispatch(
+                    &self.ctx,
+                    op,
+                    payload,
+                    Instant::now() + Duration::from_secs(15),
+                    &|| false,
+                );
+                if op != "preview-content" {
+                    crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
+                }
+                result
+            }
+            "cat-object" => self.object(payload),
+            "import" => {
+                let result = self.import_content(request, payload);
+                crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
+                result
+            }
+            "bucket-export" => export_bucket(
+                &self.ctx,
+                payload,
+                Instant::now() + Duration::from_secs(240),
+                &|| false,
+            ),
             "checkout" => {
                 let mounted = self.engine()?.mounted;
                 let result = if mounted {
@@ -814,17 +869,67 @@ impl Core {
                 crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
                 result
             }
-            // CCR-WP5.4-4 (applied by WP5.INT): the embedded status claims
-            // (`caught_up`, `metadata_caught_up`, `upload_state`) are the
-            // worker `status` reply's, which counts the feed peers; the
-            // engine's own `status` knows only the legacy lanes. Read with no
-            // engine lock held (the control reply's guard ends with it).
+            // Read details on a secondary snapshot, preserving the worker's
+            // feed/status claims and checking checkout on both sides of it.
             "folder-details" => {
-                let mut details = self.engine()?.control(request, payload)?;
+                let (root, branch, generation) = {
+                    let engine = self.engine()?;
+                    if let Some(generation) = payload["generation"].as_u64() {
+                        ensure!(generation == engine.store.generation, "STALE_VIEW");
+                    }
+                    (
+                        engine.store.root.clone(),
+                        engine.store.active.clone(),
+                        engine.store.generation,
+                    )
+                };
+                let mut details = {
+                    let store = self.ctx.sync_stores.checkout()?;
+                    let snapshot = store.db.unchecked_transaction()?;
+                    let identity: (String, Option<String>) = snapshot.query_row(
+                        "SELECT (SELECT value FROM config WHERE key='active'),
+                         (SELECT value FROM config WHERE key='generation')",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    let observed = identity.1.as_deref().unwrap_or("0").parse::<u64>()?;
+                    ensure!(
+                        store.root == root
+                            && store.active == branch
+                            && store.generation == generation
+                            && identity.0 == branch
+                            && observed == generation,
+                        "STALE_VIEW"
+                    );
+                    let offset = usize::try_from(payload["offset"].as_u64().unwrap_or(0))?;
+                    let details = super::control::folder_details(&store, offset)?;
+                    snapshot.commit()?;
+                    details
+                };
                 let status = self.status()?;
-                for member in ["caught_up", "metadata_caught_up", "upload_state"] {
-                    details["status"][member] = status[member].clone();
+                {
+                    let engine = self.engine()?;
+                    ensure!(
+                        engine.store.root == root
+                            && engine.store.active == branch
+                            && engine.store.generation == generation,
+                        "STALE_VIEW"
+                    );
                 }
+                ensure!(
+                    status["generation"].as_u64() == Some(generation),
+                    "STALE_VIEW"
+                );
+                for member in ["downloading", "requested", "partial_bytes"] {
+                    details["content"][member] = status["content"][member].clone();
+                    details["content_counters"][member] =
+                        status["content_counters"][member].clone();
+                }
+                details["status"] = status;
+                details["status"]["content"] = details["content"].take();
+                details["status"]["content_counters"] = details["content_counters"].take();
+                details["status"]["content_complete"] =
+                    details["status"]["content"]["complete"].clone();
                 Ok(details)
             }
             op => {
@@ -840,13 +945,63 @@ impl Core {
                 let result = engine.control(request, payload);
                 drop(engine);
                 if !read_only {
-                    // Journaled mutations, demand (`request-object`) and
-                    // anything unknown: refreshed before the reply.
+                    // Journaled mutations and anything unknown: refreshed
+                    // before the reply.
                     crate::worker::status_cell::note_mutation(&self.ctx, &self.vitals, true);
                 }
                 result
             }
         }
+    }
+
+    /// Prepare immutable chunks without Engine or a metadata transaction. The
+    /// second phase rechecks the selected namespace before committing its receipt.
+    fn import_content(&self, request: &str, payload: &Value) -> Result<Value> {
+        let fingerprint = hash(&serde_json::to_vec(payload)?);
+        let path = payload["path"].as_str().context("MISSING_ARGUMENT")?;
+        let context = super::content_reads::request_context(
+            &self.ctx.engine,
+            super::content::ContentWait::fixed(Duration::from_secs(240)),
+        )?;
+        let (root, branch, generation, basis) = {
+            let engine = self.engine_after_saves()?;
+            if let Some(reply) = engine.store.receipt_fingerprint(request, &fingerprint)? {
+                return Ok(reply);
+            }
+            if let Some(generation) = payload["generation"].as_u64() {
+                ensure!(generation == engine.store.generation, "STALE_VIEW");
+            }
+            engine.quiet()?;
+            engine.store.check_content_write()?;
+            (
+                engine.store.root.clone(),
+                engine.store.active.clone(),
+                engine.store.generation,
+                super::control::import_basis(&engine.store, path)?,
+            )
+        };
+        let bytes = hex::decode(payload["hex"].as_str().context("MISSING_ARGUMENT")?)?;
+        context.check()?;
+        fault::trigger("content.import.before_prepare")?;
+        let local = crate::content::LocalContent::open(&root)?;
+        let prepared = local.prepare_import(&mut bytes.as_slice(), bytes.len() as u64, &context)?;
+        fault::trigger("content.import.prepared")?;
+        context.check()?;
+        let mut engine = self.engine_after_saves()?;
+        if let Some(reply) = engine.store.receipt_fingerprint(request, &fingerprint)? {
+            return Ok(reply);
+        }
+        ensure!(
+            engine.store.root == root
+                && engine.store.active == branch
+                && engine.store.generation == generation,
+            "STALE_VIEW"
+        );
+        ensure!(
+            super::control::import_basis(&engine.store, path)? == basis,
+            "STALE_VIEW"
+        );
+        engine.control_prepared(request, payload, Some(&prepared), &fingerprint)
     }
 
     /// The engine for an RPC. `engine.poison` fires here: with
@@ -1012,6 +1167,7 @@ impl Core {
             };
         }
         self.ctx.stopping.store(true, Ordering::SeqCst);
+        super::content_writes::stop_worker(&self.ctx.engine);
         super::content_rpc::stop(&self.ctx);
         self.stop.poke();
         Ok(reply)
@@ -1191,7 +1347,7 @@ impl Core {
         Ok(status)
     }
 
-    fn object(&self, op: &str, payload: &Value) -> Result<Value> {
+    fn object(&self, payload: &Value) -> Result<Value> {
         let object = payload["object"].as_str().context("MISSING_ARGUMENT")?;
         let mut file = fetch_verified(
             &self.ctx.engine,
@@ -1201,19 +1357,10 @@ impl Core {
         use std::io::Seek;
         file.rewind()?;
         let total = file.metadata()?.len();
-        if op == "cat-object" {
-            ensure!(total <= MAX_FILE as u64, "OBJECT_REQUIRES_STREAMING");
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            return Ok(json!({"hex":hex::encode(bytes)}));
-        }
+        ensure!(total <= MAX_FILE as u64, "OBJECT_REQUIRES_STREAMING");
         let mut bytes = Vec::new();
-        file.take(64 * 1024).read_to_end(&mut bytes)?;
-        let binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
-        Ok(
-            json!({"object":object,"size":total,"truncated":total > bytes.len() as u64,
-            "text":if binary { "Binary content; text preview unavailable".to_owned() } else { String::from_utf8_lossy(&bytes).into_owned() }}),
-        )
+        file.read_to_end(&mut bytes)?;
+        Ok(json!({"hex":hex::encode(bytes)}))
     }
 }
 

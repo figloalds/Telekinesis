@@ -35,10 +35,27 @@ fn independently_encoded_descriptor_goldens() {
             descriptor
         );
     }
-    let legacy = FileContentRef::new(ContentKind::Legacy, Digest::bytes(b"abc"), 3).unwrap();
+}
+
+#[test]
+fn retired_descriptor_kind_and_untyped_hash_are_rejected() {
+    let retired = hex::decode(vectors()["legacy"]["descriptor_hex"].as_str().unwrap()).unwrap();
     assert_eq!(
-        hex::encode(legacy.encode().unwrap()),
-        vectors["legacy"]["descriptor_hex"]
+        FileContentRef::decode(&retired).unwrap_err().to_string(),
+        "UNSUPPORTED_CONTENT_KIND"
+    );
+    let mut json = serde_json::to_value(
+        FileContentRef::new(ContentKind::Direct, Digest::bytes(b"abc"), 3).unwrap(),
+    )
+    .unwrap();
+    json["kind"] = serde_json::json!("legacy");
+    json["format"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<FileContentRef>(json).is_err());
+    assert!(
+        serde_json::from_value::<FileContentRef>(serde_json::json!(
+            Digest::bytes(b"abc").to_string()
+        ))
+        .is_err()
     );
 }
 

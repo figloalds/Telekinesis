@@ -35,7 +35,7 @@ static NTSTATUS security_name(FSP_FILE_SYSTEM *fs,PWSTR name,PUINT32 attrs,PSECU
 }
 static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,UINT32 op,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {
     TK_HANDLE *handle=calloc(1,sizeof *handle);if(!handle)return STATUS_INSUFFICIENT_RESOURCES;
-    TK_INFO info={0};UINT32 flags=((options&FILE_DIRECTORY_FILE)?1:0)|((access&(FILE_WRITE_DATA|FILE_APPEND_DATA))?2:0);
+    TK_INFO info={0};UINT32 flags=((options&FILE_DIRECTORY_FILE)?1:0)|((access&(FILE_WRITE_DATA|FILE_APPEND_DATA))?2:0)|((options&FILE_DELETE_ON_CLOSE)?4:0);
     NTSTATUS result=tk_call(op,name,&handle->token,0,op==2?&attrs:0,op==2?sizeof attrs:0,flags,&info,0);
     if(!NT_SUCCESS(result)){free(handle);return result;}*context=handle;fill(fi,&info);
     /* Force ordinary reads/writes through Rust; kernel data caching would hide
@@ -46,7 +46,7 @@ static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs
 static NTSTATUS create(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,PSECURITY_DESCRIPTOR sd,UINT64 allocation,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,attrs,2,context,fi);}
 static NTSTATUS open_file(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,0,3,context,fi);}
 static NTSTATUS overwrite(FSP_FILE_SYSTEM *fs,PVOID context,UINT32 attrs,BOOLEAN replace,UINT64 allocation,FSP_FSCTL_FILE_INFO *fi) {return call(6,0,context,0,0,0,0,fi,0);}
-static void cleanup(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name,ULONG flags) {call(9,0,context,0,0,0,(flags&FspCleanupDelete)?1:0,0,0);}
+static void cleanup(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name,ULONG flags) {call(9,name,context,0,0,0,(flags&FspCleanupDelete)?1:0,0,0);}
 static void close_file(FSP_FILE_SYSTEM *fs,PVOID context) {call(10,0,context,0,0,0,0,0,0);free(context);}
 static NTSTATUS read_file(FSP_FILE_SYSTEM *fs,PVOID context,PVOID buffer,UINT64 offset,ULONG length,PULONG count) {return call(4,0,context,offset,buffer,length,0,0,count);}
 static NTSTATUS write_file(FSP_FILE_SYSTEM *fs,PVOID context,PVOID buffer,UINT64 offset,ULONG length,BOOLEAN append,BOOLEAN constrained,PULONG count,FSP_FSCTL_FILE_INFO *fi) {return call(5,0,context,offset,buffer,length,(append?1:0)|(constrained?2:0),fi,count);}
@@ -57,8 +57,12 @@ static NTSTATUS basic(FSP_FILE_SYSTEM *fs,PVOID context,UINT32 attrs,UINT64 ct,U
     return call(14,0,context,0,&update,sizeof update,0,fi,0);
 }
 static NTSTATUS size_file(FSP_FILE_SYSTEM *fs,PVOID context,UINT64 size,BOOLEAN allocation,FSP_FSCTL_FILE_INFO *fi) {return call(6,0,context,size,0,0,allocation?1:0,fi,0);}
-static NTSTATUS can_delete(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name) {return call(11,0,context,0,0,0,0,0,0);}
-static NTSTATUS rename_file(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR old_name,PWSTR new_name,BOOLEAN replace) {return call(12,new_name,context,0,0,0,replace?1:0,0,0);}
+static NTSTATUS can_delete(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name) {return call(11,0,context,0,0,0,FspFileSystemGetOperationContext()->Request->Req.SetInformation.Info.DispositionEx.Flags,0,0);}
+static NTSTATUS set_delete(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name,BOOLEAN delete_file) {
+    if(delete_file){NTSTATUS result=can_delete(fs,context,name);if(!NT_SUCCESS(result))return result;}
+    return call(15,name,context,0,0,0,delete_file?1:0,0,0);
+}
+static NTSTATUS rename_file(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR old_name,PWSTR new_name,BOOLEAN replace) {return call(12,new_name,context,0,0,0,(replace?1:0)|(FspFileSystemGetOperationContext()->Request->Req.SetInformation.Info.RenameEx.Flags&2),0,0);}
 static NTSTATUS get_security(FSP_FILE_SYSTEM *fs,PVOID context,PSECURITY_DESCRIPTOR sd,SIZE_T *size) {return sec(sd,size);}
 static NTSTATUS read_dir(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR pattern,PWSTR marker,PVOID buffer,ULONG length,PULONG count) {
     TK_HANDLE *handle=context;UINT64 ordinal;*count=0;
@@ -101,17 +105,22 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
     Interface.Create=create;Interface.Open=open_file;Interface.Overwrite=overwrite;
     Interface.Cleanup=cleanup;Interface.Close=close_file;Interface.Read=read_file;Interface.Write=write_file;
     Interface.Flush=flush;Interface.GetFileInfo=get_info;Interface.SetBasicInfo=basic;Interface.SetFileSize=size_file;
-    Interface.CanDelete=can_delete;Interface.Rename=rename_file;Interface.GetSecurity=get_security;Interface.ReadDirectory=read_dir;
+    Interface.CanDelete=can_delete;Interface.SetDelete=set_delete;Interface.Rename=rename_file;Interface.GetSecurity=get_security;Interface.ReadDirectory=read_dir;
     FSP_FSCTL_VOLUME_PARAMS p={0};p.Version=sizeof p;p.SectorSize=4096;p.SectorsPerAllocationUnit=1;
     p.MaxComponentLength=255;p.FileInfoTimeout=0;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
     p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=1;p.UmFileContextIsUserContext2=1;
+    /* Every mount uses native retirement for open destination handles. */
+    p.SupportsPosixUnlinkRename=1;
     if(irp_timeout_ms)p.IrpTimeout=irp_timeout_ms;
     wcscpy_s(p.FileSystemName,sizeof p.FileSystemName/sizeof(WCHAR),L"TKFS");
     NTSTATUS status=FspFileSystemCreate(L"WinFsp.Disk",&p,&Interface,out);
     if(!NT_SUCCESS(status))return status;
-    /* Rust serializes semantic mutations. Keep only namespace guards here so
-       a read waiting for remote content cannot hold a volume-wide mutex. */
+    /* FINE still holds a volume-wide exclusive guard across Create/rename/
+       deleting Cleanup. Native namespace reservations, entity gates and Core
+       revalidation own those mutations without that guard spanning durability.
+       The kernel's per-file serialization remains in effect. */
     FspFileSystemSetOperationGuardStrategy(*out,FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
+    FspFileSystemSetOperationGuard(*out,0,0);
     status=FspFileSystemSetMountPoint(*out,path);
     if(NT_SUCCESS(status))status=FspFileSystemStartDispatcher(*out,threads);
     if(!NT_SUCCESS(status)){FspFileSystemDelete(*out);*out=0;}return status;

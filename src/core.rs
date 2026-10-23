@@ -6,7 +6,6 @@
 //! recovery phases, branches/events/projection access, rebuilds and every local
 //! filesystem or branch operation. Per-concern `impl Store` blocks live in the
 //! submodules; `pub use` keeps every historical `tkfs::core::*` path.
-use crate::backend::ObjectBackend;
 use anyhow::{Context, Result, bail, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -24,12 +23,15 @@ use uuid::Uuid;
 
 pub mod admission;
 pub mod commit;
+pub(crate) mod content;
 pub mod content_objects;
 pub mod content_saves;
 pub mod demand;
 pub mod derive;
+mod export;
 pub mod inbox;
 pub mod objects;
+mod schema;
 pub mod sharing;
 mod snapshot;
 pub mod status;
@@ -40,6 +42,7 @@ use derive::{activated_ids, persist_projection};
 use inbox::{validate_direct_links, validate_known_links};
 
 pub use derive::project;
+pub use export::SharedExport;
 pub use objects::ScrubOutcome;
 pub(crate) use objects::install_object;
 pub use objects::{ObjectLocks, VerifyMode};
@@ -316,6 +319,13 @@ pub struct Entry {
     pub kind: String,
     pub parent: String,
     pub name: String,
+    /// Retained until the remaining status/artifact consumers are consolidated.
+    /// Supported projections never carry a whole-file string here.
+    #[serde(
+        default,
+        serialize_with = "serialize_empty_content",
+        deserialize_with = "deserialize_empty_content"
+    )]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_ref: Option<crate::model::content::FileContentRef>,
@@ -327,28 +337,42 @@ pub struct Entry {
     #[serde(default)]
     pub basic: Option<BasicInfo>,
 }
+fn deserialize_empty_content<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    let value = Option::<String>::deserialize(deserializer)?;
+    if value.is_some() {
+        return Err(serde::de::Error::custom(
+            "INVALID_CONTENT: whole-file projection strings are unsupported",
+        ));
+    }
+    Ok(None)
+}
+fn serialize_empty_content<S: serde::Serializer>(
+    value: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    if value.is_some() {
+        return Err(serde::ser::Error::custom(
+            "INVALID_CONTENT: whole-file projection strings are unsupported",
+        ));
+    }
+    serializer.serialize_none()
+}
 impl Entry {
-    /// Keep the old string field's meaning unchanged. Typed descriptors have a
-    /// separate projection field and never masquerade as whole-file hashes.
+    /// A projected file-content register is always a validated descriptor.
     pub(crate) fn set_content_value(&mut self, value: &Value) -> Result<()> {
-        if let Some(object) = value.as_str() {
-            self.content = Some(object.to_owned());
-            self.content_ref = None;
-        } else {
-            let reference: crate::model::content::FileContentRef =
-                serde_json::from_value(value.clone()).context("INVALID_CONTENT")?;
-            reference.validate()?;
-            self.content = None;
-            self.content_ref = Some(reference);
-        }
+        ensure!(value.is_object(), "INVALID_CONTENT");
+        let reference: crate::model::content::FileContentRef =
+            serde_json::from_value(value.clone()).context("INVALID_CONTENT")?;
+        reference.validate()?;
+        self.content = None;
+        self.content_ref = Some(reference);
         Ok(())
     }
 
     pub fn content_value(&self) -> Option<Value> {
-        self.content_ref
-            .as_ref()
-            .map(|reference| json!(reference))
-            .or_else(|| self.content.as_ref().map(|object| json!(object)))
+        self.content_ref.as_ref().map(|reference| json!(reference))
     }
 
     pub fn basic_info(&self) -> BasicInfo {
@@ -472,50 +496,15 @@ impl Store {
             !repo.is_empty() && !device.is_empty(),
             "INVALID_STORE_IDENTITY"
         );
-        fs::create_dir_all(root)?;
-        let mut db = Connection::open(root.join("metadata.sqlite"))?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY,value TEXT NOT NULL);")?;
-        let tx = db.transaction()?;
-        for (key, expected) in [("repo", repo), ("device", device)] {
-            let actual: Option<String> = tx
-                .query_row("SELECT value FROM config WHERE key=?", [key], |r| r.get(0))
-                .optional()?;
-            if let Some(actual) = actual {
-                ensure!(actual == expected, "STORE_IDENTITY_MISMATCH");
-            } else {
-                tx.execute("INSERT INTO config VALUES(?,?)", [key, expected])?;
-            }
-        }
-        tx.commit()?;
-        drop(db);
-        Self::open(root, Some(repo))
+        Self::open_selected(root, Some(repo), Some(device), OpenOptions::default(), true)
     }
 
-    /// Validate before invoking the legacy schema/recovery path. Missing metadata
-    /// or identities must never become a newly initialized healthy replica.
+    /// Open only an initialized current-format store, never invent identities.
     pub fn open_existing(root: &Path) -> Result<Self> {
         Self::open_existing_with(root, OpenOptions::default())
     }
-    /// `open_existing` with explicit recovery options (see `OpenOptions`).
     pub fn open_existing_with(root: &Path, options: OpenOptions) -> Result<Self> {
-        ensure!(
-            root.join("objects").is_dir() && root.join("metadata.sqlite").is_file(),
-            "STATE_NOT_INITIALIZED"
-        );
-        let db = Connection::open_with_flags(
-            root.join("metadata.sqlite"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        for key in ["repo", "device", "active", "generation"] {
-            let value: String = db
-                .query_row("SELECT value FROM config WHERE key=?", [key], |r| r.get(0))
-                .context("INVALID_STORE_METADATA")?;
-            ensure!(!value.is_empty(), "INVALID_STORE_METADATA");
-        }
-        let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM branches WHERE id=(SELECT value FROM config WHERE key='active'))", [], |r| r.get(0))?;
-        ensure!(valid, "INVALID_SELECTED_BRANCH");
-        drop(db);
-        Self::open_with(root, None, options)
+        Self::open_selected(root, None, None, options, false)
     }
 
     pub fn open(root: &Path, repo: Option<&str>) -> Result<Self> {
@@ -525,15 +514,22 @@ impl Store {
     /// on the opening thread, so startup progress stays truthful (invariant 28),
     /// and the RPC listener can only open after all of them (invariant 24).
     fn open_with(root: &Path, repo: Option<&str>, options: OpenOptions) -> Result<Self> {
-        let db = Self::open_schema(root)?;
-        snapshot::initialize(&db)?;
-        let mut store = Self::open_identity(db, root, repo)?;
-        objects::ensure_schema(&mut store)?;
-        inbox::ensure_schema(&mut store)?;
-        sharing::ensure_schema(&mut store)?;
-        admission::ensure_schema(&store.db)?;
-        content_saves::ensure_schema(&store.db)?;
-        content_objects::ensure_schema(&store.db)?;
+        Self::open_selected(root, repo, None, options, true)
+    }
+    fn open_selected(
+        root: &Path,
+        repo: Option<&str>,
+        device: Option<&str>,
+        options: OpenOptions,
+        create: bool,
+    ) -> Result<Self> {
+        commit::verified::epoch_ms();
+        let db = schema::open(root, repo, device, create)?;
+        let mut store = Self::open_identity(db, root)?;
+        objects::repair_indexes(&mut store)?;
+        sharing::repair_feed(&mut store)?;
+        snapshot::repair_journal_index(&store.db)?;
+        content_objects::reset_reconciliation(&store.db)?;
         objects::startup_object_check(&mut store, options.verify)?;
         crate::startup::progress("validating journal");
         store.evacuate_unvalidated_journal()?;
@@ -541,72 +537,28 @@ impl Store {
         store.rebuild_frontiers()?;
         store.resume_or_rebuild()?;
         inbox::startup_drain(&mut store, options.defer_activation)?;
+        if create {
+            crate::content::LocalContent::open(&store.root)?.import(
+                &mut [].as_slice(),
+                0,
+                &content::import_context(),
+            )?;
+        }
         Ok(store)
     }
-    /// Phase 1: the legacy schema. Every statement is idempotent.
-    fn open_schema(root: &Path) -> Result<Connection> {
-        fs::create_dir_all(root.join("objects"))?;
-        let db = Connection::open(root.join("metadata.sqlite"))?;
-        db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
-            CREATE TABLE IF NOT EXISTS config(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS branches(id TEXT PRIMARY KEY, name TEXT NOT NULL, shared INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS current_state(branch TEXT PRIMARY KEY, payload TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS current_parts(branch TEXT NOT NULL,entity TEXT NOT NULL,entry TEXT NOT NULL,heads TEXT NOT NULL,PRIMARY KEY(branch,entity));
-            CREATE TABLE IF NOT EXISTS conflicts(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL, resolved_by TEXT);
-            CREATE TABLE IF NOT EXISTS outbox(event TEXT PRIMARY KEY, acknowledged INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS receipts(id TEXT PRIMARY KEY, payload_hash TEXT NOT NULL, result TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS checkpoints(id TEXT PRIMARY KEY, branch TEXT NOT NULL, object TEXT NOT NULL, message TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS peer_known(peer TEXT NOT NULL,event TEXT NOT NULL,PRIMARY KEY(peer,event));
-            CREATE TABLE IF NOT EXISTS received_shared_objects(hash TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS incoming_events(id TEXT PRIMARY KEY,payload TEXT NOT NULL,error TEXT);
-            CREATE TABLE IF NOT EXISTS peer_objects(peer TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(peer,hash));")?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS event_frontier(branch TEXT NOT NULL,event TEXT NOT NULL,PRIMARY KEY(branch,event));")?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS object_sizes(hash TEXT PRIMARY KEY,size INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS published_objects(hash TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS object_requests(hash TEXT PRIMARY KEY,requested_ms INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS object_references(hash TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS object_errors(hash TEXT PRIMARY KEY,error TEXT NOT NULL,at INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS peer_requests(peer TEXT NOT NULL,hash TEXT NOT NULL,PRIMARY KEY(peer,hash));")?;
-        Ok(db)
-    }
-    /// Phase 2 (after `snapshot::initialize`): legacy branch-table migration,
-    /// store identity and the in-memory handle.
-    fn open_identity(db: Connection, root: &Path, repo: Option<&str>) -> Result<Self> {
-        let schema: String = db.query_row(
-            "SELECT sql FROM sqlite_master WHERE name='branches'",
-            [],
-            |r| r.get(0),
-        )?;
-        if schema.contains("UNIQUE") {
-            db.execute_batch("BEGIN IMMEDIATE; ALTER TABLE branches RENAME TO branches_legacy; CREATE TABLE branches(id TEXT PRIMARY KEY,name TEXT NOT NULL,shared INTEGER NOT NULL); INSERT INTO branches SELECT * FROM branches_legacy; DROP TABLE branches_legacy; COMMIT;")?;
-        }
-        let get = |key: &str| -> Result<Option<String>> {
-            Ok(db
-                .query_row("SELECT value FROM config WHERE key=?", [key], |r| r.get(0))
-                .optional()?)
+    /// The current schema initializer owns identity creation. Reopening only
+    /// reads committed identities and never fills a missing field.
+    fn open_identity(db: Connection, root: &Path) -> Result<Self> {
+        let get = |key: &str| -> Result<String> {
+            db.query_row("SELECT value FROM config WHERE key=?", [key], |r| r.get(0))
+                .context("INVALID_STORE_METADATA")
         };
-        let repo_id = get("repo")?.unwrap_or_else(|| repo.map(str::to_owned).unwrap_or_else(id));
-        if let Some(r) = repo {
-            ensure!(r == repo_id, "REPOSITORY_MISMATCH");
-        }
-        let device = get("device")?.unwrap_or_else(id);
-        let main = hash(format!("tkfs-v1/{repo_id}/main").as_bytes());
-        let active = get("active")?.unwrap_or_else(|| main.clone());
-        let generation: u64 = get("generation")?.unwrap_or_else(|| "0".into()).parse()?;
-        db.execute(
-            "INSERT OR IGNORE INTO branches VALUES(?, 'main', 1)",
-            [&main],
-        )?;
-        for (k, v) in [
-            ("repo", repo_id.as_str()),
-            ("device", device.as_str()),
-            ("active", active.as_str()),
-            ("generation", &generation.to_string()),
-        ] {
-            db.execute("INSERT OR IGNORE INTO config VALUES(?,?)", [k, v])?;
-        }
+        let repo_id = get("repo")?;
+        let device = get("device")?;
+        let active = get("active")?;
+        let generation: u64 = get("generation")?
+            .parse()
+            .context("INVALID_STORE_METADATA")?;
         Ok(Self {
             db,
             root: root.to_owned(),
@@ -646,9 +598,7 @@ impl Store {
         device: &str,
         timeout: std::time::Duration,
     ) -> Result<Self> {
-        let db = Connection::open(root.join("metadata.sqlite"))?;
-        db.busy_timeout(timeout)?;
-        db.execute_batch("PRAGMA synchronous=FULL;")?;
+        let db = schema::secondary(root, repo, device, timeout)?;
         let active = db.query_row("SELECT value FROM config WHERE key='active'", [], |row| {
             row.get(0)
         })?;
@@ -1018,11 +968,16 @@ impl Store {
             },
         ];
         if kind == "file" {
+            self.check_content_write()?;
             changes.push(Change {
                 entity: entity.clone(),
                 field: "content".into(),
                 parents: vec![],
-                value: json!(self.put_object(b"")?),
+                value: json!(crate::model::content::FileContentRef::new(
+                    crate::model::content::ContentKind::Direct,
+                    crate::model::content::Digest::bytes(&[]),
+                    0
+                )?),
             });
         }
         let branch = self.branch(&self.active)?;
@@ -1059,134 +1014,6 @@ impl Store {
         }
         let change = self.current_change(entity, "basic", json!(basic))?;
         self.commit(self.event(&self.branch(&self.active)?, vec![change]), true)
-    }
-    pub fn write_revision(
-        &mut self,
-        entity: &str,
-        base: Option<String>,
-        bytes: &[u8],
-    ) -> Result<String> {
-        // An edit also asserts existence. Parent only the existence revision the
-        // writer observed: callers needing an old base use write_with_base.
-        let alive = self.current_change(entity, "alive", json!(true))?;
-        self.write_with_parents(entity, base, alive.parents, bytes, 0)
-    }
-    pub fn write_with_base(
-        &mut self,
-        entity: &str,
-        content_base: Option<String>,
-        alive_base: Option<String>,
-        bytes: &[u8],
-    ) -> Result<String> {
-        self.write_with_base_and_times(entity, content_base, alive_base, bytes, 0)
-    }
-    pub fn write_with_base_and_times(
-        &mut self,
-        entity: &str,
-        content_base: Option<String>,
-        alive_base: Option<String>,
-        bytes: &[u8],
-        preserve_times: u8,
-    ) -> Result<String> {
-        self.write_with_parents(
-            entity,
-            content_base,
-            alive_base.into_iter().collect(),
-            bytes,
-            preserve_times,
-        )
-    }
-    fn write_with_parents(
-        &mut self,
-        entity: &str,
-        content_base: Option<String>,
-        alive_parents: Vec<String>,
-        bytes: &[u8],
-        preserve_times: u8,
-    ) -> Result<String> {
-        let object = self.put_object(bytes)?;
-        self.write_object_with_parents(entity, content_base, alive_parents, object, preserve_times)
-    }
-    pub fn write_stream_with_base_and_times(
-        &mut self,
-        entity: &str,
-        content_base: Option<String>,
-        alive_base: Option<String>,
-        source: &mut impl Read,
-        preserve_times: u8,
-    ) -> Result<String> {
-        let object = self.put_stream(source)?;
-        self.write_object_with_parents(
-            entity,
-            content_base,
-            alive_base.into_iter().collect(),
-            object,
-            preserve_times,
-        )
-    }
-    /// [`Store::write_with_base_and_times`] of bytes already stored
-    /// ([`Store::put_object`], [`Store::put_stream`]): the commit alone, so a
-    /// caller can store the bytes before it takes SQLite's writer slot
-    /// (WP4.INT re-review: a retained save held it for the whole copy).
-    pub fn write_object_with_base_and_times(
-        &mut self,
-        entity: &str,
-        content_base: Option<String>,
-        alive_base: Option<String>,
-        object: String,
-        preserve_times: u8,
-    ) -> Result<String> {
-        self.write_object_with_parents(
-            entity,
-            content_base,
-            alive_base.into_iter().collect(),
-            object,
-            preserve_times,
-        )
-    }
-    fn write_object_with_parents(
-        &mut self,
-        entity: &str,
-        content_base: Option<String>,
-        alive_parents: Vec<String>,
-        object: String,
-        preserve_times: u8,
-    ) -> Result<String> {
-        let b = self.branch(&self.active)?;
-        let mut event = self.event(
-            &b,
-            vec![
-                Change {
-                    entity: entity.into(),
-                    field: "content".into(),
-                    parents: content_base.into_iter().collect(),
-                    value: json!(object),
-                },
-                Change {
-                    entity: entity.into(),
-                    field: "alive".into(),
-                    parents: alive_parents,
-                    value: json!(true),
-                },
-            ],
-        );
-        let entry = self.entry(entity)?;
-        if entry.basic.is_some() || preserve_times != 0 {
-            let mut basic = entry.basic_info();
-            if preserve_times & 2 == 0 {
-                basic.write_time = filetime(event.created_ms);
-            }
-            if preserve_times & 4 == 0 {
-                basic.change_time = filetime(event.created_ms);
-            }
-            basic.attributes = BasicInfo::attributes(&entry.kind, basic.attributes | 0x20)?;
-            event
-                .changes
-                .push(self.current_change(entity, "basic", json!(basic))?);
-        }
-        let rev = event.id.clone();
-        self.commit(event, true)?;
-        Ok(rev)
     }
     pub fn rename(&mut self, entity: &str, target: &str, replace: bool) -> Result<()> {
         let (parent, name) = split_path(target)?;
@@ -1292,6 +1119,14 @@ impl Store {
         ensure!(p.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
         let generation = self.generation + 1;
         let tx = self.db.savepoint()?;
+        ensure!(
+            !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_delete_intents) OR EXISTS(SELECT 1 FROM directory_delete_intents)",
+                [],
+                |r| r.get::<_, bool>(0)
+            )?,
+            "RECOVERY_REQUIRED: pending native deletion"
+        );
         tx.execute("UPDATE config SET value=? WHERE key='active'", [&b.id])?;
         tx.execute(
             "UPDATE config SET value=? WHERE key='generation'",
@@ -1445,27 +1280,6 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(json!(records.into_iter().map(|(id,branch,object,message)|json!({"id":id,"branch":branch,"object":object,"message":message})).collect::<Vec<_>>()))
     }
-    /// Explicit export; all authorization remains rooted in shared events.
-    pub fn export_shared_objects(&self, backend: &dyn ObjectBackend) -> Result<Value> {
-        let events: Vec<_> = self
-            .events()?
-            .into_iter()
-            .filter(|e| e.branch.shared)
-            .collect();
-        let objects: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
-        for object in &objects {
-            ensure!(
-                backend.put_stream(&mut self.open_object(object)?)? == *object,
-                "BACKEND_HASH_MISMATCH"
-            );
-        }
-        let branches: Vec<_> = self.branches()?.into_iter().filter(|b| b.shared).collect();
-        let manifest = json!({"format":"tkfs-shared-export-1","repo":self.repo,"branches":branches,"events":events,"objects":objects});
-        let manifest_object = backend.put_verified(&serde_json::to_vec(&manifest)?)?;
-        Ok(
-            json!({"backend":"local-directory-test-bucket","manifest":manifest_object,"objects":objects.len(),"events":manifest["events"].as_array().unwrap().len(),"remote_validated":false}),
-        )
-    }
     /// Restore creates a fresh PRIVATE branch; it never rewinds shared history.
     pub fn restore(&mut self, checkpoint: &str, name: &str) -> Result<Branch> {
         name_key(name)?;
@@ -1544,6 +1358,13 @@ impl Store {
         Ok(checkpoint)
     }
     pub fn receipt(&self, request: &str, payload: &Value) -> Result<Option<Value>> {
+        self.receipt_fingerprint(request, &hash(&serde_json::to_vec(payload)?))
+    }
+    pub(crate) fn receipt_fingerprint(
+        &self,
+        request: &str,
+        fingerprint: &str,
+    ) -> Result<Option<Value>> {
         let old: Option<(String, String)> = self
             .db
             .query_row(
@@ -1553,10 +1374,7 @@ impl Store {
             )
             .optional()?;
         if let Some((h, result)) = old {
-            ensure!(
-                h == hash(&serde_json::to_vec(payload)?),
-                "REQUEST_ID_REUSED"
-            );
+            ensure!(h == fingerprint, "REQUEST_ID_REUSED");
             Ok(Some(serde_json::from_str(&result)?))
         } else {
             Ok(None)

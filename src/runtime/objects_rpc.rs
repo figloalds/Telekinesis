@@ -1416,7 +1416,7 @@ fn write(ctx: &WorkerCtx, header: WriteHeader, body: &[u8]) -> Result<(Value, Ve
             for (hash, error) in &local {
                 crate::util::fault::trigger("objects.write.before_local_backoff").map_err(wire)?;
                 let Some(work) = work.get(hash) else { continue };
-                let Ok(_family) = objects_effects::try_gate(&work.family) else {
+                let Ok(_family) = work.family.try_commit() else {
                     continue;
                 };
                 let Ok(_object) = work.object_gate() else {
@@ -1544,7 +1544,7 @@ fn wait_family_gate<'a>(
                         "object family run superseded",
                     ));
                 }
-                if Instant::now() >= deadline {
+                if family.commit_in_progress() || Instant::now() >= deadline {
                     return Err(error);
                 }
                 crate::util::fault::hang(point);
@@ -1565,7 +1565,7 @@ mod write_admission_tests {
             crate::core::Store::initialize(dir.path(), "gate-wait", &crate::core::id()).unwrap(),
         )));
         let ctx = crate::worker::build_ctx(shared, dir.path(), false, None);
-        let family = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let family = std::sync::Arc::new(objects_effects::Family::default());
         let held = family.lock().unwrap();
         let began = Instant::now();
         assert_eq!(

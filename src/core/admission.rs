@@ -8,27 +8,6 @@ use crate::model::{
 
 pub const ADMISSION_PAGE: usize = 256;
 
-pub(super) fn ensure_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("SAVEPOINT content_admission_schema;
-        CREATE TABLE IF NOT EXISTS content_root_metadata(
-            reference TEXT PRIMARY KEY,event TEXT NOT NULL,entity TEXT NOT NULL,
-            branch TEXT NOT NULL,root BLOB NOT NULL CHECK(length(root)=48),
-            generation INTEGER NOT NULL CHECK(generation>0),granted INTEGER NOT NULL,
-            shared INTEGER NOT NULL,publishable INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS content_roots_by_event ON content_root_metadata(event);
-        CREATE TABLE IF NOT EXISTS content_root_outbox(
-            seq INTEGER PRIMARY KEY AUTOINCREMENT,repository TEXT NOT NULL,branch TEXT NOT NULL,
-            reference TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),
-            root BLOB NOT NULL CHECK(length(root)=48),action TEXT NOT NULL CHECK(action IN ('grant','withdraw')),
-            shared INTEGER NOT NULL,publishable INTEGER NOT NULL,UNIQUE(reference,generation));
-        CREATE TABLE IF NOT EXISTS object_admission_cursor(consumer TEXT PRIMARY KEY,cursor INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS object_root_admission(
-            reference TEXT PRIMARY KEY,branch TEXT NOT NULL,root BLOB NOT NULL CHECK(length(root)=48),
-            generation INTEGER NOT NULL,granted INTEGER NOT NULL,shared INTEGER NOT NULL,publishable INTEGER NOT NULL);
-        RELEASE content_admission_schema;")?;
-    Ok(())
-}
-
 /// Stable per-event register identity, including unambiguous length-delimited
 /// JSON components. It is never a provider path or an authorization by hash.
 pub fn reference_id(event: &str, entity: &str) -> String {
@@ -43,8 +22,9 @@ pub(super) fn append_event(db: &Connection, event: &Event, local: bool) -> Resul
     for change in event
         .changes
         .iter()
-        .filter(|change| change.field == "content" && change.value.is_object())
+        .filter(|change| change.field == "content")
     {
+        ensure!(change.value.is_object(), "INVALID_CONTENT");
         let root: FileContentRef = serde_json::from_value(change.value.clone())?;
         let encoded = root.encode()?;
         let reference = reference_id(&event.id, &change.entity);
@@ -84,31 +64,15 @@ pub(super) fn append_event(db: &Connection, event: &Event, local: bool) -> Resul
 }
 
 impl Store {
-    /// Before activation, typed events are permitted only in explicitly marked
-    /// isolated fixture stores. WP6.6 replaces this fixture gate with negotiated
-    /// repository activation and the deployment fence. No CLI enables it.
+    /// Every selected current store supports typed content. Unsupported
+    /// representations are refused before metadata admission.
     pub(super) fn check_content_capability(&self, event: &Event) -> Result<()> {
-        if !event
-            .changes
-            .iter()
-            .any(|change| change.field == "content" && change.value.is_object())
-        {
-            return Ok(());
-        }
-        let enabled: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM config WHERE key='fixture:content_v1' AND value='1')",
-            [],
-            |row| row.get(0),
-        )?;
-        ensure!(
-            enabled,
-            "PEER_NEEDS_UPGRADE: content-v1 is not active for this repository"
-        );
         for change in event
             .changes
             .iter()
-            .filter(|change| change.field == "content" && change.value.is_object())
+            .filter(|change| change.field == "content")
         {
+            ensure!(change.value.is_object(), "INVALID_CONTENT");
             // A future valid format is an incompatibility, never corruption.
             if change
                 .value

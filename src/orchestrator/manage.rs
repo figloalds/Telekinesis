@@ -49,13 +49,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The legacy worker ops the `Folder` passthrough allows (unchanged).
+/// Worker control ops exposed by the `Folder` passthrough.
 pub const FOLDER_OPS: &[&str] = &[
     "status",
     "folder-details",
     "conflicts",
-    "preview-object",
-    "request-object",
+    "preview-content",
+    "request-content",
+    "cancel-content-request",
     "resolve",
     "recover",
     "branches",

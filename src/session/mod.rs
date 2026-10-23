@@ -5,7 +5,7 @@
 //!   cancellation, streaming, backpressure and a server handler pool (WP1.9);
 //! * `io`: the per-connection I/O thread, the only code that touches a
 //!   session socket (WP1.9);
-//! * [`handshake`] and [`auth`]: session establishment, HMAC authentication
+//! * [`handshake`] and [`auth`]: session establishment, application credentials
 //!   and legacy detection (WP1.10). `dial`/`accept` (and the loopback pair)
 //!   run the handshake and hand the authenticated socket to
 //!   [`Conn::from_established`]; `connect_v3`/`accept_v3` stop at the

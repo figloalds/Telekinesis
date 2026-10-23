@@ -22,7 +22,7 @@
 //! | State | Entered | Leaves |
 //! |---|---|---|
 //! | `Dialing` | a dial starts (every resolved address, 3 s each) | `Handshaking` once the server's `HELLO_ACK` arrives |
-//! | `Handshaking` | the HMAC step (the dialer derives its key) | `Ready`, or a failure below |
+//! | `Handshaking` | the ordinary credential exchange | `Ready`, or a failure below |
 //! | `Ready` | an authenticated session | `Backoff` when the session closes |
 //! | `Backoff` | a transient failure or a closed session | `Dialing` after 1 s → 60 s (±20 %), or on the peer's shared cadence while its network is down (below); at once when a sibling lane connects, unless the lane is backing off after a session the peer ended (below); the attempt count resets once the lane was `Ready` 5 s (healthy), and only then |
 //! | `Incompatible` | `PEER_NEEDS_UPGRADE`, `PEER_PROTOCOL_UNSUPPORTED`, any Incompatible-class refusal | rechecked after 10 min, on a change of the peer's record (a respawn), or on [`NetworkApi::reconfigure`] |
@@ -122,46 +122,11 @@
 //! are detached, counted ([`PeerManager::detached_lanes`]) and logged; they
 //! close their new session as soon as the dial returns.
 //!
-//! **Per-peer credentials (WP4.1).** A dial presents our outbound credential
-//! for the peer (`peer_credentials`, side `outbound`, read through the
-//! catalog contract, `CatalogApi::credentials`, since CCR-WP5.4-1) with
-//! the scheme `peer-hmac-v1`, the stored pairing code as the fallback for an
-//! acceptor that does not offer the scheme. Credentials are enrolled:
-//!
-//! * by [`NetworkApi::pair`], on its code-authenticated probe session, before
-//!   the peer is stored (`peer.enroll` with a fresh secret, sealed under the
-//!   code's key; `session::auth::seal_enrollment`);
-//! * automatically, for a peer paired before WP4.1 or whose credential is
-//!   gone: when lane 0 authenticated with the code, the `peer-credentials`
-//!   thread enrolls on that session (an older acceptor answers
-//!   `UNKNOWN_PEER_OPERATION`, logged once per session). No user action.
-//!
-//! An acceptor that refuses our credential (`PEER_REVOKED`: revoked by a
-//! rotation of its code, or lost) makes the supervisor stop presenting it
-//! (in memory) and the lane re-dial with the code at once; a rotated code
-//! then blocks the peer `Unauthorized` as before, a valid one re-enrolls on
-//! lane 0, which replaces the refused credential in the catalog. A refusal
-//! is not authenticated (a `GOAWAY` before `HELLO_ACK`, or after `AUTH`
-//! without a server proof), so it never deletes the stored credential:
-//! anyone answering at the peer's address could send one. Only a
-//! code-authenticated session, which proves the acceptor knows the code,
-//! replaces it. [`NetworkApi::unpair`] of a peer's last record first stops
-//! its supervisor from enrolling (an enrollment racing the revoke would
-//! leave an active credential at the peer; one already running stores
-//! nothing once the record is gone: `CatalogCmd::EnrollCredential` with
-//! `paired_only`), then, when
-//! we hold a credential, sends a best-effort `peer.revoke` (on lane 0 if it
-//! is up, else on a probe session, at most about [`REVOKE_BUDGET`]), then
-//! removes the record, which deletes our outbound credential with it.
-//! [`NetworkApi::remote_list`] presents the credential too, and retries once
-//! with the code on `PEER_REVOKED`.
-//!
-//! Invariants: 16 (a probe and every lane session are fresh requests, nothing
-//! is replayed), 20 (a legacy endpoint is `Incompatible`, the code is never
-//! sent), 21 (the code and the per-peer keys are only ever dial credentials:
-//! no status event, log line or error carries them; installation checks,
-//! self-pair refusal), 29 (every wait is interruptible by the supervisor's
-//! token and bounded).
+//! Application credentials are sent over the selected TLS/WSS or VPN channel.
+//! Pairing and a code-authenticated lane can enroll an ordinary per-peer
+//! credential. Reconnection, revocation and catalog writes use the existing
+//! bounded lane/catalog lifecycle; no custom transcript or enrollment cipher
+//! is involved. Unpair stops enrollment before removing/revoking the record.
 //!
 //! [`ConnHealth`]: crate::session::ConnHealth
 use crate::{
@@ -175,10 +140,9 @@ use crate::{
         status::{Direction, LaneState, StatusEvent},
     },
     orchestrator::{objects, scheduler},
-    pairing_code::Verifier,
     session::{
         self, ClientAuth, CodeAuth, Conn, ConnOptions, DialError, Priority, Reply,
-        auth::{self as peer_auth, EnrollReply, PEER_HMAC_V1, PeerAuth},
+        auth::{self as peer_auth, EnrollReply, PeerAuth},
     },
     util::{
         backoff::Backoff,
@@ -457,7 +421,7 @@ impl PeerManager {
         let cancel = ctx.shutdown.child();
         let ctx_catalog = ctx.catalog.clone();
         let catalog = CredentialCatalog::of(&ctx.catalog);
-        let credentials = CredentialWriter::start(ctx.installation.clone(), catalog.clone());
+        let credentials = CredentialWriter::start(catalog.clone());
         let manager = Arc::new(PeerManager {
             ctx,
             options,
@@ -756,10 +720,7 @@ impl PeerManager {
         let Some(key) = self.outbound_key(&record.installation) else {
             return self.probe_with(&record.endpoint, &code, expected, pool, cancel);
         };
-        let auth = PeerAuth {
-            key,
-            code: Some(record.code.clone()),
-        };
+        let auth = PeerAuth { key };
         match self.probe_with(&record.endpoint, &auth, expected, pool, cancel) {
             Err(error) if error.to_wire().code == "PEER_REVOKED" => {
                 self.probe_with(&record.endpoint, &code, expected, pool, cancel)
@@ -875,19 +836,10 @@ fn call_revoke(conn: &Conn) -> Result<(), ErrorWire> {
     .map_err(|error| error.to_wire())
 }
 
-/// Enrolls a fresh per-peer secret on an authenticated session (WP4.1):
-/// `peer.enroll` with the secret sealed under the pairing code's key for
-/// `server`'s salt. Returns `K_peer` once the acceptor stored it.
-fn enroll_on(
-    conn: &Conn,
-    local_installation: &str,
-    server: &session::ServerHello,
-    code: &str,
-) -> Result<[u8; 32], ErrorWire> {
+/// Sends a fresh credential enrollment over the selected TLS/WSS or VPN channel.
+fn enroll_on(conn: &Conn) -> Result<[u8; 32], ErrorWire> {
     let secret = peer_auth::new_secret();
-    let code_key = Verifier::derive_key(&server.salt, code);
-    let request =
-        peer_auth::seal_enrollment(&code_key, local_installation, &server.installation, &secret);
+    let request = peer_auth::enrollment_request(&secret);
     let header = serde_json::to_value(&request)
         .map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))?;
     let reply = conn
@@ -946,7 +898,7 @@ impl NetworkApi for PeerManager {
         // probe session. An acceptor that does not know `peer.enroll` keeps
         // the pairing code-only (its lane 0 tries again later).
         let enrolled = match &self.catalog {
-            Some(_) => match enroll_on(&conn, &self.ctx.installation, &server, code) {
+            Some(_) => match enroll_on(&conn) {
                 Ok(key) => Some(key),
                 Err(error) => {
                     event!(info, (error.code.as_str()), {
@@ -1981,7 +1933,6 @@ impl Supervisor {
         let posted = self.credentialing.writer.post(CredentialJob::Enroll {
             conn: conn.clone(),
             server: Box::new(server.clone()),
-            code: self.record.code.clone(),
             replaces: *lock(&self.refused_key),
             cancel: self.cancel.clone(),
             unpairing: self.unpairing.clone(),
@@ -2010,10 +1961,7 @@ impl Supervisor {
         let code = CodeAuth {
             code: self.record.code.clone(),
         };
-        let credential = credential.map(|key| PeerAuth {
-            key,
-            code: Some(self.record.code.clone()),
-        });
+        let credential = credential.map(|key| PeerAuth { key });
         let handshaking = || {
             self.answered(lane, attempt.id);
             self.set_lane(lane, LaneState::Handshaking, None, None, None);
@@ -2593,7 +2541,6 @@ enum CredentialJob {
     Enroll {
         conn: Conn,
         server: Box<session::ServerHello>,
-        code: String,
         replaces: Option<[u8; 32]>,
         cancel: Cancel,
         unpairing: Arc<AtomicBool>,
@@ -2609,7 +2556,7 @@ struct CredentialWriter {
 }
 
 impl CredentialWriter {
-    fn start(local: String, catalog: Option<Arc<CredentialCatalog>>) -> Arc<CredentialWriter> {
+    fn start(catalog: Option<Arc<CredentialCatalog>>) -> Arc<CredentialWriter> {
         let Some(catalog) = catalog else {
             return Arc::new(CredentialWriter {
                 tx: Mutex::new(None),
@@ -2620,7 +2567,7 @@ impl CredentialWriter {
             .name("peer-credentials".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
-                    run_credential_job(&local, &catalog, job);
+                    run_credential_job(&catalog, job);
                 }
             });
         let tx = match spawned {
@@ -2656,12 +2603,11 @@ impl CredentialWriter {
     }
 }
 
-fn run_credential_job(local: &str, catalog: &CredentialCatalog, job: CredentialJob) {
+fn run_credential_job(catalog: &CredentialCatalog, job: CredentialJob) {
     match job {
         CredentialJob::Enroll {
             conn,
             server,
-            code,
             replaces,
             cancel,
             unpairing,
@@ -2688,7 +2634,7 @@ fn run_credential_job(local: &str, catalog: &CredentialCatalog, job: CredentialJ
             // not write) is retried on the same session while it stays up
             // (WP4.INT re-review: it waited for lane 0 to reconnect, which
             // can be days on a stable link).
-            let mut outcome = enroll_on(&conn, local, &server, &code);
+            let mut outcome = enroll_on(&conn);
             for delay in ENROLL_RETRIES {
                 let retryable = outcome.as_ref().is_err_and(|error| {
                     matches!(
@@ -2703,7 +2649,7 @@ fn run_credential_job(local: &str, catalog: &CredentialCatalog, job: CredentialJ
                 if conn.closed().is_some() || stopped() {
                     break;
                 }
-                outcome = enroll_on(&conn, local, &server, &code);
+                outcome = enroll_on(&conn);
             }
             match outcome {
                 // Stored only while a record names the peer, checked in the
@@ -2820,7 +2766,7 @@ fn run_lane(supervisor: Arc<Supervisor>, lane: u32) {
             Ok((conn, server)) => {
                 supervisor.gate_success();
                 supervisor.lane_connected(lane, started, took);
-                if lane == 0 && !server.features.iter().any(|f| f == PEER_HMAC_V1) {
+                if lane == 0 && presented.is_none() {
                     supervisor.enroll_later(&conn, &server);
                 }
                 // No `backoff.success`: the attempt count resets only once

@@ -1,5 +1,4 @@
-//! Bounded coordinator for headless and explicitly installed native saves.
-//! Ordinary repositories retain the legacy path until capability activation.
+//! Bounded coordinator for current native saves.
 //! Checkpoint/construction/metadata writer/adoption run outside Engine.
 use super::{
     EngineGuard, Shared,
@@ -8,7 +7,7 @@ use super::{
 use crate::{
     content::{
         ContentProvider, LocalContent, ReadContext,
-        write::{SaveCheckpoint, WriteJournal, WriteSession},
+        write::{SaveCheckpoint, SaveIntent, WriteJournal, WriteSession},
     },
     core::content_saves::SaveReceipt,
     model::workspace::limits,
@@ -21,11 +20,15 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
+mod metadata;
+mod namespace;
+mod retirement;
+mod unlink;
 use uuid::Uuid;
 
 const POLL: Duration = Duration::from_millis(limits::CANCEL_POLL_MS);
@@ -76,6 +79,10 @@ struct FileState {
     session: Arc<WriteSession>,
     pending: Option<SaveCheckpoint>,
     needs_preflight: bool,
+    pending_basic: Option<metadata::PendingBasic>,
+    pending_rename: Option<namespace::PendingRename>,
+    pending_unlink: Option<unlink::PendingUnlink>,
+    pending_retirement: Option<SaveIntent>,
 }
 /// Stable local file identity across successful metadata/private generations.
 /// The adapter must retain this handle, not a predecessor WriteSession clone.
@@ -83,9 +90,15 @@ pub struct SaveFile {
     buffered_epoch: AtomicU64,
     checkpointed_epoch: AtomicU64,
     pub(crate) adapter_mutation: Mutex<()>,
+    pub(crate) byte_mutation: Mutex<()>,
     operation: Uuid,
     visible_len: AtomicU64,
+    visible_basic: Mutex<crate::content::write::NativeBasicState>,
+    visible_sequence: AtomicU64,
     state: Mutex<FileState>,
+    read_session: Mutex<Arc<WriteSession>>,
+    namespace_check: AtomicBool,
+    retirement_gate: Mutex<()>,
 }
 impl SaveFile {
     pub fn new(session: WriteSession) -> Arc<Self> {
@@ -95,29 +108,58 @@ impl SaveFile {
         Self::new_with_preflight(session, true)
     }
     fn new_with_preflight(session: WriteSession, needs_preflight: bool) -> Arc<Self> {
+        let session = Arc::new(session);
         Arc::new(Self {
             buffered_epoch: AtomicU64::new(0),
             checkpointed_epoch: AtomicU64::new(0),
             adapter_mutation: Mutex::new(()),
+            byte_mutation: Mutex::new(()),
             operation: session.operation(),
             visible_len: AtomicU64::new(session.visible_len()),
+            visible_basic: Mutex::new(session.native_basic_state()),
+            visible_sequence: AtomicU64::new(session.visible_sequence()),
+            read_session: Mutex::new(session.clone()),
+            namespace_check: AtomicBool::new(false),
+            retirement_gate: Mutex::new(()),
             state: Mutex::new(FileState {
-                session: Arc::new(session),
+                session,
                 pending: None,
                 needs_preflight,
+                pending_basic: None,
+                pending_rename: None,
+                pending_unlink: None,
+                pending_retirement: None,
             }),
         })
     }
     pub fn operation(&self) -> Uuid {
         self.operation
     }
+    pub(crate) fn check_namespace_before_mutation(&self) {
+        self.namespace_check.store(true, Ordering::Release);
+    }
+    pub(crate) fn visible_sequence(&self) -> u64 {
+        self.visible_sequence.load(Ordering::Acquire)
+    }
+    pub(crate) fn native_times(&self) -> Option<crate::content::write::NativeWriteTimes> {
+        self.basic_state().times
+    }
+    pub(crate) fn basic_state(&self) -> crate::content::write::NativeBasicState {
+        *crate::util::lock::lock(&self.visible_basic)
+    }
+    fn mirror(&self, session: &WriteSession) {
+        self.visible_len
+            .store(session.visible_len(), Ordering::Release);
+        *crate::util::lock::lock(&self.visible_basic) = session.native_basic_state();
+        self.visible_sequence
+            .store(session.visible_sequence(), Ordering::Release);
+    }
     pub fn write_at(&self, offset: u64, bytes: &[u8], context: &ReadContext) -> Result<()> {
         let mut state = lock(&self.state, context)?;
         state.needs_preflight = true;
         self.buffered()?;
         let result = state.session.write_at(offset, bytes, context);
-        self.visible_len
-            .store(state.session.visible_len(), Ordering::Release);
+        self.mirror(&state.session);
         result
     }
     pub fn set_len(&self, length: u64, context: &ReadContext) -> Result<()> {
@@ -125,8 +167,7 @@ impl SaveFile {
         state.needs_preflight = true;
         self.buffered()?;
         let result = state.session.set_len(length, context);
-        self.visible_len
-            .store(state.session.visible_len(), Ordering::Release);
+        self.mirror(&state.session);
         result
     }
     pub(crate) fn visible_len(&self) -> u64 {
@@ -161,6 +202,7 @@ impl SaveFile {
         bytes: &[u8],
         append: bool,
         constrained: bool,
+        time_policy: crate::content::write::NativeTimePolicy,
         preflight: crate::content::write::PreflightContext<'_>,
     ) -> Result<usize> {
         let context = preflight.context;
@@ -200,18 +242,19 @@ impl SaveFile {
         let result = (|| {
             for (index, part) in bytes[..count].chunks(limits::READ_BYTES).enumerate() {
                 selection.check(context)?;
-                state.session.write_at(
+                state.session.write_at_with_times(
                     offset
                         .checked_add((index * limits::READ_BYTES) as u64)
                         .ok_or_else(|| anyhow::anyhow!("RANGE_OVERFLOW"))?,
                     part,
+                    time_policy.disabled,
+                    time_policy.prior,
                     context,
                 )?;
             }
             Ok(count)
         })();
-        self.visible_len
-            .store(state.session.visible_len(), Ordering::Release);
+        self.mirror(&state.session);
         if result.is_ok() {
             state.needs_preflight = false;
         }
@@ -220,6 +263,7 @@ impl SaveFile {
     pub(crate) fn set_len_native(
         &self,
         length: u64,
+        time_policy: crate::content::write::NativeTimePolicy,
         preflight: crate::content::write::PreflightContext<'_>,
     ) -> Result<()> {
         let context = preflight.context;
@@ -238,22 +282,23 @@ impl SaveFile {
         session.validate_mutation(&selection, context)?;
         self.buffered()?;
         state.needs_preflight = true;
-        let result = session.set_len(length, context);
-        self.visible_len
-            .store(session.visible_len(), Ordering::Release);
+        let result =
+            session.set_len_with_times(length, time_policy.disabled, time_policy.prior, context);
+        self.mirror(&session);
         if result.is_ok() {
             state.needs_preflight = false;
         }
         result
     }
     pub fn len(&self, context: &ReadContext) -> Result<u64> {
-        lock(&self.state, context)?.session.len(context)
+        let session = lock(&self.read_session, context)?.clone();
+        session.len(context)
     }
     pub fn is_empty(&self, context: &ReadContext) -> Result<bool> {
         Ok(self.len(context)? == 0)
     }
     pub fn read_range(&self, offset: u64, bytes: &mut [u8], context: &ReadContext) -> Result<()> {
-        let session = lock(&self.state, context)?.session.clone();
+        let session = lock(&self.read_session, context)?.clone();
         session.read_range(offset, bytes, context)
     }
     pub(crate) fn read_range_waiting(
@@ -263,7 +308,7 @@ impl SaveFile {
         limits: Option<crate::content::write::BaseWaitLimits>,
         context: &ReadContext,
     ) -> Result<()> {
-        let session = lock(&self.state, context)?.session.clone();
+        let session = lock(&self.read_session, context)?.clone();
         session.read_range_waiting(offset, bytes, limits, context)
     }
 }
@@ -331,6 +376,14 @@ fn connection(
     branch: &str,
     context: &ReadContext,
 ) -> Result<(PooledStore, MetadataView)> {
+    connection_capture(pool, branch, context, true)
+}
+fn connection_capture(
+    pool: &SavePool,
+    branch: &str,
+    context: &ReadContext,
+    capture_before: bool,
+) -> Result<(PooledStore, MetadataView)> {
     let shared = pool
         .engine
         .upgrade()
@@ -344,7 +397,11 @@ fn connection(
             MetadataView {
                 branch: guard.store.active.clone(),
                 generation: guard.store.generation,
-                before: guard.capture_before(),
+                before: if capture_before {
+                    guard.capture_before()
+                } else {
+                    None
+                },
             }
         };
         match pool.stores.checkout_nowait() {
@@ -408,6 +465,7 @@ struct Job {
     file: Arc<SaveFile>,
     session: Arc<WriteSession>,
     checkpoint: SaveCheckpoint,
+    adoption_only: bool,
     context: ReadContext,
     completion: Arc<Completion>,
     _permit: Permit,
@@ -419,6 +477,18 @@ pub struct SaveExecutor {
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
 impl SaveExecutor {
+    pub(crate) fn namespace_context(&self, context: &ReadContext) -> Result<ReadContext> {
+        ensure!(
+            crate::util::lock::lock(&self.pool.state).accepting,
+            "CONTENT_CANCELLED"
+        );
+        let context = ReadContext {
+            deadline: context.deadline,
+            cancel: context.cancel.linked(&self.pool.stop),
+        };
+        context.check()?;
+        Ok(context)
+    }
     pub fn start(
         shared: &Shared,
         journal: Arc<WriteJournal>,
@@ -580,12 +650,97 @@ impl SaveExecutor {
             file,
             session,
             checkpoint,
+            adoption_only: false,
             context,
             completion,
             _permit: permit,
         });
         self.pool.changed.notify_one();
         Ok(Some(ticket))
+    }
+    /// Wait for this file's previously accepted job without starting a save.
+    pub(crate) fn wait_idle(&self, file: &SaveFile, context: &ReadContext) -> Result<()> {
+        loop {
+            context.check()?;
+            ensure!(!self.pool.stop.is_cancelled(), "CONTENT_CANCELLED");
+            let state = crate::util::lock::lock(&self.pool.state);
+            if !state.outstanding.contains_key(&file.operation) {
+                return Ok(());
+            }
+            drop(
+                self.pool
+                    .changed
+                    .wait_timeout(state, POLL)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
+    }
+    /// Adopt only an existing canonical receipt. Never checkpoint, prepare or
+    /// publish newer bytes. The caller serializes this with native mutations.
+    pub fn adopt_committed(&self, file: Arc<SaveFile>, context: &ReadContext) -> Result<bool> {
+        self.wait_idle(&file, context)?;
+        let (session, intent) = {
+            let state = lock(&file.state, context)?;
+            ensure!(
+                state.session.uses_journal(&self.pool.journal),
+                "CONTENT_SAVE_WRONG_STORE"
+            );
+            let intent = match &state.pending {
+                Some(checkpoint) => checkpoint.intent.clone(),
+                None => state.session.intent(context)?,
+            };
+            (state.session.clone(), intent)
+        };
+        let checkpoint = connection(&self.pool, &intent.branch, context)?
+            .0
+            .committed_content_checkpoint(&intent, context)?;
+        let Some(checkpoint) = checkpoint else {
+            return Ok(false);
+        };
+        let id = Uuid::new_v4();
+        {
+            let mut state = crate::util::lock::lock(&self.pool.state);
+            ensure!(state.accepting, "CONTENT_CANCELLED");
+            ensure!(
+                state.outstanding.len() < limits::SAVE_QUEUE
+                    && !state.outstanding.contains_key(&file.operation),
+                "CONTENT_RESOURCE_LIMIT"
+            );
+            state.outstanding.insert(file.operation, id);
+        }
+        let permit = Permit {
+            pool: self.pool.clone(),
+            operation: file.operation,
+            id,
+            active: false,
+        };
+        {
+            let mut state = lock(&file.state, context)?;
+            ensure!(Arc::ptr_eq(&state.session, &session), "STALE_WRITE_SESSION");
+            state.pending = Some(checkpoint.clone());
+        }
+        let completion = Arc::new(Completion::default());
+        let ticket = SaveTicket(completion.clone());
+        {
+            let mut state = crate::util::lock::lock(&self.pool.state);
+            context.check()?;
+            ensure!(state.accepting, "CONTENT_CANCELLED");
+            state.jobs.push_back(Job {
+                file,
+                session,
+                checkpoint,
+                adoption_only: true,
+                context: ReadContext {
+                    deadline: context.deadline,
+                    cancel: context.cancel.linked(&self.pool.stop),
+                },
+                completion,
+                _permit: permit,
+            });
+            self.pool.changed.notify_one();
+        }
+        ticket.wait(context)?;
+        Ok(true)
     }
     /// Explicit flush drains the captured generation and any later Saved work
     /// carried by adoption. New writes may keep it busy until its deadline.
@@ -703,6 +858,7 @@ impl SaveExecutor {
                     file: file.clone(),
                     session: state.session.clone(),
                     checkpoint,
+                    adoption_only: false,
                     context: ReadContext {
                         deadline: context.deadline,
                         cancel: context.cancel.clone(),
@@ -870,6 +1026,10 @@ fn process(pool: &SavePool, job: &mut Job) -> Result<SaveReceipt> {
         observe(pool, &receipt, retry_view, context)?;
         (receipt, pin)
     } else {
+        ensure!(
+            !job.adoption_only,
+            "CORRUPT_CONTENT_SAVE: an attested publication receipt disappeared"
+        );
         connection(pool, &job.checkpoint.intent.branch, context)?
             .0
             .select_content_checkpoint(&job.checkpoint, context)?;
@@ -900,9 +1060,10 @@ fn process(pool: &SavePool, job: &mut Job) -> Result<SaveReceipt> {
         .session
         .adopt_continuation(&handoff, pool.target.clone(), context)?;
     state.session = Arc::new(next);
-    job.file
-        .visible_len
-        .store(state.session.visible_len(), Ordering::Release);
+    // Adoption is durable already: finish both in-memory mirrors even when
+    // the caller's deadline just expired. This guard spans no journal I/O.
+    *crate::util::lock::lock(&job.file.read_session) = state.session.clone();
+    job.file.mirror(&state.session);
     state.pending = None;
     context.check()?;
     Ok(receipt)

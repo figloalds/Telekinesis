@@ -98,8 +98,6 @@ pub(crate) struct Cache {
     missing_scan: Cell<Option<(Option<i64>, i64)>>,
 }
 
-/// `schema:sharing` stamp (2: `feed_remaining`, WP3.1).
-const SCHEMA_VERSION: i64 = 2;
 /// An id a peer reported unknown is asked for again after this long.
 const NEED_RETRY_MS: i64 = 60_000;
 /// `feed_needs.reason` of ids listed by the peer's feed (elided entries we do
@@ -213,144 +211,36 @@ fn take_offer(request: &str, repo: &str, peer: &str) -> (Sent, Option<i64>) {
     }
 }
 
-/// `sharing::ensure_schema` (`schema:sharing=1`, REVAMP_PLAN §9, WP2.5 task 1):
-/// the `journal_epoch` config row and the triggers that regenerate it when the
-/// journal loses or rewrites a row; the per-peer feed tables; the
-/// `feed_journal` index of the feed (below); indexes on
-/// `incoming_sources(peer)` (per-peer inbox counts) and `feed_needs(event)`
-/// (an event that arrives clears every peer's need of it); and the
-/// `feed_outbox_known` trigger, which acks an outbox row as it is inserted
-/// when a feed peer is already known to hold the event (point lookups per
-/// feed peer: no index on `peer_known(event)` to maintain per received
-/// event). Only new objects: no table changes shape. Idempotent; runs in its
-/// own savepoint.
-///
-/// `feed_journal(seq, event)` holds the `journal_sequence` rows of shared
-/// events: the feed itself, so the tip, `journal_id_at` and the counts after
-/// a cursor are rowid operations that never visit private rows (an idle
-/// exchange stays O(1) however long the private tail is). Triggers on
-/// `journal_sequence` (which `snapshot`'s triggers keep in step with every
-/// insert, update and delete of `events`) and on a branch's `shared` flag
-/// maintain it, for writes by any executable; it is built from the journal
-/// when it is created. Reads still join the event's branch, so a row that
-/// were ever stale could not put a private event on the feed.
-///
-/// The build is a backfill (REVAMP_PLAN §9, I10, invariant 28; WP2.INT fixed
-/// the one-statement build of WP2.5's fix round 2): the table and its
-/// triggers first (they cover every row written from then on), then
-/// [`BACKFILL_CHUNK`] journal rows per transaction, resuming from the
-/// `feed_journal_v1_cursor` config key, with `startup_progress` from the
-/// opening thread after each chunk, and the `feed_journal_v1` marker at the
-/// end. A worker killed for silence mid-build resumes where it stopped.
-pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
-    define_schema(&store.db)?;
-    backfill_feed_journal(store)
-}
+/// Current feed-index repair uses the existing accepted journal sequence.
+/// Neither the epoch nor peer acknowledgements are recreated by this repair.
+pub const REPAIR_CHUNK: i64 = 10_000;
+pub const FEED_JOURNAL_MARKER: &str = "repair:feed:ready";
+pub const FEED_JOURNAL_CURSOR: &str = "repair:feed:cursor";
 
-/// `feed_journal` rows built per transaction by its backfill.
-pub const BACKFILL_CHUNK: i64 = 10_000;
-/// Config key: the `feed_journal` backfill is complete.
-pub const FEED_JOURNAL_MARKER: &str = "feed_journal_v1";
-/// Config key: the last `journal_sequence.seq` the backfill covered.
-pub const FEED_JOURNAL_CURSOR: &str = "feed_journal_v1_cursor";
-
-fn define_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("SAVEPOINT sharing_schema")?;
-    let result = (|| -> Result<()> {
-        let built: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='feed_journal')",
-            [],
-            |r| r.get(0),
-        )?;
-        db.execute_batch(
-            "INSERT OR IGNORE INTO config(key,value) VALUES('journal_epoch',lower(hex(randomblob(16))));
-            CREATE TRIGGER IF NOT EXISTS feed_epoch_delete AFTER DELETE ON events BEGIN
-                INSERT OR REPLACE INTO config(key,value) VALUES('journal_epoch',lower(hex(randomblob(16))));
-            END;
-            CREATE TRIGGER IF NOT EXISTS feed_epoch_update AFTER UPDATE ON events BEGIN
-                INSERT OR REPLACE INTO config(key,value) VALUES('journal_epoch',lower(hex(randomblob(16))));
-            END;
-            CREATE TABLE IF NOT EXISTS feed_in(peer TEXT PRIMARY KEY,epoch TEXT NOT NULL,seq INTEGER NOT NULL,id TEXT NOT NULL,
-                tip INTEGER NOT NULL,updated_ms INTEGER NOT NULL,pending_active INTEGER NOT NULL DEFAULT 0,
-                blocked INTEGER NOT NULL DEFAULT 0,quarantined INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS feed_out(peer TEXT NOT NULL,via TEXT NOT NULL,epoch TEXT NOT NULL,seq INTEGER NOT NULL,
-                id TEXT NOT NULL,reported_ms INTEGER NOT NULL,PRIMARY KEY(peer,via));
-            CREATE TABLE IF NOT EXISTS feed_needs(peer TEXT NOT NULL,event TEXT NOT NULL,reason TEXT NOT NULL,
-                requested_ms INTEGER NOT NULL,missing_at INTEGER,seq INTEGER NOT NULL DEFAULT 0,digest TEXT,
-                PRIMARY KEY(peer,event));
-            CREATE TABLE IF NOT EXISTS feed_rejected(peer TEXT NOT NULL,event TEXT NOT NULL,seq INTEGER NOT NULL,
-                code TEXT NOT NULL,message TEXT NOT NULL,payload TEXT,at_ms INTEGER NOT NULL,PRIMARY KEY(peer,event));
-            CREATE TABLE IF NOT EXISTS feed_remaining(peer TEXT PRIMARY KEY,epoch TEXT NOT NULL,seq INTEGER NOT NULL,
-                tip INTEGER NOT NULL,remaining INTEGER NOT NULL);
-            CREATE INDEX IF NOT EXISTS feed_needs_event ON feed_needs(event);
-            CREATE INDEX IF NOT EXISTS incoming_sources_peer ON incoming_sources(peer);
-            CREATE TRIGGER IF NOT EXISTS feed_outbox_known AFTER INSERT ON outbox
-                WHEN NEW.acknowledged=0 AND EXISTS(SELECT 1 FROM peer_known k WHERE k.peer IN (SELECT peer FROM feed_in) AND k.event=NEW.event) BEGIN
-                UPDATE outbox SET acknowledged=1 WHERE event=NEW.event;
-            END;
-            CREATE TABLE IF NOT EXISTS feed_journal(seq INTEGER PRIMARY KEY,event TEXT NOT NULL);
-            CREATE TRIGGER IF NOT EXISTS feed_journal_insert AFTER INSERT ON journal_sequence BEGIN
-                INSERT OR REPLACE INTO feed_journal(seq,event) SELECT NEW.seq,NEW.event FROM events e
-                    JOIN branches b ON b.id=e.branch WHERE e.id=NEW.event AND b.shared=1;
-            END;
-            CREATE TRIGGER IF NOT EXISTS feed_journal_update AFTER UPDATE ON journal_sequence BEGIN
-                DELETE FROM feed_journal WHERE seq=OLD.seq;
-                INSERT OR REPLACE INTO feed_journal(seq,event) SELECT NEW.seq,NEW.event FROM events e
-                    JOIN branches b ON b.id=e.branch WHERE e.id=NEW.event AND b.shared=1;
-            END;
-            CREATE TRIGGER IF NOT EXISTS feed_journal_delete AFTER DELETE ON journal_sequence BEGIN
-                DELETE FROM feed_journal WHERE seq=OLD.seq;
-            END;
-            CREATE TRIGGER IF NOT EXISTS feed_journal_branch AFTER UPDATE OF shared ON branches
-                WHEN OLD.shared IS NOT NEW.shared BEGIN
-                DELETE FROM feed_journal WHERE seq IN (SELECT s.seq FROM journal_sequence s
-                    JOIN events e ON e.id=s.event WHERE e.branch=NEW.id);
-                INSERT OR REPLACE INTO feed_journal(seq,event) SELECT s.seq,s.event FROM journal_sequence s
-                    JOIN events e ON e.id=s.event WHERE e.branch=NEW.id AND NEW.shared=1;
-            END;",
-        )?;
-        if !built {
-            // A new (or dropped) table: build it from the whole journal.
-            db.execute("DELETE FROM config WHERE key=?1", [FEED_JOURNAL_MARKER])?;
-            db.execute(
-                "INSERT INTO config(key,value) VALUES(?1,'0') ON CONFLICT(key) DO UPDATE SET value='0'",
-                [FEED_JOURNAL_CURSOR],
-            )?;
-        }
-        db.execute(
-            "INSERT INTO config(key,value) VALUES('schema:sharing',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(config.value AS INTEGER)<?1",
-            [SCHEMA_VERSION],
-        )?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => db.execute_batch("RELEASE sharing_schema")?,
-        Err(error) => {
-            let _ = db.execute_batch("ROLLBACK TO sharing_schema; RELEASE sharing_schema");
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
-/// The chunked, resumable `feed_journal` build ([`ensure_schema`]). A table
-/// without the marker and without a cursor was built whole by an earlier
-/// build of this module (WP2.5's one-statement build): it is complete.
-fn backfill_feed_journal(store: &mut Store) -> Result<()> {
+pub(super) fn repair_feed(store: &mut Store) -> Result<()> {
     let value = |db: &Connection, key: &str| -> Result<Option<String>> {
         Ok(db
             .query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
             .optional()?)
     };
-    if value(&store.db, FEED_JOURNAL_MARKER)?.is_some() {
+    if value(&store.db, FEED_JOURNAL_MARKER)?.as_deref() == Some("1") {
         return Ok(());
     }
-    if let Some(cursor) = value(&store.db, FEED_JOURNAL_CURSOR)? {
-        let mut cursor: i64 = cursor.parse().unwrap_or(0);
+    {
+        let mut cursor: i64 = if let Some(cursor) = value(&store.db, FEED_JOURNAL_CURSOR)? {
+            cursor.parse().context("INVALID_STORE_METADATA")?
+        } else {
+            let tx = store.db.savepoint()?;
+            tx.execute("DELETE FROM feed_journal", [])?;
+            tx.execute("INSERT INTO config VALUES(?,'0')", [FEED_JOURNAL_CURSOR])?;
+            tx.commit()?;
+            0
+        };
+        ensure!(cursor >= 0, "INVALID_STORE_METADATA");
         loop {
             let upper: Option<i64> = store.db.query_row(
                 "SELECT max(seq) FROM (SELECT seq FROM journal_sequence WHERE seq>?1 ORDER BY seq LIMIT ?2)",
-                params![cursor, BACKFILL_CHUNK],
+                params![cursor, REPAIR_CHUNK],
                 |r| r.get(0),
             )?;
             let Some(upper) = upper else { break };
@@ -366,6 +256,7 @@ fn backfill_feed_journal(store: &mut Store) -> Result<()> {
                 params![FEED_JOURNAL_CURSOR, upper.to_string()],
             )?;
             tx.commit()?;
+            crate::util::fault::trigger("store.index.feed.page")?;
             cursor = upper;
             crate::startup::progress("indexing the feed");
         }
@@ -1958,6 +1849,9 @@ impl Store {
         if event.device == self.device {
             // Not held: this replica never committed it.
             return error("FORGED_EVENT_ORIGIN", &event.id);
+        }
+        if let Err(failed) = self.check_content_capability(event) {
+            return Ok(Some(ErrorWire::from_error(&failed)));
         }
         let objects = event.objects();
         if !event.object_sizes.keys().all(|h| objects.contains(h)) {

@@ -3,17 +3,57 @@
 use crate::{model::errors::ErrorWire, util::lock::lock};
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex, MutexGuard, TryLockError, Weak},
+    ops::Deref,
+    sync::{
+        Arc, Mutex, MutexGuard, TryLockError, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const MAX_OBJECTS: usize = 64 * 1024;
 const MAX_FAMILIES: usize = crate::model::lease::MAX_RUN_FENCES;
-pub(crate) type Gate = Arc<Mutex<()>>;
+pub(crate) type Gate = Arc<Family>;
+
+/// Admissions can wait cooperatively for each other. A durable projection
+/// holds the same ownership gate, but must return contention to new claims.
+#[derive(Debug, Default)]
+pub(crate) struct Family {
+    effect: Mutex<()>,
+    committing: AtomicBool,
+}
+impl Deref for Family {
+    type Target = Mutex<()>;
+    fn deref(&self) -> &Self::Target {
+        &self.effect
+    }
+}
+impl Family {
+    pub(crate) fn commit_in_progress(&self) -> bool {
+        self.committing.load(Ordering::Acquire)
+    }
+    pub(crate) fn try_commit(&self) -> Result<CommitGuard<'_>, ErrorWire> {
+        let held = try_gate(&self.effect)?;
+        self.committing.store(true, Ordering::Release);
+        Ok(CommitGuard {
+            family: self,
+            _held: held,
+        })
+    }
+}
+pub(crate) struct CommitGuard<'a> {
+    family: &'a Family,
+    _held: MutexGuard<'a, ()>,
+}
+impl Drop for CommitGuard<'_> {
+    fn drop(&mut self) {
+        self.family.committing.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Effects {
     objects: BTreeMap<String, Weak<Slot>>,
-    families: BTreeMap<String, Weak<Mutex<()>>>,
+    families: BTreeMap<String, Weak<Family>>,
     active: BTreeMap<String, Work>,
 }
 #[derive(Debug, Default)]
@@ -71,7 +111,7 @@ impl Effects {
             return Ok(gate);
         }
         room(&mut self.families, key, MAX_FAMILIES)?;
-        let gate = Arc::new(Mutex::new(()));
+        let gate = Arc::new(Family::default());
         self.families.insert(key.into(), Arc::downgrade(&gate));
         Ok(gate)
     }

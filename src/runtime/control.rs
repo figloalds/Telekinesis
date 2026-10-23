@@ -8,11 +8,19 @@ use crate::core::*;
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 
 impl Engine {
     pub fn control(&mut self, request: &str, payload: &Value) -> Result<Value> {
-        if let Some(value) = self.store.receipt(request, payload)? {
+        self.control_prepared(request, payload, None, &hash(&serde_json::to_vec(payload)?))
+    }
+    pub(crate) fn control_prepared(
+        &mut self,
+        request: &str,
+        payload: &Value,
+        prepared: Option<&crate::content::PreparedContent>,
+        fingerprint: &str,
+    ) -> Result<Value> {
+        if let Some(value) = self.store.receipt_fingerprint(request, fingerprint)? {
             return Ok(value);
         }
         if let Some(g) = payload["generation"].as_u64() {
@@ -74,77 +82,12 @@ impl Engine {
             }
             "folder-details" => {
                 let status = self.control(request, &json!({"op":"status"}))?;
-                let conflicts = self.store.conflicts()?;
-                let review_token = hash(&serde_json::to_vec(&conflicts)?);
-                let offset = payload["offset"].as_u64().unwrap_or(0) as usize;
-                let unresolved: Vec<_> = conflicts
-                    .into_iter()
-                    .filter(|c| c.resolved_by.is_none())
-                    .collect();
-                let conflict_count = unresolved.len();
-                let conflicts: Vec<_> = unresolved.into_iter().skip(offset).take(100).collect();
-                let needed: BTreeSet<_> = conflicts
-                    .iter()
-                    .flat_map(|c| c.alternatives.iter().map(|v| v.revision.clone()))
-                    .collect();
-                let paths: BTreeMap<_, _> =
-                    visible_paths(&self.store.projection(&self.store.active)?)
-                        .into_iter()
-                        .map(|(path, entry)| (entry.id, path))
-                        .collect();
-                let revision_entities: BTreeMap<_, Vec<_>> = self
-                    .store
-                    .events()?
-                    .into_iter()
-                    .filter(|e| needed.contains(&e.id))
-                    .map(|e| {
-                        (
-                            e.id,
-                            e.changes
-                                .into_iter()
-                                .filter(|c| c.field == "location")
-                                .map(|c| c.entity)
-                                .collect(),
-                        )
-                    })
-                    .collect();
-                let missing: Vec<_> = self
-                    .store
-                    .projection(&self.store.active)?
-                    .entries
-                    .values()
-                    .filter(|e| e.alive)
-                    .filter_map(|e| e.content.as_ref().map(|object| (e, object)))
-                    .filter(|(_, object)| !self.store.object_available(object))
-                    .take(20)
-                    .map(|(e, object)| {
-                        self.store
-                            .object_state(object)
-                            .map(|state| json!({"path":paths.get(&e.id),"content":state}))
-                    })
-                    .collect::<Result<_>>()?;
-                return Ok(
-                    json!({"status":status,"conflicts":conflicts,"paths":paths,"review_token":review_token,
-                    "revision_entities":revision_entities,"offset":offset,"conflict_count":conflict_count,"missing_content":missing}),
-                );
+                let offset = usize::try_from(payload["offset"].as_u64().unwrap_or(0))?;
+                let mut details = folder_details(&self.store, offset)?;
+                details["status"] = status;
+                return Ok(details);
             }
-            "preview-object" => {
-                let object = text("object")?;
-                let mut file = self.store.open_object(object)?;
-                let total = file.metadata()?.len();
-                let mut bytes = Vec::new();
-                std::io::Read::take(&mut file, 64 * 1024).read_to_end(&mut bytes)?;
-                let binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
-                return Ok(
-                    json!({"object":object,"size":total,"truncated":total > bytes.len() as u64,
-                    "text":if binary { "Binary content; text preview unavailable".to_owned() } else { String::from_utf8_lossy(&bytes).into_owned() }}),
-                );
-            }
-            "request-object" => {
-                let object = text("object")?;
-                self.store.request_object(object)?;
-                return Ok(json!({"queued":true,"object":object}));
-            }
+
             "branches" => return Ok(json!(self.store.branches()?)),
             "conflicts" => return Ok(json!(self.store.conflicts()?)),
             "history" => return self.store.history(),
@@ -213,12 +156,12 @@ impl Engine {
                 // Import is intentionally RPC: the CLI never opens SQLite or CAS.
                 "import" => {
                     let path = text("path")?;
-                    let bytes = hex::decode(text("hex")?)?;
+                    let prepared = prepared.context("CONTENT_IMPORT_REQUIRES_PREPARATION")?;
                     let e = match self.store.lookup(path) {
                         Ok(e) => e,
                         Err(_) => self.store.create(path, "file")?,
                     };
-                    json!({"revision":self.store.write_revision(&e.id,e.revisions.get("content").cloned(),&bytes)?})
+                    json!({"revision":self.store.write_prepared_content_with_base_and_times(&e.id, e.revisions.get("content").cloned(), e.revisions.get("alive").cloned(), prepared, 0)?})
                 }
                 "mkdir" => json!(self.store.create(text("path")?, "directory")?),
                 "rename" => {
@@ -238,7 +181,7 @@ impl Engine {
                 "INSERT INTO receipts VALUES(?,?,?)",
                 rusqlite::params![
                     request,
-                    hash(&serde_json::to_vec(payload)?),
+                    fingerprint,
                     serde_json::to_string(&result)?
                 ],
             )?;
@@ -315,4 +258,72 @@ fn rollback_request(db: &rusqlite::Connection, outer: bool) -> Result<()> {
         db.execute_batch("ROLLBACK")?;
     }
     Ok(())
+}
+
+/// Bind an off-lock import to the same parent and selected file incarnation.
+pub(crate) fn import_basis(store: &Store, path: &str) -> Result<(Entry, Option<Entry>)> {
+    let (parent, _) = split_path(path)?;
+    let parent = store.lookup(&parent)?;
+    ensure!(parent.kind == "directory", "NOT_DIRECTORY");
+    let entry = match store.lookup(path) {
+        Ok(entry) => {
+            ensure!(entry.kind == "file", "IS_DIRECTORY");
+            Some(entry)
+        }
+        Err(error)
+            if crate::model::errors::ErrorWire::from_error(&error).code == "FILE_NOT_FOUND" =>
+        {
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((parent, entry))
+}
+
+/// A metadata snapshot and typed missing-content report. RPC callers run this
+/// on a secondary connection, outside Engine ownership.
+pub(crate) fn folder_details(store: &Store, offset: usize) -> Result<Value> {
+    crate::util::fault::trigger("folder_details.snapshot")?;
+    let conflicts = store.conflicts()?;
+    let review_token = hash(&serde_json::to_vec(&conflicts)?);
+    let unresolved: Vec<_> = conflicts
+        .into_iter()
+        .filter(|c| c.resolved_by.is_none())
+        .collect();
+    let conflict_count = unresolved.len();
+    let conflicts: Vec<_> = unresolved.into_iter().skip(offset).take(100).collect();
+    let needed: BTreeSet<_> = conflicts
+        .iter()
+        .flat_map(|c| c.alternatives.iter().map(|v| v.revision.clone()))
+        .collect();
+    let paths: BTreeMap<_, _> = visible_paths(&store.projection(&store.active)?)
+        .into_iter()
+        .map(|(path, entry)| (entry.id, path))
+        .collect();
+    let revision_entities: BTreeMap<_, Vec<_>> = store
+        .events()?
+        .into_iter()
+        .filter(|e| needed.contains(&e.id))
+        .map(|e| {
+            (
+                e.id,
+                e.changes
+                    .into_iter()
+                    .filter(|c| c.field == "location")
+                    .map(|c| c.entity)
+                    .collect(),
+            )
+        })
+        .collect();
+    let (counters, content) = store.content_report()?;
+    let missing: Vec<_> = content["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| json!({"path":item["path"],"content":item}))
+        .collect();
+    Ok(
+        json!({"content":content,"content_counters":counters,"conflicts":conflicts,"paths":paths,"review_token":review_token,
+        "revision_entities":revision_entities,"offset":offset,"conflict_count":conflict_count,"missing_content":missing}),
+    )
 }

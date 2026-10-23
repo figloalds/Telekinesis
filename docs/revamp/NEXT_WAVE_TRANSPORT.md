@@ -8,6 +8,12 @@ is not the complete next-wave plan or an implementation/completion claim.
 
 ## Intent
 
+The [personal-use deployment and authority scope](AUTHORITY_SCOPE.md) applies
+to this direction. Reuse TLS/WSS or VPN channel guarantees; add no custom
+security layer, Users or ACLs. Authorization below means existing DVFS
+repository/reference scope. Codec negotiation and bounds support reconstruction,
+interoperability and resource correctness, not a new security handshake.
+
 Choose how to transfer content using knowledge of the file revision, its chunks,
 the receiving peer and current resource conditions. Permit strategies to be
 added, compared, disabled and replaced without rewriting the transfer scheduler

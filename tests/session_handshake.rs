@@ -1,4 +1,4 @@
-//! WP1.10: v3 session handshake, HMAC auth and legacy detection (§6.2).
+//! Current session establishment and application credentials over TLS/WSS or VPN.
 //!
 //! The session layer (`Conn`, WP1.9) is built in parallel, so these tests
 //! drive the handshake up to the authenticated socket (`connect_v3`,
@@ -26,7 +26,6 @@ use tkfs::{
     pairing_code::Verifier,
     session::{
         self, CodeAuth, ConnOptions, PeerInfo,
-        auth::Transcript,
         handshake::{self, AcceptPolicy, DialError},
     },
     ws::{self, RawSocket},
@@ -358,7 +357,7 @@ fn hello(role: LaneRole, lane: Option<LaneSpec>) -> ClientHello {
 // Authentication
 
 #[test]
-fn right_code_authenticates_both_ways_for_every_role() {
+fn right_code_authenticates_the_client_for_every_role() {
     for (role, lane) in [
         (LaneRole::Control, None),
         (LaneRole::Bulk, Some(LaneSpec::new(1, 3))),
@@ -394,7 +393,7 @@ fn right_code_authenticates_both_ways_for_every_role() {
 }
 
 #[test]
-fn pairing_code_never_crosses_the_wire() {
+fn application_credential_uses_the_selected_channel_without_custom_wrapping() {
     let (code, verifier, policy) = paired();
     let (_, addr, server) = serve_once(policy);
     let relay = Relay::start(addr);
@@ -416,8 +415,11 @@ fn pairing_code_never_crosses_the_wire() {
         contains(&down, server_hello.salt.as_bytes()),
         "the relay saw the HELLO_ACK"
     );
-    // The code, the verifier hash and the HMAC key (the hash's raw bytes).
-    assert_absent(&up, &[&code, &verifier.hash], "client → server");
+    assert!(
+        contains(&up, verifier.hash.as_bytes()),
+        "the application credential is carried by the selected transport"
+    );
+    assert_absent(&up, &[&code], "client → server");
     assert_absent(&down, &[&code, &verifier.hash], "server → client");
     exchange_after_auth(&mut client_ws, &mut server_ws);
 }
@@ -457,105 +459,27 @@ fn wrong_code_is_unauthorized_without_verifier_leakage() {
 }
 
 #[test]
-fn replayed_proof_on_a_new_connection_fails() {
+fn an_application_credential_can_establish_fresh_connections() {
     let (code, _, policy) = paired();
-    // A legitimate handshake, scripted by hand so its AUTH can be captured.
-    let (endpoint, _, server) = serve_once(policy.clone());
-    let mut ws = raw_v3(&endpoint);
-    let hello = hello(LaneRole::Control, None);
-    send_frame(&mut ws, 1, &hello);
-    let (kind, ack) = read_frame(&mut ws);
-    assert_eq!(kind, 2, "HELLO_ACK: {ack}");
-    let first: ServerHello = serde_json::from_value(ack).unwrap();
-    let key = Verifier::derive_key(&first.salt, &code);
-    let transcript = Transcript::new(&hello, &first).unwrap();
-    let proof = hex::encode(transcript.client_proof(&key));
-    send_frame(&mut ws, 3, &json!({ "proof": proof }));
-    let (kind, ok) = read_frame(&mut ws);
-    assert_eq!(kind, 4, "AUTH_OK: {ok}");
-    assert_eq!(
-        ok["server_proof"],
-        hex::encode(transcript.server_proof(&key))
-    );
-    server.join().unwrap().unwrap();
-
-    // The same HELLO and the captured proof on a new connection.
-    let (endpoint, _, server) = serve_once(policy);
-    let mut ws = raw_v3(&endpoint);
-    send_frame(&mut ws, 1, &hello);
-    let (kind, ack) = read_frame(&mut ws);
-    assert_eq!(kind, 2);
-    let second: ServerHello = serde_json::from_value(ack).unwrap();
-    assert_ne!(second.server_nonce, first.server_nonce);
-    send_frame(&mut ws, 3, &json!({ "proof": proof }));
-    let (kind, goaway) = read_frame(&mut ws);
-    assert_eq!(kind, 11, "GOAWAY: {goaway}");
-    assert_eq!(goaway["code"], "INVALID_PAIRING_CODE");
-    assert!(drain_until_closed(&mut ws).is_empty());
-    assert_eq!(
-        server.join().unwrap().unwrap_err().code,
-        "INVALID_PAIRING_CODE"
-    );
-}
-
-#[test]
-fn client_verifies_the_server_proof() {
-    // An impostor that knows the salt but not the code (so not the key).
-    let (code, verifier, _) = paired();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-    let salt = verifier.salt.clone();
-    let impostor = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut ws = ws::accept_with(stream, 64 * 1024, |_, response| {
-            response
-                .headers_mut()
-                .insert("X-Tkfs-Sync", "3".parse().unwrap());
-        })
-        .unwrap();
-        let (kind, hello) = read_frame(&mut ws);
-        assert_eq!(kind, 1);
-        let hello: ClientHello = serde_json::from_value(hello).unwrap();
-        let server = ServerHello {
-            protocol: PROTOCOL_NAME.into(),
-            version: 3,
-            installation: SERVER.into(),
-            role: hello.role,
-            lane: hello.lane,
-            salt,
-            server_nonce: session::auth::new_nonce(),
-            verifier_generation: 1,
-            features: vec![],
-            limits: Limits::default(),
-        };
-        send_frame(&mut ws, 2, &server);
-        let (kind, _) = read_frame(&mut ws);
-        assert_eq!(kind, 3);
-        let guess = Verifier::derive_key(&server.salt, "a guessed code");
-        let transcript = Transcript::new(&hello, &server).unwrap();
+    for _ in 0..2 {
+        let (endpoint, _, server) = serve_once(policy.clone());
+        let mut socket = raw_v3(&endpoint);
+        send_frame(&mut socket, 1, &hello(LaneRole::Control, None));
+        let (kind, ack) = read_frame(&mut socket);
+        assert_eq!(kind, 2);
+        let hello: ServerHello = serde_json::from_value(ack).unwrap();
+        let key = Verifier::derive_key(&hello.salt, &code);
         send_frame(
-            &mut ws,
-            4,
-            &json!({ "server_proof": hex::encode(transcript.server_proof(&guess)) }),
+            &mut socket,
+            3,
+            &json!({"credential":hex::encode(key),"peer":false}),
         );
-        drain_until_closed(&mut ws)
-    });
-    let error = handshake::connect_v3(
-        &endpoint,
-        hello(LaneRole::Control, None),
-        &CodeAuth { code },
-        None,
-        None,
-    )
-    .unwrap_err();
-    let DialError::Unauthorized(wire) = &error else {
-        panic!("expected Unauthorized, got {error:?}");
-    };
-    assert_eq!(wire.code, "INVALID_PAIRING_CODE");
-    assert!(impostor.join().unwrap().is_empty());
+        let (kind, ack) = read_frame(&mut socket);
+        assert_eq!(kind, 4);
+        assert_eq!(ack, json!({}));
+        server.join().unwrap().unwrap();
+        let _ = socket.close(None);
+    }
 }
 
 /// A scripted v3 server: echoes the upgrade, reads HELLO and answers an
@@ -588,7 +512,6 @@ fn lying_server(
             role: hello.role,
             lane: hello.lane,
             salt: verifier.salt,
-            server_nonce: session::auth::new_nonce(),
             verifier_generation: GENERATION,
             features: vec![],
             limits: Limits::default(),
@@ -639,20 +562,6 @@ fn client_checks_the_server_hello_before_proving() {
             LaneRole::Control,
             None,
             Box::new(|_, server| server.installation = String::new()),
-            "PROTOCOL_VIOLATION",
-        ),
-        (
-            "echoes the client nonce",
-            LaneRole::Control,
-            None,
-            Box::new(|hello, server| server.server_nonce = hello.client_nonce.clone()),
-            "PROTOCOL_VIOLATION",
-        ),
-        (
-            "sends a short nonce",
-            LaneRole::Control,
-            None,
-            Box::new(|_, server| server.server_nonce = "00".into()),
             "PROTOCOL_VIOLATION",
         ),
         (
@@ -864,184 +773,6 @@ fn installation_change_is_detected_after_auth() {
     server.join().unwrap().unwrap();
 }
 
-#[test]
-fn transcript_binds_every_field() {
-    let (code, verifier) = Verifier::generate();
-    assert_eq!(Verifier::derive_key(&verifier.salt, &code), verifier.key());
-    let key = verifier.key();
-    let nonce_a = "aa".repeat(32);
-    let nonce_b = "bb".repeat(32);
-    let lane = Some(LaneSpec::new(0, 2));
-    let base = Transcript::from_parts(
-        "c",
-        "s",
-        LaneRole::Bulk,
-        lane,
-        "session",
-        &nonce_a,
-        &nonce_b,
-        1,
-    )
-    .unwrap();
-    let variants = [
-        Transcript::from_parts(
-            "c2",
-            "s",
-            LaneRole::Bulk,
-            lane,
-            "session",
-            &nonce_a,
-            &nonce_b,
-            1,
-        ),
-        Transcript::from_parts(
-            "c",
-            "s2",
-            LaneRole::Bulk,
-            lane,
-            "session",
-            &nonce_a,
-            &nonce_b,
-            1,
-        ),
-        Transcript::from_parts(
-            "c",
-            "s",
-            LaneRole::Control,
-            lane,
-            "session",
-            &nonce_a,
-            &nonce_b,
-            1,
-        ),
-        Transcript::from_parts(
-            "c",
-            "s",
-            LaneRole::Bulk,
-            Some(LaneSpec::new(1, 2)),
-            "session",
-            &nonce_a,
-            &nonce_b,
-            1,
-        ),
-        Transcript::from_parts(
-            "c",
-            "s",
-            LaneRole::Bulk,
-            None,
-            "session",
-            &nonce_a,
-            &nonce_b,
-            1,
-        ),
-        Transcript::from_parts(
-            "c",
-            "s",
-            LaneRole::Bulk,
-            lane,
-            "session2",
-            &nonce_a,
-            &nonce_b,
-            1,
-        ),
-        Transcript::from_parts(
-            "c",
-            "s",
-            LaneRole::Bulk,
-            lane,
-            "session",
-            &nonce_b,
-            &nonce_b,
-            1,
-        ),
-        Transcript::from_parts(
-            "c",
-            "s",
-            LaneRole::Bulk,
-            lane,
-            "session",
-            &nonce_a,
-            &nonce_a,
-            1,
-        ),
-        Transcript::from_parts(
-            "c",
-            "s",
-            LaneRole::Bulk,
-            lane,
-            "session",
-            &nonce_a,
-            &nonce_b,
-            2,
-        ),
-        // Moving a byte between adjacent variable-length fields.
-        Transcript::from_parts(
-            "cs",
-            "",
-            LaneRole::Bulk,
-            lane,
-            "session",
-            &nonce_a,
-            &nonce_b,
-            1,
-        ),
-    ];
-    for (index, variant) in variants.into_iter().enumerate() {
-        match variant {
-            Ok(variant) => {
-                assert_ne!(variant.as_bytes(), base.as_bytes(), "variant {index}");
-                assert_ne!(variant.client_proof(&key), base.client_proof(&key));
-            }
-            Err(error) => {
-                assert_eq!(index, 9, "only the empty id is invalid: {error}");
-                assert_eq!(error.code, "PROTOCOL_VIOLATION");
-            }
-        }
-    }
-    assert_ne!(base.client_proof(&key), base.server_proof(&key));
-    assert_ne!(
-        base.client_proof(&key),
-        base.client_proof(&Verifier::derive_key(&verifier.salt, "other"))
-    );
-    for (client, nonce) in [
-        ("c\0", nonce_a.as_str()),
-        ("c", "abcd"),
-        ("c", &"zz".repeat(32)),
-    ] {
-        assert!(
-            Transcript::from_parts(
-                client,
-                "s",
-                LaneRole::Control,
-                None,
-                "x",
-                nonce,
-                &nonce_b,
-                0
-            )
-            .is_err()
-        );
-    }
-    let proof = hex::encode(base.client_proof(&key));
-    assert!(session::auth::verify_proof(
-        &base.client_proof(&key),
-        &proof
-    ));
-    assert!(session::auth::verify_proof(
-        &base.client_proof(&key),
-        &proof.to_uppercase()
-    ));
-    assert!(!session::auth::verify_proof(
-        &base.client_proof(&key),
-        &proof[..62]
-    ));
-    assert!(!session::auth::verify_proof(
-        &base.server_proof(&key),
-        &proof
-    ));
-    assert!(!session::auth::verify_proof(&[0; 32], &"zz".repeat(32)));
-}
-
 // ---------------------------------------------------------------------------
 // Legacy detection (invariant 20)
 
@@ -1224,10 +955,7 @@ fn preauth_protocol_violations_close_the_connection() {
     trailing.extend_from_slice(b"body");
     let mut lying = frame_bytes(1, &hello(LaneRole::Control, None));
     lying[4..8].copy_from_slice(&(hello_json.len() as u32 + 10).to_le_bytes());
-    let mut no_lane = hello(LaneRole::Bulk, None);
-    no_lane.client_nonce = session::auth::new_nonce();
-    let mut bad_nonce = hello(LaneRole::Control, None);
-    bad_nonce.client_nonce = "00".into();
+    let no_lane = hello(LaneRole::Bulk, None);
     let cases: Vec<(&str, Message)> = vec![
         ("reserved field", Message::Binary(reserved.into())),
         ("flags", Message::Binary(flagged.into())),
@@ -1243,7 +971,7 @@ fn preauth_protocol_violations_close_the_connection() {
         ),
         (
             "AUTH first",
-            Message::Binary(frame_bytes(3, &json!({"proof":"00"})).into()),
+            Message::Binary(frame_bytes(3, &json!({"credential":"00","peer":false})).into()),
         ),
         (
             "array header",
@@ -1252,10 +980,6 @@ fn preauth_protocol_violations_close_the_connection() {
         (
             "bulk without lane",
             Message::Binary(frame_bytes(1, &no_lane).into()),
-        ),
-        (
-            "short nonce",
-            Message::Binary(frame_bytes(1, &bad_nonce).into()),
         ),
         (
             "text message",

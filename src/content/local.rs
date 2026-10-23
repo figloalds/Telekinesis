@@ -10,7 +10,6 @@ use crate::{
     },
 };
 use anyhow::{Context, Result, ensure};
-use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
@@ -21,6 +20,34 @@ use std::{
 use uuid::Uuid;
 
 pub use crate::model::content::{ObjectKey, ObjectKind};
+
+/// Verified immutable import, pinned until its metadata publication finishes.
+#[derive(Clone)]
+pub struct PreparedContent {
+    pin: PinnedContent,
+}
+impl PreparedContent {
+    pub fn content(&self) -> &FileContentRef {
+        self.pin.reference()
+    }
+    pub fn pin(&self) -> &PinnedContent {
+        &self.pin
+    }
+    pub(crate) fn check_store(&self, root: &Path) -> Result<()> {
+        ensure!(
+            self.pin.provider() == LocalContent::open(root)?.identity(),
+            "CONTENT_SAVE_WRONG_STORE"
+        );
+        Ok(())
+    }
+}
+impl std::fmt::Debug for PreparedContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedContent")
+            .field("content", self.content())
+            .finish()
+    }
+}
 
 #[derive(Debug)]
 enum ContentError {
@@ -174,22 +201,6 @@ impl BaseCursor<'_> {
                 level: old_level.checked_sub(1),
             };
         }
-    }
-}
-
-struct LegacyInput<'a> {
-    file: File,
-    hash: Sha256,
-    context: &'a ReadContext,
-    check: &'a dyn Fn() -> Result<()>,
-}
-impl Read for LegacyInput<'_> {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        self.context.check().map_err(std::io::Error::other)?;
-        (self.check)().map_err(std::io::Error::other)?;
-        let count = self.file.read(out)?;
-        self.hash.update(&out[..count]);
-        Ok(count)
     }
 }
 
@@ -566,7 +577,9 @@ impl LocalContent {
                 file.sync_all()?;
             }
             drop(file);
+            crate::util::fault::trigger("content.install.flushed")?;
             crate::core::objects::install_object(&temp, &dest)?;
+            crate::util::fault::trigger("content.install.installed")?;
             context.check()?;
             Ok(true)
         })();
@@ -617,6 +630,18 @@ impl LocalContent {
         ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
         let _permit = self.permit(context, 3, BufferClass::Background)?;
         self.import_inner(reader, len, context)
+    }
+    /// Prepare current direct/manifest bytes before taking a metadata writer.
+    pub fn prepare_import(
+        &self,
+        reader: &mut dyn Read,
+        len: u64,
+        context: &ReadContext,
+    ) -> Result<PreparedContent> {
+        let content = self.import(reader, len, context)?;
+        Ok(PreparedContent {
+            pin: self.pin(&content)?,
+        })
     }
     fn import_inner(
         &self,
@@ -822,100 +847,6 @@ impl LocalContent {
         Ok(())
     }
 
-    /// Legacy objects remain whole-file hashes. Stream verification with a
-    /// 64 KiB buffer while retaining only the requested range.
-    fn read_legacy(
-        &self,
-        reference: &FileContentRef,
-        offset: u64,
-        out: &mut [u8],
-        context: &ReadContext,
-    ) -> Result<()> {
-        let key = ObjectKey::root(reference);
-        let mut file = File::open(self.path(key)).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow::Error::new(ContentError::Missing(key))
-            } else {
-                error.into()
-            }
-        })?;
-        ensure!(
-            file.metadata()?.len() == reference.total_len,
-            ContentError::Corrupt(key)
-        );
-        let _hash = self.counters.begin(Phase::Hash, reference.total_len);
-        let _read = self.counters.begin(Phase::Read, reference.total_len);
-        let mut digest = Sha256::new();
-        let mut buffer = vec![0; CHUNK_SIZE as usize];
-        let mut position = 0;
-        while position < reference.total_len {
-            context.check()?;
-            let count = (reference.total_len - position).min(CHUNK_SIZE) as usize;
-            file.read_exact(&mut buffer[..count])?;
-            digest.update(&buffer[..count]);
-            let from = position.max(offset);
-            let until = (position + count as u64).min(offset + out.len() as u64);
-            if from < until {
-                out[(from - offset) as usize..(until - offset) as usize].copy_from_slice(
-                    &buffer[(from - position) as usize..(until - position) as usize],
-                );
-            }
-            position += count as u64;
-        }
-        ensure!(
-            file.read(&mut [0])? == 0 && Digest(digest.finalize().into()) == reference.digest,
-            ContentError::Corrupt(key)
-        );
-        Ok(())
-    }
-
-    /// A legacy base that is needed by a save is verified and converted in one
-    /// sequential source pass. The original identity remains untouched. No
-    /// descriptor is returned when the final whole-file hash fails.
-    pub(crate) fn convert_legacy(
-        &self,
-        base: &FileContentRef,
-        context: &ReadContext,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<PinnedContent> {
-        context.check()?;
-        ensure!(
-            base.kind == ContentKind::Legacy,
-            "LEGACY_CONVERSION_REQUIRED"
-        );
-        base.validate()?;
-        let _permit = self.permit_checked(context, 3, BufferClass::Background, check)?;
-        let _base_pin = self.pin(base)?;
-        let key = ObjectKey::root(base);
-        let file = File::open(self.path(key)).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow::Error::new(ContentError::Missing(key))
-            } else {
-                error.into()
-            }
-        })?;
-        ensure!(
-            file.metadata()?.len() == base.total_len,
-            ContentError::Corrupt(key)
-        );
-        let _read = self.counters.begin(Phase::Read, base.total_len);
-        let _hash = self.counters.begin(Phase::Hash, base.total_len);
-        let mut reader = LegacyInput {
-            file,
-            hash: Sha256::new(),
-            context,
-            check,
-        };
-        let converted = self.import_inner(&mut reader, base.total_len, context)?;
-        context.check()?;
-        ensure!(
-            reader.read(&mut [0])? == 0 && Digest(reader.hash.finalize().into()) == base.digest,
-            ContentError::Corrupt(key)
-        );
-        context.check()?;
-        self.pin(&converted)
-    }
-
     /// Canonical rebuilding walks only changed paths and shape boundaries.
     /// Unchanged data can remain absent. Structural pages needed for reuse must
     /// be locally verified; absence never falls back to a whole-file copy.
@@ -934,10 +865,6 @@ impl LocalContent {
             root: base_pin.as_ref().map(ContentEdge::root).transpose()?,
             pages: (0..MAX_DEPTH).map(|_| None).collect(),
         };
-        ensure!(
-            base.is_none_or(|r| r.kind != ContentKind::Legacy),
-            "LEGACY_CONVERSION_REQUIRED"
-        );
         let _permit = self.permit_checked(context, 3, BufferClass::Background, &|| {
             source.check(context)
         })?;
@@ -975,10 +902,6 @@ impl LocalContent {
         if len == 0 {
             return source.check(context);
         }
-        ensure!(
-            base.kind != ContentKind::Legacy,
-            "LEGACY_CONVERSION_REQUIRED"
-        );
         let pin = self.pin(base)?;
         let mut cursor = BaseCursor {
             provider: self,
@@ -1149,7 +1072,7 @@ impl LocalContent {
 
     /// Constant-length aligned-chunk COW update. Unchanged subtrees retain their
     /// identities. A fully covered chunk requires no read of its old bytes.
-    /// Legacy conversion and resize are explicit operations owned by write sessions.
+    /// Resize is an explicit operation owned by write sessions.
     pub fn overwrite(
         &self,
         pin: &PinnedContent,
@@ -1160,10 +1083,6 @@ impl LocalContent {
         ensure!(pin.provider() == self.owner.id, "CONTENT_PROVIDER_MISMATCH");
         let base = pin.reference();
         context.validate(base, offset, bytes.len())?;
-        ensure!(
-            base.kind != ContentKind::Legacy,
-            "LEGACY_CONVERSION_REQUIRED"
-        );
         if bytes.is_empty() {
             return Ok(base.clone());
         }
@@ -1278,7 +1197,6 @@ impl LocalContent {
             return context.check();
         }
         match reference.kind {
-            ContentKind::Legacy => self.read_legacy(reference, offset, out, context)?,
             ContentKind::Direct => {
                 let bytes = self.verified_blob(
                     ObjectKey::root(reference),
@@ -1350,12 +1268,6 @@ impl ContentProvider for LocalContent {
         let result = (|| -> Result<()> {
             if len == 0 {
                 return context.check();
-            }
-            if pin.reference().kind == ContentKind::Legacy {
-                // Verification-only legacy scan: no requested bytes retained.
-                return self
-                    .read_legacy(pin.reference(), range.offset, &mut [], context)
-                    .and_then(|()| context.check());
             }
             let mut offset = range.offset;
             let end = range.end()?;

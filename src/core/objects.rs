@@ -1,7 +1,7 @@
 //! Content-addressed objects: verified reads and installs, immutable sizes,
 //! local availability, the shared (sendable) inventory, per-object error state
 //! and per-object locks. Also owns the object side tables (§9), their
-//! backfills and the startup object check (phase 4 of `Store::open`).
+//! current derived-index repair and startup object verification (phase 4 of `Store::open`).
 //!
 //! # Indexes (WP1.8)
 //!
@@ -74,11 +74,8 @@ const STAMP_NS: i64 = STAMP_SECS as i64 * 1_000_000_000;
 const RACY_NS: i64 = 3_000_000_000;
 /// Rows per backfill / startup-check transaction.
 const CHUNK: usize = 10_000;
-/// `config('schema:objects')` (2: `spool_state`, WP3.2).
-const SCHEMA_VERSION: &str = "2";
-/// One-time markers (§5.3).
-const AVAILABILITY_MARKER: &str = "availability_v2";
-const EVENT_OBJECTS_MARKER: &str = "event_objects_v1";
+/// Current event-reference index repair checkpoint.
+const EVENT_OBJECTS_MARKER: &str = "repair:objects:ready";
 
 /// Object-module cache (interior mutability; derived and disposable).
 #[derive(Default)]
@@ -165,54 +162,11 @@ pub struct ScrubOutcome {
     pub bytes: u64,
 }
 
-const SCHEMA: &str = "SAVEPOINT objects_schema;
-    CREATE TABLE IF NOT EXISTS object_availability(hash TEXT PRIMARY KEY,size INTEGER NOT NULL,state INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,verified_ms INTEGER NOT NULL);
-    CREATE INDEX IF NOT EXISTS object_availability_by_state ON object_availability(state,verified_ms);
-    CREATE TABLE IF NOT EXISTS event_objects(hash TEXT NOT NULL,event TEXT NOT NULL,shared INTEGER NOT NULL,PRIMARY KEY(hash,event));
-    CREATE INDEX IF NOT EXISTS event_objects_by_event ON event_objects(event);
-    CREATE TABLE IF NOT EXISTS staged_objects(hash TEXT NOT NULL,event TEXT NOT NULL,PRIMARY KEY(hash,event));
-    CREATE INDEX IF NOT EXISTS staged_objects_by_event ON staged_objects(event);
-    CREATE TABLE IF NOT EXISTS object_error_state(hash TEXT PRIMARY KEY,code TEXT NOT NULL,class TEXT NOT NULL,attempts INTEGER NOT NULL,retry_at_ms INTEGER NOT NULL,last_ms INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS spool_state(hash TEXT PRIMARY KEY,durable INTEGER NOT NULL,total INTEGER NOT NULL,updated_ms INTEGER NOT NULL);
-    CREATE TRIGGER IF NOT EXISTS event_objects_insert AFTER INSERT ON events BEGIN
-        INSERT OR IGNORE INTO event_objects(hash,event,shared)
-            SELECT json_extract(c.value,'$.value'),NEW.id,coalesce(json_extract(NEW.payload,'$.branch.shared'),0)
-            FROM json_each(CASE WHEN json_valid(NEW.payload) THEN NEW.payload ELSE '{}' END,'$.changes') c
-            WHERE json_extract(c.value,'$.field')='content' AND json_type(c.value,'$.value')='text';
-    END;
-    CREATE TRIGGER IF NOT EXISTS event_objects_delete AFTER DELETE ON events BEGIN
-        DELETE FROM event_objects WHERE event=OLD.id;
-    END;
-    CREATE TRIGGER IF NOT EXISTS event_objects_update AFTER UPDATE OF id,payload ON events BEGIN
-        DELETE FROM event_objects WHERE event=OLD.id;
-        INSERT OR IGNORE INTO event_objects(hash,event,shared)
-            SELECT json_extract(c.value,'$.value'),NEW.id,coalesce(json_extract(NEW.payload,'$.branch.shared'),0)
-            FROM json_each(CASE WHEN json_valid(NEW.payload) THEN NEW.payload ELSE '{}' END,'$.changes') c
-            WHERE json_extract(c.value,'$.field')='content' AND json_type(c.value,'$.value')='text';
-    END;
-    CREATE TRIGGER IF NOT EXISTS staged_objects_insert AFTER INSERT ON incoming_events BEGIN
-        INSERT OR IGNORE INTO staged_objects(hash,event)
-            SELECT json_extract(c.value,'$.value'),NEW.id
-            FROM json_each(CASE WHEN json_valid(NEW.payload) THEN NEW.payload ELSE '{}' END,'$.changes') c
-            WHERE json_extract(c.value,'$.field')='content' AND json_type(c.value,'$.value')='text';
-    END;
-    CREATE TRIGGER IF NOT EXISTS staged_objects_delete AFTER DELETE ON incoming_events BEGIN
-        DELETE FROM staged_objects WHERE event=OLD.id;
-    END;
-    CREATE TRIGGER IF NOT EXISTS staged_objects_update AFTER UPDATE OF id,payload ON incoming_events BEGIN
-        DELETE FROM staged_objects WHERE event=OLD.id;
-        INSERT OR IGNORE INTO staged_objects(hash,event)
-            SELECT json_extract(c.value,'$.value'),NEW.id
-            FROM json_each(CASE WHEN json_valid(NEW.payload) THEN NEW.payload ELSE '{}' END,'$.changes') c
-            WHERE json_extract(c.value,'$.field')='content' AND json_type(c.value,'$.value')='text';
-    END;
-    RELEASE objects_schema;";
-
-/// Backfill statements: `(source table, cursor key, statement over rowid range ?1 < rowid <= ?2)`.
-const BACKFILLS: [(&str, &str, &str); 2] = [
+/// Current repair statements: `(source table, cursor key, statement over rowid range ?1 < rowid <= ?2)`.
+const INDEX_REPAIRS: [(&str, &str, &str); 2] = [
     (
         "events",
-        "event_objects_v1:events",
+        "repair:objects:cursor:events",
         "INSERT OR IGNORE INTO event_objects(hash,event,shared)
             SELECT json_extract(c.value,'$.value'),e.id,coalesce(json_extract(e.payload,'$.branch.shared'),0)
             FROM events e,json_each(CASE WHEN json_valid(e.payload) THEN e.payload ELSE '{}' END,'$.changes') c
@@ -221,7 +175,7 @@ const BACKFILLS: [(&str, &str, &str); 2] = [
     ),
     (
         "incoming_events",
-        "event_objects_v1:incoming",
+        "repair:objects:cursor:incoming",
         "INSERT OR IGNORE INTO staged_objects(hash,event)
             SELECT json_extract(c.value,'$.value'),e.id
             FROM incoming_events e,json_each(CASE WHEN json_valid(e.payload) THEN e.payload ELSE '{}' END,'$.changes') c
@@ -243,22 +197,29 @@ fn set_config(db: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Phase 3 (objects): the §9 side tables and triggers, in their own savepoint,
-/// then the one-time chunked, resumable `event_objects_v1` backfill.
-pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
-    store.db.execute_batch(SCHEMA)?;
-    if config_value(&store.db, "schema:objects")?.as_deref() != Some(SCHEMA_VERSION) {
-        set_config(&store.db, "schema:objects", SCHEMA_VERSION)?;
-    }
-    if config_value(&store.db, EVENT_OBJECTS_MARKER)?.is_some() {
+pub(super) fn repair_indexes(store: &mut Store) -> Result<()> {
+    if config_value(&store.db, EVENT_OBJECTS_MARKER)?.as_deref() == Some("1") {
         return Ok(());
     }
-    // Triggers already cover every row written from now on; the backfill
-    // covers older rows, `CHUNK` rows per transaction, resuming from a cursor.
-    for (table, cursor_key, statement) in BACKFILLS {
-        let mut cursor: i64 = config_value(&store.db, cursor_key)?
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
+    // Current triggers maintain new commits while a requested repair rebuilds
+    // only this derived index in bounded, restartable slices.
+    for (table, cursor_key, statement) in INDEX_REPAIRS {
+        let existing = config_value(&store.db, cursor_key)?;
+        let mut cursor: i64 = if let Some(value) = existing {
+            value.parse().context("INVALID_STORE_METADATA")?
+        } else {
+            let tx = store.db.savepoint()?;
+            let target = if table == "events" {
+                "event_objects"
+            } else {
+                "staged_objects"
+            };
+            tx.execute(&format!("DELETE FROM {target}"), [])?;
+            set_config(&tx, cursor_key, "0")?;
+            tx.commit()?;
+            0
+        };
+        ensure!(cursor >= 0, "INVALID_STORE_METADATA");
         loop {
             let upper: Option<i64> = store.db.query_row(
                 &format!(
@@ -272,13 +233,14 @@ pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
             tx.execute(statement, params![cursor, upper])?;
             set_config(&tx, cursor_key, &upper.to_string())?;
             tx.commit()?;
+            crate::util::fault::trigger("store.index.objects.page")?;
             cursor = upper;
             crate::startup::progress("indexing object references");
         }
     }
     let tx = store.db.savepoint()?;
     set_config(&tx, EVENT_OBJECTS_MARKER, "1")?;
-    for (_, cursor_key, _) in BACKFILLS {
+    for (_, cursor_key, _) in INDEX_REPAIRS {
         tx.execute("DELETE FROM config WHERE key=?", [cursor_key])?;
     }
     tx.commit()?;
@@ -326,8 +288,17 @@ pub(crate) fn stamp(file: &fs::File) -> Result<i64> {
 /// Regular files in `objects/` named like an object id: `hash → (len, mtime_ns)`.
 /// One directory enumeration instead of one `stat` per object.
 fn scan_objects(root: &Path) -> Result<HashMap<String, (u64, i64)>> {
+    scan_directory(&root.join("objects"))
+}
+
+fn scan_directory(dir: &Path) -> Result<HashMap<String, (u64, i64)>> {
     let mut present = HashMap::new();
-    for entry in fs::read_dir(root.join("objects"))? {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(present),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -343,24 +314,12 @@ fn scan_objects(root: &Path) -> Result<HashMap<String, (u64, i64)>> {
 /// Phase 4 of `Store::open`: reference/size bookkeeping and verification of
 /// stored bytes; corrupt content is quarantined, the journal is kept.
 ///
-/// After the one-time pass (`availability_v2`), a clean restart enumerates
+/// A clean current-format restart enumerates
 /// `objects/` once and hashes nothing: every candidate (referenced, staged or
 /// indexed object) is compared with its marker. Deleted objects are marked
 /// missing and queued for download; changed ones are hashed, and quarantined
 /// if corrupt. Each `CHUNK` candidates commit in their own savepoint.
 pub(super) fn startup_object_check(store: &mut Store, verify: VerifyMode) -> Result<()> {
-    let upgraded = config_value(&store.db, AVAILABILITY_MARKER)?.is_some();
-    // Very old states (no `availability_v1`) also publish verified shared objects.
-    let legacy = config_value(&store.db, "availability_v1")?.is_none();
-    if !upgraded {
-        one_time_bookkeeping(store)?;
-    }
-    // Lazy cannot grant the legacy publication, which requires verification.
-    let verify = if legacy && verify == VerifyMode::Lazy {
-        VerifyMode::Changed
-    } else {
-        verify
-    };
     let rows: HashMap<String, Row> = store
         .db
         .prepare("SELECT hash,size,state,mtime_ns,verified_ms FROM object_availability")?
@@ -382,15 +341,6 @@ pub(super) fn startup_object_check(store: &mut Store, verify: VerifyMode) -> Res
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     candidates.extend(rows.keys().cloned());
-    let shared: HashSet<String> = if legacy {
-        store
-            .db
-            .prepare("SELECT DISTINCT hash FROM event_objects WHERE shared=1")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?
-    } else {
-        HashSet::new()
-    };
     crate::startup::progress("verifying available objects");
     let present = scan_objects(&store.root)?;
     let candidates: Vec<String> = candidates
@@ -402,16 +352,7 @@ pub(super) fn startup_object_check(store: &mut Store, verify: VerifyMode) -> Res
         let result = (|| -> Result<()> {
             for object in chunk {
                 crate::startup::progress("verifying available objects");
-                check_object(store, object, rows.get(object), present.get(object), verify)
-                    .and_then(|ok| {
-                        if ok && legacy && shared.contains(object) {
-                            store.db.execute(
-                                "INSERT OR IGNORE INTO published_objects VALUES(?)",
-                                [object],
-                            )?;
-                        }
-                        Ok(())
-                    })?;
+                check_object(store, object, rows.get(object), present.get(object), verify)?;
             }
             Ok(())
         })();
@@ -425,47 +366,9 @@ pub(super) fn startup_object_check(store: &mut Store, verify: VerifyMode) -> Res
             }
         }
     }
-    let tx = store.db.savepoint()?;
-    set_config(&tx, AVAILABILITY_MARKER, "1")?;
-    tx.execute(
-        "INSERT OR IGNORE INTO config VALUES('availability_v1','1')",
-        [],
-    )?;
-    tx.commit()?;
-    // Spools (WP3.2): legacy adoption once, then every spool is cut back to
-    // its recorded durable offset. Nothing is registered here (I4).
+    // Reconcile only current committed spool offsets; no prior-format adoption.
     crate::startup::progress("reconciling spools");
     super::transfer::reconcile_spools(store)
-}
-
-/// The legacy per-open bookkeeping (`object_references`, `object_sizes` from
-/// every event), now run once per upgrade. Commits maintain both afterwards
-/// (in this and older binaries alike).
-fn one_time_bookkeeping(store: &mut Store) -> Result<()> {
-    crate::startup::progress("indexing object references");
-    let tx = store.db.savepoint()?;
-    tx.execute(
-        "INSERT OR IGNORE INTO object_references SELECT DISTINCT hash FROM event_objects",
-        [],
-    )?;
-    tx.commit()?;
-    let sizes: Vec<(String, i64)> = store
-        .db
-        .prepare(
-            "SELECT j.key,j.value FROM events e,json_each(CASE WHEN json_valid(e.payload) THEN e.payload ELSE '{}' END,'$.object_sizes') j",
-        )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    for chunk in sizes.chunks(CHUNK) {
-        let tx = store.db.savepoint()?;
-        for (object, size) in chunk {
-            let size = u64::try_from(*size).context("FILE_TOO_LARGE")?;
-            remember_size(&tx, object, size)?;
-        }
-        tx.commit()?;
-        crate::startup::progress("indexing object references");
-    }
-    Ok(())
 }
 
 /// `Store::remember_object_size` on any connection (transactions included).
@@ -571,17 +474,28 @@ impl Store {
     /// What `objects/` holds right now: one directory `stat`, plus one
     /// enumeration when the directory changed since the cached listing.
     pub(crate) fn presence(&self) -> Result<Arc<Presence>> {
-        let dir = self.root.join("objects");
-        let dir_mtime_ns = mtime_ns(&fs::metadata(&dir)?);
-        if let Some(presence) = listings().get(&self.root)
+        self.content_presence("objects")
+    }
+
+    pub(crate) fn content_presence(&self, folder: &str) -> Result<Arc<Presence>> {
+        let dir = self.root.join(folder);
+        let stamp = || -> Result<i64> {
+            match fs::metadata(&dir) {
+                Ok(metadata) => Ok(mtime_ns(&metadata)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+                Err(error) => Err(error.into()),
+            }
+        };
+        let dir_mtime_ns = stamp()?;
+        if let Some(presence) = listings().get(&dir)
             && presence.trusted
             && presence.dir_mtime_ns == dir_mtime_ns
         {
             return Ok(presence.clone());
         }
         let taken = now_ns();
-        let files = scan_objects(&self.root)?;
-        let after = mtime_ns(&fs::metadata(&dir)?);
+        let files = scan_directory(&dir)?;
+        let after = stamp()?;
         let presence = Arc::new(Presence {
             generation: LISTING_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             dir_mtime_ns,
@@ -590,10 +504,10 @@ impl Store {
             files,
         });
         let mut cached = listings();
-        if cached.len() >= MAX_LISTINGS && !cached.contains_key(&self.root) {
+        if cached.len() >= MAX_LISTINGS && !cached.contains_key(&dir) {
             cached.pop_first();
         }
-        cached.insert(self.root.clone(), presence.clone());
+        cached.insert(dir, presence.clone());
         Ok(presence)
     }
     pub(crate) fn count_hash(&self) {
@@ -1109,19 +1023,6 @@ impl Store {
             self.rekey_view(kept);
         }
         result
-    }
-    /// Records that a caller found the installed copy of `object` corrupt,
-    /// without hashing it again (CCR-WP5.2-7, applied by WP5.INT): the copy
-    /// a save hashed off the engine lock (`runtime::engine::store_snapshot`),
-    /// whose file had `len` bytes and mtime `mtime_ns` when it was hashed.
-    /// What [`Store::verify_object`] records for a mismatch (`CORRUPT`, no
-    /// longer served), only while the file is still that copy: a copy
-    /// installed or healed since is left to its own verification.
-    pub(crate) fn note_corrupt_copy(&self, object: &str, len: u64, mtime_ns: i64) {
-        let path = self.root.join("objects").join(object);
-        if fs::metadata(&path).is_ok_and(|m| m.len() == len && self::mtime_ns(&m) == mtime_ns) {
-            self.note_corrupt(object, len);
-        }
     }
     pub fn put_stream(&self, source: &mut impl Read) -> Result<String> {
         let temp = self.root.join("objects").join(format!("{}.part", id()));

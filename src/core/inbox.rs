@@ -95,8 +95,6 @@ fn raise_cache(db: &Connection, kib: i64) -> Option<i64> {
 }
 /// Retry backoff: `min(RETRY_CAP_MS, 2^attempts s)`, i.e. 1 s → 5 min.
 const RETRY_CAP_MS: u64 = 300_000;
-/// `schema:inbox` stamp.
-const SCHEMA_VERSION: i64 = 1;
 const READY: &str = "ready";
 const WAITING: &str = "waiting";
 const RETRY: &str = "retry";
@@ -338,60 +336,6 @@ struct SliceStats {
     elapsed: Duration,
 }
 
-/// `inbox::ensure_schema` (`schema:inbox=1`): the state columns (named-column
-/// writers only, REVAMP_PLAN §9), `incoming_waits`, `incoming_sources`, their
-/// indexes (plus a partial index on `blocked_on`, so releasing the rows
-/// blocked on a committed event is a point lookup) and the cleanup trigger.
-/// Idempotent; runs in its own savepoint.
-pub(super) fn ensure_schema(store: &mut Store) -> Result<()> {
-    let db = &store.db;
-    db.execute_batch("SAVEPOINT inbox_schema")?;
-    let result = (|| -> Result<()> {
-        let columns: BTreeSet<String> = db
-            .prepare("SELECT name FROM pragma_table_info('incoming_events')")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        for column in [
-            "state TEXT",
-            "received_ms INTEGER",
-            "attempts INTEGER",
-            "retry_at_ms INTEGER",
-            "code TEXT",
-            "error_class TEXT",
-            "blocked_on TEXT",
-        ] {
-            let name = column.split(' ').next().unwrap_or(column);
-            if !columns.contains(name) {
-                db.execute_batch(&format!("ALTER TABLE incoming_events ADD COLUMN {column}"))?;
-            }
-        }
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS incoming_waits(child TEXT NOT NULL,parent TEXT NOT NULL,PRIMARY KEY(child,parent));
-            CREATE INDEX IF NOT EXISTS incoming_waits_parent ON incoming_waits(parent);
-            CREATE TABLE IF NOT EXISTS incoming_sources(event TEXT NOT NULL,peer TEXT NOT NULL,seq INTEGER NOT NULL,PRIMARY KEY(event,peer));
-            CREATE INDEX IF NOT EXISTS incoming_events_state ON incoming_events(state,received_ms);
-            CREATE INDEX IF NOT EXISTS incoming_events_blocked_on ON incoming_events(blocked_on) WHERE blocked_on IS NOT NULL;
-            CREATE TRIGGER IF NOT EXISTS incoming_events_cleanup AFTER DELETE ON incoming_events BEGIN
-                DELETE FROM incoming_waits WHERE child=OLD.id;
-                DELETE FROM incoming_sources WHERE event=OLD.id;
-            END;",
-        )?;
-        db.execute(
-            "INSERT INTO config(key,value) VALUES('schema:inbox',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(config.value AS INTEGER)<?1",
-            [SCHEMA_VERSION],
-        )?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => db.execute_batch("RELEASE inbox_schema")?,
-        Err(error) => {
-            let _ = db.execute_batch("ROLLBACK TO inbox_schema; RELEASE inbox_schema");
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
 /// Phase 8 of `Store::open`: recover staged incoming events. A restart
 /// retries every `retry` row and re-derives waits; NULL rows are classified;
 /// with `defer=false` every ready row is activated (progress per slice).
@@ -482,6 +426,9 @@ impl Store {
                 e.branch.shared && allowed_devices.contains(&e.device),
                 "UNAUTHORIZED_EVENT"
             );
+            // Refuse unsupported file registers before the older bundle route
+            // can install bytes or record inbound disclosure provenance.
+            self.check_content_capability(e)?;
         }
         // Object bookkeeping and staging write no projection state: a view
         // that is fresh now stays fresh (no O(projection) reload per page).

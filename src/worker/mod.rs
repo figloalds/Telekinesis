@@ -584,6 +584,19 @@ impl Running {
             self.server.wait_stop(seen, MAIN_TICK);
         }
         self.server.wait_stop_reply(STOP_REPLY_FLUSH);
+        if let Err(error) = crate::runtime::content_writes::drain_worker(
+            &ctx.engine,
+            &crate::content::ReadContext {
+                deadline: Instant::now() + Duration::from_secs(5),
+                cancel: crate::util::Cancel::new(),
+            },
+        ) {
+            let wire = ErrorWire::from_error(&error);
+            crate::util::log::event!(warn, (wire.code.as_str()), {
+                "site": "worker.native_stop",
+                "message": wire.message,
+            });
+        }
         let _ = fs::remove_file(self.state.join("runtime.json"));
         let _ = record::remove(&self.state);
         remove_own_token(&self.state, self.server.token());

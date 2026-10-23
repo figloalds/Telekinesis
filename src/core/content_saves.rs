@@ -8,7 +8,7 @@ use crate::{
         write::{PreparedSave, SaveCheckpoint, SaveIntent},
     },
     model::{
-        content::{ContentKind, Digest as ContentDigest, FileContentRef},
+        content::{Digest as ContentDigest, FileContentRef},
         workspace::{FileRevision, WorkspaceId},
     },
 };
@@ -19,9 +19,23 @@ use std::time::Duration;
 const RECORD_BYTES: usize = 65_536;
 const FRONTIER_LIMIT: usize = 256;
 
+mod create;
+mod deletion;
+mod directory;
 mod metadata;
-pub use metadata::ContentMetadataReceipt;
+mod namespace;
+mod retirement;
+mod unlink;
+pub use create::ContentCreateRequest;
+pub use deletion::ContentDeleteIntent;
+pub use directory::{
+    DirectoryCreateReceipt, DirectoryCreateRequest, DirectoryDeleteIntent, DirectoryMutation,
+    DirectoryMutationReceipt, DirectoryMutationRequest, DirectorySnapshot,
+};
 pub(super) use metadata::MetadataOwner;
+pub use metadata::{ContentBasicUpdate, ContentMetadataReceipt};
+pub use namespace::NamespaceTarget;
+pub use retirement::{NamespaceContinuation, NamespaceDestination};
 
 /// The descriptor and parents selected by an open native writer. Checked
 /// inside the metadata writer transaction before superseding an operation.
@@ -32,30 +46,6 @@ pub(crate) struct ContentSaveSelection {
     pub content: FileContentRef,
     pub content_parent: Option<String>,
     pub alive_parent: Option<String>,
-}
-
-pub(super) fn ensure_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("SAVEPOINT content_save_schema;
-        CREATE TABLE IF NOT EXISTS content_save_entities(
-            branch TEXT NOT NULL,entity TEXT NOT NULL,generation INTEGER NOT NULL
-            CHECK(typeof(generation)='integer' AND generation>0),
-            owner TEXT CHECK(owner IS NULL OR length(owner)=36),PRIMARY KEY(branch,entity));
-        CREATE TABLE IF NOT EXISTS content_save_operations(
-            operation TEXT PRIMARY KEY,capture BLOB NOT NULL CHECK(length(capture)<=65536),
-            selected BLOB CHECK(length(selected)<=65536),receipt BLOB CHECK(length(receipt)<=65536));
-        CREATE TABLE IF NOT EXISTS content_save_history(
-            operation TEXT NOT NULL,checkpoint TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>0),
-            capture BLOB NOT NULL CHECK(length(capture)<=65536),
-            selected BLOB NOT NULL CHECK(length(selected)<=65536),receipt BLOB NOT NULL CHECK(length(receipt)<=65536),
-            PRIMARY KEY(operation,checkpoint),UNIQUE(operation,generation));
-        CREATE TABLE IF NOT EXISTS content_save_successors(
-            operation TEXT NOT NULL,checkpoint TEXT NOT NULL,capture BLOB NOT NULL CHECK(length(capture)<=65536),
-            PRIMARY KEY(operation,checkpoint));
-        CREATE TABLE IF NOT EXISTS content_save_metadata_changes(
-            mutation TEXT PRIMARY KEY CHECK(length(mutation)=36),
-            record BLOB NOT NULL CHECK(length(record)<=65536));
-        RELEASE content_save_schema;")?;
-    Ok(())
 }
 
 /// Every ordinary local file-register mutation supersedes pending
@@ -69,7 +59,7 @@ pub(super) fn observe_event(
 ) -> Result<()> {
     if let Some(owner) = owner {
         ensure!(local, "CONTENT_METADATA_OWNER_MISMATCH");
-        return owner.check(db, event);
+        owner.check(db, event)?;
     }
     if local {
         let mut update = db.prepare_cached(
@@ -79,6 +69,7 @@ pub(super) fn observe_event(
             .changes
             .iter()
             .filter(|c| matches!(c.field.as_str(), "content" | "alive" | "location" | "basic"))
+            .filter(|c| owner.is_none_or(|owner| c.entity != owner.entity()))
             .map(|c| &c.entity)
             .collect::<BTreeSet<_>>()
         {
@@ -157,6 +148,9 @@ struct Capture {
     predecessor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     basic_policy: Option<BasicPolicy>,
+    /// The namespace event that retired this open entity. Saves keep it dead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retirement: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -179,7 +173,8 @@ impl Capture {
                     == capture_event_id(
                         operation,
                         self.intent.base.generation,
-                        self.predecessor.as_deref()
+                        self.predecessor.as_deref(),
+                        self.retirement.as_deref()
                     )
                 && event.repo == self.intent.base.workspace.repository
                 && event.branch.id == self.intent.branch
@@ -198,6 +193,9 @@ impl Capture {
         if let Some(parent) = &self.predecessor {
             ContentDigest::parse(parent).context("CORRUPT_CONTENT_SAVE")?;
         }
+        if let Some(event) = &self.retirement {
+            Uuid::parse_str(event).context("CORRUPT_CONTENT_SAVE")?;
+        }
         let content = &event.changes[0];
         let alive = &event.changes[1];
         ensure!(
@@ -213,7 +211,7 @@ impl Capture {
                 && content.value == json!(self.intent.base.content)
                 && &alive.entity == entity
                 && alive.field == "alive"
-                && alive.value == json!(true)
+                && alive.value == json!(self.retirement.is_none())
                 && alive.parents
                     == self
                         .intent
@@ -233,7 +231,24 @@ impl Capture {
         Ok(())
     }
 }
-fn capture_event_id(operation: Uuid, generation: u64, predecessor: Option<&str>) -> String {
+fn capture_event_id(
+    operation: Uuid,
+    generation: u64,
+    predecessor: Option<&str>,
+    retirement: Option<&str>,
+) -> String {
+    if let Some(retirement) = retirement {
+        return hash(
+            &serde_json::to_vec(&(
+                "tkfs:retired-save-event:v1",
+                operation,
+                generation,
+                predecessor,
+                retirement,
+            ))
+            .unwrap(),
+        );
+    }
     match predecessor {
         None => operation.to_string(),
         Some(parent) => hash(
@@ -420,7 +435,6 @@ impl Store {
         } else {
             self.with_write("content_workspace_identity", |store| {
                 context.check()?;
-                store.content_save_enabled()?;
                 store.db.execute(
                     "INSERT OR IGNORE INTO config(key,value) VALUES('content_save_workspace',?)",
                     [Uuid::new_v4().to_string()],
@@ -455,6 +469,7 @@ fn current(store: &Store, capture: &Capture) -> Result<()> {
         generation == intent.base.generation && owner == Some(intent.operation.to_string()),
         "STALE_CONTENT_SAVE"
     );
+    store.verify_capture_retirement(capture)?;
     Ok(())
 }
 
@@ -565,17 +580,6 @@ impl Store {
             })
             .context("CONTENT_SAVE_CONNECTION_FAILED")
     }
-    fn content_save_enabled(&self) -> Result<()> {
-        ensure!(
-            self.db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM config WHERE key='fixture:content_v1' AND value='1')",
-                [],
-                |r| r.get::<_, bool>(0)
-            )?,
-            "PEER_NEEDS_UPGRADE: content-v1 is not active for this repository"
-        );
-        Ok(())
-    }
     /// Own the outer writer transaction. A receipt can never escape a caller's
     /// later rollback. Writer acquisition polls the actual deadline/cancel; no
     /// content I/O and no private-journal lock occurs while holding the writer.
@@ -590,7 +594,6 @@ impl Store {
             self.db.is_autocommit(),
             "CONTENT_SAVE_REQUIRES_OUTER_TRANSACTION"
         );
-        self.content_save_enabled()?;
         let synchronous: i64 = self.db.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
         let mode: String = self.db.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
         ensure!(
@@ -696,59 +699,139 @@ impl Store {
         context: &ReadContext,
     ) -> Result<SaveIntent> {
         self.content_save_write(context, |store| {
-            let (branch, view_generation) = active(&store.db)?;
-            ensure!(branch == store.active, "STALE_CONTENT_VIEW");
-            let entry = store.entry(entity)?;
-            ensure!(entry.kind == "file" && entry.alive, "FILE_NOT_FOUND");
-            let content = if let Some(content) = &entry.content_ref { content.clone() } else {
-                let object = entry.content.as_ref().context("MISSING_CONTENT_DESCRIPTOR")?;
-                FileContentRef::new(ContentKind::Legacy, ContentDigest::parse(object)?, store.object_size(object)?)?
-            };
-            if let Some(selected) = selection {
-                ensure!(branch == selected.branch && view_generation == selected.generation
+            store
+                .begin_content_save_inner(entity, selection, Uuid::new_v4())
+                .map(|capture| capture.intent)
+        })
+    }
+    fn begin_content_save_inner(
+        &mut self,
+        entity: &str,
+        selection: Option<&ContentSaveSelection>,
+        operation: Uuid,
+    ) -> Result<Capture> {
+        ensure!(
+            !self.db.is_autocommit(),
+            "CONTENT_SAVE_REQUIRES_TRANSACTION"
+        );
+        let (branch, view_generation) = active(&self.db)?;
+        ensure!(branch == self.active, "STALE_CONTENT_VIEW");
+        let entry = self.entry(entity)?;
+        ensure!(entry.kind == "file" && entry.alive, "FILE_NOT_FOUND");
+        let content = entry
+            .content_ref
+            .clone()
+            .context("MISSING_CONTENT_DESCRIPTOR")?;
+        if let Some(selected) = selection {
+            ensure!(
+                branch == selected.branch
+                    && view_generation == selected.generation
                     && content == selected.content
                     && entry.revisions.get("content") == selected.content_parent.as_ref()
                     && entry.revisions.get("alive") == selected.alive_parent.as_ref(),
-                    "STALE_CONTENT_VIEW");
-            }
-            let mut q = store.db.prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event LIMIT 257")?;
-            let dependencies = q.query_map([&branch], |r| {
-                let s=r.get_ref(0)?.as_str()?;
-                if s.len()>128 {return Err(rusqlite::Error::InvalidQuery);}
+                "STALE_CONTENT_VIEW"
+            );
+        }
+        let mut q = self
+            .db
+            .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event LIMIT 257")?;
+        let dependencies = q
+            .query_map([&branch], |r| {
+                let s = r.get_ref(0)?.as_str()?;
+                if s.len() > 128 {
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
                 Ok(s.to_owned())
-            })?.collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(dependencies.len() <= FRONTIER_LIMIT, "CONTENT_SAVE_CAPTURE_LIMIT");
-            store.db.execute("INSERT OR IGNORE INTO config(key,value) VALUES('content_save_workspace',?)", [Uuid::new_v4().to_string()])?;
-            let operation = Uuid::new_v4();
-            let generation: u64 = store.db.query_row(
-                "INSERT INTO content_save_entities(branch,entity,generation,owner) VALUES(?,?,1,?)
-                 ON CONFLICT(branch,entity) DO UPDATE SET generation=generation+1,owner=excluded.owner RETURNING generation",
-                params![branch, entity, operation.to_string()], |r| r.get(0))?;
-            let intent = SaveIntent {
-                operation, branch: branch.clone(),
-                content_parent: entry.revisions.get("content").cloned(),
-                alive_parent: entry.revisions.get("alive").cloned(),
-                base: FileRevision {workspace: WorkspaceId {repository: store.repo.clone(), workspace: workspace(&store.db)?},
-                    entity: entity.to_owned(), generation, content},
-            };
-            let mut event = Event {id: intent.operation.to_string(), repo:store.repo.clone(), branch:store.branch(&branch)?,
-                device:store.device.clone(), created_ms:time(), dependencies, reviewed:vec![], object_sizes:BTreeMap::new(),
-                changes:vec![Change {entity:entity.into(), field:"content".into(), parents:intent.content_parent.clone().into_iter().collect(), value:json!(intent.base.content)},
-                    Change {entity:entity.into(), field:"alive".into(), parents:intent.alive_parent.clone().into_iter().collect(), value:json!(true)}]};
-            if entry.basic.is_some() {
-                let mut basic=entry.basic_info();
-                basic.write_time=filetime(event.created_ms);
-                basic.change_time=filetime(event.created_ms);
-                basic.attributes=BasicInfo::attributes(&entry.kind,basic.attributes|0x20)?;
-                event.changes.push(Change {entity:entity.into(),field:"basic".into(),
-                    parents:entry.revisions.get("basic").cloned().into_iter().collect(),value:json!(basic)});
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(
+            dependencies.len() <= FRONTIER_LIMIT,
+            "CONTENT_SAVE_CAPTURE_LIMIT"
+        );
+        self.db.execute(
+            "INSERT OR IGNORE INTO config(key,value) VALUES('content_save_workspace',?)",
+            [Uuid::new_v4().to_string()],
+        )?;
+        let generation: u64 = self.db.query_row(
+            "INSERT INTO content_save_entities(branch,entity,generation,owner) VALUES(?,?,1,?)
+             ON CONFLICT(branch,entity) DO UPDATE SET generation=generation+1,owner=excluded.owner RETURNING generation",
+            params![branch, entity, operation.to_string()], |r| r.get(0))?;
+        let intent = SaveIntent {
+            operation,
+            branch: branch.clone(),
+            content_parent: entry.revisions.get("content").cloned(),
+            alive_parent: entry.revisions.get("alive").cloned(),
+            base: FileRevision {
+                workspace: WorkspaceId {
+                    repository: self.repo.clone(),
+                    workspace: workspace(&self.db)?,
+                },
+                entity: entity.to_owned(),
+                generation,
+                content,
+            },
+        };
+        let mut event = Event {
+            id: intent.operation.to_string(),
+            repo: self.repo.clone(),
+            branch: self.branch(&branch)?,
+            device: self.device.clone(),
+            created_ms: time(),
+            dependencies,
+            reviewed: vec![],
+            object_sizes: BTreeMap::new(),
+            changes: vec![
+                Change {
+                    entity: entity.into(),
+                    field: "content".into(),
+                    parents: intent.content_parent.clone().into_iter().collect(),
+                    value: json!(intent.base.content),
+                },
+                Change {
+                    entity: entity.into(),
+                    field: "alive".into(),
+                    parents: intent.alive_parent.clone().into_iter().collect(),
+                    value: json!(true),
+                },
+            ],
+        };
+        if entry.basic.is_some() || selection.is_some() {
+            let mut basic = entry.basic_info();
+            if selection.is_none() {
+                basic.write_time = filetime(event.created_ms);
+                basic.change_time = filetime(event.created_ms);
             }
-            let capture=Capture {intent:intent.clone(),view_generation,event,predecessor:None,basic_policy:None};
-            capture.validate(intent.operation)?;
-            store.db.execute("INSERT INTO content_save_operations(operation,capture) VALUES(?,?)",
-                params![intent.operation.to_string(),encode("capture:v1", &capture)?])?;
-            Ok(intent)
-        })
+            basic.attributes = BasicInfo::attributes(&entry.kind, basic.attributes | 0x20)?;
+            event.changes.push(Change {
+                entity: entity.into(),
+                field: "basic".into(),
+                parents: entry.revisions.get("basic").cloned().into_iter().collect(),
+                value: json!(basic),
+            });
+        }
+        let capture = Capture {
+            intent: intent.clone(),
+            view_generation,
+            event,
+            predecessor: None,
+            basic_policy: None,
+            retirement: None,
+        };
+        capture.validate(intent.operation)?;
+        self.db.execute(
+            "INSERT INTO content_save_operations(operation,capture) VALUES(?,?)",
+            params![
+                intent.operation.to_string(),
+                encode("capture:v1", &capture)?
+            ],
+        )?;
+        let (stored, selected, receipt) = load(&self.db, operation)?;
+        ensure!(
+            stored == capture && selected.is_none() && receipt.is_none(),
+            "CONTENT_METADATA_CONTINUATION_LOST"
+        );
+        current(self, &capture)?;
+        Ok(capture)
     }
 
     /// Persist the coordinator's selected durable checkpoint. A newer selection
@@ -762,76 +845,108 @@ impl Store {
         checkpoint.validate()?;
         ensure!(checkpoint.needs_publication(), "STALE_WRITE_CHECKPOINT");
         self.content_save_write(context, |store| {
-            if let Some((capture, _, receipt)) = store.published_checkpoint(checkpoint)? {
-                store.archive_publication(&capture, checkpoint, &receipt)?;
-                return Ok(());
-            }
-            let (mut capture, prior, receipt) = load(&store.db, checkpoint.intent.operation)?;
-            ensure!(
-                capture.intent == checkpoint.intent,
-                "CONTENT_SAVE_INTENT_MISMATCH"
-            );
-            if let Some(receipt) = receipt {
-                ensure!(
-                    receipt.checkpoint == checkpoint_id(checkpoint)?,
-                    "CONTENT_SAVE_ALREADY_COMMITTED"
-                );
-                store.verify_content_save_receipt(&capture, &receipt)?;
-                return Ok(());
-            }
-            current(store, &capture)?;
-            if let Some(prior) = &prior {
-                ensure!(
-                    checkpoint.sequence > prior.sequence || checkpoint == prior,
-                    "STALE_WRITE_CHECKPOINT"
-                );
-            }
-            if prior.as_ref() != Some(checkpoint)
-                && let Some(policy) = capture.basic_policy.clone()
-            {
-                ensure!(
-                    checkpoint.sequence >= policy.sequence,
-                    "STALE_WRITE_CHECKPOINT"
-                );
-                let previous = capture.clone();
-                capture.event.created_ms = time();
-                let change = capture
-                    .event
-                    .changes
-                    .get_mut(2)
-                    .context("CORRUPT_CONTENT_SAVE")?;
-                let mut basic: BasicInfo = serde_json::from_value(change.value.clone())?;
-                let preserve = if policy.sequence == checkpoint.sequence {
-                    policy.preserve_times
-                } else {
-                    0
-                };
-                if preserve & 2 == 0 {
-                    basic.write_time = filetime(capture.event.created_ms);
-                }
-                if preserve & 4 == 0 {
-                    basic.change_time = filetime(capture.event.created_ms);
-                }
-                change.value = json!(basic);
-                store.replace_pending_capture(&previous, &capture, prior.as_ref())?;
-            }
-            let changed = store.db.execute(
-                "UPDATE content_save_operations SET selected=? WHERE operation=?",
-                params![
-                    encode("selection:v1", checkpoint)?,
-                    checkpoint.intent.operation.to_string()
-                ],
-            )?;
-            let (stored, selected, receipt) = load(&store.db, checkpoint.intent.operation)?;
-            ensure!(
-                changed == 1
-                    && stored == capture
-                    && selected.as_ref() == Some(checkpoint)
-                    && receipt.is_none(),
-                "CONTENT_SAVE_SELECTION_LOST"
-            );
-            Ok(())
+            store.select_content_checkpoint_inner(checkpoint)
         })
+    }
+    fn select_content_checkpoint_inner(&mut self, checkpoint: &SaveCheckpoint) -> Result<()> {
+        ensure!(
+            !self.db.is_autocommit(),
+            "CONTENT_SAVE_REQUIRES_TRANSACTION"
+        );
+        if let Some((capture, _, receipt)) = self.published_checkpoint(checkpoint)? {
+            self.archive_publication(&capture, checkpoint, &receipt)?;
+            return Ok(());
+        }
+        let (mut capture, prior, receipt) = load(&self.db, checkpoint.intent.operation)?;
+        ensure!(
+            capture.intent == checkpoint.intent,
+            "CONTENT_SAVE_INTENT_MISMATCH"
+        );
+        if let Some(receipt) = receipt {
+            ensure!(
+                receipt.checkpoint == checkpoint_id(checkpoint)?,
+                "CONTENT_SAVE_ALREADY_COMMITTED"
+            );
+            self.verify_content_save_receipt(&capture, &receipt)?;
+            return Ok(());
+        }
+        current(self, &capture)?;
+        if let Some(prior) = &prior {
+            ensure!(
+                checkpoint.sequence > prior.sequence || checkpoint == prior,
+                "STALE_WRITE_CHECKPOINT"
+            );
+        }
+        if prior.as_ref() != Some(checkpoint)
+            && (capture.basic_policy.is_some() || checkpoint.time_update_disabled().is_some())
+        {
+            let policy = capture.basic_policy.clone();
+            ensure!(
+                policy
+                    .as_ref()
+                    .is_none_or(|p| checkpoint.sequence >= p.sequence),
+                "STALE_WRITE_CHECKPOINT"
+            );
+            let previous = capture.clone();
+            capture.event.created_ms = time();
+            if capture.event.changes.len() == 2 {
+                // v4 recovered native captures can predate basic-info
+                // capture. Preserve any remote competitor: no new parent.
+                let entry = self.entry(&capture.intent.base.entity)?;
+                capture.event.changes.push(Change {
+                    entity: entry.id.clone(),
+                    field: "basic".into(),
+                    parents: vec![],
+                    value: json!(entry.basic_info()),
+                });
+            }
+            let change = capture
+                .event
+                .changes
+                .get_mut(2)
+                .context("CORRUPT_CONTENT_SAVE")?;
+            let mut basic: BasicInfo = serde_json::from_value(change.value.clone())?;
+            let preserve_attributes = policy
+                .as_ref()
+                .is_some_and(|p| p.sequence == checkpoint.sequence);
+            let preserve = policy
+                .filter(|p| p.sequence == checkpoint.sequence)
+                .map_or(0, |p| p.preserve_times);
+            if !preserve_attributes {
+                basic.attributes = BasicInfo::attributes("file", basic.attributes | 0x20)?;
+            }
+            let modified_ms = checkpoint
+                .native_times()
+                .map_or(capture.event.created_ms, |t| t.modified_ms);
+            if preserve & 2 == 0 {
+                basic.write_time = checkpoint
+                    .native_times()
+                    .map_or_else(|| filetime(modified_ms), |times| times.write_time);
+            }
+            if preserve & 4 == 0 {
+                basic.change_time = checkpoint
+                    .native_times()
+                    .map_or_else(|| filetime(modified_ms), |times| times.change_time);
+            }
+            change.value = json!(basic);
+            self.replace_pending_capture(&previous, &capture, prior.as_ref())?;
+        }
+        let changed = self.db.execute(
+            "UPDATE content_save_operations SET selected=? WHERE operation=?",
+            params![
+                encode("selection:v1", checkpoint)?,
+                checkpoint.intent.operation.to_string()
+            ],
+        )?;
+        let (stored, selected, receipt) = load(&self.db, checkpoint.intent.operation)?;
+        ensure!(
+            changed == 1
+                && stored == capture
+                && selected.as_ref() == Some(checkpoint)
+                && receipt.is_none(),
+            "CONTENT_SAVE_SELECTION_LOST"
+        );
+        Ok(())
     }
 
     /// Atomically publish a selected canonical revision, admission outbox and
@@ -963,11 +1078,7 @@ impl Store {
                 store.verify_successor(&previous,checkpoint,&receipt,&successor)?;
                 let current=load(&store.db,operation)?.0;
                 if current.intent.base.generation!=successor.intent.base.generation {
-                    let child_key:Option<String>=record_sql(store.db.query_row("SELECT checkpoint FROM content_save_history WHERE operation=? AND generation=?",
-                        params![operation.to_string(),successor.intent.base.generation],|r|checkpoint_text(r,0)).optional())?;
-                    let child=history(&store.db,operation,&child_key.context("CORRUPT_CONTENT_SAVE")?)?.context("CORRUPT_CONTENT_SAVE")?;
-                    ensure!(child.0==successor,"CORRUPT_CONTENT_SAVE");
-                    store.verify_content_save_receipt(&child.0,&child.2)?;
+                    store.verify_obsolete_successor(&successor)?;
                 } else {ensure!(current==successor,"CORRUPT_CONTENT_SAVE");}
                 return Ok((successor.intent,receipt.content));
             }
@@ -984,7 +1095,7 @@ impl Store {
             let mut intent=previous.intent.clone();
             intent.base.generation=next; intent.base.content=receipt.content.clone();
             intent.content_parent=Some(receipt.event.clone()); intent.alive_parent=Some(receipt.event.clone());
-            let successor=store.successor_capture(intent,previous.view_generation,key.clone())?;
+            let successor=store.successor_capture(intent,previous.view_generation,key.clone(),checkpoint.native_times().is_some(),previous.retirement.clone())?;
             let changed=store.db.execute("UPDATE content_save_entities SET generation=?,owner=? WHERE branch=? AND entity=? AND generation=? AND owner IS NULL",
                 params![next,operation.to_string(),successor.intent.branch,successor.intent.base.entity,generation])?;
             ensure!(changed==1,"CONTENT_SAVE_CONTINUATION_LOST");
@@ -1037,7 +1148,8 @@ impl Store {
                 && next.intent.base.content == receipt.content
                 && next.intent.content_parent.as_deref() == Some(receipt.event.as_str())
                 && next.intent.alive_parent.as_deref() == Some(receipt.event.as_str())
-                && next.view_generation == previous.view_generation,
+                && next.view_generation == previous.view_generation
+                && next.retirement == previous.retirement,
             "CORRUPT_CONTENT_SAVE"
         );
         Ok(())
@@ -1048,6 +1160,8 @@ impl Store {
         intent: SaveIntent,
         view_generation: u64,
         predecessor: String,
+        native_times: bool,
+        retirement: Option<String>,
     ) -> Result<Capture> {
         let mut q = self
             .db
@@ -1066,7 +1180,12 @@ impl Store {
             "CONTENT_SAVE_CAPTURE_LIMIT"
         );
         let mut event = Event {
-            id: capture_event_id(intent.operation, intent.base.generation, Some(&predecessor)),
+            id: capture_event_id(
+                intent.operation,
+                intent.base.generation,
+                Some(&predecessor),
+                retirement.as_deref(),
+            ),
             repo: self.repo.clone(),
             branch: self.branch(&intent.branch)?,
             device: self.device.clone(),
@@ -1085,7 +1204,7 @@ impl Store {
                     entity: intent.base.entity.clone(),
                     field: "alive".into(),
                     parents: intent.alive_parent.clone().into_iter().collect(),
-                    value: json!(true),
+                    value: json!(retirement.is_none()),
                 },
             ],
         };
@@ -1099,8 +1218,10 @@ impl Store {
         ensure!(entry.kind == "file", "INVALID_WRITE_INTENT");
         if entry.basic.is_some() {
             let mut basic = entry.basic_info();
-            basic.write_time = filetime(event.created_ms);
-            basic.change_time = filetime(event.created_ms);
+            if !native_times {
+                basic.write_time = filetime(event.created_ms);
+                basic.change_time = filetime(event.created_ms);
+            }
             basic.attributes = BasicInfo::attributes(&entry.kind, basic.attributes | 0x20)?;
             event.changes.push(Change {
                 entity: entry.id,
@@ -1115,12 +1236,14 @@ impl Store {
             event,
             predecessor: Some(predecessor),
             basic_policy: None,
+            retirement,
         };
         capture.validate(capture.intent.operation)?;
         Ok(capture)
     }
 
     fn verify_content_save_receipt(&self, capture: &Capture, receipt: &SaveReceipt) -> Result<()> {
+        self.verify_capture_retirement(capture)?;
         let mut event = capture.event.clone();
         event.changes[0].value = json!(receipt.content);
         let payload: String = record_sql(self.db.query_row(

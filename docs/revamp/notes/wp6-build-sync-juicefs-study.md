@@ -1,5 +1,10 @@
 # Proposed Wave 6: independent metadata and object engines
 
+Scope amendment, 2026-10-22: [personal-use deployment and DVFS authority
+boundaries](../AUTHORITY_SCOPE.md) govern inherited security requirements.
+References to security floors retain DVFS authority/correctness coverage, not
+Users, ACLs, custom authentication or defenses supplied by the deployment.
+
 Planning update: [WAVE_6_PLAN.md](../WAVE_6_PLAN.md) now owns the selected wave
 scope, package numbering and gates. The package table here is historical
 investigation material; its evidence and unresolved causal claims are retained.

@@ -84,6 +84,8 @@ pub struct ObjectLease {
 /// the store root, shared by every in-process worker of a test binary).
 #[derive(Debug, Default)]
 pub struct ObjectsState {
+    /// Long control byte calls leave loopback handlers for metadata/completion.
+    pub inspection_calls: usize,
     pub effects: super::objects_effects::Effects,
     pub legacy_cancel: crate::util::Cancel,
     /// Latest ordered run per owned legacy lane scope. Never evict a fence

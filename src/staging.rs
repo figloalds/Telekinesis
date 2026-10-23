@@ -1,25 +1,11 @@
-//! Bounded-memory random-access staging. Failed saves keep their spool on disk.
-//! Native COW sessions expose cached length here; their byte I/O and durable
-//! save paths are owned by runtime::content_writes outside Engine.
-//!
-//! WP5.2 (CCR-WP4.INT-5, the staging part):
-//! * [`Staged::snapshot`] is a stable view of a session's bytes for a save
-//!   that stores them without the engine lock (`runtime::engine`): a copy of
-//!   the in-memory bytes (at most [`MEMORY_LIMIT`]), or a second handle to the
-//!   staging file, which the engine keeps from being written until the save
-//!   ends (writers of that file wait off the lock), or the object a clean
-//!   reference already is.
-//! * [`writable_copy`] makes the private writable copy of a large object
-//!   (`Reference` above [`MEMORY_LIMIT`]) that its first write needs, off the
-//!   engine lock: it copies and verifies in one pass, and the engine installs
-//!   it only if the session still references the same object
-//!   ([`Staged::install_writable`]). The first write then no longer copies the
-//!   whole file under the lock.
+//! Current immutable selections and native COW session handles.
+//! Mutable memory/disk staging remains only while the standalone deferred-save
+//! route is removed. Regular file bases require a typed descriptor; there is no
+//! whole-file CAS reference, verification cache or writable-copy conversion.
 use crate::content::{ContentProvider, PinnedContent};
-use crate::core::{IO_CHUNK, MAX_CONTENT, Store, id};
+use crate::core::{IO_CHUNK, MAX_CONTENT, id};
 use crate::model::content::FileContentRef;
-use anyhow::{Result, ensure};
-use sha2::{Digest, Sha256};
+use anyhow::{Context, Result, ensure};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Cursor, Read, Seek, SeekFrom, Write},
@@ -62,15 +48,13 @@ pub enum StageSnapshot {
     /// positional reads ([`read_file_at`]): the handle shares its file
     /// position with the session's.
     File { file: File, size: usize },
-    /// The bytes are already the object `object` (an unmodified reference).
-    Object { object: String, size: usize },
 }
 
 impl StageSnapshot {
     pub fn len(&self) -> usize {
         match self {
             Self::Bytes(bytes) => bytes.len(),
-            Self::File { size, .. } | Self::Object { size, .. } => *size,
+            Self::File { size, .. } => *size,
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -110,57 +94,10 @@ fn new_stage(root: &Path) -> Result<(File, PathBuf)> {
     Ok((file, path))
 }
 
-/// The writable copy of the object at `path` (`object`, `size` bytes) as a
-/// staging file, verified while it is copied (one read of the object). Runs
-/// without the engine lock (module docs). The copy is removed again when the
-/// result is dropped without being installed.
-pub fn writable_copy(root: &Path, path: &Path, object: &str, size: usize) -> Result<Staged> {
-    let mut source =
-        File::open(path).map_err(|e| anyhow::anyhow!("CONTENT_UNAVAILABLE: {object}: {e}"))?;
-    ensure!(
-        source.metadata()?.len() == size as u64,
-        "CORRUPT_OBJECT: {object}"
-    );
-    let (file, path) = new_stage(root)?;
-    // Removed on drop unless installed.
-    let mut staged = Staged::Disk {
-        file,
-        path,
-        size,
-        retained: false,
-    };
-    let Staged::Disk { file, .. } = &mut staged else {
-        unreachable!()
-    };
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0; IO_CHUNK];
-    let mut copied = 0usize;
-    loop {
-        let n = source.read(&mut buffer)?;
-        if n == 0 {
-            break;
-        }
-        copied += n;
-        ensure!(copied <= size, "CORRUPT_OBJECT: {object}");
-        digest.update(&buffer[..n]);
-        file.write_all(&buffer[..n])?;
-    }
-    ensure!(
-        copied == size && hex::encode(digest.finalize()) == object,
-        "CORRUPT_OBJECT: {object}"
-    );
-    Ok(staged)
-}
 pub enum Staged {
     Cow(Arc<crate::runtime::content_saves::SaveFile>),
     Content(Arc<ContentSelection>),
     Memory(Vec<u8>),
-    Reference {
-        path: PathBuf,
-        object: String,
-        size: usize,
-        verified: OnceLock<File>,
-    },
     Disk {
         file: File,
         path: PathBuf,
@@ -175,17 +112,21 @@ impl Staged {
             _ => None,
         }
     }
-    pub fn from_entry(store: &Store, entry: &crate::core::Entry) -> Result<Self> {
-        if let Some(reference) = &entry.content_ref {
-            reference.validate()?;
-            return Ok(Self::Content(Arc::new(ContentSelection {
-                reference: reference.clone(),
-                size: usize::try_from(reference.total_len)
-                    .map_err(|_| anyhow::anyhow!("FILE_TOO_LARGE"))?,
-                binding: OnceLock::new(),
-            })));
+    pub fn from_entry(entry: &crate::core::Entry) -> Result<Self> {
+        if entry.kind == "directory" {
+            return Ok(Self::Memory(Vec::new()));
         }
-        Self::from_object(store, entry.content.as_deref())
+        ensure!(entry.kind == "file", "INVALID_KIND");
+        let reference = entry
+            .content_ref
+            .as_ref()
+            .context("MISSING_CONTENT_DESCRIPTOR")?;
+        reference.validate()?;
+        Ok(Self::Content(Arc::new(ContentSelection {
+            reference: reference.clone(),
+            size: usize::try_from(reference.total_len).context("FILE_TOO_LARGE")?,
+            binding: OnceLock::new(),
+        })))
     }
     pub fn content_selection(&self) -> Option<Arc<ContentSelection>> {
         match self {
@@ -196,76 +137,17 @@ impl Staged {
     pub fn memory(bytes: Vec<u8>) -> Self {
         Self::Memory(bytes)
     }
-    pub fn from_object(store: &Store, object: Option<&str>) -> Result<Self> {
-        let Some(object) = object else {
-            return Ok(Self::memory(vec![]));
-        };
-        Ok(Self::Reference {
-            path: store.root.join("objects").join(object),
-            object: object.to_owned(),
-            size: store.object_size(object)? as usize,
-            verified: OnceLock::new(),
-        })
-    }
-    /// `(path, object, size)` of a reference whose bytes were not verified
-    /// yet (`runtime::prepare_content` verifies them off the engine lock).
-    /// An empty one has no bytes to verify (every new file's session is one).
-    pub fn reference(&self) -> Option<(&Path, &str, usize)> {
-        if let Self::Reference {
-            path,
-            object,
-            size,
-            verified,
-        } = self
-            && verified.get().is_none()
-            && *size > 0
-        {
-            return Some((path, object, *size));
-        }
-        None
-    }
-    pub fn prime(&self, file: File) {
-        if let Self::Reference { verified, .. } = self {
-            let _ = verified.set(file);
-        }
-    }
-    fn verified_file(&self) -> Result<&File> {
-        let Self::Reference {
-            path,
-            object,
-            size,
-            verified,
-        } = self
-        else {
-            unreachable!()
-        };
-        if verified.get().is_none() {
-            let mut file = File::open(path)
-                .map_err(|e| anyhow::anyhow!("CONTENT_UNAVAILABLE: {object}: {e}"))?;
-            ensure!(
-                file.metadata()?.len() == *size as u64
-                    && crate::core::stream_hash(&mut file)? == *object,
-                "CORRUPT_OBJECT"
-            );
-            let _ = verified.set(file);
-        }
-        Ok(verified.get().unwrap())
-    }
     /// A stable view of these bytes for an off-lock save (module docs). For a
     /// staging file the caller must keep the file from being written until
     /// the snapshot is dropped.
     pub fn snapshot(&self) -> Result<StageSnapshot> {
         Ok(match self {
             Self::Content(_) | Self::Cow(_) => {
-                anyhow::bail!("PEER_NEEDS_UPGRADE: content write callbacks are not enabled")
+                anyhow::bail!("CONTENT_WRITE_REQUIRES_PRIVATE_SESSION")
             }
             Self::Memory(bytes) => StageSnapshot::Bytes(bytes.clone()),
             Self::Disk { file, size, .. } => StageSnapshot::File {
                 file: file.try_clone()?,
-                size: *size,
-            },
-            Self::Reference { object, size, .. } => StageSnapshot::Object {
-                object: object.clone(),
                 size: *size,
             },
         })
@@ -275,68 +157,18 @@ impl Staged {
     pub fn is_file(&self) -> bool {
         matches!(self, Self::Disk { .. })
     }
-    /// `(path, object, size)` of a reference whose first write would copy it
-    /// whole into a staging file (larger than [`MEMORY_LIMIT`]): the copy
-    /// [`writable_copy`] makes off the engine lock.
-    pub fn large_reference(&self) -> Option<(PathBuf, String, usize)> {
-        match self {
-            Self::Reference {
-                path, object, size, ..
-            } if *size > MEMORY_LIMIT => Some((path.clone(), object.clone(), *size)),
-            _ => None,
-        }
-    }
-    /// Replaces a reference to `object` (`size` bytes) with its writable copy
-    /// ([`writable_copy`]); `false`, and the copy is dropped (removed), when
-    /// these bytes are no longer that reference.
-    pub fn install_writable(&mut self, object: &str, size: usize, copy: Staged) -> bool {
-        let same =
-            matches!(self, Self::Reference { object: o, size: s, .. } if o == object && *s == size);
-        if same && copy.is_file() && copy.len() == size {
-            *self = copy;
-            return true;
-        }
-        false
-    }
     pub fn len(&self) -> usize {
         match self {
             Self::Cow(file) => usize::try_from(file.visible_len()).unwrap_or(usize::MAX),
             Self::Content(selection) => selection.size,
             Self::Memory(b) => b.len(),
-            Self::Reference { size, .. } => *size,
             Self::Disk { size, .. } => *size,
         }
     }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-    fn make_writable(&mut self, root: &Path) -> Result<()> {
-        if matches!(self, Self::Reference { .. }) {
-            if self.len() <= MEMORY_LIMIT {
-                let mut bytes = Vec::with_capacity(self.len());
-                if !self.is_empty() {
-                    let mut source = self.verified_file()?.try_clone()?;
-                    source.rewind()?;
-                    source.read_to_end(&mut bytes)?;
-                }
-                *self = Self::Memory(bytes);
-            } else {
-                self.spool(root)?;
-            }
-        }
-        Ok(())
-    }
     fn spool(&mut self, root: &Path) -> Result<()> {
-        if matches!(self, Self::Reference { .. }) {
-            let mut source = self.verified_file()?.try_clone()?;
-            source.rewind()?;
-            let mut staged = Self::Memory(vec![]);
-            staged.spool(root)?;
-            if let Self::Disk { file, size, .. } = &mut staged {
-                *size = std::io::copy(&mut source, file)? as usize;
-            }
-            *self = staged;
-        }
         if let Self::Memory(bytes) = self {
             let (mut file, path) = new_stage(root)?;
             file.write_all(bytes)?;
@@ -352,20 +184,15 @@ impl Staged {
     pub fn resize(&mut self, root: &Path, size: usize) -> Result<()> {
         ensure!(
             !matches!(self, Self::Content(_) | Self::Cow(_)),
-            "PEER_NEEDS_UPGRADE: content write callbacks are not enabled"
+            "CONTENT_WRITE_REQUIRES_PRIVATE_SESSION"
         );
         ensure!(size as u64 <= MAX_CONTENT, "FILE_TOO_LARGE");
-        if size == 0 && matches!(self, Self::Reference { .. }) {
-            *self = Self::Memory(vec![]);
-        }
         if size > MEMORY_LIMIT {
             self.spool(root)?;
-        } else {
-            self.make_writable(root)?;
         }
         match self {
             Self::Memory(bytes) => bytes.resize(size, 0),
-            Self::Reference { .. } | Self::Content(_) | Self::Cow(_) => unreachable!(),
+            Self::Content(_) | Self::Cow(_) => unreachable!(),
             Self::Disk {
                 file, size: length, ..
             } => {
@@ -378,9 +205,8 @@ impl Staged {
     pub fn write_at(&mut self, root: &Path, offset: usize, bytes: &[u8]) -> Result<()> {
         ensure!(
             !matches!(self, Self::Content(_) | Self::Cow(_)),
-            "PEER_NEEDS_UPGRADE: content write callbacks are not enabled"
+            "CONTENT_WRITE_REQUIRES_PRIVATE_SESSION"
         );
-        self.make_writable(root)?;
         let end = offset
             .checked_add(bytes.len())
             .ok_or_else(|| anyhow::anyhow!("FILE_TOO_LARGE"))?;
@@ -389,7 +215,7 @@ impl Staged {
         }
         match self {
             Self::Memory(buffer) => buffer[offset..end].copy_from_slice(bytes),
-            Self::Reference { .. } | Self::Content(_) | Self::Cow(_) => unreachable!(),
+            Self::Content(_) | Self::Cow(_) => unreachable!(),
             Self::Disk { file, .. } => {
                 file.seek(SeekFrom::Start(offset as u64))?;
                 file.write_all(bytes)?;
@@ -411,7 +237,6 @@ impl Staged {
         } else {
             let file = match self {
                 Self::Disk { file, .. } => file,
-                Self::Reference { .. } => self.verified_file()?,
                 _ => unreachable!(),
             };
             #[cfg(unix)]
@@ -433,13 +258,8 @@ impl Staged {
     pub fn reader(&mut self) -> Result<Box<dyn Read + '_>> {
         Ok(match self {
             Self::Content(_) | Self::Cow(_) => anyhow::bail!(
-                "PEER_NEEDS_UPGRADE: content materialization callbacks are not enabled"
+                "CONTENT_UNAVAILABLE: descriptor read requires the off-lock provider path"
             ),
-            Self::Reference { .. } => {
-                let mut file = self.verified_file()?.try_clone()?;
-                file.rewind()?;
-                Box::new(file)
-            }
             Self::Memory(bytes) => Box::new(Cursor::new(bytes.as_slice())),
             Self::Disk { file, .. } => {
                 file.rewind()?;
@@ -450,7 +270,7 @@ impl Staged {
     pub fn retain(&mut self, root: &Path) -> Result<String> {
         ensure!(
             !matches!(self, Self::Content(_) | Self::Cow(_)),
-            "PEER_NEEDS_UPGRADE: content write callbacks are not enabled"
+            "CONTENT_WRITE_REQUIRES_PRIVATE_SESSION"
         );
         self.spool(root)?;
         let Self::Disk {

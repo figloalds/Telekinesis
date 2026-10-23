@@ -1,24 +1,6 @@
-//! On-demand content hydration and verified object fetches.
-//!
-//! **Reads of content still downloading (WP5.2, CCR-WP4.INT-2).** A read of
-//! a file whose object is not here registers demand (`request_object`, kept
-//! fresh while it waits) and waits while the download progresses: the wait
-//! ([`ContentWait`]) ends with the verified object, or fails when no byte
-//! arrived for `stall`, or when the whole wait reached `bound` (below the
-//! adapter's own request timeout), or when the mount is being detached. It
-//! used to wait 15 s for the whole object whatever the progress, which a
-//! 512 MiB download never met. Progress is the length of the object's spool
-//! (`incoming-objects/<hash>`, written durably by the receiving lane), read
-//! without any lock. Only verified bytes are ever served: the wait ends when
-//! the installed object hashes to its id. A failure is `CONTENT_UNAVAILABLE`,
-//! which the adapters report as a device that is not ready (WinFsp) or an
-//! I/O error (FUSE), never as an invalid argument.
-//!
-//! **The first write to a large file (WP5.2, CCR-WP4.INT-5).**
-//! [`prepare_writable`] makes the writable copy of a referenced object larger
-//! than the in-memory limit without the engine lock (it used to be copied
-//! whole under it, about 2 s per 256 MiB): the copy is verified while it is
-//! made and installed only if the session still references that object.
+//! Shared request budgets and generic immutable artifact fetches.
+//! Regular-file reads and COW preparation use content_reads/content_writes;
+//! no whole-file handle hydration or writable-copy conversion remains here.
 use super::Shared;
 use crate::core::*;
 use anyhow::{Result, ensure};
@@ -30,7 +12,7 @@ use std::{
 /// How long a read may wait for content that is downloading.
 #[derive(Clone, Copy)]
 pub struct ContentWait {
-    /// Fail when no byte of the object arrived for this long.
+    /// Fail when the requested range makes no verified progress for this long.
     pub stall: Duration,
     /// Fail when the whole wait took this long (below the adapter's request
     /// timeout).
@@ -39,8 +21,8 @@ pub struct ContentWait {
     /// finds every slot taken fails at once instead of occupying an adapter
     /// thread (the mount's other operations never run out of threads).
     pub slots: Option<&'static WaitSlots>,
-    /// The wait ends (`CONTENT_UNAVAILABLE`) as soon as this is true: a
-    /// detach or checkout fenced the mount.
+    /// A detach or checkout fenced the mount. Current range reads report
+    /// `CONTENT_CANCELLED`; the generic artifact fetch reports unavailable.
     pub cancelled: fn() -> bool,
 }
 
@@ -122,82 +104,6 @@ impl Drop for WaitSlot {
 const WAIT_POLL: Duration = Duration::from_millis(50);
 /// How often a waiting read renews its demand.
 const DEMAND_REFRESH: Duration = Duration::from_secs(10);
-
-/// Hydrate only the requested handle. Waiting and verification happen outside
-/// the engine mutex. All peers see the durable request on their next exchange.
-/// Waits at most `timeout` ([`ContentWait::fixed`]).
-pub fn prepare_content(engine: &Shared, handle: u64, timeout: Duration) -> Result<()> {
-    prepare_content_waiting(engine, handle, ContentWait::fixed(timeout))
-}
-
-/// [`prepare_content`] with a progress-based wait (module docs).
-pub fn prepare_content_waiting(engine: &Shared, handle: u64, wait: ContentWait) -> Result<()> {
-    let started = Instant::now();
-    loop {
-        let reference = {
-            let e = super::lock_engine(engine);
-            e.session(handle)?
-                .bytes
-                .reference()
-                .map(|(_, object, size)| (object.to_owned(), size))
-        };
-        let Some((object, size)) = reference else {
-            return Ok(());
-        };
-        let left = ContentWait {
-            bound: wait.bound.saturating_sub(started.elapsed()),
-            ..wait
-        };
-        let file = fetch_verified_waiting(engine, &object, left)?;
-        let e = super::lock_engine(engine);
-        let session = e.session(handle)?;
-        if session
-            .bytes
-            .reference()
-            .is_some_and(|(_, h, n)| h == object && n == size)
-        {
-            session.bytes.prime(file);
-            return Ok(());
-        }
-        ensure!(
-            started.elapsed() < wait.bound,
-            "CONTENT_UNAVAILABLE: revision changed during download"
-        );
-    }
-}
-
-/// Makes the writable copy a write (`resize: None`) or a resize to
-/// `Some((size, allocation))` through `handle` needs of a referenced object
-/// larger than the in-memory limit, without the engine lock (module docs).
-/// Call after [`prepare_content`] (the object is then here and verified). A
-/// no-op for any other session and for a resize that copies nothing (to
-/// zero, or an allocation that does not shrink); a copy that lost a race
-/// (the session changed meanwhile) is dropped.
-pub fn prepare_writable(engine: &Shared, handle: u64, resize: Option<(u64, bool)>) -> Result<()> {
-    let (reference, root) = {
-        let e = super::lock_engine(engine);
-        let session = e.session(handle)?;
-        let copies = match resize {
-            None => true,
-            Some((size, allocation)) => {
-                size != 0 && (!allocation || size < session.bytes.len() as u64)
-            }
-        };
-        (
-            session.bytes.large_reference().filter(|_| copies),
-            e.store.root.clone(),
-        )
-    };
-    let Some((path, object, size)) = reference else {
-        return Ok(());
-    };
-    crate::util::fault::trigger("engine.writable_copy")?;
-    let copy = crate::staging::writable_copy(&root, &path, &object, size)?;
-    let mut e = super::lock_engine(engine);
-    let session = e.session_mut(handle)?;
-    session.bytes.install_writable(&object, size, copy);
-    Ok(())
-}
 
 /// A verified copy of `object`, opened for reading: the installed file when
 /// its bytes hash to `object`; otherwise its download is queued

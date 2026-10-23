@@ -38,6 +38,7 @@ struct Fixture {
     checkpoint: SaveCheckpoint,
     prepared: PreparedSave,
     entity: String,
+    admission_after: u64,
     // Close every SQLite owner before removing its directory on Windows.
     dir: tempfile::TempDir,
 }
@@ -56,6 +57,11 @@ impl Fixture {
             .execute("INSERT INTO config VALUES('fixture:content_v1','1')", [])
             .unwrap();
         let entry = store.create("file", "file").unwrap();
+        let initial = store.content_admission_page(0, 256).unwrap();
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].root, entry.content_ref.clone().unwrap());
+        assert_eq!(initial[0].root.total_len, 0);
+        let admission_after = initial[0].cursor;
         let local = Arc::new(LocalContent::open(dir.path()).unwrap());
         let journal = WriteJournal::open(dir.path()).unwrap();
         let intent = store.begin_content_save(&entry.id, &context()).unwrap();
@@ -79,6 +85,7 @@ impl Fixture {
             checkpoint,
             prepared,
             entity: entry.id,
+            admission_after,
         }
     }
     fn event_count(&self) -> i64 {
@@ -92,7 +99,10 @@ impl Fixture {
             .unwrap()
     }
     fn outbox_count(&self) -> usize {
-        self.store.content_admission_page(0, 256).unwrap().len()
+        self.store
+            .content_admission_page(self.admission_after, 256)
+            .unwrap()
+            .len()
     }
     fn pending(&self) {
         let pending = self.journal.pending(None, 256, &context()).unwrap();
@@ -1318,7 +1328,13 @@ fn process_exit_at_private_adoption_boundaries_recovers_both_databases() {
                     fresh.publish_content_save(&prepared, &context()).unwrap(),
                     receipt
                 );
-                assert_eq!(fresh.content_admission_page(0, 256).unwrap().len(), 2);
+                assert_eq!(
+                    fresh
+                        .content_admission_page(f.admission_after, 256)
+                        .unwrap()
+                        .len(),
+                    2
+                );
                 assert!(fresh.verify_derived_state().unwrap().is_empty());
             }
             finish_collection(&journal);
@@ -1494,7 +1510,13 @@ fn continuation_preserves_exact_receipts_and_newer_original_journal_work() {
             .unwrap(),
         Some(second)
     );
-    assert_eq!(f.store.content_admission_page(0, 256).unwrap().len(), 2);
+    assert_eq!(
+        f.store
+            .content_admission_page(f.admission_after, 256)
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(f.journal.pending(None, 256, &context()).unwrap()[0], later);
     f.oracle();
 }
@@ -2048,7 +2070,12 @@ fn publication_receipt_and_outbox_survive_lost_reply_and_restart() {
         f.store.entry(&f.entity).unwrap().content_ref.as_ref(),
         Some(receipt.content())
     );
-    assert!(f.store.content_admission_page(0, 256).unwrap()[0].publishable);
+    assert!(
+        f.store
+            .content_admission_page(f.admission_after, 256)
+            .unwrap()[0]
+            .publishable
+    );
     f.oracle();
     f.pending();
     drop(f.store);
@@ -2938,7 +2965,10 @@ fn private_branch_publication_preserves_private_admission_and_base_permissions()
         .select_content_checkpoint(&checkpoint, &context())
         .unwrap();
     let receipt = f.store.publish_content_save(&prepared, &context()).unwrap();
-    let page = f.store.content_admission_page(0, 256).unwrap();
+    let page = f
+        .store
+        .content_admission_page(f.admission_after, 256)
+        .unwrap();
     let reference = tkfs::core::admission::reference_id(receipt.event(), &f.entity);
     let change = page.iter().find(|c| c.reference == reference).unwrap();
     assert!(!change.shared && !change.publishable);
@@ -2971,16 +3001,17 @@ fn publication_refuses_outer_transactions_and_weakened_durability() {
         f.store.publish_content_save(&f.prepared, &context()),
         "CONTENT_SAVE_REQUIRES_FULL_WAL",
     );
+    assert_eq!(f.event_count(), 0);
+    f.pending();
     f.store
         .db
         .execute_batch("PRAGMA synchronous=FULL; DELETE FROM config WHERE key='fixture:content_v1'")
         .unwrap();
-    error(
-        f.store.publish_content_save(&f.prepared, &context()),
-        "PEER_NEEDS_UPGRADE",
-    );
-    assert_eq!(f.event_count(), 0);
-    f.pending();
+    f.store
+        .publish_content_save(&f.prepared, &context())
+        .unwrap();
+    assert_eq!(f.event_count(), 1);
+    f.oracle();
 }
 
 #[test]

@@ -114,6 +114,11 @@ pub struct DemandLease {
     waiter: Uuid,
     token: Uuid,
 }
+impl DemandLease {
+    pub fn waiter(&self) -> Uuid {
+        self.waiter
+    }
+}
 impl Drop for DemandLease {
     fn drop(&mut self) {
         if let Some(owner) = self.scheduler.upgrade() {
@@ -226,6 +231,17 @@ impl ContentScheduler {
                 deadline: waiter.deadline,
             })
             .collect()
+    }
+
+    /// A reader can renew its own waiter after a stale readiness observation;
+    /// it never revives an expired or independently cancelled waiter.
+    pub fn waiter_pending(&self, waiter: Uuid) -> bool {
+        let mut state = lock(&self.state);
+        Self::prune(&mut state, Instant::now());
+        state
+            .waiters
+            .get(&waiter)
+            .is_some_and(|waiter| !waiter.satisfied)
     }
 
     pub fn work_snapshots(&self, provider: Uuid, repository: &str) -> Vec<DemandSnapshot> {
@@ -458,6 +474,27 @@ impl ContentScheduler {
             state.waiters.len(),
             state.waiter_bytes,
         )
+    }
+
+    /// Live repository activity, including batch reservations. Counts are not
+    /// inferred from old durable WANT rows or unverified partial spools.
+    pub fn repository_activity(&self, repository: &str) -> (u64, u64) {
+        let mut state = lock(&self.state);
+        Self::prune(&mut state, Instant::now());
+        let transfers = state
+            .active
+            .values()
+            .chain(state.streams.values())
+            .filter(|work| work.repository == repository)
+            .count() as u64;
+        let requested = state
+            .waiters
+            .values()
+            .filter(|waiter| {
+                waiter.demand.revision.workspace.repository == repository && !waiter.satisfied
+            })
+            .count() as u64;
+        (transfers, requested)
     }
 
     /// Joined object jobs only; `usage` also includes batch/stream reservations.

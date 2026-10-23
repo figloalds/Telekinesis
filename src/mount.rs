@@ -201,6 +201,10 @@ pub fn attach(path: &Path) -> Result<()> {
     let engine = bound()?;
     load_runtime()?;
     adapter::vacant(path)?;
+    crate::runtime::content_writes::NativeWrites::install(
+        &engine,
+        &crate::runtime::content_writes::default_context(&engine)?,
+    )?;
     let native = start_native(path)?;
     *guard = Some(Mount {
         native,
@@ -347,14 +351,114 @@ pub unsafe extern "C" fn tk_call(
     let run = std::panic::catch_unwind(|| -> Result<u32> {
         let engine = bound()?;
         let engine = &engine;
+        ensure!(
+            lock_engine(engine).native_writes.is_some(),
+            "CONTENT_STORE_NOT_INITIALIZED"
+        );
         let h = unsafe { *token };
         let path = unsafe { string(name) };
-        if [11, 12].contains(&op) {
-            let context = crate::runtime::content_reads::request_context(engine, content_wait())?;
+        if op == 2 {
+            let attributes = if length == 4 {
+                Some(unsafe { std::ptr::read_unaligned(buffer.cast::<u32>()) })
+            } else {
+                None
+            };
             ensure!(
-                crate::runtime::content_writes::file(engine, h, &context)?.is_none(),
-                "UNSUPPORTED_FS_OPERATION: native open-handle namespace integration pending"
+                flags & 1 != 0 || flags & 4 == 0 || attributes.is_none_or(|value| value & 1 == 0),
+                "ACCESS_DENIED: readonly delete-on-close file"
             );
+            let create = if flags & 1 != 0 {
+                crate::runtime::content_writes::create_directory
+            } else {
+                crate::runtime::content_writes::create
+            };
+            let (handle, entry) = create(
+                engine,
+                &path,
+                crate::runtime::content_writes::CreateOptions {
+                    writable: flags & 2 != 0,
+                    attributes,
+                    ..Default::default()
+                },
+                content_wait(),
+            )?
+            .context("CONTENT_STORE_NOT_INITIALIZED")?;
+            {
+                unsafe { *token = handle };
+                if flags & 4 != 0
+                    && let Err(error) = crate::runtime::content_writes::set_delete_disposition(
+                        engine,
+                        handle,
+                        true,
+                        content_wait(),
+                    )
+                {
+                    let _ = lock_engine(engine).release_handle(handle);
+                    unsafe { *token = 0 };
+                    return Err(error);
+                }
+                if !info.is_null() {
+                    let mut out = Info::default();
+                    fill(&mut out, &entry, 0);
+                    unsafe { *info = out };
+                }
+                return Ok(0);
+            }
+        }
+        if op == 12 {
+            let (entity, target) = {
+                let e = lock_engine(engine);
+                let entity = e.handle_entry(h)?.id;
+                let parent = e.store.lookup(&crate::core::split_path(&path)?.0)?;
+                (
+                    entity,
+                    crate::core::content_saves::NamespaceTarget {
+                        path: path.clone(),
+                        parent: parent.id,
+                    },
+                )
+            };
+            if crate::runtime::content_writes::rename_directory(
+                engine,
+                &entity,
+                Some(h),
+                None,
+                &target,
+                flags & 1 != 0,
+                content_wait(),
+            )? {
+                return Ok(0);
+            }
+            if crate::runtime::content_writes::rename(
+                engine,
+                &entity,
+                &path,
+                flags & 1 != 0,
+                content_wait(),
+            )? {
+                return Ok(0);
+            }
+            bail!("PERMISSION_DENIED: root/control rename");
+        }
+        if op == 3 && flags & 4 != 0 {
+            let e = lock_engine(engine);
+            let entry = e.lookup_visible(&path)?;
+            ensure!(
+                entry.kind != "file" || entry.basic_info().attributes & 1 == 0,
+                "ACCESS_DENIED: readonly delete-on-close file"
+            );
+        }
+        if op == 9 && flags & 1 != 0 {
+            crate::runtime::content_writes::unlink_on_cleanup(engine, h, &path, content_wait())?;
+        }
+        if op == 15 {
+            crate::runtime::content_writes::set_delete_disposition(
+                engine,
+                h,
+                flags & 1 != 0,
+                content_wait(),
+            )?;
+            return Ok(0);
         }
         if op == 5 {
             let bytes = if length == 0 {
@@ -362,7 +466,7 @@ pub unsafe extern "C" fn tk_call(
             } else {
                 unsafe { std::slice::from_raw_parts(buffer, length as usize) }
             };
-            if let Some(count) = crate::runtime::content_writes::write(
+            let count = crate::runtime::content_writes::write(
                 engine,
                 h,
                 offset,
@@ -370,12 +474,14 @@ pub unsafe extern "C" fn tk_call(
                 flags & 1 != 0,
                 flags & 2 != 0,
                 content_wait(),
-            )? {
+            )?
+            .context("CONTENT_WRITE_REQUIRES_PRIVATE_SESSION")?;
+            {
                 let e = lock_engine(engine);
                 if !info.is_null() {
                     let s = e.session(h)?;
                     let mut out = Info::default();
-                    fill(&mut out, &s.entry, s.bytes.len());
+                    fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
                     unsafe { *info = out };
                 }
                 if !transferred.is_null() {
@@ -384,32 +490,94 @@ pub unsafe extern "C" fn tk_call(
                 return Ok(0);
             }
         }
-        if op == 6
-            && crate::runtime::content_writes::truncate(
-                engine,
-                h,
-                offset,
-                flags & 1 != 0,
-                content_wait(),
-            )?
-        {
+        if op == 6 {
+            ensure!(
+                crate::runtime::content_writes::truncate(
+                    engine,
+                    h,
+                    offset,
+                    flags & 1 != 0,
+                    content_wait(),
+                )?,
+                "CONTENT_WRITE_REQUIRES_PRIVATE_SESSION"
+            );
             let e = lock_engine(engine);
             if !info.is_null() {
                 let s = e.session(h)?;
                 let mut out = Info::default();
-                fill(&mut out, &s.entry, s.bytes.len());
+                fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
                 unsafe { *info = out };
             }
             return Ok(0);
         }
+        if op == 14 && h != 0 {
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            struct BasicUpdate {
+                times: [u64; 4],
+                attributes: u32,
+            }
+            ensure!(
+                length as usize == std::mem::size_of::<BasicUpdate>() && !buffer.is_null(),
+                "INVALID_PARAMETER"
+            );
+            let update = unsafe { std::ptr::read_unaligned(buffer.cast::<BasicUpdate>()) };
+            {
+                let e = lock_engine(engine);
+                let entry = e.handle_entry(h)?;
+                ensure!(entry.id != ROOT, "UNSUPPORTED_FS_OPERATION: root metadata");
+                ensure!(entry.id != "control", "PERMISSION_DENIED");
+            }
+            ensure!(
+                crate::runtime::content_writes::set_basic(
+                    engine,
+                    h,
+                    update.attributes,
+                    update.times,
+                    content_wait(),
+                )?,
+                "CONTENT_STORE_NOT_INITIALIZED"
+            );
+            {
+                let e = lock_engine(engine);
+                if !info.is_null() {
+                    let s = e.session(h)?;
+                    let mut out = Info::default();
+                    fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
+                    unsafe { *info = out };
+                }
+                return Ok(0);
+            }
+        }
         if [7, 9].contains(&op) && h != 0 {
+            {
+                let mut e = lock_engine(engine);
+                let entry = e.handle_entry(h)?;
+                if entry.kind == "directory" || entry.id == "control" {
+                    if op == 9 {
+                        e.cleanup_unsaved(h)?;
+                    }
+                    if !info.is_null() {
+                        let mut out = Info::default();
+                        fill(&mut out, &entry, 0);
+                        unsafe { *info = out };
+                    }
+                    return Ok(0);
+                }
+            }
             let context = crate::runtime::content_reads::request_context(engine, content_wait())?;
             if crate::runtime::content_writes::file(engine, h, &context)?.is_some() {
                 ensure!(
-                    op != 9 || flags & 1 == 0,
-                    "UNSUPPORTED_FS_OPERATION: native delete-on-close requires namespace integration"
+                    op != 9
+                        || flags & 1 == 0
+                        || crate::runtime::content_writes::retired_cleanup(engine, h, &context)?,
+                    "CONTENT_METADATA_CONTINUATION_LOST: native cleanup did not retire its entity"
                 );
-                crate::runtime::engine::save_handle(engine, h)?;
+                if op == 9 {
+                    crate::runtime::engine::save_handle_on_cleanup(engine, h)?;
+                } else {
+                    crate::runtime::engine::save_handle(engine, h)?;
+                }
                 let mut e = lock_engine(engine);
                 if op == 9 {
                     e.cleanup_unsaved(h)?;
@@ -417,11 +585,26 @@ pub unsafe extern "C" fn tk_call(
                 if !info.is_null() {
                     let s = e.session(h)?;
                     let mut out = Info::default();
-                    fill(&mut out, &s.entry, s.bytes.len());
+                    fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
                     unsafe { *info = out };
                 }
                 return Ok(0);
             }
+            // A read-only immutable selection has no byte save to publish.
+            let mut e = lock_engine(engine);
+            ensure!(
+                !e.session(h)?.dirty,
+                "CONTENT_WRITE_REQUIRES_PRIVATE_SESSION"
+            );
+            if op == 9 {
+                e.cleanup_unsaved(h)?;
+            }
+            if !info.is_null() {
+                let mut out = Info::default();
+                fill(&mut out, &e.handle_entry(h)?, e.session(h)?.bytes.len());
+                unsafe { *info = out };
+            }
+            return Ok(0);
         }
         if op == 4 {
             if !transferred.is_null() {
@@ -456,68 +639,17 @@ pub unsafe extern "C" fn tk_call(
                 });
             }
         }
-        // Work that needs no engine lock comes first (WP5.2): waiting for
-        // content, the writable copy of a large file, and the hashing and
-        // copying of a save. Each phase that needs the engine takes it
-        // briefly on its own.
-        if op == 4 || op == 5 || op == 6 && offset != 0 {
-            crate::runtime::content::prepare_content_waiting(engine, h, content_wait())?;
+        if op == 7 && h == 0 {
+            crate::runtime::engine::save_handle(engine, 0)?;
+            return Ok(0);
         }
-        match op {
-            5 => crate::runtime::content::prepare_writable(engine, h, None)?,
-            6 if offset != 0 => crate::runtime::content::prepare_writable(
-                engine,
-                h,
-                Some((offset, flags & 1 != 0)),
-            )?,
-            // A flush (`FlushFileBuffers`) and a rename wait for the save; so
-            // does a delete-on-close cleanup (the save comes before the delete).
-            7 => crate::runtime::engine::save_handle(engine, h)?,
-            12 => {
-                crate::runtime::engine::save_handle(engine, h)?;
-                // The entry at the target (one a rename replaces, or a
-                // deferred create holding the name) is final first.
-                crate::runtime::engine::settle_path(engine, &path)?;
-            }
-            9 if flags & 1 != 0 => {
-                crate::runtime::engine::save_handle(engine, h)?;
-                crate::runtime::engine::settle_handle(engine, h)?;
-            }
-            // The application's close: during a burst of closes the save goes
-            // on in the background (`write_behind`, `save_handle_in_background`);
-            // a lone close saves before it returns.
-            9 if crate::runtime::engine::write_behind() => {
-                lock_engine(engine).cleanup_unsaved(h)?;
-                crate::runtime::engine::save_handle_in_background(engine, h)?;
-                return Ok(0);
-            }
-            9 => crate::runtime::engine::save_handle(engine, h)?,
-            10 => {
-                crate::runtime::engine::close_handle(engine, h)?;
-                // Qualification hook: a close-path failure after the handle closed.
-                crate::util::fault::fail("fs.close")?;
-                return Ok(0);
-            }
-            _ => {}
+        if op == 10 {
+            crate::runtime::engine::close_handle(engine, h)?;
+            crate::util::fault::fail("fs.close")?;
+            return Ok(0);
         }
-        // Background saves let the application's callbacks take the engine
-        // first, from here on (the work before the lock, a content wait among
-        // it, does not hold them back); a flush, a close, a cleanup and a
-        // rename wait for saves and are not the application's foreground.
-        let _foreground = (![7, 9, 10, 12].contains(&op)).then(crate::runtime::engine::foreground);
-        // A write waits (without the lock) for a save that reads its file; a
-        // rename and a delete on close wait for any save of the file they
-        // rename, replace or delete, so none commits after them
-        // (`runtime::engine::lock_settled`).
-        let mut e = if op == 5 || op == 6 {
-            crate::runtime::engine::lock_for_write(engine, h)
-        } else if op == 12 {
-            crate::runtime::engine::lock_settled(engine, Some(h), Some(&path))
-        } else if op == 9 && flags & 1 != 0 {
-            crate::runtime::engine::lock_settled(engine, Some(h), None)
-        } else {
-            lock_engine(engine)
-        };
+        let _foreground = crate::runtime::engine::foreground();
+        let mut e = lock_engine(engine);
         let mut out = Info::default();
         let mut count = 0;
         match op {
@@ -541,28 +673,16 @@ pub unsafe extern "C" fn tk_call(
                 };
                 fill(&mut out, &entry, size);
             }
-            2 | 3 => {
-                let create = if op == 2 {
-                    Some(if flags & 1 != 0 { "directory" } else { "file" })
-                } else {
-                    None
-                };
-                let attributes = if op == 2 && length == 4 {
-                    Some(unsafe { std::ptr::read_unaligned(buffer.cast::<u32>()) })
-                } else {
-                    None
-                };
-                // A file's creation commits with its first save (`runtime::engine`,
-                // *Deferred creates*); a directory's at once.
-                let (handle, entry) = if create == Some("file") {
-                    e.create_deferred(&path, flags & 2 != 0, attributes)?
-                } else {
-                    e.open_with_attributes(&path, create, flags & 2 != 0, attributes)?
-                };
+            3 => {
+                let (handle, entry) = e.open_with_attributes(&path, None, flags & 2 != 0, None)?;
                 unsafe { *token = handle };
                 fill(&mut out, &entry, e.session(handle)?.bytes.len());
             }
             4 => {
+                ensure!(
+                    e.handle_entry(h)?.id == "control",
+                    "MISSING_CONTENT_DESCRIPTOR"
+                );
                 let s = e.session(h)?;
                 let start = usize::try_from(offset)?;
                 if start >= s.bytes.len() {
@@ -572,20 +692,7 @@ pub unsafe extern "C" fn tk_call(
                     std::slice::from_raw_parts_mut(buffer, length as usize)
                 })? as u32;
             }
-            5 => {
-                let bytes = unsafe { std::slice::from_raw_parts(buffer, length as usize) };
-                count = e.write(h, offset, bytes, flags & 1 != 0, flags & 2 != 0)? as u32;
-            }
-            6 => e.truncate(h, offset, flags & 1 != 0)?,
-            7 => {
-                if e.native_writes.is_none() {
-                    e.flush(h)?;
-                }
-            }
             8 => {}
-            9 => e.cleanup(h, flags & 1 != 0)?,
-            // Closed before the lock (`close_handle`).
-            10 => {}
             11 => {
                 let s = e.session(h)?;
                 ensure!(
@@ -601,14 +708,6 @@ pub unsafe extern "C" fn tk_call(
                     e.children_visible(&entity)?.is_empty(),
                     "DIRECTORY_NOT_EMPTY"
                 );
-            }
-            12 => {
-                e.flush(h)?;
-                e.commit_created_at(&path)?;
-                let entity = e.session(h)?.entry.id.clone();
-                e.store.rename(&entity, &path, flags & 1 != 0)?;
-                let entry = e.store.lookup(&path)?;
-                e.sessions.get_mut(&entity).unwrap().entry = entry;
             }
             13 => {
                 // Runtime discovery is direct-lookup-only, never a directory entry.
@@ -631,25 +730,11 @@ pub unsafe extern "C" fn tk_call(
                 };
                 fill(&mut out, &entry, size);
             }
-            14 => {
-                #[repr(C)]
-                #[derive(Clone, Copy)]
-                struct BasicUpdate {
-                    times: [u64; 4],
-                    attributes: u32,
-                }
-                ensure!(
-                    length as usize == std::mem::size_of::<BasicUpdate>(),
-                    "INVALID_PARAMETER"
-                );
-                let update = unsafe { std::ptr::read_unaligned(buffer.cast::<BasicUpdate>()) };
-                e.set_basic(h, update.attributes, update.times)?;
-            }
             _ => bail!("UNSUPPORTED_FS_OPERATION"),
         }
-        if [5, 6, 7, 8, 14].contains(&op) && h != 0 {
+        if op == 8 && h != 0 {
             let s = e.session(h)?;
-            fill(&mut out, &s.entry, s.bytes.len());
+            fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
         }
         if !info.is_null() {
             unsafe { *info = out };
@@ -658,13 +743,25 @@ pub unsafe extern "C" fn tk_call(
             unsafe { *transferred = count };
         }
         e.publish_observation();
-        if [2, 3].contains(&op) {
+        if op == 3 {
             let opened = unsafe { *token };
             let descriptor = e.session(opened)?.bytes.content_selection().is_some();
             drop(e);
             if descriptor
                 && let Err(error) =
                     crate::runtime::content_reads::prepare_open(engine, opened, content_wait())
+            {
+                let _ = lock_engine(engine).release_handle(opened);
+                unsafe { *token = 0 };
+                return Err(error);
+            }
+            if flags & 4 != 0
+                && let Err(error) = crate::runtime::content_writes::set_delete_disposition(
+                    engine,
+                    opened,
+                    true,
+                    content_wait(),
+                )
             {
                 let _ = lock_engine(engine).release_handle(opened);
                 unsafe { *token = 0 };

@@ -142,6 +142,101 @@ fn read(session: &WriteSession, len: usize) -> Vec<u8> {
     out
 }
 
+#[test]
+fn native_clock_seed_validation_and_noop_mutations_preserve_the_saved_pair() {
+    let (_dir, _journal, _base, session) = setup(0, false);
+    session
+        .write_at_with_times(0, b"native", 6, [101, 202], &context())
+        .unwrap();
+    let saved = session.checkpoint(&context()).unwrap().unwrap();
+    let clocks = saved.native_times().unwrap();
+    assert_eq!([clocks.write_time, clocks.change_time], [101, 202]);
+    session
+        .write_at_with_times(0, b"", 0, [303, 404], &context())
+        .unwrap();
+    session
+        .set_len_with_times(6, 0, [303, 404], &context())
+        .unwrap();
+    assert_eq!(session.checkpoint(&context()).unwrap(), Some(saved.clone()));
+    for (mask, prior) in [
+        (1, [101, 202]),
+        (8, [101, 202]),
+        (2, [i64::MAX as u64 + 1, 202]),
+    ] {
+        let error = session
+            .write_at_with_times(0, b"x", mask, prior, &context())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("INVALID_TIMESTAMP_POLICY"));
+        assert_eq!(session.checkpoint(&context()).unwrap(), Some(saved.clone()));
+        assert_eq!(read(&session, 6), b"native");
+    }
+    session.write_at(0, b"head", &context()).unwrap();
+    assert!(
+        session
+            .checkpoint(&context())
+            .unwrap()
+            .unwrap()
+            .native_times()
+            .is_none()
+    );
+}
+#[test]
+fn native_time_policy_is_buffered_with_bytes_and_restored_from_saved() {
+    let (dir, journal, base, session) = setup(0, false);
+    let before = tkfs::util::time::now_ms();
+    session
+        .write_at_with_times(0, b"native", 2, [101, 202], &context())
+        .unwrap();
+    assert!(journal.pending(None, 64, &context()).unwrap().is_empty());
+    let saved = session.checkpoint(&context()).unwrap().unwrap();
+    let times = saved.native_times().unwrap();
+    assert_eq!(times.disabled, 2);
+    assert_eq!(times.write_time, 101);
+    assert_eq!(times.change_time, tkfs::core::filetime(times.modified_ms));
+    assert!(times.modified_ms >= before && times.modified_ms <= tkfs::util::time::now_ms());
+    let resumed = journal
+        .resume(saved.intent.operation, base.clone(), &context())
+        .unwrap();
+    assert_eq!(
+        resumed
+            .checkpoint(&context())
+            .unwrap()
+            .unwrap()
+            .native_times(),
+        Some(times)
+    );
+    resumed
+        .write_at_with_times(
+            0,
+            b"x",
+            0,
+            [times.write_time, times.change_time],
+            &context(),
+        )
+        .unwrap();
+    assert_eq!(
+        journal.pending(None, 64, &context()).unwrap(),
+        vec![saved.clone()]
+    );
+    let recovered = WriteJournal::open(dir.path())
+        .unwrap()
+        .resume(saved.intent.operation, base.clone(), &context())
+        .unwrap();
+    assert_eq!(read(&recovered, 6), b"native");
+    assert_eq!(
+        recovered
+            .checkpoint(&context())
+            .unwrap()
+            .unwrap()
+            .native_times(),
+        Some(times)
+    );
+    assert!(base.reads.lock().unwrap().is_empty());
+}
+
+#[path = "content_write/formats.rs"]
+mod formats;
+
 fn overlay_root(
     db: &rusqlite::Connection,
     operation: Uuid,
@@ -1088,32 +1183,6 @@ fn sqlite_vm_deadline_rolls_back_checkpoint_and_removes_its_progress_hook() {
 }
 
 #[test]
-fn future_or_unrecognized_journal_formats_are_refused_without_rewriting_them() {
-    let (dir, _journal, _base, _session) = setup(0, false);
-    let db = rusqlite::Connection::open(dir.path().join("write-sessions-v1.sqlite")).unwrap();
-    db.execute_batch("PRAGMA user_version=5").unwrap();
-    assert!(WriteJournal::open(dir.path()).is_err());
-    assert_eq!(
-        db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
-            .unwrap(),
-        5
-    );
-    let other = tempfile::tempdir().unwrap();
-    let foreign =
-        rusqlite::Connection::open(other.path().join("write-sessions-v1.sqlite")).unwrap();
-    foreign
-        .execute_batch("CREATE TABLE unrelated(data)")
-        .unwrap();
-    assert!(WriteJournal::open(other.path()).is_err());
-    assert_eq!(
-        foreign
-            .query_row("PRAGMA application_id", [], |r| r.get::<_, u32>(0))
-            .unwrap(),
-        0
-    );
-}
-
-#[test]
 fn process_exit_before_and_after_checkpoint_preserves_the_promised_version() {
     for boundary in [
         "content.write.before_checkpoint",
@@ -1319,22 +1388,14 @@ fn preparation_reuses_unhydrated_chunks_and_reports_missing_structure() {
 }
 
 #[test]
-fn fully_replaced_output_needs_neither_old_structure_nor_legacy_bytes() {
+fn fully_replaced_output_needs_no_original_direct_bytes_or_manifest_structure() {
     use tkfs::content::LocalContent;
-    for legacy in [false, true] {
+    for len in [32, 1 << 30] {
         let dir = tempfile::tempdir().unwrap();
         let target = LocalContent::open(dir.path()).unwrap();
         let journal = WriteJournal::open(dir.path()).unwrap();
         let fake = Base::new(false);
-        let mut save = intent(1 << 30);
-        if legacy {
-            save.base.content = FileContentRef::new(
-                ContentKind::Legacy,
-                Digest::bytes(b"unavailable legacy"),
-                1 << 30,
-            )
-            .unwrap();
-        }
+        let save = intent(len);
         let session = journal.create(save, fake.clone(), &context()).unwrap();
         let bytes = vec![89; 100_000];
         session.write_at(0, &bytes, &context()).unwrap();
@@ -1400,14 +1461,14 @@ fn sparse_maximum_length_prepares_a_bounded_zero_dag() {
 }
 
 #[test]
-fn legacy_preparation_converts_once_and_parallel_saves_do_not_nest_buffer_permits() {
+fn chunked_preparation_is_bounded_and_parallel_saves_do_not_nest_buffer_permits() {
     use tkfs::{content::LocalContent, util::phases::Phase};
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(LocalContent::open(dir.path()).unwrap());
     let bytes: Vec<_> = (0..2 * 1024 * 1024 + 133).map(original).collect();
-    let digest = Digest::bytes(&bytes);
-    fs::write(dir.path().join("objects").join(digest.to_string()), &bytes).unwrap();
-    let reference = FileContentRef::new(ContentKind::Legacy, digest, bytes.len() as u64).unwrap();
+    let reference = provider
+        .import(&mut bytes.as_slice(), bytes.len() as u64, &context())
+        .unwrap();
     let (journal, session) = native_session(dir.path(), provider.clone(), reference.clone());
     session
         .write_at(13 * CHUNK_SIZE + 317, &[78; 4096], &context())
@@ -1417,16 +1478,18 @@ fn legacy_preparation_converts_once_and_parallel_saves_do_not_nest_buffer_permit
     let prepared = session.prepare(&provider, &saved, &context()).unwrap();
     let after = provider.counters.snapshot();
     let read_bytes = after[Phase::Read as usize].bytes - before[Phase::Read as usize].bytes;
-    assert_eq!(read_bytes, bytes.len() as u64 + CHUNK_SIZE);
+    assert!(
+        read_bytes <= 2 * CHUNK_SIZE,
+        "preparation read {read_bytes} bytes"
+    );
     let repeated = provider.counters.snapshot();
     let again = session.prepare(&provider, &saved, &context()).unwrap();
     let cached_read = provider.counters.snapshot()[Phase::Read as usize].bytes
         - repeated[Phase::Read as usize].bytes;
     assert_eq!(again.content(), prepared.content());
-    assert_eq!(
-        cached_read,
-        2 * CHUNK_SIZE,
-        "repeated preparation rescanned its legacy base"
+    assert!(
+        cached_read <= 2 * CHUNK_SIZE,
+        "repeated preparation read {cached_read} bytes"
     );
     let mut expected = bytes.clone();
     expected[13 * CHUNK_SIZE as usize + 317..13 * CHUNK_SIZE as usize + 4413].fill(78);
@@ -1449,7 +1512,11 @@ fn legacy_preparation_converts_once_and_parallel_saves_do_not_nest_buffer_permit
                 deadline: Instant::now() + Duration::from_secs(5),
                 cancel: Cancel::new(),
             };
-            session.prepare(&target, &saved, &ctx)
+            let prepared = session.prepare(&target, &saved, &ctx)?;
+            let mut out = [0; 4096];
+            target.read_range(prepared.pin(), CHUNK_SIZE + 71, &mut out, &ctx)?;
+            anyhow::ensure!(out == [value; 4096], "parallel save selected wrong bytes");
+            Ok::<_, anyhow::Error>(prepared)
         }));
     }
     for job in jobs {
@@ -1458,21 +1525,23 @@ fn legacy_preparation_converts_once_and_parallel_saves_do_not_nest_buffer_permit
     assert_eq!(provider.buffer_usage().0, 0);
     println!(
         "WAVE6_PREPARE {}",
-        serde_json::json!({"scenario":"legacy_conversion","source_bytes":bytes.len(),"read_bytes":read_bytes,"cached_prepare_read_bytes":cached_read,"conversion_source_passes":1,"parallel_preparations":2,"deadline_ms":5000})
+        serde_json::json!({"scenario":"current_parallel_prepare","source_bytes":bytes.len(),"read_bytes":read_bytes,"cached_prepare_read_bytes":cached_read,"whole_file_conversion":false,"parallel_preparations":2,"deadline_ms":5000})
     );
 }
 
 #[test]
-fn corrupted_legacy_conversion_never_returns_a_publishable_preparation() {
+fn corrupted_current_base_chunk_never_returns_a_publishable_preparation() {
     use tkfs::content::LocalContent;
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(LocalContent::open(dir.path()).unwrap());
     let bytes = vec![93; 200_000];
-    let digest = Digest::bytes(&bytes);
-    let mut bad = bytes.clone();
+    let base = provider
+        .import(&mut bytes.as_slice(), bytes.len() as u64, &context())
+        .unwrap();
+    let mut bad = bytes[..CHUNK_SIZE as usize].to_vec();
+    let digest = Digest::bytes(&bad);
     bad[0] ^= 1;
     fs::write(dir.path().join("objects").join(digest.to_string()), bad).unwrap();
-    let base = FileContentRef::new(ContentKind::Legacy, digest, bytes.len() as u64).unwrap();
     let (journal, session) = native_session(dir.path(), provider.clone(), base);
     session.write_at(70000, b"edit", &context()).unwrap();
     let saved = session.checkpoint(&context()).unwrap().unwrap();
@@ -1733,37 +1802,6 @@ fn damaged_reclamation_state_does_not_fail_unrelated_healthy_file_writes() {
 }
 
 #[test]
-fn the_experimental_v1_journal_is_refused_without_discarding_its_records() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("write-sessions-v1.sqlite");
-    let db = rusqlite::Connection::open(&path).unwrap();
-    db.execute_batch("PRAGMA application_id=1414223699; PRAGMA user_version=1; CREATE TABLE sessions(id TEXT PRIMARY KEY,working BLOB,saved BLOB,dirty INTEGER);").unwrap();
-    db.execute(
-        "INSERT INTO sessions VALUES('legacy-operation',?1,?2,0)",
-        rusqlite::params![b"old buffered state", b"old durable checkpoint"],
-    )
-    .unwrap();
-    assert!(WriteJournal::open(dir.path()).is_err());
-    let row: (Vec<u8>, Vec<u8>) = db
-        .query_row("SELECT working,saved FROM sessions", [], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .unwrap();
-    assert_eq!(
-        row,
-        (
-            b"old buffered state".to_vec(),
-            b"old durable checkpoint".to_vec()
-        )
-    );
-    assert_eq!(
-        db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
-            .unwrap(),
-        1
-    );
-}
-
-#[test]
 fn late_or_cancelled_preparation_keeps_recovery_and_releases_buffer_capacity() {
     use tkfs::content::LocalContent;
     for cancel in [false, true] {
@@ -1839,19 +1877,13 @@ fn stale_preparations_retire_while_unrelated_saves_still_hold_all_background_buf
             Ok(out.len())
         }
     }
-    for legacy in [false, true] {
+    for len in [32, 2 * CHUNK_SIZE] {
         let dir = tempfile::tempdir().unwrap();
         let provider = Arc::new(LocalContent::open(dir.path()).unwrap());
-        let data = vec![190; 2 * CHUNK_SIZE as usize];
-        let base = if legacy {
-            let digest = Digest::bytes(&data);
-            fs::write(dir.path().join("objects").join(digest.to_string()), &data).unwrap();
-            FileContentRef::new(ContentKind::Legacy, digest, data.len() as u64).unwrap()
-        } else {
-            provider
-                .import(&mut data.as_slice(), data.len() as u64, &context())
-                .unwrap()
-        };
+        let data = vec![190; len as usize];
+        let base = provider
+            .import(&mut data.as_slice(), data.len() as u64, &context())
+            .unwrap();
         let (_journal, session) = native_session(dir.path(), provider.clone(), base);
         session.write_at(17, b"edit", &context()).unwrap();
         let saved = session.checkpoint(&context()).unwrap().unwrap();
@@ -1908,7 +1940,7 @@ fn stale_preparations_retire_while_unrelated_saves_still_hold_all_background_buf
         assert_eq!(provider.buffer_usage().0, 0);
         println!(
             "WAVE6_PREPARE {}",
-            serde_json::json!({"scenario":"stale_buffer_wait","legacy":legacy,"retired_ms":elapsed.as_secs_f64()*1000.0,"bound_ms":250,"blocked_background_buffers":6,"retired_before_background_release":true})
+            serde_json::json!({"scenario":"stale_buffer_wait","base_len":len,"retired_ms":elapsed.as_secs_f64()*1000.0,"bound_ms":250,"blocked_background_buffers":6,"retired_before_background_release":true})
         );
     }
 }

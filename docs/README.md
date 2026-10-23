@@ -1,5 +1,9 @@
 # Documentation
 
+- [Personal-use deployment and DVFS authority scope](revamp/AUTHORITY_SCOPE.md):
+  deployment-owned protection, required filesystem/replication authority checks,
+  and exclusion of Users, ACLs and public-service security from current plans.
+
 - [README](../README.md): what Telekinesis is, quick start, **upgrading from
   the previous release**, what every status means, error classes, runbooks.
 - [CLI](CLI.md): every command, including `manage status` and `manage watch`.

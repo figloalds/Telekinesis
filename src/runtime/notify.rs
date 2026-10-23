@@ -36,6 +36,46 @@ pub const ROOT_PATH: &str = "\\";
 pub const ACTION_ADDED: u32 = 1;
 pub const ACTION_REMOVED: u32 = 2;
 pub const ACTION_MODIFIED: u32 = 3;
+/// A basic-info change never renames the entity. Resolve one bounded path;
+/// an unknown/deep/cyclic path falls back to the existing root invalidation.
+pub(crate) fn metadata_notification(store: &Store, entity: &str) -> (String, u32) {
+    let fallback = || (ROOT_PATH.to_owned(), ACTION_MODIFIED);
+    let tx = if store.db.is_autocommit() {
+        store.db.unchecked_transaction().ok()
+    } else {
+        None
+    };
+    let mut current = entity.to_owned();
+    let mut parts = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut bytes = 0;
+    for _ in 0..128 {
+        if !seen.insert(current.clone()) {
+            return fallback();
+        }
+        let Ok(entry) = store.entry(&current) else {
+            return fallback();
+        };
+        if !entry.alive {
+            return fallback();
+        }
+        bytes += entry.name.len() + 1;
+        if bytes > 32_768 {
+            return fallback();
+        }
+        parts.push(entry.name);
+        if entry.parent == ROOT {
+            parts.reverse();
+            let result = (format!("\\{}", parts.join("\\")), ACTION_MODIFIED);
+            if let Some(tx) = tx {
+                let _ = tx.commit();
+            }
+            return result;
+        }
+        current = entry.parent;
+    }
+    fallback()
+}
 /// The notifier's wait between deliveries when nothing is queued.
 const NOTIFIER_TICK: Duration = Duration::from_millis(250);
 /// How long the notifier lets a burst accumulate before delivering it.
@@ -78,6 +118,7 @@ fn diff_paths(a: &BTreeMap<String, Entry>, b: &BTreeMap<String, Entry>) -> Vec<(
             }
             Some(new)
                 if old.content != new.content
+                    || old.content_ref != new.content_ref
                     || old.modified_ms != new.modified_ms
                     || old.basic_info() != new.basic_info() =>
             {

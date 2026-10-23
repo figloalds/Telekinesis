@@ -555,7 +555,7 @@ fn refresh_content_with(
     let target = ctx.status_generation.load(Ordering::SeqCst);
     let revision = vitals.map(EngineVitals::store_revision);
     let started = Instant::now();
-    let (cheap, full) = match store {
+    let (cheap, mut full) = match store {
         Some(store) => (
             compute_cheap(store, target, revision)?,
             compute_full(store, totals)?,
@@ -568,6 +568,14 @@ fn refresh_content_with(
             )
         }
     };
+    let content = lock(&ctx.inflight_objects).content.clone();
+    if let Some(content) = content {
+        let (downloading, requested) = content.scheduler.repository_activity(&ctx.repo);
+        full.content.downloading = downloading;
+        full.content.requested = requested;
+        full.legacy["downloading"] = json!(downloading);
+        full.legacy["requested"] = json!(requested);
+    }
     let full_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let feed = feed_peers(ctx);
     ctx.status_cell.update(|prev| {

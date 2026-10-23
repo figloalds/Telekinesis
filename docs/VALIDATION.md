@@ -1,5 +1,21 @@
 # Validation
 
+Scope amendment, 2026-10-22: apply the [personal-use authority
+scope](revamp/AUTHORITY_SCOPE.md). Current acceptance checks DVFS pairing/route
+binding, reference scope, stale work, integrity, durability and filesystem
+semantics. Users, ACLs and public-service/hostile-user hardening are not gates.
+Historical security-suite results remain evidence of those exact images;
+custom HMAC/enrollment tests are not mandatory target mechanisms. Rebase their
+applicable authority scenarios when simplifying implementation, with replacement
+coverage recorded. This documentation review neither skips current correctness
+tests nor claims new qualification.
+
+Pairing acceptance includes an online/reachable server refusing peer use with
+missing or incorrect codes, accepting the correct code, and preserving the
+admission boundary across unpair/reconnect. After admission peers are trusted;
+retained scope/ownership checks exercise filesystem correctness, not malicious
+authenticated users. These are required scenarios, not newly executed results.
+
 How this release is checked, how to run the checks, and what they measured.
 Four layers:
 
@@ -20,14 +36,284 @@ omissions and continuation decisions are recorded in the
 
 ## Wave 6 development qualification
 
-Wave 6 remains in progress with production content activation off. Its
+**Scope amendment, 2026-10-21:** this is a greenfield release. The current phase is
+the [WP6.G interlude](revamp/WAVE_6_PLAN.md#31-wp6g--greenfield-interlude-in-progress).
+Prior-version readers, legacy promotion/migration, mixed-version peers,
+previous-executable workspace/launcher fences and downgrade workflows are no
+longer acceptance gates. Existing reports below remain historical evidence;
+their references to those gates being mandatory are superseded. WP6.G is in
+progress; the [inventory and coverage ledger](revamp/notes/wp6-greenfield-inventory.md)
+distinguishes removed private-journal upgrades/readers from still-pending
+execution and transport consolidation. Its checks must use fresh stores, one
+current content/save/transport
+path, current-format restart/recovery and current-version peers, with explicit
+refusal of unsupported formats. Preserve applicable regression coverage when
+removing compatibility-only tests. Wave 5 remains an isolated performance
+baseline; all current-path safety, Windows/FUSE, timing/build, load and failure
+gates remain, including the known timestamp-policy and scheduling failures.
+
+Wave 6 remains in progress. Worker startup now initializes current native COW
+without a fixture activation marker; Core producers and execution/transport
+consolidation remain incomplete. The
 [implementation record](revamp/notes/wp6-progress.md) distinguishes completed
 package evidence, failed attempts and outstanding release gates. Per-package
 JSON under `test-evidence/wave-6/` records source hashes, commands, actual test
 images, individual samples and omissions. These focused results do not replace
-the complete Windows/Linux matrix, matched build measurements, migration and
-retention rehearsals, two-peer outage/load qualification or 30-minute soak in
+the complete Windows/Linux matrix, matched build measurements, current-format
+recovery and retention rehearsals, two-peer outage/load qualification or 30-minute soak in
 the [Wave 6 plan](revamp/WAVE_6_PLAN.md#5-build-performance-work-and-acceptance).
+
+[CCR-WP6.G-12 evidence](../test-evidence/wave-6/native-exit-retention-checks.json)
+records scoped default-worker and fatal-retention coverage: 288 ordinary tests,
+one exact off-lock/rollback/Saved regression and three actual WinFsp/FUSE kernel
+parents per platform. The final change affects only the kernel fixture's bounded
+observation of delayed Close callbacks. Unchanged harness/CLI hashes retain their
+successful results from the preceding source; the report identifies both cohorts
+and preserves the intermediate Windows BUSY_VIEW failure and exact failed images.
+Strict all-test Clippy and selected builds pass on both platforms. Core producers,
+legacy execution/representation/transfer removal and complete release gates
+remain open; default startup alone is not a complete single current path.
+
+[CCR-WP6.G-13 evidence](../test-evidence/wave-6/core-current-producers-checks.json)
+separates its producer and notification cohorts. The producer source passes nine
+complete targets (275 cases/platform) and three actual kernel parents/platform;
+the broader eleven-target matrix remains 318 pass / 36 fail on each system.
+Current notification-source verification passes 13 focused ordinary cases and
+one actual default-kernel parent per platform. It changes only the typed-root
+notification comparison and its regression; previous image results are not
+presented as executions of this source. Both cohorts pass strict all-test release
+Clippy and their selected builds. Failed transfer/lifecycle harnesses and CLI
+images, older source/logs and all remaining gates stay recorded and unwaived.
+
+[CCR-WP6.G-14 evidence](../test-evidence/wave-6/current-content-codec-checks.json)
+qualifies removal of legacy descriptor codecs, whole-file provider conversion,
+both conversion caches and fallback save capture. Each platform passes 395 cases
+across 16 runtime targets (including eight internal write/retention cases), in
+two explicitly identified cohorts: 359 from 14 complete successful targets, then
+36 from the two corrected test files. The initial matrix's 393 passes/two
+failures and actual failed images remain preserved. All unaffected harness
+hashes were verified unchanged; earlier executions are not called executions of
+the final source. Strict all-test release Clippy passes on both sources/systems.
+Three actual WinFsp/FUSE parents pass again with final selected CLI images; the
+Linux CLI hash changed after rebuild, so its old CLI-dependent results were not
+carried. SDK/loaded-driver hashes remain unchanged. Bare strings, standalone
+Engine/staging, duplicate transport and all remaining Wave 6 gates stay open.
+
+[CCR-WP6.G-15 evidence](../test-evidence/wave-6/native-saved-lifecycle-checks.json)
+records 305 successful cases/platform: 295 across eight integration targets and
+ten internal write/exit cases, in two source cohorts. The initial cohort passes
+304 and fails one old create expectation; its actual failed executor/CLI images
+are preserved. The final test-only correction compares the complete committed
+empty entry during blocked publication and requires clean owned-fixture teardown.
+Its executor/lifecycle targets pass 46 cases/platform; 259 earlier cases retain
+their source/image identity and unchanged harness hashes. One explicit actual
+WinFsp/FUSE parent passes again with each final CLI. Current force-stop/Saved
+restart, rollback/connection replacement, metadata writer contention, failed
+COMMIT followed by failed retention, lock-free heartbeat counting and grouped/
+adoption count transitions are covered. Strict all-test Clippy, selected builds
+and unchanged SDK/loaded-driver checks pass. The old standalone poison hook is
+removed; other standalone execution/staging and transport routes remain pending.
+
+[CCR-WP6.G-16 evidence](../test-evidence/wave-6/mount-default-current-checks.json)
+records 209 Windows /215 Linux ordinary passes across six targets, plus two
+explicit actual-kernel parents per platform, all on one frozen source/image
+cohort. The new parent uses public direct mounting without RPC startup: typed
+import/COW rewrite, create/rename/truncate/fsync, idempotent service reuse and
+recovery of an exact Saved revision that was not canonical beforehand. It also
+checks unsupported private-journal bytes/sidecars and mountpoint preservation
+with fresh valid metadata. Existing RPC-default kernel coverage passes alongside
+it. Controller force-detach/dispatch-loss cases use current Saved and off-lock
+retry. Strict all-test Clippy, selected builds and unchanged SDK/loaded-driver
+checks pass. The C optional mode is removed; remaining Rust fallbacks and full
+startup ordering/removal/release gates are still open.
+
+[CCR-WP6.G-17 evidence](../test-evidence/wave-6/current-handle-content-checks.json)
+records one final 434-input source cohort: 227 Windows/233 Linux passes across
+seven complete targets, eight focused passes per platform, and two explicit
+actual-kernel parents per platform. The scoped ordinary totals are therefore
+235/241. The focused cases cover chunk-local first edits, corrupt-chunk write
+and truncation refusal without false dirty state, prior accepted edits, verified
+range progress, deadline/fence/capacity release, immutable selection refresh and
+actual mounted missing/progress reads. Whole-file handle hydration/reference
+staging/copy conversion is removed. Strict all-test release Clippy and selected
+builds pass on both platforms; all eleven selected images/platform and the
+installed SDK/loaded-driver identities stay fixed through proof.
+
+Three whole broader targets remain diagnostic: `local_fs_throughput` 11 pass/28
+fail, `partial_content` 1/7 and `worker_concurrency` 22/7 on each platform. They
+are not qualified passing targets and their repetitions do not add to 235/241.
+Exact failed harnesses/CLIs and logs are preserved in the final capsule. Earlier
+candidates preserve the discovered premature-dirty failure and a test-fixture
+cleanup abort; the latter is corrected without changing production poison
+handling. The final diagnostic completes all 29 worker cases and retains its
+seven original failures. Applicable obligations still need current-path
+replacements; retired APIs/formats are not restored to satisfy old expectations.
+
+[CCR-WP6.G-18 evidence](../test-evidence/wave-6/descriptor-only-metadata-checks.json)
+records one final source/image cohort: 281 passes/platform across eleven complete
+targets and one focused bulk-fixture parent, for **282 scoped ordinary passes**
+per platform. Both explicit current RPC/direct actual-kernel parents pass per
+platform. The full 45-case feed target retains its original pagination, 5K-event
+and idle/private-tail bounds. Current store/header/restart and descriptor tests
+pass; strict all-test release Clippy and selected builds pass on both systems.
+All thirteen selected harness/CLI images/platform and the SDK/loaded-driver
+identities stay fixed through proof. This is not the complete harness-selftest
+target or whole-repository runtime suite.
+
+The first runtime candidate passes 11 admission cases and fails one because
+public nonlocal commit reads the old whole-file object before type validation.
+Its actual failed harness/CLI are preserved before correction. The production
+correction passes ten complete targets (236/platform), two actual-kernel parents
+and 41 feed cases, but four bulk-feed fixtures still synthesize old strings;
+their actual failed images are preserved before replacing that shortcut with
+public Core commits. A subsequent fixture collision precondition error and its
+failed harnesses/CLIs are also preserved. The final focused fixture covers full
+projection, typed bytes, root/outbox handoff, rollback, restart and receiver
+convergence. Status/preview/demand consumers and earlier diagnostics remain
+unqualified in their recorded scopes; no old-format support or gate waiver is
+inferred from their failures.
+
+[CCR-WP6.G-19 evidence](../test-evidence/wave-6/current-status-checks.json)
+records one final source/image cohort: **319 scoped ordinary passes/platform**,
+318 across fourteen complete targets and one focused bulk-fixture parent. The
+new complete targets include ten current-status cases, nine scheduler cases and
+eighteen typed-object cases. Both explicit current RPC/direct actual-kernel
+parents pass/platform. Strict all-test release Clippy, selected builds, format
+and diff checks pass on both platforms; all sixteen chosen harness/CLI hashes
+per platform and the WinFsp SDK/loaded-driver identity remain unchanged.
+
+Status coverage includes direct/empty/metadata-only roots, two-level manifests
+with repeated chunks and missing tail pages, canonical adjacency checks, known
+corruption and repair, receipt provenance independent of private dedup, rollback
+and foreign verification commits. A real worker without peers completes local
+indexing. Actual folder-details RPC cases prove typed details, stale generation
+refusal and Engine availability during a delayed snapshot followed by checkout.
+This does not qualify hidden in-place corruption detection by status, uncached
+large-store performance, preview/demand APIs, old tables, standalone saves or the
+full repository suite. The initial unused-import static failure and the later
+inspection finding about no-peer local verification are preserved separately;
+the latter interrupted ongoing compilations before any runtime proof. A later
+candidate has two failed parents/platform: an incorrect empty-fixture directory
+assumption and a missing-descriptor error name absent from classification.
+Exact failed status/contracts harnesses and CLIs were preserved before the
+fixture correction and reuse of the established Fatal error contract. Earlier
+source-specific runtime failures remain unwaived in their recorded scopes.
+
+[CCR-WP6.G-20 evidence](../test-evidence/wave-6/reference-consumer-checks.json)
+records **94 scoped ordinary passes/platform** in one source/image cohort: 90
+across five complete targets and four exact content_transport parents. The full
+new inspection target has 12 cases. Strict all-test release Clippy, selected
+builds/CLI and format/diff checks pass on Windows and Linux; seven chosen image
+hashes per platform remain fixed through proof. No new kernel-mount or full
+content_transport/repository/release qualification is claimed.
+
+Coverage includes current empty/direct/binary/manifest prefixes, historical
+conflict alternatives, exact requested ranges and verified receipt completion,
+independent cancellation/withdrawal, session deadlines and large reply bodies,
+joined explicit requests and stale-owner cancellation, global prefetch limits,
+capacity for other workers/readers, status on a session with simultaneous
+previews, checkout fences, shutdown/pin release, private missing data and SQL
+contention. Two new actual paired-peer/loopback cases hydrate preview/prefetch
+while an unrelated source chunk stays absent; existing typed-frame and adapter
+range cases also pass. The latter retains its original 250ms admission bound.
+
+Static candidates preserve the Windows GUI namespace error and source findings
+about global prefetch and handler reservations. No runtime image was invoked
+for either static candidate. Earlier source-specific receipt/readiness, timestamp,
+scheduler and broader diagnostic failures remain unwaived; these focused cases
+do not relabel those full-target failures. Kernel evidence from G19 belongs to
+its earlier source and is not a G20 execution.
+
+[CCR-WP6.G-21 evidence](../test-evidence/wave-6/current-adapter-checks.json)
+records 194 ordinary passes across five complete targets/platform, one
+exact adapter-range pass/platform, nine focused FUSE unit passes on Linux and
+eight actual-kernel parents/platform. Strict all-test release Clippy, selected
+builds/CLI and format/diff checks pass; seven Windows/eight Linux chosen images remain fixed
+through proof. Kernel cases exercise default RPC/direct startup, create/close,
+directory mutation, retained open unlink/replacement, offline fsync and real-peer
+range hydration. This qualifies current-only adapter mutation dispatch, not full
+transport/library/repository, standalone removal, build/load/soak or release gates.
+Earlier source-specific failures remain recorded and unwaived.
+
+
+[CCR-WP6.G-23 evidence](../test-evidence/wave-6/journal-recovery-checks.json)
+records two complete targets (86 ordinary cases/platform), both actual RPC/direct
+WinFsp/FUSE parents/platform, strict release all-test Clippy and selected builds.
+The new pending-directory regression covers RPC/direct unsupported-journal
+refusal without namespace mutation, then current recovery of the retained intent.
+The earlier G22 load/suite counts remain tied to their own source. Full Wave 6
+and release qualification remain open.
+
+
+[CCR-WP6.G-22 evidence](../test-evidence/wave-6/deferred-creation-checks.json)
+records 358 passes across eleven complete targets/platform, plus three exact
+adapter/current-lifecycle cases on Windows and those three plus nine FUSE units
+on Linux: 361/370 scoped ordinary passes. Sixteen actual-kernel parents pass
+per platform, including every rebased local filesystem case. The 300-file copy,
+eight writers x150 files/5s operation and probe limits, atomic replacement,
+absent/progressing reads, graceful detach, open/unlinked handles and fsync during
+concurrent closes retain actual invocation and byte oracles. Missing mount
+capability no longer counts as a passing local scenario.
+
+Strict all-test release Clippy, staged selected builds/CLI and format/diff checks
+pass. Fourteen Windows/fifteen Linux image hashes stay fixed throughout proof.
+The 26-function ledger replaces old standalone snapshot/spool/deferred test
+mechanisms with named current owners, without relabeling historical failures.
+Standalone staging/pending APIs/table, full transport/worker-lifecycle/library/
+repository, matched builds, storage/outage/aggregate load/soak and release gates
+remain open. No format/header/layout change or old-data upgrade is introduced.
+The first concurrent Linux execution failed with EIO; diagnostic replay decoded
+STALE_CONTENT_VIEW on rename. Its exact initial/debug source and failed harness/
+CLI capsules remain in the report. The final source retains operation handles
+for both sessions and tests last-user-close plus deadline cleanup deterministically.
+
+
+The first implemented greenfield tranche is
+[CCR-WP6.G-2](revamp/notes/wp6-progress.md#current-private-journals-ccr-wp6g-2):
+[greenfield-journal-checks.json](../test-evidence/wave-6/greenfield-journal-checks.json)
+records 515 Windows / 523 Linux ordinary passes across 16 targets/platform,
+20/19 default ignores, and five actual WinFsp/FUSE parents per platform counted
+separately. The private journal accepts only v7 or genuinely fresh input;
+prior-layout upgrades/readers are removed. Five new journal parents include
+104 nonmutating open/closed refusal combinations and three actual initialization
+exits. A separate actual-image probe caught a gap the initial green matrix
+missed: read-only SQLite created empty WAL/SHM sidecars for closed unsupported
+WAL-mode input. The corrected standalone-header guard, permanent regression,
+independent rerun and exact before/final source/image/log capsules are recorded.
+Strict release Clippy, formatting and diff checks pass. These results qualify
+this journal change; other WP6.G routes/default-path acceptance and final Wave 6
+gates remain pending in the inventory.
+
+[CCR-WP6.G-3](revamp/notes/wp6-progress.md#current-core-metadata-ccr-wp6g-3)
+selects the directly initialized Core metadata layout and retains bounded current
+derived-index repair. [greenfield-schema-checks.json](../test-evidence/wave-6/greenfield-schema-checks.json)
+records 761 Windows / 769 Linux ordinary cases across 29 selected targets, 29/28
+default ignores and five real kernel parents/platform. The final follow-up is
+test-only: W2 waits for the public hub's published readiness before the unchanged
+CLI assertions. Exact input/image comparisons carry successful unchanged targets
+with their original source SHA; final W2 runs on both platforms and outstanding
+Windows worker-status/kernel cases are recorded separately. The preceding failed
+Windows status assertion and complete Linux matrix are preserved. Strict release
+Clippy, formatting/diff checks and before/after WinFsp SDK/driver checks pass.
+This qualifies the Core change. The separate catalog tranche follows below;
+descriptor, default-execution, transport and final Wave 6 gates remain open.
+
+[CCR-WP6.G-4](revamp/notes/wp6-progress.md#current-catalog-ccr-wp6g-4) selects the
+directly initialized seven-table catalog. Its
+[greenfield-catalog-checks.json](../test-evidence/wave-6/greenfield-catalog-checks.json)
+records **1,143 Windows / 1,151 Linux ordinary passes across 43 selected targets**,
+43/42 default ignores, five actual kernel parents/platform and one separately
+invoked current restart/two-peer scenario/platform. The last fixture rebase is
+test-only: replace a dropped-table migration fixture with credential-row loss in
+stopped current fixtures, preserving identities and requiring new authenticated
+credentials after restart. All 28 security cases rerun on both platforms. The
+other 42 targets, five kernel cases and peer scenario retain their actual preceding
+source SHA and unchanged invoked images; all production and other inputs match.
+This is staged evidence, not one uninterrupted final-source run. Both original
+27-pass/1-fail security results and exact before/final source/log capsules remain.
+Strict release Clippy, format/diff checks and before/after WinFsp SDK/driver checks
+pass. This qualifies catalog consolidation; the typed filesystem/transport path
+is still optional and the remaining WP6.G/Wave 6 gates remain open.
 
 The isolated COW base tests use real SQLite, verified CAS and authenticated
 loopback/peer sessions. A focused ordinary run creates only temporary stores:
@@ -77,6 +363,236 @@ receipts or revert otherwise valid captures. The implementation record retains
 the pre-fix failures. These Core checks do not claim WinFsp/FUSE set-basic
 callback integration; existing kernel scenarios are separate regression checks.
 
+Native attribute/close isolation uses an ordinary checkpoint-fault regression
+and the existing isolated kernel write parent on actual WinFsp/FUSE:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_mount_writes -- --exact read_only_native_cleanup_and_close_keep_other_writers_buffered_but_fsync_saves --test-threads=1 --nocapture
+cargo test -j 1 --release --locked --offline --test content_mount_writes -- --exact read_only_cleanup_rechecks_checkpoint_state_after_a_started_native_write --test-threads=1 --nocapture
+cargo test -j 1 --release --locked --offline --test content_mount_writes -- --exact isolated_kernel_mount_writes_truncates_flushes_and_reopens_native_content --ignored --test-threads=1 --nocapture
+```
+
+The kernel parent checks typed size before open, private mutation time through
+path and handle stat, and read-only open/stat/close without publishing dirty
+bytes, followed by truncate/fsync/read/reopen equality. Its current expanded
+scenario also applies native `file.set_times` on both platforms and Linux chmod
+without publishing bytes before fsync. It uses existing descriptor files in
+temporary stores; native namespace creation remains a separate requirement.
+The owned-rename extension moves the open file away/back, reads private bytes
+through the new name, keeps the same private file/operation, and requires two
+namespace receipts with zero byte publications before later fsync.
+The strengthened truncate assertion blocks `content.write.before_checkpoint`
+during `File.set_len`, requires zero hook hits and zero byte publications, then
+checks explicit fsync and exact read/reopen bytes. Native truncate through an
+open handle must remain buffered; this does not weaken fsync or close durability.
+The concurrent cleanup case waits for an already-started write, then requires
+the recoverability check under that gate to leave newly buffered bytes private.
+The existing process-exit recovery parent still requires exactly one published
+Saved revision after reopening/closing a read-only handle.
+
+Checkpoint-bound partial metadata has a separate Core target and native
+coordinator cases, including selected-save rebasing, adoption without newer-byte
+publication, exact receipt reconciliation after reply expiry, and restart:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_metadata -- --test-threads=1 --nocapture
+cargo test -j 1 --release --locked --offline --test content_mount_writes native_basic_setter_ -- --test-threads=1 --nocapture
+```
+
+The Windows-only ignored
+`isolated_kernel_windows_time_policy_requires_an_observable_driver_contract`
+is a retained **failing** actual-kernel probe. WinFsp 2.1 rewrites disable (-1)
+to unchanged (0) before its callback. Direct native decoder disable/reset tests
+do not establish OS behavior. Keep this gate open; its failure must not be
+included in successful kernel counts or treated as an activation waiver.
+
+Exact native clock-pair checks cover two buffered writes and one fsync with
+write/change/both clocks disabled on the second handle, plus three real process
+exits before publication and exact Saved clock recovery:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_mount_writes -- --exact native_time_masks_preserve_earlier_buffered_clocks_before_one_fsync --test-threads=1 --nocapture
+cargo test -j 1 --release --locked --offline --test content_mount_writes -- --exact saved_native_clock_pairs_survive_process_exit_before_publication_and_reopen --test-threads=1 --nocapture
+```
+
+Private v7 compatibility qualification also needs the three attested reference images
+and their exact SHA256 environment values (`TKFS_V4_READER`/`_SHA256` and
+`TKFS_V5_READER`/`_SHA256` and `TKFS_V6_READER`/`_SHA256`). The explicit ignored parents execute actual old
+readers against v7. The v5 parent additionally creates a real v5 native Saved
+fixture with the old writer, requires upgrade refusal and compares persistent
+DB/WAL hashes. Headless v4/v5 and exact-clock v6 upgrade parents preserve record/checkpoint
+bytes and drive nine actual exits. This does not supply production migration,
+native-v5 recovery/export or old legacy executable workspace isolation.
+
+Live private reads during FULL checkpoint have independent-file and native
+same-file regressions. Both stall at the real private transaction's
+`content.write.before_checkpoint_commit` for 1,500 ms and require reads under
+300 ms, correct bytes and zero canonical publications while the writer remains
+stalled. `WAVE6_PRIVATE_READER` records individual times and marks the physical
+disk-stall claim false. Two library parents check the four-connection capacity,
+deadline/cancel/reuse and failed/panicking read-snapshot cleanup. These controlled
+stalls do not replace physical slow-disk, aggregate resource or build/load gates.
+
+Owned namespace durability has a separate temporary-store target:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_namespace -- --test-threads=1 --nocapture
+```
+
+It covers lost reply, newer Saved binding, replaced-writer fencing, remote
+alternatives, moved parent identity and silent capture/selection/receipt SQL
+reversion. Its crash parent runs three actual exit86 children before rename,
+before commit and after commit, then checks recovered name/private bytes and
+exactly one publication. Native runtime tests also cover reply expiry before
+later write, no retry after collision disappears, and adapter admission before
+the file gate. Native replacement has its own runtime and actual-kernel cases
+below; unlink/delete-on-close and complete namespace lifetime remain required.
+
+The Core/private destination-retirement contract adds exact-destination atomic
+replacement, a namespace-only journal handoff and publication with `alive=false`.
+Its additional crash parent executes nine actual exits around namespace commit,
+private adoption and canonical publication, then reopens and finishes exactly
+one retired publication without restoring the name. Further parents check
+clean and previously published destinations, old successor replay, newer native
+clocks, retained buffered maps, lost replies, ordinary restore fencing and silent
+destination capture/selection/owner/handoff reversion. Native replacement now
+adds a separate set of runtime/crash parents and an actual kernel parent:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_mount_writes replacement:: -- --test-threads=1 --nocapture
+cargo test -j 1 --release --locked --offline --test content_mount_writes -- --exact replacement::isolated_kernel_native_replacement_preserves_open_destination --ignored --test-threads=1 --nocapture
+```
+
+The kernel parent requires retained open destination reads, metadata/set_times,
+write/fsync and a final close without explicit fsync, while the new name keeps
+the source's bytes. Linux checks nlink0. Windows first verifies a native NTFS
+classic-vs-POSIX control, then uses actual std rename through WinFsp; native
+unlink and delete-on-close were required to fail before ACK at that historical
+checkpoint. CCR-WP6.G-5 now has a positive dedicated kernel parent for those
+operations; the correction removes the replacement parent's two temporary
+refusal guards while retaining all replacement assertions. That parent passes
+in the corrected G5 matrix. The initial G5 candidate remains preserved as failed:
+persistent unlink commit failure on actual WinFsp logs a void Cleanup error and
+leaves the name visible. The exact initial source, actual failed Windows harness,
+worker CLI and raw positive/negative results are preserved in
+[native-unlink-initial-checks.json](../test-evidence/wave-6/native-unlink-initial-checks.json).
+Its two focused ordinary targets pass 31+57 cases per platform and its one
+dedicated actual kernel parent passes per platform. Those results do not replace
+the failing Cleanup probe, the unrun 11-target/six-kernel matrix or required
+durable deletion/cancellation/restart coverage. The correction closes that scoped
+gap in
+[native-unlink-durable-checks.json](../test-evidence/wave-6/native-unlink-durable-checks.json):
+512 Windows/520 Linux ordinary cases across 12 targets/platform and seven actual
+kernel parents/platform, strict release Clippy and unchanged source/13 image
+identities/platform. The new actual Windows parent verifies cancellation and
+restart of existing-file and new-file delete-on-close under persistent metadata
+failure, retaining Saved bytes. FUSE must return the unlink error and preserve
+the file. The source/log/image failure capsules remain intact; repeated diagnostics
+and actual exit helpers do not add unique case counts. Complete directory/default
+execution and the remaining Wave 6 gates stay open.
+Runtime cases cover sorted dual-file ownership, both saved checkpoints without
+byte publication, lost Core/private replies, destination reconciliation before
+source observation, startup progress while canonical preparation stalls, nine
+actual exit86 boundaries, pending-name collisions and reservation release.
+
+CCR-WP6.G-6 directory creation and native SDK guard proof is
+[native-directory-create-checks.json](../test-evidence/wave-6/native-directory-create-checks.json):
+522 Windows/530 Linux ordinary cases across 12 targets/platform and nine explicit
+actual kernel parents/platform, with 26/25 default ignores. Five new Core and
+five runtime parents cover metadata-only creation, initial mode, exact receipt
+replay, scope/parent fencing, rollback/lost replies, three exit86 children,
+expired ACKs, reservations and enumeration. The two added kernel parents exercise
+real mkdir with delayed commit/independent existing-handle metadata/nested files,
+and committed rename with parallel new-name open and old-name recreation. Initial
+same-parent named-stat failures and actual failed images are preserved. The final
+test records an unopened-name lookup separately; Linux's observed wait is not a
+passing named-lookup/cache/load gate. The Windows handle wait is fixed by the
+supported native SDK null operation guards, with Rust namespace/entity ownership
+and Core validation retained. The unchanged current-image Windows time-policy
+probe still fails exit101 and has its own exact source/harness/CLI archive.
+G6 did not qualify directory rename/delete/basic metadata or durable directory
+dispositions. Their scoped G7 result is
+[native-directory-metadata-checks.json](../test-evidence/wave-6/native-directory-metadata-checks.json):
+429 frozen inputs, strict release Clippy on both platforms, 539 Windows/548 Linux
+ordinary cases across 12 targets/platform, 29/28 default ignores and eleven
+actual kernel parents/platform. All 13 images/platform remain unchanged through
+proof. New coverage includes full-scope rollback after receipt insertion, shared
+64-request disposition capacity, three actual exit86 removal boundaries, restored
+directory inode separation, empty-directory replacement with old handles and
+persistent Windows Cleanup failure/cancellation/restart. FUSE removal remains
+fallible. Exact failed source/logs/images and the current source archive are
+recorded in the report. Default execution, full remote/deadline/lost-observation
+lifetimes, the unresolved Windows timestamp probe and all other original Wave 6
+release gates remain open. No new transport-security gate is introduced; the
+selected channel boundary is standard TLS/WSS or the enclosing VPN.
+CCR-WP6.G-8 removes custom HMAC/nonces/mutual proofs and enrollment wrapping.
+Scoped [authentication simplification evidence](../test-evidence/wave-6/basic-transport-auth-checks.json)
+records strict Clippy on both platforms, 272 ordinary cases across six Windows
+targets and 335 across seven Linux targets, plus two actual peer/kernel parents
+per platform. The Windows broader typed-transfer target separately passed 53
+and failed one receipt/readiness counter assertion; its source and actual failed
+images are preserved, and the failure remains unwaived. Directory post-commit
+deadline reconciliation is being corrected separately; this is not whole-wave
+qualification or an additional security release gate.
+CCR-WP6.G-9's [directory observation evidence](../test-evidence/wave-6/directory-observation-checks.json)
+passes 184 ordinary cases per platform in explicitly recorded stages: 130
+namespace/runtime cases on the production correction, then 54 transfer cases
+after a test-only diagnostic startup guard. No explicit kernel parents were run
+in this stage. Retained metadata/Cleanup now recovers the owned removal receipt
+after a deadline, without adopting a later restoration. Read-only enumeration
+and full remote lifetimes are still open. The older Windows receipt-counter
+failure remains unresolved despite the passing reruns.
+CCR-WP6.G-10's [retained enumeration evidence](../test-evidence/wave-6/directory-enumeration-checks.json)
+adds 78 ordinary cases and two actual directory kernel parents per platform on
+its explicit source, with 13 Windows/12 Linux default ignores. The unchanged
+standalone reproduction now enumerates after the committed-removal deadline.
+All two harness/CLI hashes per platform and the five WinFsp SDK/driver files
+remain unchanged through proof. This closes that owned-removal enumeration gap;
+full remote/concurrent-parent lifetimes and all other original release gates
+remain open.
+A Core parent swaps the target directory's identity before commit and verifies
+exact parent-bound receipts after that directory moves again. Final CCR29 proof
+is [native-replacement-checks.json](../test-evidence/wave-6/native-replacement-checks.json):
+501 Windows/509 Linux ordinary cases across16 targets/platform, four explicit
+actual-kernel parents and three actual-reader compatibility parents/platform.
+All images were hashed before/after execution against395 frozen inputs; strict
+release Clippy, formatting and diff checks passed. The separate current-image
+Windows time-policy probe still fails. The initial unsettled legacy fixture
+failure and corrected cleanup ordering are retained with exact source/logs.
+These scoped
+proofs do not supply native create, legacy migration, complete remote/cache
+ordering or any other remaining Wave6 gate.
+
+Typed native regular-file creation has separate Core/runtime and actual-kernel
+parents. Its initial namespace event and byte-owner capture must commit together;
+byte writes remain buffered, and fsync/close retain their existing FULL contract:
+
+```powershell
+cargo test -j 1 --release --locked --offline --test content_namespace create:: -- --test-threads=1 --nocapture
+cargo test -j 1 --release --locked --offline --test content_mount_writes create:: -- --test-threads=1 --nocapture
+cargo test -j 1 --release --locked --offline --test content_mount_writes -- --exact create::isolated_kernel_native_create_close_and_replace_preserve_typed_bytes --ignored --test-threads=1 --nocapture
+```
+
+The real kernel parent creates direct empty content, writes privately, fsyncs,
+replaces a newly-created open target, saves final source and retired-destination
+writes by close without explicit final fsync, and creates/reopens manifest
+content in a new directory. Runtime/Core parents cover permissions, pending-name
+capacity, concurrent creators, reply expiry, stale owner preparation, readonly
+opens during preparation and nine actual process exits. Sealed but altered valid
+captures must fail at both insertion boundaries; a missing/corrupt-record test
+alone cannot prove that. The initial green matrix missed that defect; its exact
+negative probe, source and initial passing diagnostics are preserved separately.
+Final scoped proof is
+[native-create-checks.json](../test-evidence/wave-6/native-create-checks.json):
+399 frozen inputs,514 Windows/522 Linux ordinary cases across16 targets/platform,
+five actual-kernel parents and three actual-reader compatibility parents/platform,
+plus before/after direct capture-integrity probes with retained image identities.
+All selected images stayed unchanged during proof. Strict release Clippy,
+formatting and diff checks passed. The current-image Windows time-policy probe
+still fails and is archived separately. This regular-file work does not qualify
+legacy promotion, unlink/delete-on-close,
+all directory mutation/lock surfaces or the remaining Wave6 release gates.
+
 Use the full command/toolchain/target-cache details in the relevant evidence
 when reproducing a recorded result. A successful compile is not a test pass;
 an ignored case, an early-return child driver and a parent-invoked helper are
@@ -117,8 +633,8 @@ What the suite covers, by area (file names under `tests/`):
 | Store, activation, conflicts | `core`, `activation_inbox`, `derive_oracle` (randomized histories checked against the full reducer), `offlock_commit`, `startup_snapshots`, `recovery`, `directory_progress`, `availability_index` |
 | Metadata feed | `feed_v7` (acks from evidence only, rejections, regressions, private branches, forged origins, large events), `feed_fuzz` (seeded random topologies of 2–4 replicas with lost requests and replies, partial activation, restarts and restores; the oracle after every step, convergence, acks and per-id evidence at the end) |
 | Objects | `objects_v3_worker` (durability, crash resume, authorization, leases), `objects_v3_lanes` (both directions, backoffs, handoff, slow links), `partial_content`, `availability` |
-| Sessions | `session_core` (framing, multiplexing, heartbeats, deadlines, WSS), `session_handshake` (HMAC, replay, legacy detection both ways) |
-| Security | `security` (local tokens on the control and worker endpoints, per-peer credentials and their enrollment, revocation on unpair within 1 s, rotation, replay, no code, secret or token in status or logs) |
+| Sessions | `session_core` (framing, multiplexing, heartbeats, deadlines, WSS), `session_handshake` (ordinary hashed pairing admission, lane/version validation, cancellation, TLS) |
+| Pairing and application lifecycle | `security` (existing local endpoint tokens, stored peer credentials, revocation on unpair within 1 s, rotation, reconnect, no code, secret or token in status or logs); custom HMAC/transcript tests are retired scope |
 | Operations | `logging` (log rotation, redaction, the desktop's daemon log, `worker.log` rotation, diagnostics bundles without secrets) |
 | Daemon | `catalog_actor` (including the 6298d0b catalog upgrade and downgrade), `folder_controller` (lifecycle, adoption, gate), `management_api`, `peer_supervisor`, `meta_scheduler`, `inbound_v3`, `status_hub`, `orchestrator` (real daemons over the network), `w1/w2/w3_integration` |
 | Worker | `worker_lifecycle`, `worker_process`, `worker_concurrency`, `mount_lifecycle` (WinFsp and FUSE) |
@@ -245,6 +761,13 @@ while that disk was full (0–11 GB free); WP4.2's and this run kept scenario
 data on the SATA SSD (`F:`), where they hold with margin.
 
 ### Interoperability and upgrade checks
+
+Historical Wave 3 evidence below is retained. These prior-version gates are
+superseded by WP6.G. CCR-WP6.G-4 rebases the old-datadir sync scenario to
+`qual_wp3_int_e2e::current_restart_then_sync` and replaces the catalog's
+upgrade/downgrade parents with current-format restart, identity, gate and
+credential coverage. Its qualification is recorded separately in the current
+implementation record; old fixture results are not relabeled as current passes.
 
 - `qual_wp3_1_transport::upgrade_against_a_6298d0b_peer_fails_closed_on_both_sides`
   (needs `TKFS_BASELINE_BIN`): two previous-release daemons paired both ways,

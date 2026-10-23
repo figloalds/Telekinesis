@@ -6,10 +6,48 @@ seal on close, pack store, per-entity conflicts, one benchmark gate). This
 file is kept as the historical record of the chunked-journal design and its
 evidence; do not continue its packages.
 
-Status: implementation in progress, 2026-10-21. Content activation remains off;
-see the [implementation record](notes/wp6-progress.md) for completed work,
+Status: implementation in progress, 2026-10-23. Default current-worker
+initialization and fatal retention pass scoped regressions; single-path
+consolidation and release gates remain open. Typed Core producer/notification
+checks pass in the recorded scopes. Legacy descriptor/provider conversion is
+removed with scoped current-content qualification. Current Saved lifecycle and
+heartbeat checks also pass; earlier API/transport failures and pending route
+removal remain recorded. No complete current-path qualification is claimed. No release/deployment
+has been performed. See the [implementation record](notes/wp6-progress.md) for completed work,
 verification and outstanding gates. The package and release requirements below
 remain the complete Wave 6 scope.
+
+Scope revision, 2026-10-21: the user confirmed this is greenfield. Support for
+prior releases, stores, journals and peers is no longer required. WP6.G below
+is the current implementation phase, inserted after CCR-WP6.4-30 and before the
+remaining Wave 6 work. This revision supersedes earlier compatibility and
+migration obligations in contracts, progress notes and validation guidance;
+their recorded implementation and test results remain historical evidence.
+
+Transport security boundary, 2026-10-22: the user selected standard TLS/WSS or
+the enclosing VPN to secure the channel. Reuse those mechanisms; do not add
+custom channel cryptography, security negotiation or another transport-security
+layer. Keep implementation within this boundary when consolidating transport.
+Simplify the existing custom HMAC handshake/enrollment wrapping in that work;
+do not preserve those mechanisms merely as historical compatibility. Ordinary
+application authority remains scoped by the decision below.
+
+Personal-use authority scope, 2026-10-22: [deployment assumptions and DVFS
+boundaries](AUTHORITY_SCOPE.md) govern security-related requirements throughout
+this plan and inherited documents. Rely on deployment-provided protection;
+implement only DVFS pairing/routing, repository/reference scope and filesystem
+correctness. Users, roles, ACLs, multi-tenancy and hostile-user defenses are out
+of scope. The selected simple hashed pairing-code model does not require custom
+HMAC/enrollment infrastructure. Existing authorization/permission requirements
+refer to DVFS authority boundaries, not a new user-permission system. This adds
+no security phase or gate before completing current implementation.
+
+Pairing clarification: the server may be online. The hashed pairing-code
+challenge remains mandatory admission control against unwanted use, even over
+TLS/WSS or VPN. Peers that pass pairing are trusted; checks after admission
+enforce DVFS routing/reference authority and filesystem correctness, without
+assuming malicious authenticated users or adding Users/ACLs.
+
 Baseline: integrated local `master` at `b1b8e52`; see the
 [Wave 5 handoff](notes/wave-5-handoff.md). The user selected one next wave
 covering the 64 KiB foundation, independent metadata/object engines,
@@ -19,7 +57,7 @@ This is the authoritative Wave 6 scope and package numbering. It supersedes
 the exploratory WP6.0–WP6.4 tables in the earlier studies. The original
 [revamp plan](REVAMP_PLAN.md) remains the historical Waves 0–5 specification;
 its invariants apply except where an explicit change below requires new
-contracts and compatibility evidence. This document authorizes planning scope,
+contracts and correctness evidence. This document authorizes planning scope,
 not a claim that implementation, qualification or deployment has occurred.
 
 ## 1. Deliverable and boundaries
@@ -33,7 +71,7 @@ recovery, permissions and offline conflict preservation remain requirements.
 In scope:
 
 - Versioned file-content descriptors, fixed 65,536-byte chunks, bounded indexed
-  manifests, direct small-file objects and legacy whole-file reads.
+  manifests and direct small-file objects on a single current content path.
 - Independent metadata and object scheduling, durable admission/reconciliation,
   generation-owned work and fair DB/CPU/disk/memory budgets.
 - Private dirty-range write sessions, recoverable saves, chunk verification,
@@ -54,6 +92,12 @@ Deferred:
 - SQLite replacement, a custom WAL, new global consensus, distributed reference
   counting, or a mandatory Tokio migration. No global authority is introduced.
 
+Removed from this release scope: prior-format reads/writes, legacy promotion,
+old-store or private-journal upgrades, mixed-version interoperability, old-reader
+qualification, previous-executable launcher fences and downgrade/export-to-old-
+version workflows. These are not deferred release gates. Fresh stores and peers
+running the selected current format/protocol are the supported baseline.
+
 The runtime stays `std`/`polling` for this wave unless measured evidence shows
 it prevents a required gate. Record that evidence and a scoped ADR before any
 runtime change; a runtime comparison is no longer a mandatory side project.
@@ -64,15 +108,16 @@ The selected default is **64 KiB**, with files at or below 64 KiB represented
 directly and a short final chunk stored without padding. Compare 16/256 KiB
 in experiments to explain tradeoffs, not to silently alter this selected scope.
 All representation parameters are immutable/versioned. Empty content keeps
-one explicit canonical representation. Existing whole-file identities remain
-valid. A manifest digest is never presented as the SHA-256 of file bytes.
+one explicit canonical representation. WP6.G removes legacy descriptor handling
+and freezes the current-only contract. A manifest digest is never presented as
+the SHA-256 of file bytes.
 
 WP6.0 produces a contract document and golden fixtures before consumers land.
 The following names describe required contracts, not existing Rust APIs:
 
 | Contract | Required information / behavior |
 |---|---|
-| `FileContentRef` | Explicit legacy/direct/manifest kind, format and digest algorithm, identity, total length; no ambiguous interpretation of existing hash strings. |
+| `FileContentRef` | Explicit direct/manifest kind, format and digest algorithm, identity, total length; legacy tags and untyped hash strings are unsupported after WP6.G. |
 | `ManifestNode` | Canonical encoding, ordered child/range references, lengths and coverage, bounded fanout/depth, typed leaf versus internal references. |
 | `ContentProvider` | Immutable-version range read, availability, verification and lifetime/pin operations; bounded buffers, deadlines and cancellation. Local provider locators are not wire references. |
 | `WriteSession` | Workspace/entity/base generation, dirty ranges, pending operation identity, retained base and durable recovery record. |
@@ -91,9 +136,8 @@ Zero ranges may be explicit authenticated ranges; sparse support must never
 turn missing bytes into zeros. Version 1 writes aligned fixed chunks, although
 the provider/session interfaces can represent general ranges for future use.
 
-Do not require a whole-file digest on every chunked save. Legacy materialization
-may calculate it on demand. File revision identity, physical byte layout and
-Git identity remain distinct. Fixed chunks do not guarantee small deltas after
+Do not require a whole-file digest on every chunked save. File revision identity,
+physical byte layout and Git identity remain distinct. Fixed chunks do not guarantee small deltas after
 text insertion or atomic editor replacement; measure those cases explicitly.
 
 ### Local save and durability contract
@@ -124,8 +168,8 @@ availability separately. Retain pending creates, names, deletes/renames and
 ordering against later operations across restart, including the previously
 fixed deferred-create collision. Shutdown/checkout fences must account for
 durable but not yet canonical saves. No fsync weakening is a performance fix.
-For an unchanged existing legacy base, its first conversion may scan the file;
-do not claim chunk-local cost until that conversion is complete.
+Fresh files enter the current direct/manifest path from creation; no legacy
+conversion stage is required or supported.
 
 ### Independent engine contract
 
@@ -182,21 +226,24 @@ can release only its own generation's leases.
 ## 3. Packages, dependencies and ownership
 
 These packages are dependency units, not instructions to launch parallel agents.
-Use a single integration line; merge in order 6.0, 6.1, 6.2, 6.3, 6.4, 6.5, 6.6,
-6.INT. Read-only measurement can continue throughout. Content activation stays
-off until 6.6 passes. Existing source paths below are ownership starting points;
+Use a single integration line. Preserve completed work through CCR-WP6.4-30,
+execute WP6.G next, then finish remaining 6.1–6.4 obligations and proceed to
+6.5, 6.6 and 6.INT. Read-only measurement can continue throughout. Production
+release stays gated on 6.6 and 6.INT; WP6.G enables the current path for fresh
+development stores. Existing source paths below are ownership starting points;
 WP6.0 records exact file ownership after carving new modules.
 
 | Package | Dependencies | Deliverable | Principal source seams | Exit evidence |
 |---|---|---|---|---|
-| WP6.0 Baseline and contracts | Wave 5 | Reproducible native/mounted build harness; phase counters; frozen format, API, resource and migration contracts; golden fixtures | `src/model/`, `src/util/`, integration-owned `src/core.rs`, qualification scripts | Release baseline, callback/durability map, format vectors and ownership map; no placeholders for correctness-critical decisions |
-| WP6.1 Content representation and lifetimes | 6.0 | 64 KiB CAS, direct-file path, indexed manifests, provider and root-handle interfaces, pins and reachability accounting | New content/manifest/provider modules, `src/core/objects.rs` | Legacy read compatibility, malformed manifest limits, verified ranges and shared-content isolation; mock provider with delayed/failing reads |
+| WP6.0 Baseline and contracts | Wave 5 measurement reference | Reproducible native/mounted build harness; phase counters; frozen format, API and resource contracts; golden fixtures | `src/model/`, `src/util/`, integration-owned `src/core.rs`, qualification scripts | Release baseline, callback/durability map, format vectors and ownership map; no placeholders for correctness-critical decisions |
+| WP6.1 Content representation and lifetimes | 6.0 | 64 KiB CAS, direct-file path, indexed manifests, provider and root-handle interfaces, pins and reachability accounting | New content/manifest/provider modules, `src/core/objects.rs` | Current-format reads, malformed manifest limits, verified ranges and shared-content isolation; mock provider with delayed/failing reads |
 | WP6.2 Metadata engine and admission | 6.0, 6.1 | Durable root outbox/inbox replay, content-independent activation, scoped coordination, incremental view publication | `src/core/{commit,inbox,derive,sharing}.rs`, `src/worker/activator.rs`, `src/orchestrator/meta_exchange.rs`, `src/runtime/sync_rpc.rs` | Offline convergence oracle with no bytes present; lost-notification/index-failure recovery; independent metadata progresses during object stalls |
 | WP6.3 Object engine and demand | 6.1, 6.2 | Bounded manifest traversal, descendant authorization, cross-repository demand, joined verification, source retry and generation leases | `src/core/{transfer,demand}.rs`, `src/orchestrator/{objects,inbound_objects,scheduler}.rs`, `src/runtime/objects_rpc.rs`, `src/worker/maintenance.rs` | Demand under saturation, authorized partial hydration, independent cancellation, source loss and stale completion tests |
 | WP6.4 Local COW reads/saves and durability | 6.1–6.3 | Dirty-range sessions, recovery checkpoints, durable close/flush, chunk-local finalization, provider-independent mounted reads | `src/runtime/{engine,content}.rs`, `src/mount.rs`, `src/fuse_linux.rs` | Crash/restart save matrix, no full-base staging for a small edit to chunked content, bounded resources, real Windows/FUSE adapter tests |
-| WP6.5 Build performance and change journal | 6.2, 6.4 | Correct cache invalidation, resumable local/remote changes, view freshness fixes, transaction/notification batching and build tuning | New change-journal/cache modules; owned adapter hooks from 6.4; `src/runtime/published.rs`, `src/core/status.rs` | Real builds meet section 5; remote changes visible through cached views; journal overflow/restart safely requests rescan |
-| WP6.6 Compatibility, retention and status | 6.1–6.5 | Explicit feature activation, restartable migration, retention audit/reclamation, meaningful per-engine state, bounded error episodes | New migration/retention modules, `src/startup.rs`, `src/worker/status_cell.rs`, `src/model/{status,health,errors}.rs` via integrator | Mixed-version fixtures, recovery/downgrade rehearsal, GC/pin race tests, no retry spam or unrelated breaker trips |
-| WP6.INT Integration | All | Release gates, migration rehearsal, evidence, docs and handoff | Integration-owned shared files, contract fixtures and validation docs | All correctness gates plus matched build evidence; deviations explicit, actual Git integration absent |
+| WP6.G Greenfield interlude | Implemented work through CCR-WP6.4-30; before remaining implementation | Remove legacy content, fallback transport/save paths and compatibility scaffolding; make fresh stores use one current path | Model/codec/schema, startup, Core, runtime, object RPC/dispatch, WinFsp/FUSE, fixtures and harnesses | Section 3.1 removal inventory, current-only contracts, fresh-store native/peer/restart checks and no reachable legacy fallback |
+| WP6.5 Build performance and change journal | 6.G, 6.2, 6.4 | Correct cache invalidation, resumable local/remote changes, view freshness fixes, transaction/notification batching and build tuning | New change-journal/cache modules; owned adapter hooks from 6.4; `src/runtime/published.rs`, `src/core/status.rs` | Real builds meet section 5; remote changes visible through cached views; journal overflow/restart safely requests rescan |
+| WP6.6 Fresh-store readiness, retention and status | 6.G, 6.1–6.5 | Current-format startup/recovery, protocol validation, retention audit/reclamation, meaningful per-engine state, bounded error episodes | Retention modules, `src/startup.rs`, `src/worker/status_cell.rs`, `src/model/{status,health,errors}.rs` via integrator | Fresh-store initialization and same-format recovery, unsupported-format refusal, GC/pin race tests, no retry spam or unrelated breaker trips |
+| WP6.INT Integration | All | Release gates, fresh-store release rehearsal, evidence, docs and handoff | Integration-owned shared files, contract fixtures and validation docs | All correctness gates plus matched build evidence; deviations explicit, actual Git integration absent |
 
 The integrator owns shared contract edits, `src/core.rs`, protocol/wire
 definitions, schema migrations, module registries and dependency files. Packages
@@ -206,33 +253,206 @@ the old frozen interfaces with versioned seams; it must not silently retrofit
 new meanings into existing fields. Ownership may transfer between sequential
 packages only when recorded in the integration notes.
 
-## 4. Compatibility, retention and rollout
+### 3.1 WP6.G — greenfield interlude (in progress)
 
-New binaries read existing whole-file events and objects unchanged. They write
-legacy content until an explicit repository feature activation. Do not rewrite
-historical causal events, their IDs, feed cursors or provenance. New writes after
-activation use direct or chunked descriptors; old revisions remain readable.
-Existing bytes can be reused while their new-format descriptor is computed.
+Purpose: stop extending two implementations to support unreleased history.
+Complete this interlude before more legacy promotion, compatibility work or
+performance tuning. Preserve the qualified current-path behavior and simplify
+its dependencies. The [removal/replacement inventory](notes/wp6-greenfield-inventory.md)
+records landed changes and pending routes; partial consolidation does not close
+the interlude. CCR-WP6.G-2 removes the private-journal upgrade chain and keeps
+one selected current layout. CCR-WP6.G-3 consolidates Core metadata initialization
+and current derived-index repair, with fresh/current-store qualification recorded.
+CCR-WP6.G-4 consolidates and qualifies the separate current catalog, including
+rebased current restart, credential rotation and enrollment coverage. Descriptor,
+execution and transport consolidation remain pending.
+CCR-WP6.G-5 qualifies native file unlink and durable per-handle dispositions,
+including cancellation and restart after persistent WinFsp Cleanup failure.
+That scoped qualification used fresh metadata layout 2, with no prior-layout
+reader or upgrade. The scoped proof passes 512 Windows/520 Linux ordinary cases
+and seven actual kernel parents per platform. Complete directory/lifetime work,
+default typed execution and the other greenfield removals remain open.
+CCR-WP6.G-6 qualifies directory creation outside the Engine lock and the native
+WinFsp operation-guard replacement. Its scoped proof passes 522 Windows/530 Linux
+ordinary cases and nine actual kernel parents per platform. It did not qualify
+directory rename/delete/basic metadata or dispositions; the separate Windows
+timestamp probe still fails.
+CCR-WP6.G-7 qualifies the scoped directory mutations, durable dispositions and
+retained-handle cases in
+[native-directory-metadata-checks.json](../../test-evidence/wave-6/native-directory-metadata-checks.json).
+Its 429-input source passes 539 Windows/548 Linux ordinary cases across 12
+targets/platform and eleven actual kernel parents/platform. The selected fresh
+metadata layout is 3 (114 objects), without a prior-layout reader or upgrade.
+CCR-WP6.G-8 removes custom channel proofs and enrollment wrapping under the
+selected TLS/WSS/VPN boundary, with scoped pairing/session/lifecycle evidence
+on both platforms. Its broader Windows receipt/readiness diagnostic remains
+failed and unwaived. Full remote ordering, deadline/lost-observation lifetimes,
+default execution, transport consolidation and every remaining Wave 6 gate are
+still open.
+CCR-WP6.G-9 qualifies retained directory mutation/Cleanup reconciliation after
+a committed removal loses observation to a deadline (184 staged ordinary cases
+per platform). Read-only enumeration and full remote lifetimes remain open;
+the passing rerun does not waive the earlier Windows receipt-counter failure.
+CCR-WP6.G-10 closes the scoped retained-enumeration observation gap using the
+same receipt. It passes 78 ordinary cases and two actual WinFsp/FUSE directory
+parents per platform. Full remote/concurrent-parent lifetime work, default
+current execution and the remaining greenfield inventory stay open.
+CCR-WP6.G-11 starts default worker initialization without fixture gates.
+Its candidate passes the three new ordinary startup/recovery cases on both
+systems and one actual FUSE mount, but exposes fatal-retention and existing
+producer/fixture integration failures. It remains failed/unqualified; see the
+implementation record before treating the default path as ready.
+CCR-WP6.G-12 closes scoped default-worker fatal-retention/integration defects
+with 288 ordinary, one exact unit and three actual kernel parents per platform,
+recorded with exact source/image cohorts. CCR-WP6.G-13 now consolidates Core
+producers and off-lock import preparation. Nine complete targets pass 275 cases
+per platform at its producer cohort; broader ordinary diagnostics remain 318
+pass / 36 fail. The subsequent typed-notification fix passes its focused 13
+cases and an actual default-kernel parent per platform. Source cohorts and
+remaining API/transport/consumer qualification are recorded explicitly; these
+are not a complete matrix or interlude closure.
 
-The initial policy requires capable peers for the activated repository.
-Negotiate descriptor/manifest capability on both worker IPC and peer discovery
-before exchanging unsupported events. An old or disconnected unsupported peer
-gets an actionable upgrade-required state for that repository; supported
-repositories continue. Do not quarantine unsupported valid events as corrupt,
-advance their acknowledgements, or synthesize downgraded events with new IDs.
-Automatic legacy-peer materialization is deferred; explicit byte export is
-separate from causal synchronization.
+G14 removes legacy descriptor codecs/provider conversion and qualifies its
+current-content scope. G15 removes the unused standalone poison hook, moves the
+retained lifecycle obligations to current native saves and fixes heartbeat
+accounting for durable Saved revisions. Its scoped 305 cases/platform and actual
+default-kernel parent do not remove the remaining Engine/staging/adapter/table,
+string consumer and duplicate transport routes in the inventory.
+G16 closes the direct-mount initialization gap and removes the WinFsp C bridge's
+optional native-content mode. Its single runtime cohort passes 209 Windows/215
+Linux cases and both RPC/direct actual-kernel parents per platform. This is a
+prerequisite for further callback/staging removal, not completion of that removal.
 
-WP6.0 must prove the database-version fence with the actual previous executable.
-A new marker alone cannot make an old binary obey a new rule. If the old binary
-does not reject the upgraded store, require an isolated new store location and
-a tested launcher/deployment fence before activation. No unsupported in-place
-downgrade: rollback after activation uses a backup in a separate store and
-preserves/exports all post-activation work before switching. Disabling new writes
-does not make already-written descriptors readable by an old binary.
+G17 removes whole-file handle hydration, CAS reference staging and writable-copy
+conversion from both adapters. Current range/progress/capacity/activation cases
+are rebased, and native mutation completion releases a premature dirty marker
+when no bytes changed. Scoped qualification passes 235 Windows/241 Linux cases
+and both explicit actual-kernel parents/platform. Standalone memory/disk saves,
+tables, string consumers and duplicate transport remain pending; broader raw-API
+diagnostics are recorded separately and are not passing targets.
 
-Startup migration is bounded, resumable and measured; no eager whole-repository
-rehash. Pins include current revisions, retained history and conflict alternatives,
+G18 closes Core's string-valued metadata/projection acceptance and removes the
+regular-file size fallback. Public nonlocal commit, bundle reception and feed
+precheck validate descriptors before old byte/provenance work. Bulk fixtures now
+use public typed Core commits instead of fabricating rows. Its one final cohort
+passes 282 scoped cases/platform and both explicit actual-kernel parents/platform,
+including all 45 feed cases and current-store checks. This does not consolidate
+the remaining null-field status/preview/demand consumers, standalone execution,
+old file-object tables or duplicate transfer routes.
+
+G19 moves status and folder-details to current descriptors and verified chunk/
+manifest indexes. Missing, pending indexing and known corruption have distinct
+states; logical missing bytes include repeated chunks and missing page coverage.
+Shared completeness keeps receipt provenance separate from private deduplication.
+Folder-details reads its secondary SQLite snapshot outside Engine and rejects
+checkout races. Bounded local maintenance verifies installed data without peers.
+Its final cohort passes 319 scoped ordinary cases and both explicit actual-kernel
+parents per platform. Preview/demand APIs, old tables, standalone saves and the
+remaining Wave 6 integration/performance gates are still open.
+
+G20 replaces the file-preview and explicit-request hash consumers. GUI conflict
+previews resolve the registered event/entity reference and read only a verified
+64 KiB prefix. Current range demands hydrate absent shared data; explicit bounded
+prefetches join/cancel by their own owner and keep provider pins. Byte work and
+waits are outside Engine/SQL transactions, with view/admission rechecks, session
+deadlines/cancellation, reserved handler/read capacity and shutdown cleanup.
+Five complete targets plus four exact real-peer cases pass 94 cases/platform;
+this is not the full transport suite or a new kernel/release qualification.
+Generic artifact fetching, old tables/transport, standalone execution and the
+remaining Wave 6 gates stay open.
+
+CCR-WP6.G-21: G21 removes standalone mutation fallback selection from the WinFsp/FUSE
+callbacks. Mounted ordinary operations require the current service installed
+before attachment and use its private byte/metadata/namespace owners. Root,
+directories and discovery retain explicit virtual/metadata behavior. Closed and
+readonly immutable rename sources now prepare a temporary current metadata owner
+without hydrating file bytes. Five complete
+targets pass 194 ordinary cases/platform; focused adapter coverage adds
+1 Windows/10 Linux cases, with eight actual-kernel parents/platform.
+This qualifies adapter dispatch, not deletion of shared savers, standalone APIs,
+pending_saves, old tables/transport or remaining Wave 6 gates.
+
+CCR-WP6.G-22: G22 removes the deferred-create API, its string-valued empty-file constructor,
+parallel pending-name index, first-save creation, late name restoration and
+TKFS_DEFERRED_CREATE. Current file names are canonical before the first byte
+write; dirty sizes remain private COW observations. Rename also retains source
+and destination operation handles through metadata gates, so the last user close
+cannot evict a selected session. The old local test mechanisms
+have an explicit replacement ledger: five ordinary current COW/range parents and
+all eight retained actual-mounted scenarios, including 300-file copy and eight
+writers x150 files with the original 5s per-operation/probe bounds. Eleven full
+targets plus focused cases pass 361 Windows/370 Linux ordinary cases and sixteen
+actual-kernel parents/platform. Remaining standalone staging/snapshot/pending
+APIs/table and all broader Wave 6 gates remain open.
+
+CCR-WP6.G-23 validates the private journal before pending directory recovery
+can commit metadata. Unsupported private input preserves the pending disposition,
+directory incarnation, projection and events through both RPC startup and direct
+attachment. A fresh current test journal then recovers the same intent. Two full
+targets pass 86 ordinary cases/platform, plus the actual RPC/direct WinFsp/FUSE
+parents/platform. This closes the scoped unsupported-journal ordering gap; full
+standalone removal and the remaining Wave 6 gates stay open.
+
+
+1. **Inventory and freeze scope.** Trace production entry points, codecs, schema,
+   workers and tests. Record each legacy-only component as remove, replace or
+   retain with a current-path reason. Distinguish obsolete compatibility from
+   required authorization, causal ordering, ownership and recovery mechanisms.
+2. **Consolidate storage and contracts.** Keep typed direct/manifest content and
+   one selected private-journal layout. Remove legacy whole-file descriptors,
+   string-hash event fallbacks, conversion caches, promotion/import adapters,
+   upgrade chains and old-reader support. Update schemas, version tags and golden
+   fixtures together; fresh initialization must not traverse historical migrations.
+   Direct small files remain supported, including their byte-digest verification.
+3. **Consolidate execution.** Route fresh-store create/read/write/flush/close,
+   rename/replacement and recovery through the current native COW path. Remove
+   deferred legacy saves, whole-file staging and optional fallback selection.
+   Remove legacy-only WANT/pull/push RPCs, capability fallbacks and duplicate
+   schedulers after routing current needs through bounded typed object demand.
+   Retain intended-peer/route binding under the selected pairing/deployment
+   model, cancellation, generation ownership and fairness. Do not retain custom
+   authentication/enrollment solely to satisfy historical security requirements.
+   If a required ordinary operation has no current implementation, implement
+   that replacement before removing its only working route; do not substitute
+   a stub, disable the operation or silently fall back to legacy behavior.
+4. **Rebase fixtures and acceptance.** Move applicable regression scenarios to
+   fresh current-format stores; remove tests whose sole purpose is prior-version
+   interoperability. Preserve historical evidence and known failures as such.
+   Keep Wave 5 only as an isolated performance reference, without shipping its
+   runtime paths. Record why each removed test is obsolete and where retained
+   correctness coverage now lives; do not erase a still-relevant failing test.
+5. **Qualify the single path.** Format/lint affected targets and run current-format
+   codec/provider, admission/demand, namespace and save/restart regressions.
+   Exercise fresh-store startup, actual WinFsp/FUSE create/read/write/fsync/close,
+   rename/replacement and same-version two-peer partial hydration/reconnection.
+   Verify unsupported formats/protocols fail clearly without mutation or fallback.
+   Inventory reachable production routes again and attach source/image evidence.
+
+Exit: the current path is the default for every fresh qualification store,
+legacy runtime branches and compatibility gates are removed, and all retained
+behavior has an owner and applicable tests. Document any remaining generic
+infrastructure explicitly; a hidden legacy fallback does not close this phase.
+Update contracts, architecture, validation and the progress record. Then resume
+the remaining Wave 6 gates; do not restart already completed work wholesale.
+
+This interlude does not waive the Windows timestamp-policy failure, structural
+demand reliability, crash durability, permissions, GC races, resource budgets,
+build targets or final platform/peer/outage/soak qualification. Namespace and
+lifetime work still required by the single current path stays in scope.
+
+## 4. Greenfield stores, retention and rollout
+
+Support fresh stores, current-format restarts and peers/workers implementing
+the selected current protocol. Fresh stores use direct/chunked descriptors
+without an opt-in legacy/new-content switch after WP6.G. Keep explicit format
+and protocol checks: unsupported input is refused with an actionable error,
+without silent reinterpretation, destructive reset or acknowledgement advance.
+There is no requirement that an old executable safely open a new store, or that
+a new executable migrate an old store. Previously created development stores
+are unsupported; use a fresh test directory rather than altering existing data.
+
+Startup and recovery remain bounded and measured. Pins include current
+revisions, retained history and conflict alternatives,
 pending saves, retained snapshot handles and in-flight reads. Preserve existing
 history retention rather than silently collecting older revisions. Reclamation
 in this wave is conservative local cleanup of provably unreferenced temporary
@@ -241,9 +461,11 @@ Deleting a reference is distinct from deleting bytes, and an offline peer's
 absence is not a collection signal. Keep deduplicated ownership and permissions
 separate. A reader cannot lose its pinned content during a GC pass.
 
-Rollout stages: fixture-only readers -> opt-in local test store -> two capable
-peers -> mounted build qualification -> documented explicit activation. No
-live user workspace is migrated merely to run a benchmark.
+Rollout stages: current-path fixtures -> fresh local store -> two current-version
+peers -> mounted build qualification -> documented fresh-store release. Production
+release remains gated on 6.6 and 6.INT; making the path default in development
+does not deploy it. Existing stores and archived evidence are not deleted by
+this scope change.
 
 ## 5. Build-performance work and acceptance
 
@@ -296,7 +518,7 @@ small-file and large-file costs independently; chunking is not a small-file fix.
 | W6-READ | Once required manifest pages and chunks are verified, a range read completes while an unrelated file chunk remains unavailable; a corrupt demanded chunk is never served. |
 | W6-SCALE | Cached lookup and unchanged-content bookkeeping do not scan total history/tree size; test fixed local work at 5K and 50K entries/events and explain any growth. Record cache misses separately. |
 | W6-BOUNDS | All recorded queue/byte budgets enforced; cancellation/shutdown complete within documented deadlines; no sustained post-warm-up resource growth in the targeted final run. |
-| W6-SAFETY | All new crash, authorization, oracle, migration and retention gates pass, plus applicable historical invariants/floors. No data-loss or permission exception is traded for a timing pass. |
+| W6-SAFETY | All current-format crash, authorization, oracle, fresh-store/restart and retention gates pass, plus applicable historical invariants/floors. Prior-version compatibility is excluded. No data-loss or permission exception is traded for a timing pass. |
 
 WP6.0 may expose an unrealistic target on the reference workload. Preserve the
 original result and propose a concrete revised target with attribution before
@@ -336,9 +558,10 @@ final report. Passing synthetic throughput alone does not close W6-BUILD.
 10. Slow disk/fsync, ENOSPC, SQLite busy, unsupported peer and absent source have
     distinct bounded outcomes. Expected readiness/retry episodes do not flood
     fatal errors or trip unrelated engine breakers; actual corruption stays visible.
-11. Restart during migration and GC, reopen with supported/old executables and
-    resume a disconnected old peer. Prove feature fencing, retained data and
-    acknowledgement correctness before enabling new-format writes.
+11. Initialize a fresh store, restart during current-format recovery and GC,
+    and reconnect a current-version peer. Prove retained data and acknowledgement
+    correctness. Refuse unsupported store/journal/protocol versions without
+    modifying their data; no old-executable or mixed-version rehearsal is required.
 
 ## 7. Verification, closure and retained knowledge
 
@@ -347,18 +570,19 @@ the final release gate. The user's earlier instruction to skip long tests was
 for Wave 5 closure; this plan does not retroactively reinterpret it as new test
 results or start long runs. No tests are launched by writing this document.
 
-Extend the existing `local_fs_throughput`, `availability_index`,
+Rebase or extend applicable scenarios from `local_fs_throughput`, `availability_index`,
 `objects_v3_worker`, `objects_v3_lanes`, `peer_supervisor`, `feed_v7`,
 `replication_regressions`, `startup_snapshots`, `derive_oracle`,
-`worker_feed_status` and `contracts` coverage where ownership permits. Add
-focused manifest/provider/save-recovery/change-journal/migration tests instead
+`worker_feed_status` and `contracts` where ownership permits; legacy-only
+targets may be retired under the WP6.G coverage inventory. Add
+focused manifest/provider/save-recovery/change-journal/fresh-store tests instead
 of duplicating the old assertions. Run deterministic interleaving/fault seeds
 alongside real SQLite WAL and Windows/FUSE tests; simulated storage is not a
 substitute for platform durability evidence.
 
 Per package: format, compile/lint affected targets, focused correctness tests,
 and matched measurements for changed hot paths. At integration: full applicable
-Windows suite once, relevant WSL/FUSE coverage, two-peer compatibility/recovery,
+Windows suite once, relevant WSL/FUSE coverage, current-version two-peer recovery,
 the section 5 build matrix and a bounded 30-minute saturation/recovery run.
 Retain the existing long qualification floors as outstanding until rerun or
 explicitly waived; neither a short run nor Wave 5 evidence proves them for a
@@ -367,8 +591,8 @@ changed storage format. A waiver must identify the omitted gate and limitation.
 Write evidence with source/executable identity, commands, configuration,
 individual samples, fault seeds and pass/fail/skipped outcomes. Never turn an
 unavailable environment or missing solution into a passing test. Update
-ARCHITECTURE, VALIDATION, configuration/upgrade guidance and the final handoff.
-Do not alter live mounts or automatically activate/migrate repositories merely
+ARCHITECTURE, VALIDATION, fresh-store setup guidance and the final handoff.
+Do not alter live mounts or automatically reset existing repositories merely
 because code merged. Merge/push/deployment follow the user's later instruction.
 
 Carried knowledge and owners:

@@ -52,10 +52,7 @@ use tkfs::{
         ctx::DaemonNetwork,
         manage::manage,
     },
-    session::{
-        self, ConnOptions, DialError,
-        auth::{PEER_HMAC_V1, PeerAuth, Transcript},
-    },
+    session::{self, ConnOptions, DialError, auth::PeerAuth},
     ws,
 };
 use tungstenite::{Message, client::IntoClientRequest};
@@ -223,7 +220,7 @@ fn dial_per_peer(
     session::dial(
         &server.endpoint(),
         session::client_hello(as_installation, LaneRole::Probe, None, 2),
-        &PeerAuth { key, code: None },
+        &PeerAuth { key },
         None,
         ConnOptions::default(),
     )
@@ -482,14 +479,7 @@ fn pairing_enrolls_a_per_peer_credential_that_replaces_the_code() {
     let key = wait_enrolled(&a, &b);
 
     let (conn, server) = dial_per_peer(&b, &a.installation(), key).unwrap();
-    assert!(
-        server
-            .features
-            .iter()
-            .any(|feature| feature == PEER_HMAC_V1),
-        "{:?}",
-        server.features
-    );
+    assert!(server.features.is_empty());
     let listed = tkfs::orchestrator::peer::list_catalog(&conn, None).unwrap();
     assert_eq!(listed.entries, vec![], "B publishes nothing");
     conn.close();
@@ -550,136 +540,39 @@ fn hello(endpoint: &str, hello: &ClientHello) -> (ws::RawSocket, ServerHello) {
     (socket, serde_json::from_value(header).unwrap())
 }
 
-/// §14 WP4.1 acceptance: a replayed per-peer handshake fails. The `AUTH` of
-/// a successful handshake, sent again on a new connection with the very same
-/// `HELLO` (same client nonce), meets a fresh server nonce and is refused.
 #[test]
-fn a_replayed_per_peer_handshake_fails() {
+fn an_enrolled_application_credential_establishes_fresh_connections() {
     let b = Daemon::start();
     let _code = b.code();
-    let dialer = "replaying-dialer";
+    let dialer = "credential-dialer";
     let key = tkfs::session::auth::peer_key(&tkfs::session::auth::new_secret());
     b.catalog
         .enroll(dialer, CredentialSide::Inbound, key)
         .unwrap();
-    let mut client = session::client_hello(dialer, LaneRole::Probe, None, 2);
-    client.features = vec![PEER_HMAC_V1.to_owned()];
-
-    let (mut socket, server) = hello(&b.endpoint(), &client);
-    assert!(
-        server
-            .features
-            .iter()
-            .any(|feature| feature == PEER_HMAC_V1)
-    );
-    let transcript = Transcript::per_peer(&client, &server).unwrap();
-    let auth = frame(
-        3,
-        &json!({ "proof": hex::encode(transcript.client_proof(&key)) }),
-    );
-    socket.send(Message::Binary(auth.clone().into())).unwrap();
-    let (kind, header) = read_frame(&mut socket);
-    assert_eq!(kind, 4, "AUTH_OK expected: {header}");
-    let ok: AuthOk = serde_json::from_value(header).unwrap();
-    assert_eq!(
-        ok.server_proof,
-        hex::encode(transcript.server_proof(&key)),
-        "mutual authentication"
-    );
-    let _ = socket.close(None);
-
-    let (mut replay, again) = hello(&b.endpoint(), &client);
-    assert_ne!(again.server_nonce, server.server_nonce);
-    replay.send(Message::Binary(auth.into())).unwrap();
-    let (kind, header) = read_frame(&mut replay);
-    assert_eq!(kind, 11, "GOAWAY expected: {header}");
-    assert_eq!(header["code"], "PEER_REVOKED", "{header}");
-}
-
-/// A dialer holding a credential offers `peer-hmac-v1`; an acceptor that
-/// does not know the scheme (a pre-WP4.1 v3 orchestrator) ignores it, and the
-/// dialer authenticates with its pairing code in the same handshake.
-#[test]
-fn a_credential_falls_back_to_the_code_with_an_acceptor_without_the_scheme() {
-    let (code, verifier) = tkfs::pairing_code::Verifier::generate();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
-    let acceptor = thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut socket = ws::accept_with(stream, 64 * 1024, |_, response| {
-            response
-                .headers_mut()
-                .insert("X-Tkfs-Sync", "3".parse().unwrap());
-        })
-        .unwrap();
-        let (kind, header) = read_frame(&mut socket);
-        assert_eq!(kind, 1);
-        let client: ClientHello = serde_json::from_value(header).unwrap();
-        let offered = client.features.clone();
-        let server = ServerHello {
-            protocol: "tkfs-peer".into(),
-            version: 3,
-            installation: "older-acceptor".into(),
-            role: client.role,
-            lane: client.lane,
-            salt: verifier.salt.clone(),
-            server_nonce: tkfs::session::auth::new_nonce(),
-            verifier_generation: 1,
-            // An older acceptor announces no features.
-            features: vec![],
-            limits: tkfs::model::protocol::frame::Limits::default(),
-        };
-        socket
-            .send(Message::Binary(frame(2, &json!(server)).into()))
-            .unwrap();
-        let (kind, header) = read_frame(&mut socket);
-        assert_eq!(kind, 3);
-        let transcript = Transcript::new(&client, &server).unwrap();
-        let expected = hex::encode(transcript.client_proof(&verifier.key()));
-        assert_eq!(header["proof"], expected.as_str(), "a code proof");
-        let ok = hex::encode(transcript.server_proof(&verifier.key()));
+    for _ in 0..2 {
+        let client = session::client_hello(dialer, LaneRole::Probe, None, 2);
+        let (mut socket, server) = hello(&b.endpoint(), &client);
+        assert!(server.features.is_empty());
         socket
             .send(Message::Binary(
-                frame(4, &json!({ "server_proof": ok })).into(),
+                frame(3, &json!({"credential":hex::encode(key),"peer":true})).into(),
             ))
             .unwrap();
-        thread::sleep(Duration::from_millis(200));
-        offered
-    });
-    let auth = PeerAuth {
-        key: tkfs::session::auth::peer_key(&[1; 32]),
-        code: Some(code),
-    };
-    let (socket, server) = session::connect_v3(
-        &endpoint,
-        session::client_hello("dialer", LaneRole::Probe, None, 2),
-        &auth,
-        None,
-        None,
-    )
-    .unwrap();
-    drop(socket);
-    assert!(server.features.is_empty());
-    assert_eq!(acceptor.join().unwrap(), vec![PEER_HMAC_V1.to_owned()]);
+        let (kind, header) = read_frame(&mut socket);
+        assert_eq!(kind, 4);
+        let _: AuthOk = serde_json::from_value(header).unwrap();
+        let _ = socket.close(None);
+    }
 }
 
 /// The client hello of a per-peer handshake as `installation`.
 fn per_peer_hello(installation: &str) -> ClientHello {
-    let mut client = session::client_hello(installation, LaneRole::Probe, None, 2);
-    client.features = vec![PEER_HMAC_V1.to_owned()];
-    client
+    session::client_hello(installation, LaneRole::Probe, None, 2)
+}
+fn per_peer_auth(key: &[u8; 32]) -> Vec<u8> {
+    frame(3, &json!({"credential":hex::encode(key),"peer":true}))
 }
 
-/// The `AUTH` frame of a per-peer handshake with `key`.
-fn per_peer_auth(client: &ClientHello, server: &ServerHello, key: &[u8; 32]) -> Vec<u8> {
-    let transcript = Transcript::per_peer(client, server).unwrap();
-    frame(
-        3,
-        &json!({ "proof": hex::encode(transcript.client_proof(key)) }),
-    )
-}
-
-/// Reads frames until one of `kind` (heartbeats and other frames skipped).
 fn read_until(socket: &mut ws::RawSocket, kind: u8) -> Value {
     if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_ref() {
         stream
@@ -695,10 +588,9 @@ fn read_until(socket: &mut ws::RawSocket, kind: u8) -> Value {
 }
 
 /// A credential revoked, or replaced, between the server's `HELLO_ACK` and
-/// the dialer's `AUTH` refuses the proof (`PEER_REVOKED`), although the
-/// proof matches the key the handshake started with.
+/// the dialer's `AUTH` refuses the credential (`PEER_REVOKED`).
 #[test]
-fn a_credential_revoked_during_the_handshake_refuses_the_proof() {
+fn a_credential_revoked_during_the_handshake_is_refused() {
     let b = Daemon::start();
     let _code = b.code();
     let dialer = "racing-dialer";
@@ -710,7 +602,7 @@ fn a_credential_revoked_during_the_handshake_refuses_the_proof() {
             .unwrap();
         let client = per_peer_hello(dialer);
         let (mut socket, server) = hello(&b.endpoint(), &client);
-        assert!(server.features.iter().any(|f| f == PEER_HMAC_V1));
+        assert!(server.features.is_empty());
         match change {
             "revoked" => b.catalog.revoke(dialer, CredentialSide::Inbound).unwrap(),
             _ => b
@@ -719,9 +611,7 @@ fn a_credential_revoked_during_the_handshake_refuses_the_proof() {
                 .unwrap(),
         }
         socket
-            .send(Message::Binary(
-                per_peer_auth(&client, &server, &key).into(),
-            ))
+            .send(Message::Binary(per_peer_auth(&key).into()))
             .unwrap();
         let (kind, header) = read_frame(&mut socket);
         assert_eq!(kind, 11, "{change}: GOAWAY expected: {header}");
@@ -745,9 +635,9 @@ fn a_per_peer_handshake_that_raced_a_revocation_is_sent_away() {
         .enroll(dialer, CredentialSide::Inbound, key)
         .unwrap();
     let (conn, _) = dial_per_peer(&b, dialer, key).unwrap();
-    // The racing handshake reads the credential (HELLO_ACK) ...
+    // The racing handshake reaches HELLO_ACK ...
     let client = per_peer_hello(dialer);
-    let (mut socket, server) = hello(&b.endpoint(), &client);
+    let (mut socket, _) = hello(&b.endpoint(), &client);
     // ... the dialer revokes itself on its other session ...
     let reply = conn
         .call(
@@ -766,9 +656,7 @@ fn a_per_peer_handshake_that_raced_a_revocation_is_sent_away() {
         .enroll(dialer, CredentialSide::Inbound, key)
         .unwrap();
     socket
-        .send(Message::Binary(
-            per_peer_auth(&client, &server, &key).into(),
-        ))
+        .send(Message::Binary(per_peer_auth(&key).into()))
         .unwrap();
     let (kind, header) = read_frame(&mut socket);
     assert_eq!(
@@ -798,11 +686,10 @@ fn a_per_peer_handshake_that_raced_a_revocation_is_sent_away() {
 /// What a scripted impostor at a peer's address answers.
 #[derive(Clone, Copy)]
 enum Impostor {
-    /// `HELLO_ACK` (echoing `peer-hmac-v1` when offered), then an `AUTH_OK`
-    /// with a wrong server proof: it holds neither the key nor the code.
-    WrongServerProof,
-    /// `GOAWAY{PEER_REVOKED}` before `HELLO_ACK` to a hello offering the
-    /// scheme, `GOAWAY{INVALID_PAIRING_CODE}` to a code hello.
+    /// `HELLO_ACK`, then an `AUTH_OK` with an unexpected field.
+    MalformedAck,
+    /// `GOAWAY{PEER_REVOKED}` before `HELLO_ACK`, then
+    /// `GOAWAY{INVALID_PAIRING_CODE}` on the next attempt.
     Refuses,
 }
 
@@ -838,7 +725,22 @@ fn impersonate(
     let (kind, header) = try_read_frame(&mut socket)?;
     anyhow::ensure!(kind == 1, "HELLO expected");
     let client: ClientHello = serde_json::from_value(header)?;
-    let offered = client.features.iter().any(|f| f == PEER_HMAC_V1);
+    let (_, verifier) = tkfs::pairing_code::Verifier::generate();
+    let server = ServerHello {
+        protocol: "tkfs-peer".into(),
+        version: 3,
+        installation: installation.to_owned(),
+        role: client.role,
+        lane: client.lane,
+        salt: verifier.salt,
+        verifier_generation: 1,
+        features: vec![],
+        limits: tkfs::model::protocol::frame::Limits::default(),
+    };
+    socket.send(Message::Binary(frame(2, &json!(server)).into()))?;
+    let (kind, header) = try_read_frame(&mut socket)?;
+    anyhow::ensure!(kind == 3, "AUTH expected");
+    let offered = header["peer"].as_bool().unwrap_or(false);
     offers.lock().unwrap().push(offered);
     match behaviour {
         Impostor::Refuses => {
@@ -848,32 +750,12 @@ fn impersonate(
                 "INVALID_PAIRING_CODE"
             };
             socket.send(Message::Binary(
-                frame(11, &json!({ "code": code, "message": "refused" })).into(),
+                frame(11, &json!({"code":code,"message":"refused"})).into(),
             ))?;
         }
-        Impostor::WrongServerProof => {
-            let (_, verifier) = tkfs::pairing_code::Verifier::generate();
-            let server = ServerHello {
-                protocol: "tkfs-peer".into(),
-                version: 3,
-                installation: installation.to_owned(),
-                role: client.role,
-                lane: client.lane,
-                salt: verifier.salt.clone(),
-                server_nonce: tkfs::session::auth::new_nonce(),
-                verifier_generation: 1,
-                features: if offered {
-                    vec![PEER_HMAC_V1.to_owned()]
-                } else {
-                    vec![]
-                },
-                limits: tkfs::model::protocol::frame::Limits::default(),
-            };
-            socket.send(Message::Binary(frame(2, &json!(server)).into()))?;
-            let (kind, _) = try_read_frame(&mut socket)?;
-            anyhow::ensure!(kind == 3, "AUTH expected");
+        Impostor::MalformedAck => {
             socket.send(Message::Binary(
-                frame(4, &json!({ "server_proof": hex::encode([0u8; 32]) })).into(),
+                frame(4, &json!({"unexpected":true})).into(),
             ))?;
         }
     }
@@ -924,12 +806,11 @@ fn pair_with_impostor(daemon: &Daemon, endpoint: &str, installation: &str, key: 
         .unwrap();
 }
 
-/// A refusal at the peer's address is not authenticated, so it never makes
-/// the dialer delete its per-peer credential (an impostor, a reused address
-/// or port):
+/// A malformed reply or refusal at the peer's address does not make
+/// the dialer delete its stored credential:
 ///
-/// * an acceptor that echoes `peer-hmac-v1` but fails the server proof is
-///   `INVALID_PAIRING_CODE` (`Unauthorized`), and the lanes keep presenting
+/// * an acceptor with a malformed acknowledgment is a protocol violation,
+///   and the lanes keep presenting
 ///   the key on every later dial;
 /// * a `GOAWAY{PEER_REVOKED}` before `HELLO_ACK` makes the supervisor fall
 ///   back to the code (in memory), and the stored credential stays until a
@@ -937,40 +818,44 @@ fn pair_with_impostor(daemon: &Daemon, endpoint: &str, installation: &str, key: 
 #[test]
 fn an_unauthenticated_refusal_never_drops_the_credential() {
     let a = Daemon::start();
-    let failing = "impostor-failing-its-proof";
+    let failing = "peer-with-malformed-ack";
     let refusing = "impostor-refusing-the-key";
     let failing_key = tkfs::session::auth::peer_key(&tkfs::session::auth::new_secret());
     let refusing_key = tkfs::session::auth::peer_key(&tkfs::session::auth::new_secret());
-    let (failing_endpoint, failing_offers) = impostor(failing, Impostor::WrongServerProof);
+    let (failing_endpoint, failing_offers) = impostor(failing, Impostor::MalformedAck);
     let (refusing_endpoint, refusing_offers) = impostor(refusing, Impostor::Refuses);
 
-    // The session layer: the impostor's wrong server proof.
+    // The session layer rejects the malformed acknowledgment.
     let error = session::dial(
         &failing_endpoint,
         session::client_hello(&a.installation(), LaneRole::Probe, None, 2),
-        &PeerAuth {
-            key: failing_key,
-            code: None,
-        },
+        &PeerAuth { key: failing_key },
         None,
         ConnOptions::default(),
     )
     .unwrap_err();
-    assert!(
-        matches!(&error, DialError::Unauthorized(wire) if wire.code == "INVALID_PAIRING_CODE"),
-        "{error:?}"
-    );
+    assert!(matches!(&error, DialError::Protocol(_)), "{error:?}");
 
     // The lanes.
     pair_with_impostor(&a, &failing_endpoint, failing, failing_key);
     pair_with_impostor(&a, &refusing_endpoint, refusing, refusing_key);
     for installation in [failing, refusing] {
+        let expected = if installation == failing {
+            "PROTOCOL_VIOLATION"
+        } else {
+            "INVALID_PAIRING_CODE"
+        };
         assert!(
             wait_until(Duration::from_secs(20), || a
-                .lanes(installation)
-                .contains(&LaneState::Unauthorized)),
-            "{installation}: {:?}",
-            a.lanes(installation)
+                .net
+                .peers()
+                .unwrap()
+                .peer(installation)
+                .is_some_and(|peer| peer.lanes.iter().any(|lane| lane
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.code == expected)))),
+            "{installation}"
         );
     }
     let view = a.net.peers().unwrap().peer(failing).unwrap();
@@ -978,7 +863,7 @@ fn an_unauthenticated_refusal_never_drops_the_credential() {
         view.lanes.iter().any(|lane| lane
             .error
             .as_ref()
-            .is_some_and(|error| error.code == "INVALID_PAIRING_CODE")),
+            .is_some_and(|error| error.code == "PROTOCOL_VIOLATION")),
         "{:?}",
         view.lanes
     );
@@ -1331,14 +1216,13 @@ fn an_enrollment_racing_a_rotation_never_outlives_it() {
 fn rotation_race_child() {
     use tkfs::{
         model::orchestrator::CatalogApi,
-        pairing_code::Verifier,
         session::{CodeAuth, Priority, auth},
         util::fault::{self, FaultAction, FaultConfig},
     };
     let b = Daemon::start();
     let code = b.code();
     let dialer = uuid::Uuid::new_v4().to_string();
-    let (conn, server) = session::dial(
+    let (conn, _) = session::dial(
         &b.endpoint(),
         session::client_hello(&dialer, LaneRole::Probe, None, 2),
         &CodeAuth { code: code.clone() },
@@ -1367,12 +1251,7 @@ fn rotation_race_child() {
         "the rotation was not held: the race is not exercised"
     );
     let secret = auth::new_secret();
-    let request = auth::seal_enrollment(
-        &Verifier::derive_key(&server.salt, &code),
-        &dialer,
-        &server.installation,
-        &secret,
-    );
+    let request = auth::enrollment_request(&secret);
     let reply = conn.call(
         auth::ops::PEER_ENROLL,
         serde_json::to_value(&request).unwrap(),
@@ -1677,13 +1556,13 @@ fn rotation_invalidates_live_sessions_and_per_peer_credentials() {
     assert!(wait_until(Duration::from_secs(20), || a.lanes_ready(&b.installation())));
 }
 
-/// The upgrade path (§14 WP4.1, brief): daemons paired before WP4.1 have no
-/// `peer_credentials` table. On their next start the table is created and
-/// the dialer's control lane, authenticated with the code, enrolls a
-/// credential without any user action.
+/// Current code-paired daemons can enroll again after losing their credential
+/// rows. Keep the selected schema and identities; missing tables are corruption,
+/// not a request for an old-format migration.
 #[test]
-fn code_paired_peers_enroll_on_their_next_connection() {
+fn current_code_paired_peers_reenroll_after_credential_loss_and_restart() {
     let (a, b) = paired();
+    let old_key = wait_enrolled(&a, &b);
     let (a_installation, b_installation) = (a.installation(), b.installation());
     let a_data = a.config.data_directory.clone();
     let b_data = b.config.data_directory.clone();
@@ -1692,13 +1571,20 @@ fn code_paired_peers_enroll_on_their_next_connection() {
     b.stop();
     for data in [&a_data, &b_data] {
         let db = rusqlite::Connection::open(data.join("folders.sqlite")).unwrap();
-        db.execute_batch("DROP TABLE peer_credentials").unwrap();
+        assert!(db.execute("DELETE FROM peer_credentials", []).unwrap() > 0);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM peer_credentials", [], |r| r
+                .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
     }
     let b = b.restart();
     let a = a.restart();
     assert_eq!(a.installation(), a_installation);
     assert_eq!(b.installation(), b_installation);
     let key = wait_enrolled(&a, &b);
+    assert_ne!(key, old_key);
     let (conn, _) = dial_per_peer(&b, &a_installation, key).unwrap();
     conn.close();
     assert!(wait_until(Duration::from_secs(20), || a.lanes_ready(&b_installation)));
@@ -2268,16 +2154,9 @@ fn unauthenticated_worker_connections_are_bounded_and_closed() {
     );
 }
 
-/// WP4.INT re-review (the security review's minor, invariant 21): a revamp
-/// build before WP4.1 knows no per-peer credentials; its ResetPairingCode
-/// stores the new verifier and records the new generation and salt itself,
-/// so the open-time fold-in (which looks for a salt the generation was not
-/// bumped for) saw nothing and the peer's inbound credential stayed active
-/// past the rotation. The catalog now records the generation its
-/// credentials were reconciled with, and an open that finds it moved
-/// revokes them.
+/// A current verifier rotation durably revokes old inbound credentials.
 #[test]
-fn a_rotation_by_a_build_without_credentials_revokes_them_at_the_next_open() {
+fn current_verifier_rotation_revokes_credentials_across_restarts() {
     use tkfs::model::orchestrator::{CatalogApi, CatalogCmd};
     let root = tempfile::tempdir().unwrap();
     let config = Config {
@@ -2308,29 +2187,21 @@ fn a_rotation_by_a_build_without_credentials_revokes_them_at_the_next_open() {
     assert!(catalog.close());
     drop(catalog);
 
-    // The older build's rotation: the new verifier, generation + 1 and the
-    // new salt, written together; the credential table is not touched.
-    let (_, verifier) = tkfs::pairing_code::Verifier::generate();
-    {
-        let db = rusqlite::Connection::open(config.data_directory.join("folders.sqlite")).unwrap();
-        let upsert =
-            "INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
-        db.execute(
-            upsert,
-            [
-                "pairing",
-                serde_json::to_string(&verifier).unwrap().as_str(),
-            ],
-        )
+    // The current command rotates verifier/generation and revokes in one commit.
+    let catalog = Catalog::open(&config).unwrap();
+    catalog
+        .apply(CatalogCmd::SetVerifier {
+            verifier: tkfs::pairing_code::Verifier::generate().1,
+        })
         .unwrap();
-        db.execute(
-            upsert,
-            ["verifier_generation", &(generation + 1).to_string()],
-        )
-        .unwrap();
-        db.execute(upsert, ["verifier_salt", verifier.salt.as_str()])
-            .unwrap();
-    }
+    assert_eq!(
+        catalog
+            .credentials()
+            .active("peer", CredentialSide::Inbound),
+        None
+    );
+    assert!(catalog.close());
+    drop(catalog);
     let catalog = Catalog::open(&config).unwrap();
     assert_eq!(catalog.snapshot().verifier_generation, generation + 1);
     assert_eq!(
@@ -2338,7 +2209,7 @@ fn a_rotation_by_a_build_without_credentials_revokes_them_at_the_next_open() {
             .credentials()
             .active("peer", CredentialSide::Inbound),
         None,
-        "the credential enrolled before the other build's rotation is still active"
+        "the credential enrolled before the current rotation is still active"
     );
     // A credential enrolled at the new generation survives later opens.
     catalog
@@ -2399,7 +2270,7 @@ fn credential_requests_do_not_wait_for_exchange_slots() {
     let (conn, _) = session::dial(
         &endpoint,
         session::client_hello(dialer, LaneRole::Control, None, 2),
-        &PeerAuth { key, code: None },
+        &PeerAuth { key },
         None,
         ConnOptions::default(),
     )

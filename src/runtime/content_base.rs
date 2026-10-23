@@ -8,7 +8,7 @@ use crate::{
         write::{BaseRequest, BaseWait, WriteSession},
     },
     model::{
-        content::{ContentKind, ObjectKind},
+        content::ObjectKind,
         workspace::{Demand, DemandPriority},
     },
 };
@@ -81,9 +81,6 @@ impl BaseWait for NativeBase {
         let Some(worker) = self.worker.upgrade() else {
             return Err(error);
         };
-        if request.intent.base.content.kind == ContentKind::Legacy {
-            return Err(error);
-        }
         crate::util::fault::trigger("content.base.before_demand")?;
         self.check(&worker, &request, context)?;
         let _permit = super::content_reads::WAITERS

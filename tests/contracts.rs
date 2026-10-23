@@ -37,9 +37,9 @@ use tkfs::{
     util::{
         self, Backoff, Cancel, Clock, ManualClock, Notify, Snapshot, SystemClock,
         fault::{self, FaultAction, FaultConfig},
-        hmac::{ct_eq, hmac_sha256, hmac_sha256_parts},
         lock::{self, PoisonPolicy, Tracked},
         log::{self, MemorySink},
+        secret::ct_eq,
     },
 };
 
@@ -1203,7 +1203,6 @@ fn golden_fixtures_round_trip_byte_for_byte() {
             lane: Some(LaneSpec::new(1, 3)),
             pool: 4,
             session: "2b3c4d5e-6f70-4812-9a3b-4c5d6e7f8091".into(),
-            client_nonce: "11".repeat(32),
             features: vec![],
         },
         f,
@@ -1217,7 +1216,6 @@ fn golden_fixtures_round_trip_byte_for_byte() {
             role: LaneRole::Bulk,
             lane: Some(LaneSpec::new(1, 3)),
             salt: "22".repeat(32),
-            server_nonce: "33".repeat(32),
             verifier_generation: 5,
             features: vec![],
             limits: Limits::default(),
@@ -1227,17 +1225,12 @@ fn golden_fixtures_round_trip_byte_for_byte() {
     golden_eq(
         "frame.auth",
         &Auth {
-            proof: "44".repeat(32),
+            credential: "44".repeat(32),
+            peer: false,
         },
         f,
     );
-    golden_eq(
-        "frame.auth_ok",
-        &AuthOk {
-            server_proof: "55".repeat(32),
-        },
-        f,
-    );
+    golden_eq("frame.auth_ok", &AuthOk {}, f);
     golden_eq(
         "frame.request_header",
         &vec![
@@ -2203,7 +2196,7 @@ fn wave6_error_scopes_extend_the_historical_table() {
         ErrorClass::NeedsUserAction
     );
     assert_eq!(
-        classify("WRITE_JOURNAL_NEEDS_UPGRADE"),
+        classify("UNSUPPORTED_WRITE_JOURNAL"),
         ErrorClass::Incompatible
     );
     assert_eq!(classify("CORRUPT_CONTENT"), ErrorClass::Transient);
@@ -2519,7 +2512,6 @@ fn model_helpers_follow_the_spec() {
         Some(Duration::from_secs(2))
     );
     assert_eq!(protocol::op_role(protocol::ops::PEER_ENROLL), None);
-    assert_eq!(protocol::PEER_HMAC_V1, "peer-hmac-v1");
     assert_eq!(protocol::max_body(protocol::ops::OBJECTS_PULL), 1 << 20);
     assert_eq!(protocol::max_body(protocol::ops::PING), 1 << 20);
     assert_eq!(protocol::max_body(tkfs::model::content_wire::READ), 65_536);
@@ -2686,7 +2678,6 @@ fn session_entry_points_fail_closed() {
         lane: None,
         pool: 2,
         session: "s".into(),
-        client_nonce: "00".repeat(32),
         features: vec![],
     };
     let auth = session::CodeAuth { code: "c".into() };
@@ -3004,56 +2995,7 @@ fn shared_handles_are_send_and_sync() {
 // util
 
 #[test]
-fn hmac_matches_rfc_4231_cases_1_to_7() {
-    let cases: [(Vec<u8>, Vec<u8>, &str); 7] = [
-        (
-            vec![0x0b; 20],
-            b"Hi There".to_vec(),
-            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
-        ),
-        (
-            b"Jefe".to_vec(),
-            b"what do ya want for nothing?".to_vec(),
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
-        ),
-        (
-            vec![0xaa; 20],
-            vec![0xdd; 50],
-            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe",
-        ),
-        (
-            (1..=25).collect(),
-            vec![0xcd; 50],
-            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b",
-        ),
-        (
-            vec![0x0c; 20],
-            b"Test With Truncation".to_vec(),
-            // RFC 4231 truncates this case to 128 bits.
-            "a3b6167473100ee06e0c796c2955552b",
-        ),
-        (
-            vec![0xaa; 131],
-            b"Test Using Larger Than Block-Size Key - Hash Key First".to_vec(),
-            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
-        ),
-        (
-            vec![0xaa; 131],
-            b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.".to_vec(),
-            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2",
-        ),
-    ];
-    for (n, (key, data, expected)) in cases.iter().enumerate() {
-        let mac = hex::encode(hmac_sha256(key, data));
-        assert_eq!(&mac[..expected.len()], *expected, "RFC 4231 case {}", n + 1);
-        let (left, right) = data.split_at(data.len() / 2);
-        assert_eq!(
-            hmac_sha256_parts(key, &[left, right, b""]),
-            hmac_sha256(key, data),
-            "case {}",
-            n + 1
-        );
-    }
+fn application_credential_comparison_handles_equal_different_and_empty_values() {
     assert!(ct_eq(b"abc", b"abc"));
     assert!(!ct_eq(b"abc", b"abd"));
     assert!(!ct_eq(b"abc", b"abcd"));

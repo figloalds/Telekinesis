@@ -567,9 +567,6 @@ impl Store {
 
 /// Most items one `objects.write` call may carry.
 pub const MAX_WRITE_ITEMS: usize = 4096;
-/// `config` marker: legacy spools (written before `spool_state` existed) were
-/// adopted at their file length, once (§6.4).
-pub const SPOOLS_MARKER: &str = "spools_v1";
 /// Set once the directory fsync of a batch of installs failed: from then on
 /// this process installs each object with its own durable rename.
 static DIR_SYNC_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -686,9 +683,8 @@ struct Group {
 /// Startup spool reconciliation (§6.4; phase 4 of `Store::open`, after the
 /// object check). Nothing is registered here (I4).
 ///
-/// * Once per store (`spools_v1`), a legacy spool without a row adopts its
-///   file length (the legacy code fsynced every append before advertising
-///   it). Afterwards a spool without a row has durable offset 0.
+/// * A spool without a committed row has durable offset 0. Current recovery
+///   never promotes unrecorded bytes into a promised offset.
 /// * A spool longer than its recorded durable offset is truncated to it: the
 ///   bytes past it were written, maybe fsynced, but never advertised (a crash
 ///   between the fsync and the commit, or before the fsync).
@@ -724,15 +720,6 @@ pub(super) fn reconcile_spools(store: &Store) -> Result<()> {
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let adopt = store
-        .db
-        .query_row(
-            "SELECT value FROM config WHERE key=?",
-            [SPOOLS_MARKER],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-        .is_none();
     store.in_savepoint("reconcile_spools", || {
         for object in rows.keys() {
             if !files.contains_key(object) {
@@ -747,7 +734,6 @@ pub(super) fn reconcile_spools(store: &Store) -> Result<()> {
                 let durable = match row {
                     Some(row) if row.total.is_some_and(|t| known.is_some_and(|k| k != t)) => 0,
                     Some(row) => row.durable.min(len),
-                    None if adopt => len,
                     None => 0,
                 };
                 let finished = store.object_shareable(object)? && store.object_available(object);
@@ -787,10 +773,6 @@ pub(super) fn reconcile_spools(store: &Store) -> Result<()> {
                 });
             }
         }
-        store.db.execute(
-            "INSERT INTO config(key,value) VALUES(?,'1') ON CONFLICT(key) DO NOTHING",
-            [SPOOLS_MARKER],
-        )?;
         Ok(())
     })
 }

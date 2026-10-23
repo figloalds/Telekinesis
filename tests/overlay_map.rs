@@ -625,7 +625,7 @@ fn roles_scopes_and_future_roots_cannot_reinterpret_a_patch_tree() {
             &mut MapWork::default(),
             &context(),
         ),
-        "WRITE_JOURNAL_NEEDS_UPGRADE",
+        "UNSUPPORTED_WRITE_JOURNAL",
     );
     error(
         OverlayMap::new(&tx, scope(), MapKind::Truncations).get(

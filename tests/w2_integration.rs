@@ -242,6 +242,13 @@ fn pause_and_resume_on_the_legacy_lanes() {
 fn manage_status_and_watch_show_lifecycle_and_mount() {
     let a = Node::new();
     let (_, state) = running_folder(&a, "Cli folder");
+    // Inspect reads the controller directly; CLI status uses the hub's
+    // snapshot, published at most four times per second during startup.
+    a.wait_for(
+        "running lifecycle published",
+        Duration::from_secs(1),
+        || phase(&a, &state).as_deref() == Some("running"),
+    );
     let config = a.config_path();
     let tkfs = |args: &[&str]| {
         let out = Command::new(bin())
@@ -554,8 +561,8 @@ fn the_feed_journal_backfill_resumes_from_its_cursor() {
         for i in 0..5 {
             s.create(&format!("private-{i}"), "file").unwrap();
         }
-        assert_eq!(config(&s.db, "feed_journal_v1").as_deref(), Some("1"));
-        assert_eq!(config(&s.db, "feed_journal_v1_cursor"), None);
+        assert_eq!(config(&s.db, "repair:feed:ready").as_deref(), Some("1"));
+        assert_eq!(config(&s.db, "repair:feed:cursor"), None);
     }
     // An interrupted build: the table exists, the rows up to the cursor are
     // built (the first one marked), the rest are not, no marker.
@@ -573,10 +580,10 @@ fn the_feed_journal_backfill_resumes_from_its_cursor() {
             [expected[0].0],
         )
         .unwrap();
-        db.execute("DELETE FROM config WHERE key='feed_journal_v1'", [])
+        db.execute("DELETE FROM config WHERE key='repair:feed:ready'", [])
             .unwrap();
         db.execute(
-            "INSERT OR REPLACE INTO config(key,value) VALUES('feed_journal_v1_cursor',?1)",
+            "INSERT OR REPLACE INTO config(key,value) VALUES('repair:feed:cursor',?1)",
             [half.to_string()],
         )
         .unwrap();
@@ -586,8 +593,8 @@ fn the_feed_journal_backfill_resumes_from_its_cursor() {
     let built = rows(&s.db, FEED_JOURNAL);
     assert_eq!(built[0].1, "built-before", "resumed after {half}");
     assert_eq!(built[1..], expected[1..]);
-    assert_eq!(config(&s.db, "feed_journal_v1").as_deref(), Some("1"));
-    assert_eq!(config(&s.db, "feed_journal_v1_cursor"), None);
+    assert_eq!(config(&s.db, "repair:feed:ready").as_deref(), Some("1"));
+    assert_eq!(config(&s.db, "repair:feed:cursor"), None);
     drop(s);
     // A dropped table is built again from the whole journal.
     {
@@ -601,7 +608,7 @@ fn the_feed_journal_backfill_resumes_from_its_cursor() {
     }
     let s = Store::open(root, Some("w2-backfill")).unwrap();
     assert_eq!(rows(&s.db, FEED_JOURNAL), expected);
-    assert_eq!(config(&s.db, "feed_journal_v1").as_deref(), Some("1"));
+    assert_eq!(config(&s.db, "repair:feed:ready").as_deref(), Some("1"));
 }
 
 /// Stages `count` ready rows on `branch` with `pad` bytes of padding each

@@ -1,4 +1,4 @@
-//! Wave 6 immutable content format. These types do not enable new-format writes.
+//! Current immutable direct/manifest content format.
 //!
 //! The byte encoding, limits and digest domains are frozen in
 //! `docs/revamp/WAVE_6_CONTRACTS.md`. Decode before allocating from untrusted lengths.
@@ -85,7 +85,6 @@ impl<'de> Deserialize<'de> for Digest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContentKind {
-    Legacy,
     Direct,
     Manifest,
 }
@@ -136,7 +135,7 @@ impl FileContentRef {
     pub fn new(kind: ContentKind, digest: Digest, total_len: u64) -> Result<Self> {
         let result = Self {
             kind,
-            format: if kind == ContentKind::Legacy { 0 } else { 1 },
+            format: 1,
             algorithm: DigestAlgorithm::Sha256,
             digest,
             total_len,
@@ -147,10 +146,6 @@ impl FileContentRef {
 
     pub fn validate(&self) -> Result<()> {
         match self.kind {
-            ContentKind::Legacy => ensure!(
-                self.format == 0 && self.total_len <= i64::MAX as u64,
-                "INVALID_LEGACY_DESCRIPTOR"
-            ),
             ContentKind::Direct => {
                 ensure!(
                     self.format == 1 && self.total_len <= CHUNK_SIZE,
@@ -176,7 +171,6 @@ impl FileContentRef {
         let mut bytes = [0; 48];
         bytes[..5].copy_from_slice(b"TKFC\x01");
         bytes[5] = match self.kind {
-            ContentKind::Legacy => 0,
             ContentKind::Direct => 1,
             ContentKind::Manifest => 2,
         };
@@ -193,7 +187,6 @@ impl FileContentRef {
             "UNSUPPORTED_CONTENT_DESCRIPTOR"
         );
         let kind = match bytes[5] {
-            0 => ContentKind::Legacy,
             1 => ContentKind::Direct,
             2 => ContentKind::Manifest,
             _ => anyhow::bail!("UNSUPPORTED_CONTENT_KIND"),

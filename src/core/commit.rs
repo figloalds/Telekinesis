@@ -577,6 +577,7 @@ pub(super) enum Plan {
 
 impl Store {
     pub fn commit(&mut self, event: Event, local: bool) -> Result<()> {
+        self.check_content_capability(&event)?;
         if local {
             return self.commit_ready(event, true);
         }
@@ -707,12 +708,9 @@ impl Store {
                 ),
                 "alive" => ensure!(change.value.is_boolean(), "INVALID_ALIVE"),
                 "content" => {
-                    if !change.value.is_string() {
-                        let reference: crate::model::content::FileContentRef =
-                            serde_json::from_value(change.value.clone())
-                                .context("INVALID_CONTENT")?;
-                        reference.validate()?;
-                    }
+                    let reference: crate::model::content::FileContentRef =
+                        serde_json::from_value(change.value.clone()).context("INVALID_CONTENT")?;
+                    reference.validate()?;
                 }
                 "basic" => serde_json::from_value::<BasicInfo>(change.value.clone())?.validate()?,
                 _ => {}
@@ -1333,6 +1331,7 @@ impl Store {
         // Other connections' commits that changed no projection row keep the
         // view (WP3.INT).
         self.adopt_foreign_commits();
+        crate::util::fault::trigger("core.commit.before_sql")?;
         fault("before_sql");
         let tx = self.db.savepoint()?;
         for object in &objects {
@@ -1589,6 +1588,7 @@ impl Store {
             Plan::Fast(_) => *cache = None,
         }
         drop(cache);
+        crate::util::fault::trigger("core.commit.sql_committed")?;
         fault("sql_committed");
         Ok(())
     }
@@ -2603,44 +2603,31 @@ mod tests {
         assert!(store.verify_derived_state().unwrap().is_empty());
     }
 
-    /// WP5.1 task 5: a local commit of bytes this process has just stored
-    /// (`put_object`, `put_stream`) does not hash them again; bytes that
-    /// changed on disk since (another size or mtime) are verified, and
-    /// corrupt ones are refused as before.
     #[test]
-    fn a_local_commit_skips_the_rehash_of_bytes_just_verified() {
+    fn current_content_publication_refuses_a_preparation_from_another_store() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Store::open(dir.path(), None).unwrap();
-        let file = s.create("f.txt", "file").unwrap();
-        let skipped = verified::skipped();
-        let hashes = s.object_hashes();
-        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
-        s.write_revision(&file.id, content, b"fresh bytes").unwrap();
-        assert_eq!(
-            s.object_hashes(),
-            hashes,
-            "the fresh object was hashed again"
-        );
-        assert!(verified::skipped() > skipped);
-        let mut stream: &[u8] = b"streamed bytes";
-        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
-        s.write_stream_with_base_and_times(&file.id, content, None, &mut stream, 0)
+        let mut store = Store::open(dir.path(), None).unwrap();
+        let file = store.create("file", "file").unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let local = crate::content::LocalContent::open(other.path()).unwrap();
+        let prepared = local
+            .prepare_import(
+                &mut b"other bytes".as_slice(),
+                11,
+                &crate::core::content::import_context(),
+            )
             .unwrap();
-        assert_eq!(
-            s.object_hashes(),
-            hashes,
-            "the streamed object was hashed again"
-        );
-        // Changed behind the store's back (same size): verified, refused.
-        let object = s.put_object(b"other bytes").unwrap();
-        fs::write(s.root.join("objects").join(&object), b"Other bytes").unwrap();
-        let content = s.entry(&file.id).unwrap().revisions.get("content").cloned();
-        let refused = s.write_object_with_base_and_times(&file.id, content, None, object, 0);
-        assert!(
-            format!("{:#}", refused.unwrap_err()).contains("CORRUPT_OBJECT"),
-            "corrupt bytes accepted"
-        );
-        assert_eq!(s.object_hashes(), hashes + 1);
+        let error = store
+            .write_prepared_content_with_base_and_times(
+                &file.id,
+                file.revisions.get("content").cloned(),
+                file.revisions.get("alive").cloned(),
+                &prepared,
+                0,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("CONTENT_SAVE_WRONG_STORE"));
+        assert_eq!(store.entry(&file.id).unwrap(), file);
     }
 
     /// WP5.1 review (round 1): a verification observed within `RACY_NS` of

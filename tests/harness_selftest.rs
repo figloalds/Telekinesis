@@ -464,11 +464,14 @@ fn replicas_have_receiver_rows() {
     assert_eq!(meta.content_status().unwrap()["complete"], false);
 }
 
-/// Large fixtures write rows directly (`direct_creates`); the result must equal a
-/// full re-projection of the journal, reopen from its sealed snapshot, and accept
-/// further local and remote work.
+/// Bulk fixtures use current Core commits: full projection, durable root handoff,
+/// rollback, sealed restart and further local/remote work must remain coherent.
 #[test]
 fn direct_rows_match_full_projection() {
+    use tkfs::{
+        content::{ContentProvider, LocalContent, ReadContext},
+        util::Cancel,
+    };
     let dir = tempfile::tempdir().unwrap();
     let repo = id();
     let mut s = Store::open(&dir.path().join("a"), Some(&repo)).unwrap();
@@ -476,6 +479,7 @@ fn direct_rows_match_full_projection() {
     let ids = linear_history(&mut s, n).unwrap();
     assert_eq!(ids.len(), n);
     let hashes = small_objects_in(&mut s, "objs", DIRECT_ROWS + 50, 40, 9).unwrap();
+    small_objects_in(&mut s, "few", 5, 40, 21).unwrap();
     let check = |s: &Store| {
         let events: Vec<_> = s
             .events()
@@ -488,18 +492,74 @@ fn direct_rows_match_full_projection() {
         assert!(s.conflicts().unwrap().is_empty());
     };
     check(&s);
-    assert_eq!(
-        s.lookup("objs/obj-000007.bin").unwrap().content,
-        Some(hashes[7].clone())
-    );
-    assert!(s.object_available(&hashes[DIRECT_ROWS + 49]));
+    let entry = s.lookup("objs/obj-000007.bin").unwrap();
+    assert!(entry.content.is_none());
+    let reference = entry.content_ref.unwrap();
+    assert_eq!(reference.digest.to_string(), hashes[7]);
+    let native = LocalContent::open(&s.root).unwrap();
+    let pin = native.pin(&reference).unwrap();
+    let mut out = vec![0; 40];
+    native
+        .read_range(
+            &pin,
+            0,
+            &mut out,
+            &ReadContext {
+                deadline: Instant::now() + Duration::from_secs(30),
+                cancel: Cancel::new(),
+            },
+        )
+        .unwrap();
+    let mut expected = seeded_bytes(9 * 1_000_003 + 7, 40);
+    expected[..8].copy_from_slice(&7u64.to_le_bytes());
+    assert_eq!(out, expected);
+    let events = s.events().unwrap();
+    let roots = events
+        .iter()
+        .flat_map(|event| event.changes.iter())
+        .filter(|change| change.field == "content")
+        .count();
+    assert!(events.iter().all(|event| event.object_sizes.is_empty()));
+    for table in ["content_root_metadata", "content_root_outbox"] {
+        let count: usize =
+            s.db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, roots);
+    }
+    let before = s.projection(&s.active).unwrap();
+    let before_events = s.events().unwrap();
+    let duplicate = || NewFile {
+        parent: tkfs::core::ROOT.into(),
+        name: "batch-collision".into(),
+        content: hash(b""),
+        size: 0,
+    };
+    assert!(direct_creates(&mut s, &[duplicate(), duplicate()]).is_err());
+    assert_eq!(s.projection(&s.active).unwrap(), before);
+    assert_eq!(s.events().unwrap(), before_events);
+    for table in ["content_root_metadata", "content_root_outbox"] {
+        let count: usize =
+            s.db.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, roots);
+    }
     drop(s);
     let mut s = Store::open_existing(&dir.path().join("a")).unwrap();
     check(&s);
     s.create("after-direct.txt", "file").unwrap();
     check(&s);
-    let status = s.content_status().unwrap();
-    assert_eq!(status["complete"], true, "{status}");
+    let mut receiver = Store::initialize(&dir.path().join("b"), &repo, &id()).unwrap();
+    let allowed = devices([&s, &receiver]);
+    sync_into(&s, &mut receiver, &allowed).unwrap();
+    assert_eq!(
+        receiver.projection(&receiver.active).unwrap(),
+        s.projection(&s.active).unwrap()
+    );
+    check(&receiver);
     // The sealed snapshot resumes without a full rebuild: a reopen is quick.
     drop(s);
     let (reopened, ms) = time_ms(|| Store::open_existing(&dir.path().join("a")).unwrap());
@@ -745,150 +805,6 @@ fn legacy_copies_skip_sqlite_side_files() {
         legacy::sqlite_side_files(&datadir.data),
         Vec::<PathBuf>::new()
     );
-}
-
-#[test]
-fn legacy_worker_fixture_opens_with_current_build() {
-    let fx = copy_legacy_worker();
-    let m = fx.manifest.clone();
-    assert!(
-        legacy::tree_size(&legacy::legacy_dir().join("worker")) <= 2 * 1024 * 1024,
-        "fixture over 2 MB"
-    );
-    {
-        let store = Store::open_existing(&fx.state).unwrap();
-        assert_eq!(store.repo, m["repo"].as_str().unwrap());
-        assert_eq!(store.device, m["device"].as_str().unwrap());
-        let events: i64 = store
-            .db
-            .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(events, m["events"].as_i64().unwrap());
-        let conflicts = store.conflicts().unwrap();
-        assert!(
-            conflicts.iter().any(|c| c.resolved_by.is_none()),
-            "unresolved"
-        );
-        assert!(
-            conflicts.iter().any(|c| c.resolved_by.is_some()),
-            "resolved"
-        );
-        let count = |sql: &str| -> i64 { store.db.query_row(sql, [], |r| r.get(0)).unwrap() };
-        assert_eq!(
-            count("SELECT count(*) FROM incoming_events"),
-            m["incoming"]["total"].as_i64().unwrap(),
-            "staged rows are never dropped"
-        );
-        assert_eq!(
-            count("SELECT count(*) FROM incoming_events WHERE error IS NOT NULL"),
-            m["incoming"]["quarantined"].as_i64().unwrap()
-        );
-        let partial = store.partial_objects().unwrap();
-        let spool = m["partial"]["hash"].as_str().unwrap();
-        assert_eq!(
-            partial.get(spool).copied(),
-            m["partial"]["offset"].as_u64(),
-            "partial spool kept"
-        );
-        let mut engine = Engine::new(store);
-        engine.retry_pending().unwrap();
-        assert_eq!(
-            engine
-                .store
-                .lookup(m["pending_save"]["path"].as_str().unwrap())
-                .unwrap()
-                .content
-                .as_deref(),
-            m["pending_save"]["content"].as_str(),
-            "pending save recovered"
-        );
-    }
-    // The real binary opens a second copy and recovers the pending save.
-    let fx = copy_legacy_worker();
-    let mut worker = WorkerProc::spawn(&fx.state, &[], &[]).unwrap();
-    let ready = worker.wait_ready(Duration::from_secs(60)).unwrap();
-    assert_eq!(ready["repo"], m["repo"]);
-    let path = m["pending_save"]["path"].as_str().unwrap().to_owned();
-    let content = m["pending_save"]["content"].as_str().unwrap().to_owned();
-    assert!(
-        wait_until(Duration::from_secs(20), || {
-            worker.rpc(json!({"op":"state"})).is_ok_and(|s| {
-                s["entries"].as_object().is_some_and(|e| {
-                    e.values()
-                        .any(|e| e["name"] == path && e["content"] == content)
-                })
-            })
-        }),
-        "worker did not recover the pending save:\n{}",
-        worker.log_tail()
-    );
-    worker.stop().unwrap();
-}
-
-#[test]
-fn legacy_datadir_fixture_opens_with_current_build() {
-    assert!(
-        legacy::tree_size(&legacy::legacy_dir().join("datadir")) <= 2 * 1024 * 1024,
-        "fixture over 2 MB"
-    );
-    let fx = copy_legacy_datadir();
-    let m = fx.manifest.clone();
-    let node = Node::adopt_root(fx.root, NodeConfig::default());
-    let list = node.list();
-    assert_eq!(list["installation"], m["installation"]);
-    let labels: BTreeSet<_> = list["folders"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| f["label"].as_str().unwrap().to_owned())
-        .collect();
-    let expected: BTreeSet<_> = m["folders"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| f["label"].as_str().unwrap().to_owned())
-        .collect();
-    assert_eq!(labels, expected);
-    let peers = node.peers();
-    assert_eq!(peers.as_array().unwrap().len(), 1);
-    // The copy's peer is moved to a closed port (no dials into parallel tests).
-    assert_eq!(peers[0]["endpoint"], legacy::DEAD_PEER_ENDPOINT);
-    assert_eq!(peers[0]["installation"], m["peers"][0]["installation"]);
-    for folder in m["folders"].as_array().unwrap() {
-        let state = folder["state"].as_str().unwrap();
-        let inspect = node.inspect(state);
-        assert_eq!(inspect["desired_running"], folder["desired_running"]);
-        assert_eq!(
-            inspect["initial_sync_pending"], folder["initial_sync"],
-            "{inspect}"
-        );
-        if let Some(name) = folder["file"].as_str() {
-            node.wait_for("legacy folder running", Duration::from_secs(60), || {
-                node.try_inspect(state).is_ok_and(|p| p["running"] == true)
-            });
-            let p = node.inspect(state);
-            assert!(
-                wait_until(Duration::from_secs(10), || has_hash(
-                    &p,
-                    name,
-                    folder["content"].as_str().unwrap()
-                )),
-                "legacy content missing"
-            );
-        }
-    }
-    // The verifier survived: rotating the code still works and changes it.
-    let verifier = || -> String {
-        let db = rusqlite::Connection::open(node.data_dir().join("folders.sqlite")).unwrap();
-        db.query_row("SELECT value FROM settings WHERE key='pairing'", [], |r| {
-            r.get(0)
-        })
-        .unwrap()
-    };
-    let before = verifier();
-    assert!(before.contains("salt"));
-    node.code();
-    assert_ne!(verifier(), before);
 }
 
 // ---------------------------------------------------------------- compat goldens

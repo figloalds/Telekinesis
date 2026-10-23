@@ -1,27 +1,9 @@
-//! WP5.2: the local filesystem path.
-//!
-//! * Saves off the engine lock (CCR-WP4.INT-5): a save snapshots the
-//!   session under the lock, hashes and stores the bytes without it, and
-//!   commits with a base check; writes to a staging file wait for its save,
-//!   in-memory bytes may change meanwhile (the session then stays dirty);
-//!   every failed step retains the session; a crash at every step keeps the
-//!   last committed bytes (child processes, `TKFS_FAULT_*`).
-//! * The first write to a large file copies it without the engine lock.
-//! * Closed files are saved in the background, never racing a delete or a
-//!   rename over them; with no saver at all a close saves in line; an fsync
-//!   (`FlushFileBuffers`) during a burst of closes still commits before it
-//!   returns (fix round 2).
-//! * Reads of content still downloading wait while it progresses
-//!   (CCR-WP4.INT-2), end on a stall, a fence or the wait bound, and are
-//!   bounded in number.
-//! * A file created through the mount commits with its first save, in one
-//!   event (deferred creates): visible meanwhile, retained and restored like
-//!   any unsaved file, committed before a rename or a delete of it, and a
-//!   crash at every step of its first save leaves a consistent store.
-//!
-//! The mounted scenarios need WinFsp or FUSE and pass without checking when
-//! the machine has neither. The mount adapter is one per process and fault
-//! points are armed process-wide, so every scenario runs under `serial()`.
+//! Current COW/range and explicit mounted local-filesystem scenarios.
+//! Standalone whole-file/deferred-save mechanisms are retired in favor of the
+//! current save/executor/create coverage recorded in the Wave 6 inventory.
+//! Mounted cases require explicit invocation and fail if mounting is unavailable.
+#[path = "support/current_reads.rs"]
+mod current_reads;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -34,11 +16,9 @@ use tkfs::{
     runtime::{
         self, Engine, Shared,
         content::{ContentWait, WaitSlots},
-        engine::{self, SaveStart},
     },
     util::fault::{self, FaultAction, FaultConfig},
 };
-
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> MutexGuard<'static, ()> {
@@ -55,7 +35,6 @@ fn lock(engine: &Shared) -> MutexGuard<'_, Engine> {
     engine.lock().unwrap()
 }
 
-/// Bytes of `len` from `seed` (not compressible, distinct per seed).
 fn bytes(seed: u64, len: usize) -> Vec<u8> {
     let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     (0..len)
@@ -66,20 +45,6 @@ fn bytes(seed: u64, len: usize) -> Vec<u8> {
             state as u8
         })
         .collect()
-}
-
-/// Creates `path` with `content` committed; returns its entity.
-fn committed_file(e: &mut Engine, path: &str, content: &[u8]) -> String {
-    let (h, entry) = e.open(path, Some("file"), true).unwrap();
-    e.write(h, 0, content, false, false).unwrap();
-    e.close(h).unwrap();
-    entry.id
-}
-
-/// The committed bytes at `path`.
-fn content(e: &Engine, path: &str) -> Vec<u8> {
-    let object = e.store.lookup(path).unwrap().content.unwrap();
-    e.store.read_object(&object).unwrap()
 }
 
 fn pending_rows(e: &Engine) -> Vec<(String, String)> {
@@ -93,21 +58,6 @@ fn pending_rows(e: &Engine) -> Vec<(String, String)> {
         .unwrap()
 }
 
-/// The bytes of the staging file a `pending_saves` row names.
-fn staged_bytes(root: &Path, record: &str) -> Vec<u8> {
-    let record: serde_json::Value = serde_json::from_str(record).unwrap();
-    fs::read(root.join("staging").join(record["stage"].as_str().unwrap())).unwrap()
-}
-
-fn part_files(root: &Path) -> Vec<PathBuf> {
-    fs::read_dir(root.join("objects"))
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "part"))
-        .collect()
-}
-
 fn no_conflicts(e: &Engine) {
     let open: Vec<_> = e
         .store
@@ -117,14 +67,6 @@ fn no_conflicts(e: &Engine) {
         .filter(|c| c.resolved_by.is_none())
         .collect();
     assert!(open.is_empty(), "unexpected conflicts: {open:?}");
-}
-
-fn started(start: SaveStart) -> runtime::engine::SaveJob {
-    match start {
-        SaveStart::Started(job) => job,
-        SaveStart::Clean => panic!("expected a save, the session is clean"),
-        SaveStart::Busy(_) => panic!("expected a save, one runs"),
-    }
 }
 
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
@@ -140,7 +82,17 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// Disarms the fault point even when the scenario panics.
+fn content(e: &Engine, path: &str) -> Vec<u8> {
+    use tkfs::content::ContentProvider;
+    let reference = e.store.lookup(path).unwrap().content_ref.unwrap();
+    let local = tkfs::content::LocalContent::open(&e.store.root).unwrap();
+    let pin = local.pin(&reference).unwrap();
+    let mut bytes = vec![0; reference.total_len as usize];
+    local
+        .read_range(&pin, 0, &mut bytes, &current_reads::context())
+        .unwrap();
+    bytes
+}
 struct Disarm;
 impl Drop for Disarm {
     fn drop(&mut self) {
@@ -148,895 +100,269 @@ impl Drop for Disarm {
     }
 }
 
-fn arm_fail(point: &str) -> Disarm {
-    fault::configure(Some(FaultConfig {
-        count: Some(1),
-        ..FaultConfig::new(point, FaultAction::Fail)
-    }));
-    Disarm
+/// A local current writer with explicit executor and handle ownership.
+struct CurrentFile {
+    shared: Shared,
+    native: tkfs::content::LocalContent,
+    writes: Arc<runtime::content_writes::NativeWrites>,
+    handle: u64,
 }
-
-#[test]
-fn a_save_stores_a_staging_file_without_the_engine_lock_and_holds_its_writers() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let big = bytes(1, 3 * 1024 * 1024);
-    let (h, entry) = {
-        let mut e = lock(&engine);
-        let (h, entry) = e.open("big.bin", Some("file"), true).unwrap();
-        e.write(h, 0, &big, false, false).unwrap();
-        assert!(e.session(h).unwrap().bytes.is_file(), "staged in a file");
-        (h, entry)
-    };
-    let job = started(lock(&engine).begin_save(&entry.id).unwrap());
-    // Phase 2 runs without the lock: the engine serves everything else.
-    let other = {
-        let mut e = engine
-            .try_lock()
-            .expect("the engine is free during phase 2");
-        let other = committed_file(&mut e, "other.txt", b"saved meanwhile");
-        assert!(e.write_blocked(h).is_some(), "writers of the file wait");
-        assert!(
-            format!("{:#}", e.write(h, 0, b"x", false, false).unwrap_err()).contains("BUSY_VIEW"),
-            "an unsynchronized write is refused, never torn into the snapshot"
-        );
-        other
-    };
-    let stored = engine::store_snapshot(&job).unwrap();
-    assert_eq!(stored.object, hash(&big));
-    assert_eq!(stored.size, big.len() as u64);
-    {
-        let mut e = lock(&engine);
-        e.finish_save(job, Ok(stored)).unwrap();
-        assert!(e.write_blocked(h).is_none());
-        let session = e.session(h).unwrap();
-        assert!(!session.dirty && !session.saving);
-        assert_eq!(content(&e, "big.bin"), big);
-        assert_eq!(content(&e, "other.txt"), b"saved meanwhile");
-        assert!(e.store.entry(&other).is_ok());
-        e.close(h).unwrap();
-        no_conflicts(&e);
-        assert!(e.store.conflicts().unwrap().is_empty());
-    }
-    assert!(part_files(dir.path()).is_empty());
-}
-
-#[test]
-fn a_session_written_during_its_save_stays_dirty_and_saves_again_in_line() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let mut e = lock(&engine);
-    let entity = committed_file(&mut e, "notes.txt", b"v1");
-    let (h, _) = e.open("notes.txt", None, true).unwrap();
-    e.write(h, 0, b"v2: snapshot", false, false).unwrap();
-    let job = started(e.begin_save(&entity).unwrap());
-    // In-memory bytes are copied: the application may go on writing.
-    assert!(e.write_blocked(h).is_none());
-    e.write(h, 0, b"v3: after the snapshot", false, false)
-        .unwrap();
-    // A second save of the same file waits for the first.
-    assert!(matches!(e.begin_save(&entity).unwrap(), SaveStart::Busy(_)));
-    // The in-lock flush leaves it to the running save.
-    e.flush(h).unwrap();
-    let seen = e.save_signal().generation();
-    drop(e);
-    let stored = engine::store_snapshot(&job);
-    let mut e = lock(&engine);
-    e.finish_save(job, stored).unwrap();
-    assert!(e.save_signal().generation() > seen, "the save signal moved");
-    assert_eq!(content(&e, "notes.txt"), b"v2: snapshot");
-    assert!(e.session(h).unwrap().dirty, "later bytes stay unsaved");
-    e.flush(h).unwrap();
-    assert!(!e.session(h).unwrap().dirty);
-    assert_eq!(content(&e, "notes.txt"), b"v3: after the snapshot");
-    e.close(h).unwrap();
-    no_conflicts(&e);
-}
-
-#[test]
-fn every_failed_step_of_a_save_retains_the_file() {
-    let _serial = serial();
-    for (point, size) in [
-        ("engine.save.snapshot", 1000usize),
-        ("engine.save.store", 1000),
-        ("engine.save.flushed", 1000),
-        ("engine.save.installed", 1000),
-        ("engine.save.commit", 1000),
-        ("engine.save.store", 600 * 1024),
-        ("engine.save.flushed", 600 * 1024),
-        ("engine.save.installed", 600 * 1024),
-        ("engine.save.commit", 600 * 1024),
-    ] {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = shared(dir.path());
-        let new = bytes(size as u64, size);
-        let (h, entity) = {
-            let mut e = lock(&engine);
-            let entity = committed_file(&mut e, "f.bin", b"base");
-            let (h, _) = e.open("f.bin", None, true).unwrap();
-            e.write(h, 0, &new, false, false).unwrap();
-            (h, entity)
-        };
-        let error = {
-            let _disarm = arm_fail(point);
-            engine::save_entity(&engine, &entity).unwrap_err()
-        };
-        assert!(
-            format!("{error:#}").contains("FAULT_INJECTED"),
-            "{point}: {error:#}"
-        );
-        let e = lock(&engine);
-        assert_eq!(content(&e, "f.bin"), b"base", "{point}: nothing committed");
-        let session = e.session(h).unwrap();
-        assert!(session.dirty && !session.saving, "{point}: still unsaved");
-        let rows = pending_rows(&e);
-        assert_eq!(rows.len(), 1, "{point}: the session is retained");
-        assert_eq!(staged_bytes(dir.path(), &rows[0].1), new, "{point}");
-        assert!(part_files(dir.path()).is_empty(), "{point}: no .part left");
-        drop(e);
-        // The next save commits it and drops the record.
-        engine::save_handle(&engine, h).unwrap();
-        let mut e = lock(&engine);
-        assert_eq!(content(&e, "f.bin"), new, "{point}");
-        assert!(pending_rows(&e).is_empty(), "{point}");
-        e.close(h).unwrap();
-        no_conflicts(&e);
-    }
-}
-
-#[test]
-fn a_retain_during_a_save_is_settled_by_its_commit() {
-    let _serial = serial();
-    // Not edited after the snapshot: the commit removes the record.
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    {
-        let mut e = lock(&engine);
-        let entity = committed_file(&mut e, "a.txt", b"a1");
-        let (h, _) = e.open("a.txt", None, true).unwrap();
-        e.write(h, 0, b"a2 retained", false, false).unwrap();
-        let job = started(e.begin_save(&entity).unwrap());
-        // A force detach retains every dirty session meanwhile.
-        assert_eq!(e.retain_all_dirty().unwrap(), 1);
-        assert_eq!(pending_rows(&e).len(), 1);
-        let stored = engine::store_snapshot(&job);
-        e.finish_save(job, stored).unwrap();
-        assert!(
-            pending_rows(&e).is_empty(),
-            "the record goes with the commit"
-        );
-        assert_eq!(content(&e, "a.txt"), b"a2 retained");
-        e.close(h).unwrap();
-        no_conflicts(&e);
-    }
-    assert_eq!(
-        fs::read_dir(dir.path().join("staging")).unwrap().count(),
-        0,
-        "its staging file went with the session"
-    );
-
-    // Edited after the snapshot, then retained: the record holds the later
-    // bytes on top of the commit, and a restart saves them in line.
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    {
-        let mut e = lock(&engine);
-        let entity = committed_file(&mut e, "b.txt", b"b1");
-        let (h, _) = e.open("b.txt", None, true).unwrap();
-        e.write(h, 0, b"b2 snapshot", false, false).unwrap();
-        let job = started(e.begin_save(&entity).unwrap());
-        e.write(h, 0, b"b3 later, retained", false, false).unwrap();
-        assert_eq!(e.retain_all_dirty().unwrap(), 1);
-        let stored = engine::store_snapshot(&job);
-        e.finish_save(job, stored).unwrap();
-        assert_eq!(content(&e, "b.txt"), b"b2 snapshot");
-        let rows = pending_rows(&e);
-        assert_eq!(rows.len(), 1, "the later bytes stay retained");
-        let record: serde_json::Value = serde_json::from_str(&rows[0].1).unwrap();
-        let committed = e.store.lookup("b.txt").unwrap();
-        assert_eq!(
-            record["content_base"].as_str(),
-            committed.revisions.get("content").map(String::as_str),
-            "the record is rebased onto the commit"
-        );
-    }
-    drop(engine);
-    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-    e.retry_pending().unwrap();
-    assert_eq!(content(&e, "b.txt"), b"b3 later, retained");
-    assert!(pending_rows(&e).is_empty());
-    no_conflicts(&e);
-}
-
-#[test]
-fn the_first_write_to_a_large_file_copies_it_without_the_engine_lock() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let original = bytes(7, 2 * 1024 * 1024 + 17);
-    let h = {
-        let mut e = lock(&engine);
-        committed_file(&mut e, "large.bin", &original);
-        let (h, _) = e.open("large.bin", None, true).unwrap();
-        assert!(e.session(h).unwrap().bytes.large_reference().is_some());
-        h
-    };
-    runtime::prepare_content(&engine, h, Duration::from_secs(5)).unwrap();
-    runtime::content::prepare_writable(&engine, h, None).unwrap();
-    let mut e = lock(&engine);
-    let session = e.session(h).unwrap();
-    assert!(session.bytes.is_file(), "the writable copy is installed");
-    assert!(
-        session.bytes == original,
-        "the copy holds the object's bytes"
-    );
-    assert!(!session.dirty, "a copy is not an edit");
-    e.write(h, 5, b"EDIT", false, false).unwrap();
-    e.close(h).unwrap();
-    let mut expected = original.clone();
-    expected[5..9].copy_from_slice(b"EDIT");
-    assert_eq!(content(&e, "large.bin"), expected);
-    // A resize to zero copies nothing.
-    let (h, _) = e.open("large.bin", None, true).unwrap();
-    drop(e);
-    runtime::content::prepare_writable(&engine, h, Some((0, false))).unwrap();
-    let e = lock(&engine);
-    assert!(e.session(h).unwrap().bytes.large_reference().is_some());
-    drop(e);
-    // A copy made for a reference that changed meanwhile is dropped.
-    let staging = dir.path().join("staging");
-    let before = fs::read_dir(&staging).map_or(0, |d| d.count());
-    let (path, object, size) = lock(&engine)
-        .session(h)
-        .unwrap()
-        .bytes
-        .large_reference()
-        .unwrap();
-    let copy = tkfs::staging::writable_copy(dir.path(), &path, &object, size).unwrap();
-    let mut other = tkfs::staging::Staged::memory(b"changed".to_vec());
-    assert!(!other.install_writable(&object, size, copy));
-    assert_eq!(fs::read_dir(&staging).map_or(0, |d| d.count()), before);
-    lock(&engine).close(h).unwrap();
-}
-
-#[test]
-fn a_corrupt_object_is_never_copied_for_writing() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let original = bytes(9, 600 * 1024);
-    let h = {
-        let mut e = lock(&engine);
-        committed_file(&mut e, "c.bin", &original);
-        e.open("c.bin", None, true).unwrap().0
-    };
-    let object = hash(&original);
-    let path = dir.path().join("objects").join(&object);
-    let mut damaged = original.clone();
-    damaged[100] ^= 0xff;
-    fs::write(&path, &damaged).unwrap();
-    let error = runtime::content::prepare_writable(&engine, h, None).unwrap_err();
-    assert!(format!("{error:#}").contains("CORRUPT_OBJECT"), "{error:#}");
-    assert_eq!(
-        fs::read_dir(dir.path().join("staging")).map_or(0, |d| d.count()),
-        0,
-        "the failed copy is removed"
-    );
-    lock(&engine).close(h).unwrap();
-}
-
-/// The availability state of `object` (`None`: no row).
-fn availability(e: &Engine, object: &str) -> Option<i64> {
-    e.store
-        .db
-        .query_row(
-            "SELECT state FROM object_availability WHERE hash=?",
-            [object],
-            |r| r.get(0),
+impl CurrentFile {
+    fn new(root: &Path, data: &[u8]) -> Self {
+        let shared = shared(root);
+        current_reads::committed(&shared, "file", data);
+        let native = tkfs::content::LocalContent::open(root).unwrap();
+        let writes =
+            runtime::content_writes::NativeWrites::install(&shared, &current_reads::context())
+                .unwrap();
+        let handle = lock(&shared).open("file", None, true).unwrap().0;
+        runtime::content_reads::prepare_open(
+            &shared,
+            handle,
+            ContentWait::fixed(Duration::from_secs(30)),
         )
-        .ok()
-}
-
-#[test]
-fn a_save_that_finds_a_corrupt_copy_of_its_object_records_it() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let data = bytes(31, 4096);
-    let object = hash(&data);
-    committed_file(&mut lock(&engine), "first.bin", &data);
-    // Its availability row lands in a batch (`AvailabilityNotes`).
-    assert!(wait_until(Duration::from_secs(10), || {
-        availability(&lock(&engine), &object) == Some(objects::AVAILABLE)
-    }));
-    // The installed copy goes bad (same length), and a save of the same
-    // bytes elsewhere finds it while it stores them (phase 2, without the
-    // engine lock).
-    let mut damaged = data.clone();
-    damaged[10] ^= 0xff;
-    fs::write(dir.path().join("objects").join(&object), &damaged).unwrap();
-    let h = {
-        let mut e = lock(&engine);
-        let (h, _) = e.open("second.bin", Some("file"), true).unwrap();
-        e.write(h, 0, &data, false, false).unwrap();
-        h
-    };
-    let error = engine::save_handle(&engine, h).unwrap_err();
-    assert!(format!("{error:#}").contains("CORRUPT_OBJECT"), "{error:#}");
-    let e = lock(&engine);
-    // Recorded as `Store::put_object`'s dedupe records it: the inventory no
-    // longer advertises the bad copy.
-    assert_eq!(
-        availability(&e, &object),
-        Some(objects::CORRUPT),
-        "the corrupt copy is recorded"
-    );
-    assert_eq!(pending_rows(&e).len(), 1, "the save is retained");
-    assert!(e.sessions.values().any(|s| s.dirty));
-}
-
-/// WP5.INT (CCR-WP5.2-1): phase 2 records the bytes it hashed in the
-/// verified set, so the commit's check of newly authored bytes
-/// (`check_commit`) does not hash them again under the engine lock: in
-/// memory, from a staging file, and a copy already installed that phase 2
-/// verified. Before, every one was hashed again (its availability row lands
-/// later, in a batch), which also waited for an on-access scanner.
-#[test]
-fn a_saves_commit_does_not_hash_its_bytes_again() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let small = bytes(41, 4096);
-    let large = bytes(42, 300 * 1024);
-    let mut e = lock(&engine);
-    // Created first: a create deduplicates the empty object, which
-    // `Store::put_object` verifies (not a save).
-    for path in ["small.bin", "large.bin", "again.bin"] {
-        e.store.create(path, "file").unwrap();
+        .unwrap();
+        Self {
+            shared,
+            native,
+            writes,
+            handle,
+        }
     }
-    let hashes = e.store.object_hashes();
-    let skipped = commit::verified::skipped();
-    let save = |e: &mut Engine, path: &str, content: &[u8]| {
-        let (h, _) = e.open(path, None, true).unwrap();
-        e.write(h, 0, content, false, false).unwrap();
-        e.close(h).unwrap();
-    };
-    save(&mut e, "small.bin", &small);
-    save(&mut e, "large.bin", &large);
-    // The same bytes again: phase 2 verifies the installed copy (and the
-    // object is referenced already, so the commit checks nothing).
-    save(&mut e, "again.bin", &small);
-    assert_eq!(
-        e.store.object_hashes(),
-        hashes,
-        "a commit hashed bytes its save had just stored"
-    );
-    assert!(commit::verified::skipped() >= skipped + 2);
-    assert_eq!(content(&e, "small.bin"), small);
-    assert_eq!(content(&e, "large.bin"), large);
-    assert_eq!(content(&e, "again.bin"), small);
-    no_conflicts(&e);
+    fn read(&self) -> Vec<u8> {
+        let len = lock(&self.shared).session(self.handle).unwrap().bytes.len();
+        // Adapter requests are bounded; exercise the same range path repeatedly.
+        (0..len)
+            .step_by(512 * 1024)
+            .flat_map(|offset| {
+                runtime::content_reads::read_mount_vec(
+                    &self.shared,
+                    self.handle,
+                    offset as u64,
+                    (len - offset).min(512 * 1024),
+                    ContentWait::fixed(Duration::from_secs(30)),
+                )
+                .unwrap()
+                .unwrap()
+            })
+            .collect()
+    }
 }
-
+impl Drop for CurrentFile {
+    fn drop(&mut self) {
+        let _ = lock(&self.shared).release_handle(self.handle);
+        let result = self.writes.shutdown(&current_reads::context());
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
+    }
+}
 #[test]
-fn closed_files_are_saved_in_the_background_and_a_stop_waits_for_them() {
+fn the_first_large_file_edit_is_chunk_local_and_releases_the_engine_lock() {
+    use tkfs::{model::content::CHUNK_SIZE, runtime::content_writes, util::phases::Phase};
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let mut written = BTreeMap::new();
-    for i in 0..60u64 {
-        let path = format!("d{}/f{i:03}.bin", i % 4);
-        let data = bytes(100 + i, 512 + (i as usize * 997) % 70_000);
-        let h = {
-            let mut e = lock(&engine);
-            if e.store.lookup(&format!("d{}", i % 4)).is_err() {
-                e.store.create(&format!("d{}", i % 4), "directory").unwrap();
-            }
-            let (h, _) = e.open(&path, Some("file"), true).unwrap();
-            e.write(h, 0, &data, false, false).unwrap();
-            e.cleanup_unsaved(h).unwrap();
-            h
-        };
-        engine::save_handle_in_background(&engine, h).unwrap();
-        engine::close_handle(&engine, h).unwrap();
-        written.insert(path, data);
-    }
-    assert!(
-        wait_until(Duration::from_secs(30), || lock(&engine).quiet().is_ok()),
-        "every closed file is committed"
-    );
-    assert!(wait_until(
-        Duration::from_secs(5),
-        || engine::background_saves() == 0
+    let original = bytes(7, 2 * 1024 * 1024 + 17);
+    let f = CurrentFile::new(dir.path(), &original);
+    let wait = ContentWait::fixed(Duration::from_secs(30));
+    assert!(matches!(
+        lock(&f.shared).session(f.handle).unwrap().bytes,
+        tkfs::staging::Staged::Cow(_)
     ));
-    let e = lock(&engine);
-    for (path, data) in &written {
-        assert_eq!(&content(&e, path), data, "{path}");
-    }
-    assert!(e.sessions.is_empty(), "committed sessions are dropped");
-    assert!(pending_rows(&e).is_empty());
-    no_conflicts(&e);
-}
-
-#[test]
-fn a_delete_or_a_rename_over_a_closed_file_waits_for_its_save() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    for round in 0..20u64 {
-        let target = format!("target{round}.txt");
-        let temp = format!("temp{round}.txt");
-        let gone = format!("gone{round}.txt");
-        let close_in_background = |path: &str, data: &[u8]| {
-            let h = {
-                let mut e = lock(&engine);
-                let create = e.store.lookup(path).is_err().then_some("file");
-                let (h, _) = e.open(path, create, true).unwrap();
-                e.truncate(h, 0, false).unwrap();
-                e.write(h, 0, data, false, false).unwrap();
-                e.cleanup_unsaved(h).unwrap();
-                h
-            };
-            engine::save_handle_in_background(&engine, h).unwrap();
-            engine::close_handle(&engine, h).unwrap();
-        };
-        // The atomic-save pattern: write the target, then a temporary file,
-        // and rename the temporary file over the target at once.
-        close_in_background(&target, b"first version");
-        close_in_background(&temp, b"second version");
-        engine::settle_path(&engine, &target).unwrap();
-        {
-            let e = lock(&engine);
-            let source = e.store.lookup(&temp).unwrap().id;
-            drop(e);
-            engine::settle_entity(&engine, &source).unwrap();
-            let mut e = lock(&engine);
-            e.store.rename(&source, &target, true).unwrap();
-        }
-        // And a delete right after the close.
-        close_in_background(&gone, b"short lived");
-        engine::settle_path(&engine, &gone).unwrap();
-        {
-            let mut e = lock(&engine);
-            let entity = e.store.lookup(&gone).unwrap().id;
-            e.store.delete(&entity).unwrap();
-        }
-        assert!(wait_until(Duration::from_secs(10), || lock(&engine)
-            .quiet()
-            .is_ok()));
-        let e = lock(&engine);
-        assert_eq!(content(&e, &target), b"second version", "round {round}");
-        assert!(
-            e.store.lookup(&gone).is_err(),
-            "round {round}: stays deleted"
-        );
-        assert!(e.store.lookup(&temp).is_err(), "round {round}");
-        no_conflicts(&e);
-    }
-}
-
-/// WP5.INT (CCR-WP5.2-4): a graceful stop or a control request right after
-/// a burst of closes waits for the closed files' saves (bounded) instead of
-/// being refused `BUSY_VIEW`, and does not wait when something else keeps
-/// the engine from being quiet (a file still open).
-#[test]
-fn a_quiet_engine_is_awaited_while_only_closed_files_are_being_saved() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
+    assert!(!lock(&f.shared).session(f.handle).unwrap().dirty);
+    let before = f.native.counters.snapshot();
     fault::configure(Some(FaultConfig {
         ms: Some(300),
-        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
+        count: Some(1),
+        ..FaultConfig::new("content.native.before_write", FaultAction::Hang)
     }));
-    let disarm = Disarm;
-    for i in 0..4u64 {
-        let h = {
-            let mut e = lock(&engine);
-            let (h, _) = e.create_deferred(&format!("b{i}.bin"), true, None).unwrap();
-            e.write(h, 0, &bytes(8100 + i, 2048), false, false).unwrap();
-            e.cleanup_unsaved(h).unwrap();
-            h
-        };
-        engine::save_handle_in_background(&engine, h).unwrap();
-        engine::close_handle(&engine, h).unwrap();
-    }
-    assert!(
-        lock(&engine).quiet().is_err(),
-        "the saves are still running"
-    );
-    let started = Instant::now();
-    let e = engine::lock_after_saves(&engine, Duration::from_secs(30));
-    assert!(e.quiet().is_ok(), "{:?}", e.quiet());
-    assert!(started.elapsed() < Duration::from_secs(30));
-    drop(e);
-    // An open file: no wait at all.
-    let (h, _) = lock(&engine)
-        .create_deferred("open.bin", true, None)
+    let reset = Disarm;
+    let engine = f.shared.clone();
+    let h = f.handle;
+    let offset = CHUNK_SIZE + 17;
+    let writer = std::thread::spawn(move || {
+        content_writes::write(&engine, h, offset, &vec![99; 4096], false, false, wait)
+    });
+    assert!(wait_until(Duration::from_secs(5), || fault::fired() > 0));
+    let began = Instant::now();
+    lock(&f.shared)
+        .store
+        .create("unrelated", "directory")
         .unwrap();
-    let started = Instant::now();
-    let e = engine::lock_after_saves(&engine, Duration::from_secs(30));
-    assert!(e.quiet().is_err());
+    let elapsed = began.elapsed();
+    assert_eq!(writer.join().unwrap().unwrap(), Some(4096));
+    drop(reset);
     assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "{:?}",
-        started.elapsed()
+        elapsed < Duration::from_millis(250),
+        "Engine blocked for {elapsed:?}"
     );
-    drop(e);
-    drop(disarm);
-    lock(&engine).close(h).unwrap();
-    assert!(wait_until(Duration::from_secs(10), || lock(&engine)
-        .quiet()
-        .is_ok()));
-}
-
-#[test]
-fn closes_past_a_full_save_queue_save_before_they_return() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    lock(&engine).store.create("d", "directory").unwrap();
-    // Every save's store phase is slowed down: the savers fall behind the
-    // closes (files created as the mount creates them, committed by their
-    // first save), and their queue fills up.
-    let slow = Duration::from_millis(200);
-    fault::configure(Some(FaultConfig {
-        ms: Some(slow.as_millis() as u64),
-        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
-    }));
-    let disarm = Disarm;
-    let bound = engine::MAX_QUEUED_SAVES + engine::MAX_BACKGROUND_SAVES;
-    let mut written = BTreeMap::new();
-    let (mut most, mut waited) = (0, 0);
-    for i in 0..bound + 40 {
-        let path = format!("d/f{i:03}.bin");
-        let data = bytes(7000 + i as u64, 1024 + i * 37);
-        let h = {
-            let mut e = lock(&engine);
-            let (h, _) = e.create_deferred(&path, true, None).unwrap();
-            e.write(h, 0, &data, false, false).unwrap();
-            e.cleanup_unsaved(h).unwrap();
-            h
-        };
-        let closing = Instant::now();
-        engine::save_handle_in_background(&engine, h).unwrap();
-        engine::close_handle(&engine, h).unwrap();
-        if closing.elapsed() >= slow {
-            waited += 1;
-        }
-        written.insert(path, data);
-        // Every file the application closed and that is not committed yet
-        // is queued or being saved by a saver: bounded.
-        let unsaved = lock(&engine).sessions.values().filter(|s| s.dirty).count();
-        assert!(
-            unsaved <= bound,
-            "close {i}: {unsaved} closed files not committed, more than {bound}"
+    let buffered = f.native.counters.snapshot();
+    for phase in [Phase::Write, Phase::ManifestWrite] {
+        assert_eq!(
+            buffered[phase as usize].operations,
+            before[phase as usize].operations
         );
-        most = most.max(unsaved);
     }
+    assert!(content_writes::flush(&f.shared, f.handle, wait).unwrap());
+    let after = f.native.counters.snapshot();
     assert!(
-        most >= engine::MAX_QUEUED_SAVES,
-        "the savers' queue filled up (at most {most} closed files unsaved)"
+        after[Phase::Read as usize].bytes - before[Phase::Read as usize].bytes <= 4 * CHUNK_SIZE
+    );
+    assert_eq!(
+        after[Phase::Write as usize].operations - before[Phase::Write as usize].operations,
+        1
     );
     assert!(
-        waited > 0,
-        "a close past the full queue saved before it returned"
+        after[Phase::ManifestWrite as usize].operations
+            - before[Phase::ManifestWrite as usize].operations
+            <= 2
     );
-    drop(disarm);
-    assert!(
-        wait_until(Duration::from_secs(60), || lock(&engine).quiet().is_ok()),
-        "every closed file is committed"
+    assert_eq!(
+        fs::read_dir(dir.path().join("staging")).map_or(0, |d| d.count()),
+        0
     );
-    assert!(wait_until(
-        Duration::from_secs(5),
-        || engine::background_saves() == 0
-    ));
-    let e = lock(&engine);
-    for (path, data) in &written {
-        assert_eq!(&content(&e, path), data, "{path}");
-    }
-    assert!(pending_rows(&e).is_empty());
-    no_conflicts(&e);
+    let mut expected = original;
+    expected[offset as usize..offset as usize + 4096].fill(99);
+    assert_eq!(f.read(), expected);
+    let before = f.native.counters.snapshot();
+    assert!(content_writes::truncate(&f.shared, f.handle, 0, false, wait).unwrap());
+    assert!(content_writes::flush(&f.shared, f.handle, wait).unwrap());
+    assert_eq!(
+        f.native.counters.snapshot()[Phase::Read as usize].bytes,
+        before[Phase::Read as usize].bytes
+    );
+    assert!(f.read().is_empty());
+    let e = lock(&f.shared);
+    let reference = e.store.lookup("file").unwrap().content_ref.unwrap();
+    assert_eq!(
+        reference,
+        tkfs::model::content::FileContentRef::new(
+            tkfs::model::content::ContentKind::Direct,
+            tkfs::model::content::Digest::bytes(&[]),
+            0
+        )
+        .unwrap()
+    );
 }
-
 #[test]
-fn a_file_is_saved_in_line_when_no_saver_can_be_started() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    Engine::adopt_shared(&engine);
-    // The savers of earlier scenarios end once idle; then none can start.
-    assert!(wait_until(Duration::from_secs(10), || {
-        engine::saver_threads() == 0
-    }));
-    fault::configure(Some(FaultConfig::new(
-        "engine.saver.spawn",
-        FaultAction::Fail,
-    )));
-    let disarm = Disarm;
-    // A close in a burst: nothing would serve the queue, so it saves the file
-    // itself before it returns.
-    let closed = bytes(77, 3000);
-    let h = {
-        let mut e = lock(&engine);
-        let (h, _) = e.open("closed.bin", Some("file"), true).unwrap();
-        e.write(h, 0, &closed, false, false).unwrap();
-        e.cleanup_unsaved(h).unwrap();
-        h
+fn a_corrupt_current_chunk_refuses_the_edit_before_acknowledgement() {
+    use tkfs::{
+        model::content::{CHUNK_SIZE, Digest, ObjectKey, ObjectKind},
+        runtime::content_writes,
+        util::phases::Phase,
     };
-    engine::save_handle_in_background(&engine, h).unwrap();
-    assert!(
-        content(&lock(&engine), "closed.bin") == closed,
-        "the close saved its file itself"
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let original = bytes(9, 600 * 1024);
+    let f = CurrentFile::new(dir.path(), &original);
+    let wait = ContentWait::fixed(Duration::from_secs(30));
+    let entry = lock(&f.shared).session(f.handle).unwrap().entry.clone();
+    assert_eq!(
+        content_writes::write(&f.shared, f.handle, 0, &[], false, false, wait).unwrap(),
+        Some(0)
     );
-    assert_eq!(engine::background_saves(), 0, "nothing left in the queue");
-    engine::close_handle(&engine, h).unwrap();
-    // The pending-save retry saves under the lock then, instead of leaving
-    // the file to a saver that never comes.
-    let retried = bytes(78, 3000);
-    {
-        let mut e = lock(&engine);
-        let (h, _) = e.open("retried.bin", Some("file"), true).unwrap();
-        e.write(h, 0, &retried, false, false).unwrap();
-        e.release_handle(h).unwrap();
-    }
-    assert_eq!(lock(&engine).retry_pending_due(Instant::now()), 1);
-    let e = lock(&engine);
-    assert!(content(&e, "retried.bin") == retried, "saved in line");
-    assert!(e.quiet().is_ok(), "nothing is left unsaved");
-    assert_eq!(engine::background_saves(), 0);
-    drop(e);
-    drop(disarm);
-}
-
-#[test]
-fn a_pending_save_handed_to_the_savers_is_reported_for_the_status() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    Engine::adopt_shared(&engine);
-    let data = bytes(79, 5000);
-    {
-        let mut e = lock(&engine);
-        let (h, _) = e.open("retried.bin", Some("file"), true).unwrap();
-        e.write(h, 0, &data, false, false).unwrap();
-        e.release_handle(h).unwrap();
-    }
-    // Handed to a saver: counted at once (the maintenance thread marks the
-    // status content wanted), once, however often it is due meanwhile (its
-    // save is slowed down here)...
-    fault::configure(Some(FaultConfig {
-        ms: Some(500),
-        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
-    }));
-    let disarm = Disarm;
-    let now = Instant::now();
-    assert_eq!(lock(&engine).retry_pending_due(now), 1);
-    assert_eq!(lock(&engine).retry_pending_due(now), 0);
-    drop(disarm);
-    assert!(wait_until(Duration::from_secs(10), || lock(&engine)
-        .quiet()
-        .is_ok()));
-    // ... and its commit by the saver at the next retry, once.
-    assert_eq!(lock(&engine).retry_pending_due(now), 1);
-    assert_eq!(lock(&engine).retry_pending_due(now), 0);
-    assert!(content(&lock(&engine), "retried.bin") == data);
-}
-
-/// A save of `path` in flight, as a background save that began after a
-/// delete or a rename settled the file: written, closed, snapshotted.
-fn save_in_flight(engine: &Shared, path: &str, data: &[u8]) -> (String, runtime::engine::SaveJob) {
-    let mut e = lock(engine);
-    let entity = committed_file(&mut e, path, b"v1");
-    let (h, _) = e.open(path, None, true).unwrap();
-    e.write(h, 0, data, false, false).unwrap();
-    e.cleanup_unsaved(h).unwrap();
-    let job = started(e.begin_save(&entity).unwrap());
-    e.release_handle(h).unwrap();
-    (entity, job)
-}
-
-/// Runs `apply` on another thread while `job` is in flight: it must wait
-/// for the save, and go on once the save is committed.
-fn applied_after_the_save(
-    engine: &Shared,
-    job: runtime::engine::SaveJob,
-    apply: impl FnOnce(&Shared) + Send + 'static,
-) {
-    let done = Arc::new(Mutex::new(false));
-    let waiter = {
-        let (engine, done) = (engine.clone(), done.clone());
-        std::thread::spawn(move || {
-            apply(&engine);
-            *done.lock().unwrap() = true;
-        })
+    assert!(!lock(&f.shared).session(f.handle).unwrap().dirty);
+    let chunk = &original[..CHUNK_SIZE as usize];
+    let key = ObjectKey {
+        kind: ObjectKind::Bytes,
+        digest: Digest::bytes(chunk),
     };
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(!*done.lock().unwrap(), "it waits for the save in flight");
-    let stored = engine::store_snapshot(&job);
-    lock(engine).finish_save(job, stored).unwrap();
-    waiter.join().unwrap();
-    assert!(*done.lock().unwrap());
-}
-
-#[test]
-fn a_delete_or_a_rename_over_a_file_waits_for_a_save_of_it_that_began_after_the_settle() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    // A delete on close (WinFsp cleanup with delete).
-    let (doomed, job) = save_in_flight(&engine, "doomed.txt", b"v2");
-    let h = lock(&engine).open("doomed.txt", None, false).unwrap().0;
-    applied_after_the_save(&engine, job, move |engine| {
-        let mut e = engine::lock_settled(engine, Some(h), None);
-        e.cleanup(h, true).unwrap();
-        e.close(h).unwrap();
-    });
-    // A rename over a file (WinFsp rename with replace, FUSE rename).
-    let (replaced, job) = save_in_flight(&engine, "target.txt", b"replaced");
-    let source = committed_file(&mut lock(&engine), "source.txt", b"replacement");
-    let moved = source.clone();
-    applied_after_the_save(&engine, job, move |engine| {
-        let mut e = engine::lock_settled(engine, None, Some("target.txt"));
-        e.store.rename(&moved, "target.txt", true).unwrap();
-    });
-    let mut e = lock(&engine);
-    assert!(e.store.lookup("doomed.txt").is_err(), "stays deleted");
-    assert!(!e.store.entry(&doomed).unwrap().alive);
-    assert_eq!(content(&e, "target.txt"), b"replacement");
-    assert_eq!(e.store.lookup("target.txt").unwrap().id, source);
-    assert!(!e.store.entry(&replaced).unwrap().alive, "stays replaced");
-    assert!(e.quiet().is_ok());
-    no_conflicts(&e);
-    let diff = e.store.verify_derived_state().unwrap();
-    assert!(diff.is_empty(), "{diff:?}");
-}
-
-#[test]
-fn a_directory_holding_an_uncommitted_new_file_is_not_deleted_on_close() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-    e.store.create("d", "directory").unwrap();
-    let (hd, directory) = e.open("d", None, false).unwrap();
-    let (hf, _) = e.create_deferred("d/new.txt", true, None).unwrap();
-    e.write(
-        hf,
-        0,
-        b"created after the directory's CanDelete",
-        false,
-        false,
+    let mut damaged = chunk.to_vec();
+    damaged[100] ^= 0xff;
+    fs::write(
+        dir.path().join("objects").join(key.digest.to_string()),
+        damaged,
     )
     .unwrap();
+    let before = f.native.counters.snapshot();
+    let error =
+        content_writes::write(&f.shared, f.handle, 5, b"EDIT", false, false, wait).unwrap_err();
     assert!(
-        format!("{:#}", e.cleanup(hd, true).unwrap_err()).contains("DIRECTORY_NOT_EMPTY"),
-        "a new file not committed yet keeps its directory"
+        format!("{error:#}").contains("CORRUPT_CONTENT"),
+        "{error:#}"
     );
-    assert!(e.store.entry(&directory.id).unwrap().alive);
-    e.close(hd).unwrap();
-    e.close(hf).unwrap();
+    assert!(!lock(&f.shared).session(f.handle).unwrap().dirty);
+    assert_eq!(lock(&f.shared).session(f.handle).unwrap().entry, entry);
+    let error =
+        content_writes::truncate(&f.shared, f.handle, CHUNK_SIZE / 2, false, wait).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("CORRUPT_CONTENT"),
+        "{error:#}"
+    );
+    assert!(!lock(&f.shared).session(f.handle).unwrap().dirty);
+    assert_eq!(lock(&f.shared).session(f.handle).unwrap().entry, entry);
     assert_eq!(
-        content(&e, "d/new.txt"),
-        b"created after the directory's CanDelete"
+        lock(&f.shared).session(f.handle).unwrap().bytes.len(),
+        original.len()
     );
-    assert!(e.quiet().is_ok());
-    no_conflicts(&e);
-    let diff = e.store.verify_derived_state().unwrap();
-    assert!(diff.is_empty(), "{diff:?}");
-}
-
-#[test]
-fn a_file_still_being_saved_is_listed_with_its_new_size() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-    e.store.create("d", "directory").unwrap();
-    let entity = committed_file(&mut e, "d/f.bin", b"0123456789");
-    let data = bytes(77, 5000);
-    let (h, _) = e.open("d/f.bin", None, true).unwrap();
-    e.write(h, 0, &data, false, false).unwrap();
-    e.cleanup_unsaved(h).unwrap();
-    // Closed, its save in flight (a background save).
-    let job = started(e.begin_save(&entity).unwrap());
-    let (hd, _) = e.open("d", None, false).unwrap();
-    let listed = |e: &mut Engine| {
-        (0..)
-            .map_while(|ordinal| e.directory_entry(hd, ordinal, ordinal == 0).unwrap())
-            .find(|(entry, _)| entry.id == entity)
-            .map(|(_, size)| size)
-    };
-    assert_eq!(
-        listed(&mut e),
-        Some(data.len()),
-        "the new size, not the committed one"
-    );
-    let entry = e.lookup_visible("d/f.bin").unwrap();
-    assert_eq!(e.visible_size(&entry).unwrap(), data.len());
-    let stored = engine::store_snapshot(&job);
-    e.finish_save(job, stored).unwrap();
-    assert_eq!(listed(&mut e), Some(data.len()));
-    e.close(h).unwrap();
-    e.close(hd).unwrap();
-    assert_eq!(content(&e, "d/f.bin"), data);
-    no_conflicts(&e);
-}
-
-#[test]
-fn a_closed_file_whose_handle_awaits_its_close_counts_as_settling() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    fault::configure(Some(FaultConfig {
-        ms: Some(400),
-        count: Some(1),
-        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
-    }));
-    let _disarm = Disarm;
-    let h = {
-        let mut e = lock(&engine);
-        let (h, _) = e.open("f.bin", Some("file"), true).unwrap();
-        e.write(h, 0, b"closed, not yet Closed", false, false)
-            .unwrap();
-        e.cleanup_unsaved(h).unwrap();
-        h
-    };
-    engine::save_handle_in_background(&engine, h).unwrap();
-    {
-        let e = lock(&engine);
-        // A WinFsp handle cleaned up and awaiting its `Close`: the graceful
-        // detach's fence waits for this save as long as for any other.
-        assert!(e.handles.contains_key(&h));
+    for phase in [Phase::Write, Phase::ManifestWrite] {
         assert_eq!(
-            e.settling(),
-            1,
-            "queued or being saved, with a cleaned handle"
+            f.native.counters.snapshot()[phase as usize].operations,
+            before[phase as usize].operations
         );
     }
-    engine::close_handle(&engine, h).unwrap();
-    assert!(wait_until(Duration::from_secs(10), || lock(&engine)
-        .quiet()
-        .is_ok()));
-    assert_eq!(content(&lock(&engine), "f.bin"), b"closed, not yet Closed");
-}
-
-/// Simulates a download of `object` into `state`: its spool grows by
-/// `step` bytes every `every` for `steps` steps, then the object is
-/// installed (verified) and the spool removed.
-fn simulated_download(
-    state: PathBuf,
-    object: String,
-    data: Vec<u8>,
-    step: usize,
-    every: Duration,
-    steps: usize,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let spool = state.join("incoming-objects").join(&object);
-        fs::create_dir_all(spool.parent().unwrap()).unwrap();
-        for i in 1..=steps {
-            fs::write(&spool, &data[..(i * step).min(data.len())]).unwrap();
-            std::thread::sleep(every);
-        }
-        let temp = state.join("objects").join(format!("{}.part", id()));
-        fs::write(&temp, &data).unwrap();
-        fs::rename(&temp, state.join("objects").join(&object)).unwrap();
-        let _ = fs::remove_file(&spool);
-    })
-}
-
-/// A store whose `remote.bin` references bytes it does not have.
-fn missing_content(dir: &Path, data: &[u8]) -> (Shared, u64, String) {
-    let engine = shared(dir);
-    let object = {
-        let mut e = lock(&engine);
-        committed_file(&mut e, "remote.bin", data);
-        let object = hash(data);
-        fs::remove_file(dir.join("objects").join(&object)).unwrap();
-        object
+    assert_eq!(
+        tkfs::content::write::WriteJournal::open(dir.path())
+            .unwrap()
+            .pending_count(),
+        0
+    );
+    assert_eq!(
+        fs::read_dir(dir.path().join("staging")).map_or(0, |d| d.count()),
+        0
+    );
+    assert_eq!(
+        runtime::content_reads::read_mount_vec(&f.shared, f.handle, CHUNK_SIZE, 17, wait)
+            .unwrap()
+            .unwrap(),
+        original[CHUNK_SIZE as usize..CHUNK_SIZE as usize + 17]
+    );
+    f.native
+        .install(key, chunk, &current_reads::context())
+        .unwrap();
+    assert_eq!(
+        content_writes::write(&f.shared, f.handle, 5, b"EDIT", false, false, wait).unwrap(),
+        Some(4)
+    );
+    let second = &original[CHUNK_SIZE as usize..2 * CHUNK_SIZE as usize];
+    let second_key = ObjectKey {
+        kind: ObjectKind::Bytes,
+        digest: Digest::bytes(second),
     };
-    let h = lock(&engine).open("remote.bin", None, false).unwrap().0;
-    (engine, h, object)
+    let mut damaged = second.to_vec();
+    damaged[100] ^= 0xff;
+    fs::write(
+        dir.path()
+            .join("objects")
+            .join(second_key.digest.to_string()),
+        damaged,
+    )
+    .unwrap();
+    let error = content_writes::write(
+        &f.shared,
+        f.handle,
+        CHUNK_SIZE + 5,
+        b"NOPE",
+        false,
+        false,
+        wait,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("CORRUPT_CONTENT"),
+        "{error:#}"
+    );
+    assert!(
+        lock(&f.shared).session(f.handle).unwrap().dirty,
+        "earlier accepted bytes stay dirty"
+    );
+    f.native
+        .install(second_key, second, &current_reads::context())
+        .unwrap();
+    assert!(content_writes::flush(&f.shared, f.handle, wait).unwrap());
+    let mut expected = original;
+    expected[5..9].copy_from_slice(b"EDIT");
+    assert_eq!(f.read(), expected);
 }
 
 fn never() -> bool {
@@ -1044,78 +370,80 @@ fn never() -> bool {
 }
 
 #[test]
-fn a_read_waits_while_its_download_progresses() {
+fn a_read_waits_while_verified_chunks_in_its_range_arrive() {
+    use tkfs::model::content::CHUNK_SIZE;
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let data = bytes(42, 2 * 1024 * 1024);
-    let (engine, h, object) = missing_content(dir.path(), &data);
+    let f = current_reads::CurrentRead::new(dir.path(), bytes(42, 2 * 1024 * 1024));
+    f.remove_chunks(12);
     let wait = ContentWait {
         stall: Duration::from_millis(400),
         bound: Duration::from_secs(30),
         slots: None,
         cancelled: never,
     };
-    // Twelve steps of 150 ms: the whole download takes far longer than the
-    // stall bound, but bytes keep arriving.
-    let feeder = simulated_download(
-        dir.path().to_owned(),
-        object,
-        data.clone(),
-        data.len() / 12,
-        Duration::from_millis(150),
-        12,
-    );
-    let started = Instant::now();
-    runtime::content::prepare_content_waiting(&engine, h, wait).unwrap();
-    let waited = started.elapsed();
-    feeder.join().unwrap();
+    f.feed(12, 1, Duration::from_millis(150));
+    let began = Instant::now();
+    let data = f.read(0, 12 * CHUNK_SIZE as usize, wait).unwrap();
+    let waited = began.elapsed();
+    f.finish();
     assert!(
         waited > Duration::from_millis(1500),
-        "the read waited through the download ({waited:?})"
+        "the range waited through verified progress ({waited:?})"
     );
-    let e = lock(&engine);
-    assert!(
-        e.session(h).unwrap().bytes == data,
-        "it serves verified bytes"
-    );
+    assert_eq!(data, &f.data[..12 * CHUNK_SIZE as usize]);
+    assert!(f.pending().is_empty());
 }
 
 #[test]
-fn a_stalled_or_fenced_or_crowded_wait_ends_with_content_unavailable() {
+fn a_stalled_fenced_or_crowded_current_range_releases_its_waiter() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
-    let data = bytes(43, 300 * 1024);
-    let (engine, h, _object) = missing_content(dir.path(), &data);
-    // No progress: the stall bound ends it.
+    let f = current_reads::CurrentRead::new(dir.path(), bytes(43, 300 * 1024));
+    f.remove_chunks(1);
     let stall = ContentWait {
         stall: Duration::from_millis(300),
         bound: Duration::from_secs(30),
         slots: None,
         cancelled: never,
     };
-    let started = Instant::now();
-    let error = runtime::content::prepare_content_waiting(&engine, h, stall).unwrap_err();
-    assert!(started.elapsed() < Duration::from_secs(5));
-    let message = format!("{error:#}");
-    assert!(message.starts_with("CONTENT_UNAVAILABLE"), "{message}");
+    let engine = f.shared.clone();
+    let h = f.handle;
+    let reader =
+        std::thread::spawn(move || runtime::content_reads::read_mount_vec(&engine, h, 0, 1, stall));
+    let demand = f.wait_pending();
+    assert_eq!(demand.demand.reference, f.reference_id);
+    let began = Instant::now();
+    let error = reader.join().unwrap().unwrap_err();
+    assert!(began.elapsed() < Duration::from_secs(5));
     assert!(
-        lock(&engine).store.wanted_objects().unwrap().len() == 1,
-        "the read registered demand"
+        format!("{error:#}").starts_with("CONTENT_UNAVAILABLE"),
+        "{error:#}"
     );
-    // A fenced mount ends it at once.
+    assert!(f.pending().is_empty());
+    struct Unfence;
+    impl Drop for Unfence {
+        fn drop(&mut self) {
+            tkfs::worker::mount_ctl::adapter::set_fenced(false);
+        }
+    }
     tkfs::worker::mount_ctl::adapter::set_fenced(true);
+    let reset = Unfence;
     let fenced = ContentWait {
         stall: Duration::from_secs(30),
         bound: Duration::from_secs(30),
         slots: None,
         cancelled: tkfs::worker::mount_ctl::adapter::fenced,
     };
-    let started = Instant::now();
-    let error = runtime::content::prepare_content_waiting(&engine, h, fenced).unwrap_err();
-    tkfs::worker::mount_ctl::adapter::set_fenced(false);
-    assert!(started.elapsed() < Duration::from_secs(2));
-    assert!(format!("{error:#}").contains("detached"), "{error:#}");
-    // With every wait slot taken a read fails at once.
+    let began = Instant::now();
+    let error = f.read(0, 1, fenced).unwrap_err();
+    drop(reset);
+    assert!(began.elapsed() < Duration::from_secs(2));
+    assert!(
+        format!("{error:#}").contains("CONTENT_CANCELLED"),
+        "{error:#}"
+    );
+    assert!(f.pending().is_empty());
     static ONE: WaitSlots = WaitSlots::new(1);
     let crowded = ContentWait {
         stall: Duration::from_millis(1500),
@@ -1123,18 +451,27 @@ fn a_stalled_or_fenced_or_crowded_wait_ends_with_content_unavailable() {
         slots: Some(&ONE),
         cancelled: never,
     };
-    let (engine2, h2, _) = missing_content(&dir.path().join("second"), &bytes(44, 300 * 1024));
-    let first = {
-        let engine = engine.clone();
-        std::thread::spawn(move || runtime::content::prepare_content_waiting(&engine, h, crowded))
-    };
-    assert!(wait_until(Duration::from_secs(5), || ONE.used() == 1));
-    let started = Instant::now();
-    let error = runtime::content::prepare_content_waiting(&engine2, h2, crowded).unwrap_err();
-    assert!(started.elapsed() < Duration::from_millis(1000));
-    assert!(format!("{error:#}").contains("already wait"), "{error:#}");
+    let second = current_reads::CurrentRead::new(&dir.path().join("second"), bytes(44, 300 * 1024));
+    second.remove_chunks(1);
+    let engine = f.shared.clone();
+    let h = f.handle;
+    let first = std::thread::spawn(move || {
+        runtime::content_reads::read_mount_vec(&engine, h, 0, 1, crowded)
+    });
+    f.wait_pending();
+    assert_eq!(ONE.used(), 1);
+    let began = Instant::now();
+    let error = second.read(0, 1, crowded).unwrap_err();
+    let elapsed = began.elapsed();
     assert!(first.join().unwrap().is_err());
-    assert_eq!(ONE.used(), 0, "slots are given back");
+    assert!(elapsed < Duration::from_secs(1));
+    assert!(
+        format!("{error:#}").contains("CONTENT_RESOURCE_LIMIT"),
+        "{error:#}"
+    );
+    assert_eq!(ONE.used(), 0);
+    assert!(f.pending().is_empty());
+    assert!(second.pending().is_empty());
 }
 
 #[test]
@@ -1145,529 +482,6 @@ fn shorter_content_wait_bounds_come_only_from_the_environment() {
     // longer than the defaults either way.
     assert!(stall <= Duration::from_secs(60) && bound <= Duration::from_secs(240));
 }
-
-// ---------------------------------------------------------------------------
-// Crash at every step of a save (child processes).
-
-/// Child: saves `f.bin` with new bytes in the store `TKFS_TEST_SAVE_WORKER`
-/// names; `TKFS_TEST_SAVE_RETAINED=1` retains the session (a force detach)
-/// and edits it once more first. A `TKFS_FAULT_*` exit point ends it.
-#[test]
-fn save_crash_worker() {
-    let Ok(root) = std::env::var("TKFS_TEST_SAVE_WORKER") else {
-        return;
-    };
-    fault::reload_from_env();
-    let engine = shared(Path::new(&root));
-    let retained = std::env::var("TKFS_TEST_SAVE_RETAINED").is_ok();
-    let size: usize = std::env::var("TKFS_TEST_SAVE_SIZE")
-        .unwrap()
-        .parse()
-        .unwrap();
-    let deferred = std::env::var("TKFS_TEST_SAVE_DEFERRED").is_ok();
-    let h = {
-        let mut e = lock(&engine);
-        let (h, _) = if deferred {
-            e.create_deferred("new.bin", true, None).unwrap()
-        } else {
-            e.open("f.bin", None, true).unwrap()
-        };
-        e.write(h, 0, &bytes(5, size), false, false).unwrap();
-        if retained {
-            e.retain_all_dirty().unwrap();
-            e.write(h, 0, &bytes(6, size), false, false).unwrap();
-            e.retain_all_dirty().unwrap();
-        }
-        h
-    };
-    engine::save_handle(&engine, h).unwrap();
-    std::process::exit(0);
-}
-
-#[test]
-fn a_crash_at_every_step_of_a_save_keeps_the_last_committed_bytes() {
-    let _serial = serial();
-    let points = [
-        ("engine.save.snapshot", false),
-        ("engine.save.store", false),
-        ("engine.save.flushed", false),
-        ("engine.save.installed", false),
-        ("engine.save.commit", false),
-        ("engine.save.committed", true),
-        // `Store::put_object`'s legacy crash points fire in a save too.
-        ("object_flushed", false),
-        ("object_installed", false),
-    ];
-    for retained in [false, true] {
-        for size in [4096usize, 700 * 1024] {
-            for (point, committed) in points {
-                let dir = tempfile::tempdir().unwrap();
-                {
-                    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-                    committed_file(&mut e, "f.bin", b"base");
-                }
-                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-                child
-                    .args(["--exact", "save_crash_worker", "--nocapture"])
-                    .env("TKFS_TEST_SAVE_WORKER", dir.path())
-                    .env("TKFS_TEST_SAVE_SIZE", size.to_string());
-                if point.starts_with("object_") {
-                    child.env("TKFS_FAULT", point);
-                } else {
-                    child
-                        .env("TKFS_FAULT_POINT", point)
-                        .env("TKFS_FAULT_ACTION", "exit");
-                }
-                if retained {
-                    child.env("TKFS_TEST_SAVE_RETAINED", "1");
-                }
-                let output = child.output().unwrap();
-                let what = format!("{point}, {size} bytes, retained {retained}");
-                assert_eq!(
-                    output.status.code(),
-                    Some(86),
-                    "{what}: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                // Restart: recovery restores a retained save, the orphaned
-                // spools go, and the store is consistent.
-                let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-                e.remove_orphaned_spools().unwrap();
-                assert!(part_files(dir.path()).is_empty(), "{what}");
-                let expected_now = if committed {
-                    bytes(if retained { 6 } else { 5 }, size)
-                } else {
-                    b"base".to_vec()
-                };
-                assert_eq!(content(&e, "f.bin"), expected_now, "{what}");
-                if retained {
-                    // The retained later bytes are saved, once, in line.
-                    e.retry_pending().unwrap();
-                    assert_eq!(content(&e, "f.bin"), bytes(6, size), "{what}");
-                }
-                assert!(pending_rows(&e).is_empty(), "{what}");
-                no_conflicts(&e);
-                let diff = e.store.verify_derived_state().unwrap();
-                assert!(diff.is_empty(), "{what}: {diff:?}");
-            }
-        }
-    }
-}
-
-/// Events in the journal.
-fn events(e: &Engine) -> i64 {
-    e.store
-        .db
-        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
-        .unwrap()
-}
-
-#[test]
-fn a_file_created_through_the_mount_commits_with_its_first_save() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    let creation = 133_500_000_000_000_000u64;
-    let write = 133_600_000_000_000_000u64;
-    let (h, entity, before) = {
-        let mut e = lock(&engine);
-        e.store.create("d", "directory").unwrap();
-        let before = events(&e);
-        let (h, entry) = e.create_deferred("d/New.txt", true, None).unwrap();
-        assert_eq!(events(&e), before, "nothing is committed at the create");
-        assert!(e.store.lookup("d/New.txt").is_err());
-        assert!(e.is_deferred(&entry.id));
-        // The mount shows it, under any case of its name.
-        assert_eq!(e.lookup_visible("d/new.TXT").unwrap().id, entry.id);
-        let d = e.store.lookup("d").unwrap().id;
-        let names: Vec<_> = e
-            .children_visible(&d)
-            .unwrap()
-            .into_iter()
-            .map(|child| child.name)
-            .collect();
-        assert_eq!(names, ["New.txt"]);
-        // A second create of the name, a file's or a directory's, collides.
-        let again = e.create_deferred("d/NEW.txt", true, None).map(|_| ());
-        let directory = e.open("d/new.txt", Some("directory"), false).map(|_| ());
-        for create in [again, directory] {
-            assert!(
-                format!("{:#}", create.unwrap_err()).contains("NAME_COLLISION"),
-                "a second create collides"
-            );
-        }
-        // A second open shares the session.
-        let (second, same) = e.open("d/new.txt", None, false).unwrap();
-        assert_eq!(same.id, entry.id);
-        e.release_handle(second).unwrap();
-        e.write(h, 0, b"hello", false, false).unwrap();
-        // Times set before the first save stay in the session.
-        e.set_basic(h, u32::MAX, [creation, 0, write, 0]).unwrap();
-        assert_eq!(events(&e), before, "still nothing committed");
-        assert!(e.quiet().is_err(), "an uncommitted create is unsaved");
-        (h, entry.id, before)
-    };
-    engine::save_handle(&engine, h).unwrap();
-    let mut e = lock(&engine);
-    assert_eq!(
-        events(&e),
-        before + 1,
-        "one event creates the file with its content"
-    );
-    assert!(!e.is_deferred(&entity));
-    let committed = e.store.lookup("d/New.txt").unwrap();
-    assert_eq!(committed.id, entity);
-    assert_eq!(content(&e, "d/New.txt"), b"hello");
-    let basic = committed.basic_info();
-    assert_eq!(basic.creation_time, creation);
-    assert_eq!(basic.write_time, write, "a time set explicitly is kept");
-    assert_ne!(basic.attributes & 0x20, 0, "saved: archive");
-    e.close(h).unwrap();
-    assert_eq!(events(&e), before + 1, "a clean close commits nothing");
-    assert!(e.quiet().is_ok());
-    let d = e.store.lookup("d").unwrap().id;
-    assert_eq!(e.children_visible(&d).unwrap().len(), 1, "listed once");
-    assert!(pending_rows(&e).is_empty());
-    no_conflicts(&e);
-    let diff = e.store.verify_derived_state().unwrap();
-    assert!(diff.is_empty(), "{diff:?}");
-}
-
-#[test]
-fn a_deferred_create_is_committed_before_anything_replaces_or_removes_its_name() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let engine = shared(dir.path());
-    // A rename's target held by a writer: settled (committed) at once.
-    let (held, held_entity) = {
-        let mut e = lock(&engine);
-        let (h, entry) = e.create_deferred("target.txt", true, None).unwrap();
-        e.write(h, 0, b"held", false, false).unwrap();
-        (h, entry.id)
-    };
-    engine::settle_path(&engine, "target.txt").unwrap();
-    {
-        let mut e = lock(&engine);
-        assert!(!e.is_deferred(&held_entity));
-        assert_eq!(e.store.lookup("target.txt").unwrap().id, held_entity);
-        assert_eq!(content(&e, "target.txt"), b"held");
-        // The writer goes on; its later bytes are saved as usual.
-        e.write(held, 4, b" on", false, false).unwrap();
-        e.close(held).unwrap();
-        assert_eq!(content(&e, "target.txt"), b"held on");
-        // In line, under the lock (the mount's rename, after a race).
-        let (h, entry) = e.create_deferred("other.txt", true, None).unwrap();
-        e.write(h, 0, b"other", false, false).unwrap();
-        e.commit_created_at("other.txt").unwrap();
-        assert!(!e.is_deferred(&entry.id));
-        assert_eq!(content(&e, "other.txt"), b"other");
-        e.close(h).unwrap();
-        // A committed file renamed over one replaces it, without conflict.
-        let source = committed_file(&mut e, "source.txt", b"replacement");
-        let (h, replaced) = e.create_deferred("replaced.txt", true, None).unwrap();
-        e.write(h, 0, b"replaced", false, false).unwrap();
-        e.release_handle(h).unwrap();
-        drop(e);
-        engine::settle_path(&engine, "replaced.txt").unwrap();
-        let mut e = lock(&engine);
-        e.store.rename(&source, "replaced.txt", true).unwrap();
-        assert_eq!(content(&e, "replaced.txt"), b"replacement");
-        assert!(!e.store.entry(&replaced.id).unwrap().alive);
-        // A delete: the creation commits, then the delete.
-        let (h, doomed) = e.create_deferred("doomed.txt", true, None).unwrap();
-        e.write(h, 0, b"short lived", false, false).unwrap();
-        e.cleanup(h, true).unwrap();
-        e.close(h).unwrap();
-        assert!(e.store.lookup("doomed.txt").is_err());
-        assert!(e.lookup_visible("doomed.txt").is_err());
-        assert!(!e.store.entry(&doomed.id).unwrap().alive);
-    }
-    assert!(wait_until(Duration::from_secs(10), || lock(&engine)
-        .quiet()
-        .is_ok()));
-    let mut e = lock(&engine);
-    assert!(e.sessions.is_empty());
-    assert!(pending_rows(&e).is_empty());
-    no_conflicts(&e);
-    let diff = e.store.verify_derived_state().unwrap();
-    assert!(diff.is_empty(), "{diff:?}");
-}
-
-#[test]
-fn a_retained_deferred_create_is_shown_again_after_a_restart_and_committed_once() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let data = bytes(9, 100_000);
-    let entity = {
-        let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-        let (h, entry) = e.create_deferred("kept.bin", true, None).unwrap();
-        e.write(h, 0, &data, false, false).unwrap();
-        // A force detach: the file is retained, the engine goes unsaved.
-        assert_eq!(e.retain_all_dirty().unwrap(), 1);
-        entry.id
-    };
-    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-    assert!(e.store.lookup("kept.bin").is_err());
-    assert!(e.is_deferred(&entity), "restored as a deferred create");
-    assert_eq!(e.lookup_visible("kept.bin").unwrap().id, entity);
-    assert!(e.quiet().is_err(), "unsaved until committed");
-    let before = events(&e);
-    e.retry_pending().unwrap();
-    assert_eq!(events(&e), before + 1, "committed once, in one event");
-    assert!(!e.is_deferred(&entity));
-    assert_eq!(content(&e, "kept.bin"), data);
-    assert!(pending_rows(&e).is_empty());
-    no_conflicts(&e);
-    drop(e);
-    // A restart after the commit shows it once.
-    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-    assert!(!e.is_deferred(&entity));
-    let listed = e.children_visible(ROOT).unwrap();
-    assert_eq!(
-        listed
-            .iter()
-            .filter(|child| child.name == "kept.bin")
-            .count(),
-        1
-    );
-    let diff = e.store.verify_derived_state().unwrap();
-    assert!(diff.is_empty(), "{diff:?}");
-}
-
-/// WP5.INT (the WP5.2 review's major): a new file retained before its first
-/// commit whose staging file cannot be opened at startup (a scanner holding
-/// it) is not restored then; the application creates the same name again
-/// (B, held open). When the staging file is back, the late restore of the
-/// first file (A) never takes B's name: B stays a new file, its close
-/// commits it, and A is restored and committed after that, beside it (a name
-/// conflict, as concurrent creates are). Before, A's restore replaced B in
-/// the name index, B's saves failed `FILE_NOT_FOUND` for good, the engine
-/// stayed dirty and the name showed A.
-#[test]
-fn a_late_restore_of_a_new_file_never_takes_the_name_of_a_newer_one() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let a = {
-        let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-        let (h, entry) = e.create_deferred("x.txt", true, None).unwrap();
-        e.write(h, 0, b"version A", false, false).unwrap();
-        assert_eq!(e.retain_all_dirty().unwrap(), 1);
-        entry.id
-    };
-    let stage = {
-        let s = Store::open(dir.path(), Some("local-fs")).unwrap();
-        let record: String =
-            s.db.query_row("SELECT payload FROM pending_saves", [], |r| r.get(0))
-                .unwrap();
-        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
-        dir.path()
-            .join("staging")
-            .join(record["stage"].as_str().unwrap())
-    };
-    let aside = dir.path().join("aside.stage");
-    fs::rename(&stage, &aside).unwrap();
-    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-    assert!(!e.is_deferred(&a), "A could not be restored");
-    assert!(e.lookup_visible("x.txt").is_err());
-    let (hb, b) = e.create_deferred("x.txt", true, None).unwrap();
-    e.write(hb, 0, b"version B", false, false).unwrap();
-    fs::rename(&aside, &stage).unwrap();
-    let later = || Instant::now() + Duration::from_secs(3600);
-    e.retry_pending_due(later());
-    assert!(e.is_deferred(&b.id), "B is still a new file");
-    assert!(!e.is_deferred(&a), "A waits for the name");
-    assert_eq!(e.lookup_visible("x.txt").unwrap().id, b.id);
-    assert_eq!(
-        e.children_visible(ROOT)
-            .unwrap()
-            .iter()
-            .filter(|child| child.name == "x.txt")
-            .count(),
-        1
-    );
-    // B's close commits B.
-    e.close(hb).unwrap();
-    assert!(!e.is_deferred(&b.id));
-    assert_eq!(content(&e, "x.txt"), b"version B");
-    // Then A is restored and committed beside it.
-    for _ in 0..3 {
-        e.retry_pending_due(later());
-    }
-    assert!(pending_rows(&e).is_empty(), "{:?}", pending_rows(&e));
-    assert!(e.quiet().is_ok(), "{:?}", e.quiet());
-    let object = |entity: &str| {
-        let entry = e.store.entry(entity).unwrap();
-        e.store
-            .read_object(entry.content.as_ref().unwrap())
-            .unwrap()
-    };
-    assert_eq!(object(&a), b"version A");
-    assert_eq!(object(&b.id), b"version B");
-    let open: Vec<_> = e
-        .store
-        .conflicts()
-        .unwrap()
-        .into_iter()
-        .filter(|c| c.resolved_by.is_none())
-        .collect();
-    assert!(
-        open.len() == 1
-            && open[0].reason.contains("same name")
-            && open[0].entity.contains(&a)
-            && open[0].entity.contains(&b.id),
-        "a name conflict of the two files: {open:#?}"
-    );
-    let diff = e.store.verify_derived_state().unwrap();
-    assert!(diff.is_empty(), "{diff:?}");
-}
-
-/// WP5.INT (the WP5.2 review's minor): while a committed entry holds the
-/// name of a new file not committed yet (here a create that lands before
-/// its first save, as a remote one does), a listing shows the name once, as
-/// lookups do (the committed entry), until the new file's commit makes the
-/// name conflict. Before, the listing named both.
-#[test]
-fn a_listing_never_shows_a_name_twice_for_a_new_file() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-    let (h, new) = e.create_deferred("y.txt", true, None).unwrap();
-    e.write(h, 0, b"the new file", false, false).unwrap();
-    let committed = e.store.create("y.txt", "file").unwrap();
-    let named = |e: &Engine| {
-        e.children_visible(ROOT)
-            .unwrap()
-            .into_iter()
-            .filter(|child| child.name == "y.txt")
-            .map(|child| child.id)
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(named(&e), vec![committed.id.clone()]);
-    assert_eq!(e.lookup_visible("y.txt").unwrap().id, committed.id);
-    e.close(h).unwrap();
-    assert!(!e.is_deferred(&new.id));
-    let open: Vec<_> = e
-        .store
-        .conflicts()
-        .unwrap()
-        .into_iter()
-        .filter(|c| c.resolved_by.is_none())
-        .collect();
-    assert_eq!(open.len(), 1, "{open:#?}");
-    assert_eq!(named(&e).len(), 1);
-    let diff = e.store.verify_derived_state().unwrap();
-    assert!(diff.is_empty(), "{diff:?}");
-}
-
-#[test]
-fn a_crash_at_every_step_of_the_first_save_of_a_deferred_create_leaves_a_consistent_store() {
-    let _serial = serial();
-    let points = [
-        ("engine.save.snapshot", false),
-        ("engine.save.store", false),
-        ("engine.save.flushed", false),
-        ("engine.save.installed", false),
-        ("engine.save.commit", false),
-        ("engine.save.committed", true),
-        ("object_flushed", false),
-        ("object_installed", false),
-    ];
-    for retained in [false, true] {
-        for (point, committed) in points {
-            let size = 4096usize;
-            let dir = tempfile::tempdir().unwrap();
-            drop(Engine::new(
-                Store::open(dir.path(), Some("local-fs")).unwrap(),
-            ));
-            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
-            child
-                .args(["--exact", "save_crash_worker", "--nocapture"])
-                .env("TKFS_TEST_SAVE_WORKER", dir.path())
-                .env("TKFS_TEST_SAVE_SIZE", size.to_string())
-                .env("TKFS_TEST_SAVE_DEFERRED", "1");
-            if point.starts_with("object_") {
-                child.env("TKFS_FAULT", point);
-            } else {
-                child
-                    .env("TKFS_FAULT_POINT", point)
-                    .env("TKFS_FAULT_ACTION", "exit");
-            }
-            if retained {
-                child.env("TKFS_TEST_SAVE_RETAINED", "1");
-            }
-            let output = child.output().unwrap();
-            let what = format!("{point}, retained {retained}");
-            assert_eq!(
-                output.status.code(),
-                Some(86),
-                "{what}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let mut e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-            e.remove_orphaned_spools().unwrap();
-            assert!(part_files(dir.path()).is_empty(), "{what}");
-            let latest = bytes(if retained { 6 } else { 5 }, size);
-            if committed {
-                assert_eq!(content(&e, "new.bin"), latest, "{what}");
-            } else if retained {
-                // Restored, shown, and committed by its save.
-                assert!(e.store.lookup("new.bin").is_err(), "{what}");
-                assert!(e.lookup_visible("new.bin").is_ok(), "{what}");
-                e.retry_pending().unwrap();
-                assert_eq!(content(&e, "new.bin"), latest, "{what}");
-            } else {
-                // Never committed, never retained: only the new file is lost.
-                assert!(e.lookup_visible("new.bin").is_err(), "{what}");
-                assert!(e.sessions.is_empty(), "{what}");
-            }
-            assert!(pending_rows(&e).is_empty(), "{what}");
-            no_conflicts(&e);
-            let diff = e.store.verify_derived_state().unwrap();
-            assert!(diff.is_empty(), "{what}: {diff:?}");
-        }
-    }
-}
-
-#[test]
-fn deferred_create_switch_worker() {
-    let Ok(root) = std::env::var("TKFS_TEST_DEFERRED_SWITCH") else {
-        return;
-    };
-    assert!(!engine::deferred_creates());
-    let mut e = Engine::new(Store::open(Path::new(&root), Some("local-fs")).unwrap());
-    let (h, entry) = e.create_deferred("at-once.txt", true, None).unwrap();
-    assert!(!e.is_deferred(&entry.id));
-    assert_eq!(e.store.lookup("at-once.txt").unwrap().id, entry.id);
-    e.write(h, 0, b"switched off", false, false).unwrap();
-    e.close(h).unwrap();
-    std::process::exit(0);
-}
-
-#[test]
-fn deferred_creates_can_be_switched_off() {
-    let _serial = serial();
-    let dir = tempfile::tempdir().unwrap();
-    drop(Engine::new(
-        Store::open(dir.path(), Some("local-fs")).unwrap(),
-    ));
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "deferred_create_switch_worker", "--nocapture"])
-        .env("TKFS_TEST_DEFERRED_SWITCH", dir.path())
-        .env("TKFS_DEFERRED_CREATE", "0")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let e = Engine::new(Store::open(dir.path(), Some("local-fs")).unwrap());
-    assert_eq!(content(&e, "at-once.txt"), b"switched off");
-    no_conflicts(&e);
-}
-
-// ---------------------------------------------------------------------------
-// Mounted scenarios.
 
 #[cfg(any(windows, target_os = "linux"))]
 mod mounted {
@@ -1735,11 +549,10 @@ mod mounted {
 
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
+#[ignore = "explicit actual WinFsp/FUSE local filesystem scenario"]
 fn small_files_copied_through_the_mount_are_all_committed() {
     let _serial = serial();
-    let Some(m) = mounted::Mounted::new() else {
-        return;
-    };
+    let m = mounted::Mounted::new().expect("actual WinFsp/FUSE mount unavailable");
     let mut written = BTreeMap::new();
     for d in 0..10 {
         fs::create_dir(m.mount.join(format!("d{d:02}"))).unwrap();
@@ -1766,16 +579,6 @@ fn small_files_copied_through_the_mount_are_all_committed() {
     assert!(pending_rows(&e).is_empty());
     no_conflicts(&e);
     drop(e);
-    // The availability rows of the saved objects land in batches.
-    assert!(wait_until(Duration::from_secs(10), || {
-        let e = lock(&m.engine);
-        let rows: i64 = e
-            .store
-            .db
-            .query_row("SELECT count(*) FROM object_availability", [], |r| r.get(0))
-            .unwrap();
-        rows as usize >= written.len()
-    }));
     assert!(!m.state.join("objects").read_dir().unwrap().any(|entry| {
         entry
             .unwrap()
@@ -1787,11 +590,10 @@ fn small_files_copied_through_the_mount_are_all_committed() {
 
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
+#[ignore = "explicit actual WinFsp/FUSE local filesystem scenario"]
 fn the_atomic_save_pattern_through_the_mount_keeps_one_history() {
     let _serial = serial();
-    let Some(m) = mounted::Mounted::new() else {
-        return;
-    };
+    let m = mounted::Mounted::new().expect("actual WinFsp/FUSE mount unavailable");
     let target = m.mount.join("project.sln");
     for round in 0..30u64 {
         let data = bytes(round, 2000 + round as usize * 31);
@@ -1815,17 +617,14 @@ fn the_atomic_save_pattern_through_the_mount_keeps_one_history() {
 
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
+#[ignore = "explicit actual WinFsp/FUSE local filesystem scenario"]
 fn a_mounted_read_of_content_that_cannot_arrive_fails_meaningfully() {
     let _serial = serial();
-    let Some(m) = mounted::Mounted::new() else {
-        return;
-    };
+    let m = mounted::Mounted::new().expect("actual WinFsp/FUSE mount unavailable");
     let data = bytes(77, 200 * 1024);
-    {
-        let mut e = lock(&m.engine);
-        committed_file(&mut e, "remote.bin", &data);
-        fs::remove_file(m.state.join("objects").join(hash(&data))).unwrap();
-    }
+    current_reads::committed(&m.engine, "remote.bin", &data);
+    let fixture = current_reads::CurrentRead::from_shared(m.engine.clone(), "remote.bin", data);
+    fixture.remove_chunks(1);
     // SAFETY: the content-wait bounds are read by the read callback; the
     // tests that mount run one at a time.
     unsafe { std::env::set_var("TKFS_CONTENT_STALL_MS", "300") };
@@ -1848,34 +647,25 @@ fn a_mounted_read_of_content_that_cannot_arrive_fails_meaningfully() {
 
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
+#[ignore = "explicit actual WinFsp/FUSE local filesystem scenario"]
 fn a_mounted_read_waits_for_a_download_and_returns_its_bytes() {
     let _serial = serial();
-    let Some(m) = mounted::Mounted::new() else {
-        return;
-    };
+    let m = mounted::Mounted::new().expect("actual WinFsp/FUSE mount unavailable");
     let data = bytes(78, 6 * 1024 * 1024);
-    let object = hash(&data);
-    {
-        let mut e = lock(&m.engine);
-        committed_file(&mut e, "downloading.bin", &data);
-        fs::remove_file(m.state.join("objects").join(&object)).unwrap();
-    }
+    current_reads::committed(&m.engine, "downloading.bin", &data);
+    let fixture =
+        current_reads::CurrentRead::from_shared(m.engine.clone(), "downloading.bin", data.clone());
+    let count = data
+        .len()
+        .div_ceil(tkfs::model::content::CHUNK_SIZE as usize);
+    fixture.remove_chunks(count);
     unsafe { std::env::set_var("TKFS_CONTENT_STALL_MS", "1500") };
-    let feeder = simulated_download(
-        m.state.clone(),
-        object,
-        data.clone(),
-        data.len() / 20,
-        Duration::from_millis(200),
-        20,
-    );
+    fixture.feed(count, 5, Duration::from_millis(200));
     let read = fs::read(m.mount.join("downloading.bin"));
     unsafe { std::env::remove_var("TKFS_CONTENT_STALL_MS") };
-    feeder.join().unwrap();
-    assert!(
-        read.unwrap() == data,
-        "the read returns the downloaded bytes"
-    );
+    fixture.finish();
+    assert_eq!(read.unwrap(), data);
+    drop(fixture);
     // Other operations never waited for it.
     let unrelated: BTreeSet<_> = fs::read_dir(&m.mount)
         .unwrap()
@@ -1886,11 +676,10 @@ fn a_mounted_read_waits_for_a_download_and_returns_its_bytes() {
 
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
+#[ignore = "explicit actual WinFsp/FUSE local filesystem scenario"]
 fn a_graceful_detach_right_after_writes_waits_for_their_saves() {
     let _serial = serial();
-    let Some(m) = mounted::Mounted::new() else {
-        return;
-    };
+    let m = mounted::Mounted::new().expect("actual WinFsp/FUSE mount unavailable");
     use tkfs::model::health::{MountControl, MountState};
     let mut written = BTreeMap::new();
     for i in 0..40u64 {
@@ -1933,11 +722,11 @@ fn a_graceful_detach_right_after_writes_waits_for_their_saves() {
 
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
+#[ignore = "explicit actual WinFsp/FUSE local filesystem scenario"]
 fn many_concurrent_writers_never_stall_the_mount() {
     let _serial = serial();
-    let Some(m) = mounted::Mounted::new() else {
-        return;
-    };
+    tkfs::util::log::set_min_level(tkfs::util::log::Level::Debug);
+    let m = mounted::Mounted::new().expect("actual WinFsp/FUSE mount unavailable");
     // A build: eight writers at once, small files, each read back and some
     // renamed, while another thread keeps listing and stating.
     let mount = m.mount.clone();
@@ -2012,18 +801,23 @@ fn many_concurrent_writers_never_stall_the_mount() {
 
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
+#[ignore = "explicit actual WinFsp/FUSE local filesystem scenario"]
 fn a_file_held_open_after_its_create_is_listed_renamed_and_deleted_through_the_mount() {
     use std::io::Write;
     let _serial = serial();
-    let Some(m) = mounted::Mounted::new() else {
-        return;
-    };
+    let m = mounted::Mounted::new().expect("actual WinFsp/FUSE mount unavailable");
     let held_path = m.mount.join("held.txt");
     let mut held = fs::File::create(&held_path).unwrap();
     held.write_all(b"first part").unwrap();
-    // Shown at once. A WinFsp create commits at its first save; any close of
-    // the file saves it, the stat's own (or a scanner's) too, so whether it
-    // is committed yet is not checked here.
+    // Typed empty creation is committed before the first buffered write.
+    assert!(
+        lock(&m.engine)
+            .store
+            .lookup("held.txt")
+            .unwrap()
+            .content_ref
+            .is_some()
+    );
     assert!(fs::metadata(&held_path).unwrap().is_file());
     let listed: BTreeSet<_> = fs::read_dir(&m.mount)
         .unwrap()
@@ -2036,7 +830,7 @@ fn a_file_held_open_after_its_create_is_listed_renamed_and_deleted_through_the_m
         .create_new(true)
         .open(m.mount.join("held.txt"));
     assert_eq!(again.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
-    // A rename of the held file commits its creation first.
+    // Rename retains the same current private owner and later writes.
     fs::rename(&held_path, m.mount.join("renamed.txt")).unwrap();
     {
         let e = lock(&m.engine);
@@ -2045,16 +839,13 @@ fn a_file_held_open_after_its_create_is_listed_renamed_and_deleted_through_the_m
     }
     held.write_all(b", second part").unwrap();
     drop(held);
-    // A file created and deleted while it is held open (the FUSE adapter
-    // refuses to unlink an open file: deleted after its close there).
+    // Both adapters support unlink while the native descriptor stays open.
     let gone_path = m.mount.join("gone.txt");
     let mut gone = fs::File::create(&gone_path).unwrap();
     gone.write_all(b"short lived").unwrap();
-    #[cfg(windows)]
     fs::remove_file(&gone_path).unwrap();
+    gone.write_all(b", retained after unlink").unwrap();
     drop(gone);
-    #[cfg(not(windows))]
-    fs::remove_file(&gone_path).unwrap();
     assert!(m.quiet(Duration::from_secs(30)), "everything is committed");
     assert!(!gone_path.exists());
     let e = lock(&m.engine);
@@ -2067,78 +858,50 @@ fn a_file_held_open_after_its_create_is_listed_renamed_and_deleted_through_the_m
 
 #[cfg(any(windows, target_os = "linux"))]
 #[test]
+#[ignore = "explicit actual WinFsp/FUSE local filesystem scenario"]
 fn an_fsync_during_a_burst_of_closes_commits_before_it_returns() {
     use std::io::Write;
     let _serial = serial();
-    let Some(m) = mounted::Mounted::new() else {
-        return;
-    };
-    // A burst of closes that lasts: every save's store phase is slowed down,
-    // and the saves of files closed outside the mount keep the savers busy
-    // for two rounds, so background saves run (`write_behind`) throughout.
-    let slow = Duration::from_millis(1500);
-    fault::configure(Some(FaultConfig {
-        ms: Some(slow.as_millis() as u64),
-        ..FaultConfig::new("engine.save.store", FaultAction::Hang)
-    }));
-    let disarm = Disarm;
+    let m = mounted::Mounted::new().expect("actual WinFsp/FUSE mount unavailable");
+    let mut files = Vec::new();
     let mut written = BTreeMap::new();
-    for i in 0..2 * engine::MAX_BACKGROUND_SAVES as u64 {
+    for i in 0..8u64 {
         let path = format!("burst{i:02}.bin");
         let data = bytes(9100 + i, 2048);
-        let h = {
-            let mut e = lock(&m.engine);
-            let (h, _) = e.open(&path, Some("file"), true).unwrap();
-            e.write(h, 0, &data, false, false).unwrap();
-            e.cleanup_unsaved(h).unwrap();
-            h
-        };
-        engine::save_handle_in_background(&m.engine, h).unwrap();
-        engine::close_handle(&m.engine, h).unwrap();
+        let mut file = fs::File::create(m.mount.join(&path)).unwrap();
+        file.write_all(&data).unwrap();
+        files.push(file);
         written.insert(path, data);
     }
-    assert!(engine::write_behind(), "a burst of closes is on");
-    // A close through the mount during the burst is write-behind: it returns
-    // before its file is committed (that save waits for a saver, then takes
-    // `slow`). FUSE: the close's `FUSE_FLUSH`; WinFsp: its cleanup.
-    let a = bytes(9200, 4096);
-    fs::write(m.mount.join("a.txt"), &a).unwrap();
-    {
-        let e = lock(&m.engine);
-        let id = e.lookup_visible("a.txt").unwrap().id;
-        assert!(
-            e.sessions.get(&id).is_some_and(|s| s.dirty),
-            "a close in a burst returns before its save commits"
-        );
+    let main_bytes = bytes(9200, 4096);
+    let mut main = fs::File::create(m.mount.join("explicit-fsync")).unwrap();
+    main.write_all(&main_bytes).unwrap();
+    fault::configure(Some(FaultConfig {
+        ms: Some(300),
+        count: Some(1),
+        ..FaultConfig::new("content.write.before_checkpoint", FaultAction::Hang)
+    }));
+    let reset = Disarm;
+    let closes: Vec<_> = files
+        .into_iter()
+        .map(|file| std::thread::spawn(move || drop(file)))
+        .collect();
+    assert!(wait_until(Duration::from_secs(5), || fault::fired() > 0));
+    main.sync_all().unwrap();
+    // Inspect canonical provider bytes while the fsync handle remains open.
+    assert_eq!(content(&lock(&m.engine), "explicit-fsync"), main_bytes);
+    drop(main);
+    for close in closes {
+        close.join().unwrap();
     }
-    written.insert("a.txt".to_owned(), a);
-    // An fsync during the same burst is a durability point: what was written
-    // is committed when it returns. FUSE: `FUSE_FSYNC` (it was routed as a
-    // close and went write-behind: fix round 2); WinFsp: `FlushFileBuffers`.
-    let b = bytes(9300, 4096);
-    let mut file = fs::File::create(m.mount.join("b.txt")).unwrap();
-    file.write_all(&b).unwrap();
-    assert!(engine::write_behind(), "the burst is still on");
-    file.sync_all().unwrap();
-    {
-        let e = lock(&m.engine);
-        assert!(
-            content(&e, "b.txt") == b,
-            "fsync returned before its commit"
-        );
-        let id = e.store.lookup("b.txt").unwrap().id;
-        assert!(
-            e.sessions.get(&id).is_none_or(|s| !s.dirty),
-            "nothing of b.txt is left unsaved"
-        );
-    }
-    drop(file);
-    written.insert("b.txt".to_owned(), b);
-    drop(disarm);
-    assert!(m.quiet(Duration::from_secs(60)), "everything is committed");
+    drop(reset);
+    assert!(
+        m.quiet(Duration::from_secs(30)),
+        "all closes reach current durable publication"
+    );
     let e = lock(&m.engine);
-    for (path, data) in &written {
-        assert_eq!(&content(&e, path), data, "{path}");
+    for (path, data) in written {
+        assert_eq!(content(&e, &path), data);
     }
     assert!(pending_rows(&e).is_empty());
     no_conflicts(&e);

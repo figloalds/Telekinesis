@@ -264,7 +264,6 @@ impl WriteJournal {
             seal,
             provider,
             base,
-            converted: Mutex::new(None),
             _lease: lease,
         };
         reader.check(context)?;
@@ -301,7 +300,6 @@ pub struct RetainedRead {
     seal: Digest,
     provider: Arc<dyn ContentProvider>,
     base: PinnedContent,
-    converted: Mutex<Option<PinnedContent>>,
     _lease: ReadLease,
 }
 impl RetainedRead {
@@ -322,15 +320,6 @@ impl RetainedRead {
     }
     /// Output must be discarded on error, as with live session reads.
     pub fn read_range(&self, offset: u64, out: &mut [u8], context: &ReadContext) -> Result<()> {
-        self.read_using(offset, out, None, context)
-    }
-    fn read_using(
-        &self,
-        offset: u64,
-        out: &mut [u8],
-        override_base: Option<(&dyn ContentProvider, &PinnedContent)>,
-        context: &ReadContext,
-    ) -> Result<()> {
         ensure!(out.len() <= limits::READ_BYTES, "CONTENT_BUFFER_LIMIT");
         let end = offset
             .checked_add(out.len() as u64)
@@ -362,10 +351,9 @@ impl RetainedRead {
                 })
                 .transpose()?
             };
-            let (provider, pin) = override_base.unwrap_or((&*self.provider, &self.base));
             read_overlay_chunk(
-                provider,
-                pin,
+                &*self.provider,
+                &self.base,
                 self.checkpoint.base_visible_len,
                 from,
                 &mut out[(from - offset) as usize..(until - offset) as usize],
@@ -376,63 +364,7 @@ impl RetainedRead {
         }
         self.check(context)
     }
-    fn needs_legacy_base(&self, context: &ReadContext) -> Result<bool> {
-        let mut offset = 0;
-        while offset < self.checkpoint.base_visible_len {
-            self.check(context)?;
-            let db = self.journal.lock(context)?;
-            let c = chunk_meta(
-                &db,
-                self.checkpoint.roots.patches,
-                self.checkpoint.intent.operation,
-                offset / CHUNK_SIZE,
-                self.checkpoint.roots.floor,
-                context,
-            )?;
-            let Some(c) = c else {
-                return Ok(true);
-            };
-            let count = (self.checkpoint.base_visible_len - offset).min(CHUNK_SIZE) as usize;
-            if c.valid < count {
-                return Ok(true);
-            }
-            let bytes = payload(&db, &c)?;
-            if (0..count).any(|i| bytes[CHUNK_SIZE as usize + i / 8] & (1 << (i % 8)) == 0) {
-                return Ok(true);
-            }
-            offset += count as u64;
-        }
-        Ok(false)
-    }
-    fn converted_base(
-        &self,
-        target: &LocalContent,
-        context: &ReadContext,
-    ) -> Result<PinnedContent> {
-        loop {
-            self.check(context)?;
-            match self.converted.try_lock() {
-                Ok(mut cache) => {
-                    if let Some(pin) = cache.as_ref().filter(|p| p.provider() == target.identity())
-                    {
-                        return Ok(pin.clone());
-                    }
-                    let pin = target.convert_legacy(
-                        &self.checkpoint.intent.base.content,
-                        context,
-                        &|| self.check(context),
-                    )?;
-                    *cache = Some(pin.clone());
-                    return Ok(pin);
-                }
-                Err(TryLockError::Poisoned(_)) => anyhow::bail!("WRITE_CONVERSION_POISONED"),
-                Err(TryLockError::WouldBlock) => {
-                    context.cancel.sleep(Duration::from_millis(5));
-                }
-            }
-        }
-    }
-    /// Reconstruct/pin canonical Saved bytes, with normal COW/legacy rules.
+    /// Reconstruct/pin canonical Saved bytes with the current COW rules.
     /// Returns content only; no active owner or metadata publication authority.
     pub fn restore_native(
         &self,
@@ -440,24 +372,13 @@ impl RetainedRead {
         context: &ReadContext,
     ) -> Result<PinnedContent> {
         self.check(context)?;
-        let legacy = self.checkpoint.intent.base.content.kind == ContentKind::Legacy;
-        let converted = if legacy && self.needs_legacy_base(context)? {
-            Some(self.converted_base(target, context)?)
-        } else {
-            None
-        };
-        let base = if legacy {
-            converted.as_ref().map(PinnedContent::reference)
-        } else {
-            Some(&self.checkpoint.intent.base.content)
-        };
-        let mut source = RetainedEdit {
-            reader: self,
-            converted: converted
-                .as_ref()
-                .map(|pin| (target as &dyn ContentProvider, pin)),
-        };
-        let content = target.rebuild(base, self.checkpoint.length, &mut source, context)?;
+        let mut source = RetainedEdit { reader: self };
+        let content = target.rebuild(
+            Some(&self.checkpoint.intent.base.content),
+            self.checkpoint.length,
+            &mut source,
+            context,
+        )?;
         self.check(context)?;
         let pin = target.pin(&content)?;
         self.check(context)?;
@@ -466,7 +387,6 @@ impl RetainedRead {
 }
 struct RetainedEdit<'a> {
     reader: &'a RetainedRead,
-    converted: Option<(&'a dyn ContentProvider, &'a PinnedContent)>,
 }
 impl EditSource for RetainedEdit<'_> {
     fn check(&self, context: &ReadContext) -> Result<()> {
@@ -497,7 +417,7 @@ impl EditSource for RetainedEdit<'_> {
         })
     }
     fn read(&mut self, offset: u64, out: &mut [u8], context: &ReadContext) -> Result<()> {
-        self.reader.read_using(offset, out, self.converted, context)
+        self.reader.read_range(offset, out, context)
     }
 }
 
@@ -513,7 +433,7 @@ mod tests {
         }
     }
     #[test]
-    fn retained_legacy_restoration_caches_conversion_and_full_replacement_needs_no_base() {
+    fn retained_chunked_restoration_reuses_missing_chunks_and_full_replacement_needs_no_base() {
         for full in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let native = Arc::new(LocalContent::open(dir.path()).unwrap());
@@ -521,12 +441,18 @@ mod tests {
             let original: Vec<u8> = (0..3 * CHUNK_SIZE)
                 .map(|i| ((i * 13 + 9) % 251) as u8)
                 .collect();
-            let digest = Digest::bytes(&original);
-            let legacy =
-                FileContentRef::new(ContentKind::Legacy, digest, original.len() as u64).unwrap();
-            let path = dir.path().join("objects").join(digest.to_string());
-            if !full {
-                std::fs::write(&path, &original).unwrap();
+            let base = native
+                .import(&mut original.as_slice(), original.len() as u64, &context())
+                .unwrap();
+            if full {
+                for folder in ["objects", "manifests-v1"] {
+                    for entry in std::fs::read_dir(dir.path().join(folder)).unwrap() {
+                        std::fs::remove_file(entry.unwrap().path()).unwrap();
+                    }
+                }
+            } else {
+                let missing = Digest::bytes(&original[..CHUNK_SIZE as usize]);
+                std::fs::remove_file(dir.path().join("objects").join(missing.to_string())).unwrap();
             }
             let intent = SaveIntent {
                 operation: Uuid::new_v4(),
@@ -540,7 +466,7 @@ mod tests {
                     },
                     entity: "file".into(),
                     generation: 1,
-                    content: legacy,
+                    content: base,
                 },
             };
             let session = journal.create(intent, native.clone(), &context()).unwrap();
@@ -554,7 +480,7 @@ mod tests {
             }
             session.checkpoint(&context()).unwrap();
             let archive = Uuid::new_v4();
-            // Trusted archive fixture exercises legacy recovery independently
+            // Trusted archive fixture exercises current recovery independently
             // of metadata's continuation/capture protocol.
             {
                 let mut db = journal.lock(&context()).unwrap();
@@ -569,12 +495,19 @@ mod tests {
                 .open_retained_checkpoint(archive, native.clone(), &context())
                 .unwrap();
             let restored = reader.restore_native(&native, &context()).unwrap();
-            let oracle = native
+            let oracle_dir = tempfile::tempdir().unwrap();
+            let oracle = LocalContent::open(oracle_dir.path())
+                .unwrap()
                 .import(&mut expected.as_slice(), expected.len() as u64, &context())
                 .unwrap();
             assert_eq!(restored.reference(), &oracle);
+            let mut changed = [0; 4];
+            native
+                .read_range(&restored, 70000, &mut changed, &context())
+                .unwrap();
+            assert_eq!(changed, expected[70000..70004]);
             if !full {
-                std::fs::remove_file(&path).unwrap();
+                assert!(reader.read_range(0, &mut [0], &context()).is_err());
             }
             let again = reader.restore_native(&native, &context()).unwrap();
             assert_eq!(again.reference(), restored.reference());

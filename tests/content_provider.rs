@@ -38,8 +38,8 @@ fn file_bytes(size: usize) -> Vec<u8> {
 }
 
 #[test]
-fn direct_boundary_manifest_and_legacy_ranges() {
-    let (temp, store) = setup();
+fn direct_boundary_and_manifest_ranges() {
+    let (_temp, store) = setup();
     for size in [0, 1, 65_536, 65_537, 195_001] {
         let data = file_bytes(size);
         let reference = store
@@ -68,38 +68,6 @@ fn direct_boundary_manifest_and_legacy_ranges() {
                 .is_err()
         );
     }
-    let data = file_bytes(270_000);
-    let digest = Digest::bytes(&data);
-    fs::write(temp.path().join("objects").join(digest.to_string()), &data).unwrap();
-    let legacy = FileContentRef::new(ContentKind::Legacy, digest, data.len() as u64).unwrap();
-    let pin = store.pin(&legacy).unwrap();
-    let mut out = [0; 101];
-    store
-        .read_range(&pin, 190_012, &mut out, &context())
-        .unwrap();
-    assert_eq!(out, data[190_012..190_113]);
-    // Even corruption outside the requested range must invalidate a legacy
-    // whole-file identity. Chunked content has independent verification.
-    let mut corrupt = data;
-    corrupt[0] ^= 1;
-    fs::write(
-        temp.path().join("objects").join(digest.to_string()),
-        corrupt,
-    )
-    .unwrap();
-    assert_eq!(
-        store
-            .availability(
-                &pin,
-                ByteRange {
-                    offset: 190_012,
-                    len: 101
-                },
-                &context()
-            )
-            .unwrap(),
-        Availability::Corrupt
-    );
 }
 
 #[test]

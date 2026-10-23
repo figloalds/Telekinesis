@@ -4,15 +4,10 @@
 //! inputs (and `seed`). Event and entity ids are random UUIDs by design, so
 //! callers compare operation logs, names and content hashes, never ids.
 //!
-//! Speed: bulk fixtures wrap their commits in one outer SAVEPOINT (one durable
-//! commit) and `small_objects` writes CAS files without per-file fsync. At 6298d0b
-//! every local create costs O(history) (the startup snapshot is re-sealed every
-//! 128 events), so N creates cost O(N^2): 24K creates take about 60 s and 150K
-//! would take about 40 min. Above `DIRECT_ROWS`, `direct_creates` records the
-//! creates exactly as the incremental local-create path records them (same rows,
-//! same JSON) and the final create goes through `Store::create`, which seals a
-//! valid snapshot. `tests/harness_selftest.rs` checks the result against a full
-//! re-projection. None of these shortcuts changes a stored format.
+//! Bulk metadata uses the public current commit path inside one outer
+//! SAVEPOINT. It does not synthesize projection rows, legacy object catalogs or
+//! root-admission effects. Small direct-data fixture bytes are installed outside
+//! that transaction; normal immutable readers still verify them.
 use anyhow::{Context, Result, ensure};
 use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
 use serde_json::{Value, json};
@@ -23,7 +18,8 @@ use std::{
     path::Path,
 };
 use tkfs::{
-    core::{Bundle, Change, Entry, Event, ROOT, Store, Version, hash, id, register, time},
+    core::{Bundle, Change, Event, ROOT, Store, hash, id, time},
+    model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef},
     runtime::Engine,
 };
 
@@ -177,7 +173,7 @@ pub fn linear_history(store: &mut Store, n: usize) -> Result<Vec<String>> {
 pub fn linear_history_named(store: &mut Store, prefix: &str, n: usize) -> Result<Vec<String>> {
     let before = store.shared_event_inventory()?;
     if n > DIRECT_ROWS {
-        let empty = store.put_object(b"")?;
+        let empty = hash(b"");
         let files: Vec<NewFile> = (0..n - 1)
             .map(|i| NewFile {
                 parent: ROOT.into(),
@@ -205,24 +201,44 @@ pub struct NewFile {
     /// Parent directory entity id (`ROOT` for the root).
     pub parent: String,
     pub name: String,
-    /// Content object hash (the CAS file should exist for a local author).
+    /// Digest of one direct data blob (not a whole-file/manifest conversion).
     pub content: String,
     pub size: u64,
 }
 
-/// Record `files` as consecutive local single-file creates on the active branch,
-/// one event each, with exactly the rows `Store::create` → `commit` writes on the
-/// incremental creation fast path (`events` + its `journal_sequence` trigger,
-/// `outbox`, `object_references`, `object_sizes`, `published_objects`,
-/// `current_parts` entry/heads, `event_frontier`), but without re-sealing the
-/// startup snapshot every 128 events. Callers finish with one real local commit,
-/// which seals it (a store reopened before that rebuilds instead). Names must be
-/// free and parents live directories. Returns the event ids in order.
+/// Commit one current descriptor-valued creation per file through the public
+/// metadata path. The Core owns projection/seals, root handoff and save-owner
+/// generations. No byte work occurs inside the batch; descriptors name direct
+/// fixture data already installed by the caller (empty content needs no blob).
 pub fn direct_creates(store: &mut Store, files: &[NewFile]) -> Result<Vec<String>> {
     let branch = store.branch(&store.active.clone())?;
     let device = store.device.clone();
     let repo = store.repo.clone();
-    let objects = store.root.join("objects");
+    let projection = store.projection(&store.active)?;
+    let mut parent_paths = BTreeMap::new();
+    for parent in files
+        .iter()
+        .map(|file| &file.parent)
+        .collect::<BTreeSet<_>>()
+    {
+        let mut current = parent.as_str();
+        let mut parts = vec![];
+        let mut seen = BTreeSet::new();
+        while current != ROOT {
+            ensure!(seen.insert(current), "INVALID_PARENT");
+            let entry = projection.entries.get(current).context("INVALID_PARENT")?;
+            parts.push(entry.name.as_str());
+            current = &entry.parent;
+        }
+        parts.reverse();
+        let path = parts.join("/");
+        let directory = store.lookup(&path)?;
+        ensure!(
+            directory.id == *parent && directory.kind == "directory",
+            "INVALID_PARENT"
+        );
+        parent_paths.insert(parent.clone(), path);
+    }
     let mut previous: Vec<String> = store
         .db
         .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")?
@@ -230,104 +246,43 @@ pub fn direct_creates(store: &mut Store, files: &[NewFile]) -> Result<Vec<String
         .collect::<rusqlite::Result<_>>()?;
     let start_ms = time();
     batched(store, |s| {
-        let db = &s.db;
-        db.execute(
-            "INSERT OR IGNORE INTO branches VALUES(?,?,?)",
-            rusqlite::params![branch.id, branch.name, branch.shared],
-        )?;
         let mut ids = Vec::with_capacity(files.len());
         for (i, file) in files.iter().enumerate() {
+            let parent = &parent_paths[&file.parent];
+            let path = if parent.is_empty() {
+                file.name.clone()
+            } else {
+                format!("{parent}/{}", file.name)
+            };
+            ensure!(s.lookup(&path).is_err(), "NAME_COLLISION");
+            let reference = FileContentRef::new(
+                ContentKind::Direct,
+                Digest::parse(&file.content)?,
+                file.size,
+            )?;
             let entity = id();
             let event_id = id();
-            let created_ms = start_ms + i as u64;
-            let changes = vec![
-                change(&entity, "kind", json!("file")),
-                change(
-                    &entity,
-                    "location",
-                    json!({"parent": file.parent, "name": file.name}),
-                ),
-                change(&entity, "alive", json!(true)),
-                change(&entity, "content", json!(file.content)),
-            ];
             let event = Event {
-                object_sizes: BTreeMap::from([(file.content.clone(), file.size)]),
+                object_sizes: BTreeMap::new(),
                 id: event_id.clone(),
                 repo: repo.clone(),
                 branch: branch.clone(),
                 device: device.clone(),
-                created_ms,
-                changes: changes.clone(),
+                created_ms: start_ms + i as u64,
+                changes: vec![
+                    change(&entity, "kind", json!("file")),
+                    change(
+                        &entity,
+                        "location",
+                        json!({"parent":file.parent,"name":file.name}),
+                    ),
+                    change(&entity, "alive", json!(true)),
+                    change(&entity, "content", json!(reference)),
+                ],
                 dependencies: previous.clone(),
                 reviewed: vec![],
             };
-            db.execute(
-                "INSERT OR IGNORE INTO object_references VALUES(?)",
-                [&file.content],
-            )?;
-            db.execute(
-                "INSERT OR IGNORE INTO object_sizes VALUES(?,?)",
-                rusqlite::params![file.content, file.size],
-            )?;
-            if branch.shared && objects.join(&file.content).is_file() {
-                db.execute(
-                    "INSERT OR IGNORE INTO published_objects VALUES(?)",
-                    [&file.content],
-                )?;
-            }
-            db.execute(
-                "INSERT INTO events VALUES(?,?,?)",
-                rusqlite::params![event_id, branch.id, serde_json::to_string(&event)?],
-            )?;
-            if branch.shared {
-                db.execute("INSERT INTO outbox(event) VALUES(?)", [&event_id])?;
-            }
-            let mut entry = Entry {
-                id: entity.clone(),
-                kind: "file".into(),
-                parent: file.parent.clone(),
-                name: file.name.clone(),
-                alive: true,
-                created_ms,
-                modified_ms: created_ms,
-                ..Default::default()
-            };
-            let mut heads: BTreeMap<String, Vec<Version>> = BTreeMap::new();
-            for c in &changes {
-                entry.revisions.insert(c.field.clone(), event_id.clone());
-                if c.field == "content" {
-                    entry.content = c.value.as_str().map(str::to_owned);
-                }
-                heads.insert(
-                    register(&entity, &c.field),
-                    vec![Version {
-                        revision: event_id.clone(),
-                        device: device.clone(),
-                        created_ms,
-                        parents: vec![],
-                        value: c.value.clone(),
-                    }],
-                );
-            }
-            db.execute(
-                "INSERT INTO current_parts VALUES(?,?,?,?) ON CONFLICT(branch,entity) DO UPDATE SET entry=excluded.entry,heads=excluded.heads",
-                rusqlite::params![
-                    branch.id,
-                    entity,
-                    serde_json::to_string(&entry)?,
-                    serde_json::to_string(&heads)?
-                ],
-            )?;
-            for parent in &previous {
-                db.execute(
-                    "DELETE FROM event_frontier WHERE branch=? AND event=?",
-                    rusqlite::params![branch.id, parent],
-                )?;
-            }
-            db.execute(
-                "INSERT INTO event_frontier VALUES(?,?)",
-                rusqlite::params![branch.id, event_id],
-            )?;
+            s.commit(event, true)?;
             previous = vec![event_id.clone()];
             ids.push(event_id);
         }
@@ -680,9 +635,9 @@ pub fn small_objects(engine: &mut Engine, count: usize, size: usize) -> Result<V
     small_objects_in(&mut engine.store, "objects", count, size, 0)
 }
 
-/// `small_objects` on a store, under directory `dir`, with a seed offset: one
-/// create event per file (`direct_creates` above `DIRECT_ROWS`); CAS files are
-/// written without fsync.
+/// `small_objects` on a store: direct blobs installed outside the metadata
+/// batch, then current descriptor-valued creates through public Core commits.
+/// Fixture-only byte installation skips per-file fsync.
 pub fn small_objects_in(
     store: &mut Store,
     dir: &str,
@@ -690,6 +645,10 @@ pub fn small_objects_in(
     size: usize,
     seed: u64,
 ) -> Result<Vec<String>> {
+    ensure!(
+        size as u64 <= CHUNK_SIZE,
+        "small_objects requires direct data; use the streamed large fixture for manifests"
+    );
     if store.lookup(dir).is_err() {
         store.create(dir, "directory")?;
     }
@@ -714,25 +673,15 @@ pub fn small_objects_in(
         contents.push(bytes);
     }
     let name = |i: usize| format!("obj-{i:06}.bin");
-    if count > DIRECT_ROWS {
-        let files: Vec<NewFile> = (0..count - 1)
-            .map(|i| NewFile {
-                parent: parent.clone(),
-                name: name(i),
-                content: hashes[i].clone(),
-                size: size as u64,
-            })
-            .collect();
-        direct_creates(store, &files)?;
-    } else if count > 1 {
-        batched(store, |s| {
-            for (i, bytes) in contents.iter().enumerate().take(count - 1) {
-                let e = s.create(&format!("{dir}/{}", name(i)), "file")?;
-                s.write_revision(&e.id, e.revisions.get("content").cloned(), bytes)?;
-            }
-            Ok(())
-        })?;
-    }
+    let files: Vec<NewFile> = (0..count.saturating_sub(1))
+        .map(|i| NewFile {
+            parent: parent.clone(),
+            name: name(i),
+            content: hashes[i].clone(),
+            size: size as u64,
+        })
+        .collect();
+    direct_creates(store, &files)?;
     if count > 0 {
         // The last file goes through the real commit path (and seals the snapshot).
         let last = count - 1;
@@ -768,11 +717,13 @@ pub fn large_object_in(store: &mut Store, path: &str, bytes: u64, seed: u64) -> 
         entry.revisions.get("content").cloned(),
         entry.revisions.get("alive").cloned(),
         &mut source,
+        bytes,
         0,
     )?;
     store
         .lookup(path)?
-        .content
+        .content_ref
+        .map(|content| content.digest.to_string())
         .context("LARGE_OBJECT_CONTENT_MISSING")
 }
 
@@ -1054,7 +1005,7 @@ pub fn large_event(store: &mut Store, dir: &str, files: usize, name_len: usize) 
         store.create(dir, "directory")?;
     }
     let parent = store.lookup(dir)?.id;
-    let empty = store.put_object(b"")?;
+    let empty = hash(b"");
     let mut changes = vec![];
     for i in 0..files {
         let entity = id();

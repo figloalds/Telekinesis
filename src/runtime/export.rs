@@ -1,17 +1,38 @@
 //! Export of authorized shared data to an explicit local test bucket.
-use super::{Discovery, Shared};
-use crate::core::*;
+use super::{Discovery, ctx::WorkerCtx};
+use crate::content::ReadContext;
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::Path};
+use serde_json::Value;
+use std::{
+    path::Path,
+    sync::atomic::Ordering,
+    time::{Duration, Instant},
+};
 
-pub(super) fn export_bucket(engine: &Shared, payload: &Value) -> Result<Value> {
-    use crate::backend::{DirectoryBackend, ObjectBackend};
+static EXPORTS: super::content::WaitSlots = super::content::WaitSlots::new(2);
+
+pub(super) fn export_bucket(
+    worker: &WorkerCtx,
+    payload: &Value,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Value> {
+    use crate::backend::DirectoryBackend;
+    let _slot = EXPORTS.take().context("CONTENT_RESOURCE_LIMIT")?;
+    let context = ReadContext {
+        deadline: deadline.min(Instant::now() + Duration::from_secs(240)),
+        cancel: crate::util::lock::lock(&worker.inflight_objects)
+            .legacy_cancel
+            .child(),
+    };
+    let interrupted = || cancelled() || worker.stopping.load(Ordering::Acquire);
+    ensure!(!interrupted(), "CONTENT_CANCELLED");
+    context.check()?;
     let requested = std::path::absolute(Path::new(
         payload["directory"].as_str().context("MISSING_DIRECTORY")?,
     ))?;
     let (state, mount) = {
-        let e = super::lock_engine(engine);
+        let e = super::lock_engine(&worker.engine);
         let info: Discovery = serde_json::from_slice(&e.discovery)?;
         (e.store.root.clone(), info.mount)
     };
@@ -68,40 +89,8 @@ pub(super) fn export_bucket(engine: &Shared, payload: &Value) -> Result<Value> {
         );
     }
     let backend = DirectoryBackend::new(&destination)?;
-    // Capture only authorized immutable data under the lock; backend I/O outside.
-    let (repo, branches, events, objects) = {
-        let e = super::lock_engine(engine);
-        let events: Vec<_> = e
-            .store
-            .events()?
-            .into_iter()
-            .filter(|e| e.branch.shared)
-            .collect();
-        let objects: BTreeSet<_> = events.iter().flat_map(Event::objects).collect();
-        (
-            e.store.repo.clone(),
-            e.store
-                .branches()?
-                .into_iter()
-                .filter(|b| b.shared)
-                .collect::<Vec<_>>(),
-            events,
-            objects,
-        )
-    };
-    for object in &objects {
-        let mut file = {
-            let e = super::lock_engine(engine);
-            e.store.open_object(object)?
-        };
-        ensure!(
-            backend.put_stream(&mut file)? == *object,
-            "BACKEND_HASH_MISMATCH"
-        );
-    }
-    let manifest = json!({"format":"tkfs-shared-export-1","repo":repo,"branches":branches,"events":events,"objects":objects});
-    let hash = backend.put_verified(&serde_json::to_vec(&manifest)?)?;
-    Ok(
-        json!({"backend":"local-directory-test-bucket","manifest":hash,"objects":objects.len(),"remote_validated":false}),
-    )
+    let store = worker.sync_stores.checkout_nowait()?;
+    let export = store.prepare_shared_export(&context, &interrupted)?;
+    drop(store);
+    export.write(&backend, &context, &interrupted)
 }

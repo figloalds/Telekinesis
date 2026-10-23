@@ -259,6 +259,41 @@ fn demand(waiter: Uuid) -> Demand {
 }
 
 #[test]
+fn repository_activity_counts_live_waiters_and_both_transfer_kinds() {
+    let scheduler = Arc::new(ContentScheduler::default());
+    let context = ReadContext {
+        deadline: Instant::now() + Duration::from_secs(5),
+        cancel: Cancel::new(),
+    };
+    let request = demand(Uuid::new_v4());
+    let id = request.waiter;
+    let waiter = scheduler.demand(request, &context).unwrap();
+    let joined = scheduler
+        .try_acquire(key(700), "repo", "peer", DemandPriority::Foreground, 3)
+        .unwrap()
+        .unwrap();
+    let stream = scheduler
+        .try_reserve_stream("repo", "peer", DemandPriority::Background, 1)
+        .unwrap()
+        .unwrap();
+    let other = scheduler
+        .try_reserve_stream("other", "peer", DemandPriority::Background, 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(scheduler.repository_activity("repo"), (2, 1));
+    assert_eq!(scheduler.repository_activity("other"), (1, 0));
+    scheduler.satisfied(id);
+    assert_eq!(scheduler.repository_activity("repo"), (2, 0));
+    drop((joined, stream, waiter));
+    assert_eq!(scheduler.repository_activity("repo"), (0, 0));
+    drop(other);
+    let pending = scheduler.demand(demand(Uuid::new_v4()), &context).unwrap();
+    context.cancel.cancel();
+    assert_eq!(scheduler.repository_activity("repo"), (0, 0));
+    drop(pending);
+}
+
+#[test]
 fn cancellation_and_stale_waiter_drop_do_not_cancel_other_readers() {
     let scheduler = Arc::new(ContentScheduler::default());
     let one = ReadContext {

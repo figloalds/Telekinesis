@@ -1,12 +1,44 @@
 use serde_json::json;
 use std::{collections::BTreeSet, path::Path};
+use tkfs::{
+    content::{ContentProvider, LocalContent, ReadContext},
+    model::{
+        content::{ContentKind, Digest, FileContentRef},
+        workspace::ByteRange,
+    },
+    util::Cancel,
+};
 use tkfs::{core::*, runtime::Engine};
+fn context() -> ReadContext {
+    ReadContext {
+        deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+        cancel: Cancel::new(),
+    }
+}
+fn direct(bytes: &[u8]) -> FileContentRef {
+    FileContentRef::new(
+        ContentKind::Direct,
+        Digest::bytes(bytes),
+        bytes.len() as u64,
+    )
+    .unwrap()
+}
+fn read_current(store: &Store, path: &str) -> Vec<u8> {
+    let entry = store.lookup(path).unwrap();
+    assert!(entry.content.is_none());
+    let reference = entry.content_ref.unwrap();
+    let local = LocalContent::open(&store.root).unwrap();
+    let pin = local.pin(&reference).unwrap();
+    let mut bytes = vec![0; reference.total_len as usize];
+    local.read_range(&pin, 0, &mut bytes, &context()).unwrap();
+    bytes
+}
 
 fn store(path: &Path) -> Store {
     Store::open(path, Some("test-repo")).unwrap()
 }
 fn changes(e: &str, kind: &str, name: &str, content: &str) -> Vec<Change> {
-    vec![
+    let mut result = vec![
         Change {
             entity: e.into(),
             field: "kind".into(),
@@ -29,9 +61,13 @@ fn changes(e: &str, kind: &str, name: &str, content: &str) -> Vec<Change> {
             entity: e.into(),
             field: "content".into(),
             parents: vec![],
-            value: json!(hash(content.as_bytes())),
+            value: json!(direct(content.as_bytes())),
         },
-    ]
+    ];
+    if kind != "file" {
+        result.retain(|change| change.field != "content");
+    }
+    result
 }
 fn event(s: &Store, revision: &str, device: &str, cs: Vec<Change>) -> Event {
     let mut e = s.event(&s.branch("main").unwrap(), cs);
@@ -49,7 +85,7 @@ fn edit(s: &Store, rev: &str, device: &str, base: &str, bytes: &str) -> Event {
             entity: "file".into(),
             field: "content".into(),
             parents: vec![base.into()],
-            value: json!(hash(bytes.as_bytes())),
+            value: json!(direct(bytes.as_bytes())),
         }],
     )
 }
@@ -93,8 +129,8 @@ fn causal_successor_wins_even_with_lower_identity() {
     )
     .unwrap();
     assert_eq!(
-        s.lookup("test.txt").unwrap().content,
-        Some(hash(b"successor"))
+        s.lookup("test.txt").unwrap().content_ref,
+        Some(direct(b"successor"))
     );
     assert!(s.projection(&s.active).unwrap().conflicts.is_empty());
 }
@@ -127,7 +163,7 @@ fn three_competitors_converge_in_all_delivery_orders_with_duplicates_and_restart
         assert!(result.0.pending.is_empty());
         assert_eq!(result.0.heads[&register("file", "content")].len(), 3);
         assert_eq!(result.0.conflicts.len(), 3);
-        assert_eq!(result.0.entries["file"].content, Some(hash(b"c")));
+        assert_eq!(result.0.entries["file"].content_ref, Some(direct(b"c")));
         if let Some(want) = &expected {
             assert_eq!(&result, want);
         } else {
@@ -181,7 +217,10 @@ fn child_before_parent_stays_pending_and_activates_atomically() {
     assert!(s.lookup("test.txt").is_err());
     s.commit(base, false).unwrap();
     assert!(s.projection(&s.active).unwrap().pending.is_empty());
-    assert_eq!(s.lookup("test.txt").unwrap().content, Some(hash(b"a")));
+    assert_eq!(
+        s.lookup("test.txt").unwrap().content_ref,
+        Some(direct(b"a"))
+    );
 }
 
 #[test]
@@ -195,7 +234,7 @@ fn rename_and_offline_edit_combine_on_stable_identity() {
     assert!(s.lookup("test.txt").is_err());
     let e = s.lookup("renamed.txt").unwrap();
     assert_eq!(e.id, "file");
-    assert_eq!(e.content, Some(hash(b"b")));
+    assert_eq!(e.content_ref, Some(direct(b"b")));
 }
 
 #[test]
@@ -248,7 +287,7 @@ fn delete_edit_preserves_both_existence_and_bytes() {
                 entity: "file".into(),
                 field: "content".into(),
                 parents: vec!["zz-base".into()],
-                value: json!(hash(b"a")),
+                value: json!(direct(b"a")),
             },
             Change {
                 entity: "file".into(),
@@ -358,16 +397,48 @@ fn deleted_parent_and_descendant_creation_is_an_inspectable_conflict() {
 }
 
 #[test]
-fn missing_corrupt_content_cannot_enter_visible_journal() {
+fn remote_content_metadata_activates_without_bytes_and_reads_refuse_corruption() {
     let dir = tempfile::tempdir().unwrap();
-    let mut s = store(dir.path());
-    let e = event(&s, "new", "a", changes("file", "file", "test.txt", "base"));
-    assert!(s.commit(e.clone(), false).is_err());
-    assert!(s.events().unwrap().is_empty());
-    s.put_object(b"base").unwrap();
-    std::fs::write(s.root.join("objects").join(hash(b"base")), b"bad").unwrap();
-    assert!(s.commit(e, false).is_err());
-    assert!(s.events().unwrap().is_empty());
+    let mut store = store(dir.path());
+    let local = LocalContent::open(dir.path()).unwrap();
+    let before = serde_json::to_value(local.counters.snapshot()).unwrap();
+    let event = event(
+        &store,
+        "new",
+        "a",
+        changes("file", "file", "test.txt", "base"),
+    );
+    store.commit(event, false).unwrap();
+    assert_eq!(
+        before,
+        serde_json::to_value(local.counters.snapshot()).unwrap()
+    );
+    assert_eq!(
+        store.lookup("test.txt").unwrap().content_ref,
+        Some(direct(b"base"))
+    );
+    let pin = local.pin(&direct(b"base")).unwrap();
+    let range = ByteRange { offset: 0, len: 4 };
+    assert_eq!(
+        local.availability(&pin, range, &context()).unwrap(),
+        tkfs::content::Availability::Missing
+    );
+    std::fs::write(store.root.join("objects").join(hash(b"base")), b"BAD!").unwrap();
+    assert_eq!(
+        local.availability(&pin, range, &context()).unwrap(),
+        tkfs::content::Availability::Corrupt
+    );
+    assert!(
+        format!(
+            "{:#}",
+            local
+                .read_range(&pin, 0, &mut [0; 4], &context())
+                .unwrap_err()
+        )
+        .contains("CORRUPT_CONTENT")
+    );
+    assert!(!store.content_admission_page(0, 64).unwrap()[0].publishable);
+    assert!(store.verify_derived_state().unwrap().is_empty());
 }
 
 #[test]
@@ -404,7 +475,42 @@ fn private_branch_upload_is_rooted_in_shared_events_across_restart_and_dedup() {
     .unwrap();
     let published = s.fork("public", true).unwrap();
     let bundle = s.shared_bundle(&BTreeSet::new()).unwrap();
-    assert!(bundle.objects.contains_key(&hash(b"published-visible")));
+    assert!(
+        bundle.objects.is_empty(),
+        "metadata bundle carried file bytes"
+    );
+    let visible = direct(b"published-visible");
+    assert!(
+        bundle
+            .events
+            .iter()
+            .flat_map(|event| &event.changes)
+            .any(|change| change.entity == e.id
+                && change.field == "content"
+                && change.value == json!(visible))
+    );
+    let admissions = s.content_admission_page(0, 256).unwrap();
+    let private = admissions
+        .iter()
+        .find(|change| change.branch == private.id && change.root == visible)
+        .unwrap();
+    let public = admissions
+        .iter()
+        .find(|change| change.branch == published.id && change.root == visible)
+        .unwrap();
+    assert!(
+        !s.content_reference_authorized(&private.reference, private.generation)
+            .unwrap()
+    );
+    assert!(
+        s.content_reference_authorized(&public.reference, public.generation)
+            .unwrap()
+    );
+    assert!(
+        !serde_json::to_string(&bundle)
+            .unwrap()
+            .contains(&hash(b"PRIVATE-CANARY"))
+    );
     assert!(!bundle.objects.contains_key(&hash(b"PRIVATE-CANARY")));
     let root = bundle
         .events
@@ -415,39 +521,71 @@ fn private_branch_upload_is_rooted_in_shared_events_across_restart_and_dedup() {
 }
 
 #[test]
-fn long_lived_writer_keeps_real_base_and_shared_local_staging() {
+fn long_lived_writer_keeps_real_base_and_shared_current_sessions() {
+    use std::sync::{Arc, Mutex};
+    use tkfs::runtime::{
+        self,
+        content::ContentWait,
+        content_reads,
+        content_writes::{self, NativeWrites},
+    };
     let dir = tempfile::tempdir().unwrap();
-    let mut s = store(dir.path());
-    seed(&mut s);
-    let mut e = Engine::new(s);
-    let (h, _) = e.open("test.txt", None, true).unwrap();
-    let (reader, _) = e.open("test.txt", None, false).unwrap();
-    e.store
-        .commit(edit(&e.store, "remote", "z", "zz-base", "b"), false)
-        .unwrap();
-    e.truncate(h, 0, false).unwrap();
-    e.write(h, 0, b"a", false, false).unwrap();
-    assert_eq!(e.session(reader).unwrap().bytes, b"a");
-    e.flush(h).unwrap();
-    assert!(
-        !e.store
-            .projection(&e.store.active)
+    let mut store = store(dir.path());
+    seed(&mut store);
+    let shared = Arc::new(Mutex::new(Engine::new(store)));
+    let writes = NativeWrites::install(&shared, &context()).unwrap();
+    let wait = || ContentWait::fixed(std::time::Duration::from_secs(30));
+    let open = |writable| {
+        let h = runtime::lock_engine(&shared)
+            .open("test.txt", None, writable)
             .unwrap()
-            .conflicts
-            .is_empty()
-    );
-    e.write(h, 1, b"!", false, false).unwrap();
-    e.flush(h).unwrap();
-    assert!(
-        !e.store
-            .projection(&e.store.active)
+            .0;
+        content_reads::prepare_open(&shared, h, wait()).unwrap();
+        h
+    };
+    let h = open(true);
+    let reader = open(false);
+    {
+        let mut engine = runtime::lock_engine(&shared);
+        let remote = edit(&engine.store, "remote", "z", "zz-base", "b");
+        engine.store.commit(remote, false).unwrap();
+    }
+    assert!(content_writes::truncate(&shared, h, 0, false, wait()).unwrap());
+    content_writes::write(&shared, h, 0, b"a", false, false, wait()).unwrap();
+    assert_eq!(
+        content_reads::read_mount_vec(&shared, reader, 0, 1, wait())
             .unwrap()
-            .conflicts
-            .is_empty()
+            .unwrap(),
+        b"a"
     );
-    e.cleanup(h, false).unwrap();
-    e.close(h).unwrap();
-    e.close(reader).unwrap();
+    content_writes::flush(&shared, h, wait()).unwrap();
+    {
+        let engine = runtime::lock_engine(&shared);
+        assert!(
+            !engine
+                .store
+                .projection(&engine.store.active)
+                .unwrap()
+                .conflicts
+                .is_empty()
+        );
+    }
+    content_writes::write(&shared, h, 1, b"!", false, false, wait()).unwrap();
+    content_writes::flush(&shared, h, wait()).unwrap();
+    {
+        let engine = runtime::lock_engine(&shared);
+        assert!(
+            !engine
+                .store
+                .projection(&engine.store.active)
+                .unwrap()
+                .conflicts
+                .is_empty()
+        );
+    }
+    runtime::engine::close_handle(&shared, h).unwrap();
+    runtime::engine::close_handle(&shared, reader).unwrap();
+    writes.shutdown(&context()).unwrap();
 }
 
 #[test]
@@ -486,16 +624,22 @@ fn fault_worker() {
     };
     let mut s = store(Path::new(&root));
     let e = s.lookup("test.txt").unwrap();
+    if let Ok(point) = std::env::var("TKFS_TEST_CRASH_POINT") {
+        let mut config =
+            tkfs::util::fault::FaultConfig::new(&point, tkfs::util::fault::FaultAction::Exit);
+        config.count = Some(1);
+        tkfs::util::fault::configure(Some(config));
+    }
     s.write_revision(&e.id, e.revisions.get("content").cloned(), b"acknowledged")
         .unwrap();
 }
 #[test]
 fn process_crash_boundaries_preserve_last_committed_generation() {
     for (point, new_visible) in [
-        ("object_flushed", false),
-        ("object_installed", false),
-        ("before_sql", false),
-        ("sql_committed", true),
+        ("content.install.flushed", false),
+        ("content.install.installed", false),
+        ("core.commit.before_sql", false),
+        ("core.commit.sql_committed", true),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path());
@@ -504,7 +648,8 @@ fn process_crash_boundaries_preserve_last_committed_generation() {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "fault_worker", "--nocapture"])
             .env("TKFS_TEST_WORKER", dir.path())
-            .env("TKFS_FAULT", point)
+            .env("TKFS_TEST_CRASH_POINT", point)
+            .env_remove("TKFS_FAULT")
             .output()
             .unwrap();
         assert_eq!(
@@ -514,9 +659,8 @@ fn process_crash_boundaries_preserve_last_committed_generation() {
             String::from_utf8_lossy(&result.stderr)
         );
         let s = store(dir.path());
-        let object = s.lookup("test.txt").unwrap().content.unwrap();
         assert_eq!(
-            s.read_object(&object).unwrap(),
+            read_current(&s, "test.txt"),
             if new_visible {
                 b"acknowledged".as_slice()
             } else {

@@ -123,13 +123,25 @@ impl Fixture {
     }
 
     fn pending_saves(&self) -> i64 {
-        self.engine
+        i64::from(self.engine.lock().unwrap().vitals.pending_saves())
+    }
+
+    fn retry_saved(&self) {
+        let entities: Vec<_> = self
+            .engine
             .lock()
             .unwrap()
-            .store
-            .db
-            .query_row("SELECT count(*) FROM pending_saves", [], |r| r.get(0))
-            .unwrap()
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.dirty)
+            .map(|(entity, session)| {
+                assert!(matches!(session.bytes, tkfs::staging::Staged::Cow(_)));
+                entity.clone()
+            })
+            .collect();
+        for entity in entities {
+            tkfs::runtime::engine::save_entity(&self.engine, &entity).unwrap();
+        }
     }
 
     fn health(&self) -> Option<String> {
@@ -310,7 +322,7 @@ fn force_detach_persists_dirty_sessions_and_reattach_shows_them() {
         fs::read(f.mount.join("dirty.txt")).ok().as_deref() == Some(bytes.as_slice())
     }));
     // The pending-save retry (the worker's recovery thread) commits it.
-    f.engine.lock().unwrap().retry_pending().unwrap();
+    f.retry_saved();
     assert!(wait_until(Duration::from_secs(10), || f.pending_saves() == 0));
     f.detach();
     assert!(f.attach());
@@ -697,7 +709,7 @@ fn dispatch_death_retains_dirty_sessions() {
     f.detach();
     assert!(f.attach());
     assert_eq!(fs::read(f.mount.join("dirty.txt")).unwrap(), bytes);
-    f.engine.lock().unwrap().retry_pending().unwrap();
+    f.retry_saved();
     assert!(wait_until(Duration::from_secs(10), || f.pending_saves() == 0));
     f.detach();
 }

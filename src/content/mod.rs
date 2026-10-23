@@ -8,6 +8,6 @@ pub mod walk;
 pub mod work;
 pub mod write;
 
-pub use local::LocalContent;
+pub use local::{LocalContent, PreparedContent};
 pub use provider::{Availability, ContentProvider, PinnedContent, ReadContext, SnapshotRootHandle};
 pub use walk::{ContentEdge, ContentWalk, WalkBatch};

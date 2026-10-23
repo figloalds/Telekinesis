@@ -1,98 +1,17 @@
-//! Owned by WP1.1 — the catalog actor (REVAMP_PLAN §3.2, §14 WP1.1).
+//! Single-owner current catalog and immutable snapshot publication.
 //!
-//! One thread, `tkfs-catalog`, takes `orchestrator.lock` (and shares it with
-//! the [`Catalog`] handle) and owns the only connection to `folders.sqlite`. Everything else reads the immutable
-//! [`CatalogSnapshot`] it publishes through a [`Snapshot`] cell, so a read is
-//! an `Arc` clone that never waits for a write in progress (RC8).
+//! `Catalog::open` validates the selected format before writable access, then
+//! owns `orchestrator.lock` and one FULL WAL connection. Fresh schema, identity
+//! and header commit together; existing authoritative state is never synthesized.
+//! `mount_gates` is the sole durable gate source. There is no old-catalog upgrade
+//! or downgrade reconciliation. Per-open durable lease incarnations still fence
+//! stale work, and verifier rotations revoke inbound credentials atomically.
 //!
-//! * [`Catalog::open`] takes the lock, opens the database with the legacy
-//!   pragmas (`journal_mode=WAL; synchronous=FULL`), runs the legacy
-//!   `CREATE TABLE IF NOT EXISTS` statements, then the additive schema of §9
-//!   (guarded by `settings('catalog_schema','1')`): `folder_intents`,
-//!   `mount_gates` (backfilled from `initial_sync`), `peer_meta` and the
-//!   `verifier_generation` setting. Existing tables are never altered: the
-//!   positional writers of a downgraded binary keep working.
-//! * [`CatalogApi::apply`] runs each [`CatalogCmd`] in one `BEGIN IMMEDIATE`
-//!   transaction with cached prepared statements, inside `catch_unwind`, with
-//!   [`BUSY_RETRIES`] retries on `SQLITE_BUSY`. The snapshot that includes the
-//!   change is built inside the same transaction, published after the commit,
-//!   and returned. A command that changes nothing visible publishes nothing;
-//!   every other successful command bumps the generation by exactly one.
-//!   The caller waits at most [`APPLY_WAIT`] (a slow write never parks a
-//!   folder controller or a control connection for good: WP2.INT's
-//!   post-integration re-review). Its errors say what happened to the
-//!   command: [`is_refusal`] (never ran, the catalog is alive) and
-//!   [`outcome_unknown`] (`REQUEST_TIMEOUT`: it may still be applied); any
-//!   other error means it was not applied.
-//! * If the thread has died, `apply` answers `CATALOG_UNAVAILABLE` and
-//!   `snapshot()` keeps serving the last good snapshot. The thread and the
-//!   [`Catalog`] handle share `orchestrator.lock`, so a dead thread never
-//!   frees the data directory while the daemon still runs on its handle
-//!   (invariant 23): the lock is released once the thread has exited **and**
-//!   the handle is closed or dropped.
-//! * Gate markers are written twice: the legacy `initial_sync` row (identical
-//!   positional SQL) and the `mount_gates` row. Both are deleted together by
-//!   `ClearGate`, so a downgraded binary still sees every gate. Changes a
-//!   downgraded binary makes to `initial_sync` (a legacy Receive adds a row,
-//!   a satisfied legacy gate deletes one) are folded into `mount_gates` on the
-//!   next open, and a pairing code it rotated bumps `verifier_generation`
-//!   (the setting `verifier_salt` records which verifier the generation
-//!   belongs to).
-//! * Generations are per process (the first snapshot is generation 1). Every
-//!   visible change wakes every `wait_newer` caller, so consumers diff the
-//!   records they care about, and `RecordPeerSeen` belongs on session
-//!   establishment rather than on every request.
-//!
-//! [`validate_mount_path`] is the mount-path rule of the legacy
-//! `Supervisor::mount_path`, as a function of a snapshot.
-//!
-//! Fault points ([`faults`]): `catalog.slow_write` fires inside every command
-//! transaction, after its writes and before the commit (`hang` holds the
-//! transaction, `fail` and `panic` abort it); `catalog.actor` fires on the
-//! actor loop outside the per-command guard (`panic` kills the thread).
-//!
-//! **Per-peer credentials (WP4.1, §14, §9).** `peer_credentials` holds
-//! `K_peer` (`session::auth::peer_key`) per peer installation and
-//! [`CredentialSide`]: `inbound` (a dialer enrolled with us; the inbound
-//! server verifies it) and `outbound` (we enrolled with an acceptor; our
-//! lanes present it). Both sides of a mutual pairing are separate rows, so
-//! the key is `(installation, side)`. The table is created on every open
-//! (`IF NOT EXISTS`; `catalog_schema` stays 1, older binaries never read
-//! it). The actor publishes the rows as [`Credentials`] beside the
-//! [`CatalogSnapshot`] ([`CatalogApi::credentials`]; a credential change
-//! moves no snapshot generation). They change through the catalog
-//! contract's credential commands (CCR-WP4.1-1, applied by WP5.4):
-//! `CatalogCmd::EnrollCredential` (optionally only while a peer record
-//! names the installation, or only at a verifier generation, both checked
-//! in the same transaction), `RevokeCredential` and `ForgetCredential`, run
-//! like every command (same transaction, retry and [`APPLY_WAIT`] rules;
-//! [`Catalog::enroll`], [`Catalog::enroll_paired`],
-//! [`Catalog::enroll_at_generation`], [`Catalog::revoke`] and
-//! [`Catalog::forget`] are shorthands for them), and as part of three other
-//! catalog commands:
-//!
-//! * `SetVerifier` (ResetPairingCode), and a rotation by a downgraded binary
-//!   folded in at open, revoke every inbound credential with the verifier
-//!   generation bump, in the same transaction (invariant 21); so does an
-//!   open that finds the generation moved since the credentials were last
-//!   reconciled with it (`credentials_generation`: a revamp build before
-//!   WP4.1 bumps the generation and records the salt itself; WP4.INT
-//!   re-review);
-//! * `RemovePeer` deletes our outbound credential for the installation once
-//!   no peer record names it any more (an unpair);
-//! * `UpsertPeer` of an endpoint whose record named another installation (a
-//!   re-pair of an endpoint that now answers as a different installation:
-//!   the record is replaced in place) does the same for the old
-//!   installation.
-//!
-//! A component that holds only `Arc<dyn CatalogApi>` reads and changes the
-//! credentials through the trait; a catalog that keeps none (a test's fake)
-//! answers `credentials()` with `None`, and its peers use the pairing code
-//! alone. Every caller does so since CCR-WP5.4-1 (applied by WP5.INT), which
-//! removed WP4.1's adapter to the concrete catalog (`Catalog::of`) with its
-//! registry of open catalogs. `folders.sqlite` holds these keys and the
-//! dialers' codes: on Unix it is made owner-only (0600) at open; on Windows
-//! it inherits the profile ACL.
+//! Commands retain bounded SQLite retries, queued-request withdrawal, unknown
+//! running outcomes, panic rollback and immutable snapshots that never wait for
+//! a writer. Actor and handle share the directory lock through shutdown.
+//! Credential-only changes publish their own immutable view without waking
+//! catalog-snapshot waiters. Unpair/re-pair still retires outbound credentials.
 use super::{Config, lock};
 use crate::{
     core::id,
@@ -125,8 +44,6 @@ use std::{
 
 /// The actor thread's name (§2.5).
 pub const THREAD_NAME: &str = "tkfs-catalog";
-/// The additive schema version this build writes (`settings.catalog_schema`).
-pub const SCHEMA_VERSION: u32 = 1;
 /// Retries of a command that failed with `SQLITE_BUSY` (so at most 4 attempts).
 pub const BUSY_RETRIES: u32 = 3;
 /// SQLite busy handler budget per attempt. Only the catalog writes the file,
@@ -201,54 +118,26 @@ mod keys {
     pub const INSTALLATION: &str = "installation";
     pub const OBJECTS_INCARNATION: &str = "objects_incarnation";
     pub const PAIRING: &str = "pairing";
-    pub const CATALOG_SCHEMA: &str = "catalog_schema";
     pub const VERIFIER_GENERATION: &str = "verifier_generation";
-    /// The salt of the verifier `verifier_generation` belongs to, so a code
-    /// rotated by a downgraded binary still bumps the generation.
+    /// Current consistency check: the generation belongs to this verifier.
     pub const VERIFIER_SALT: &str = "verifier_salt";
-    /// The `verifier_generation` the inbound per-peer credentials were last
-    /// reconciled with (WP4.INT re-review): a generation bumped by a binary
-    /// that knows no credentials (a revamp build before WP4.1 records the
-    /// salt and the generation itself, so no salt discrepancy shows it)
-    /// revokes them at the next open.
-    pub const CREDENTIALS_GENERATION: &str = "credentials_generation";
 }
 
-/// SQL text. The `LEGACY_*` and positional statements are byte-identical to
-/// the legacy `Supervisor` (`catalog_db.rs`, 6298d0b).
+mod format;
+
+/// Current catalog command statements; persistent layout lives in schema.sql.
 mod sql {
-    pub const LEGACY_SCHEMA: &str = "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS projects(state TEXT PRIMARY KEY,label TEXT NOT NULL,repo TEXT NOT NULL UNIQUE,device TEXT NOT NULL,directory TEXT NOT NULL,mount TEXT,desired INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS peers(endpoint TEXT PRIMARY KEY,code TEXT NOT NULL,installation TEXT NOT NULL,connections INTEGER NOT NULL,revision TEXT NOT NULL);";
-    pub const LEGACY_INITIAL_SYNC: &str =
-        "CREATE TABLE IF NOT EXISTS initial_sync(state TEXT PRIMARY KEY,endpoint TEXT NOT NULL);";
-    pub const INSERT_INSTALLATION: &str = "INSERT OR IGNORE INTO settings VALUES('installation',?)";
     pub const INSERT_PROJECT: &str = "INSERT INTO projects VALUES(?,?,?,?,?,?,1)";
     pub const SET_DESIRED_1: &str = "UPDATE projects SET desired=1 WHERE state=?";
     pub const SET_DESIRED_0: &str = "UPDATE projects SET desired=0 WHERE state=?";
     pub const SET_MOUNT: &str = "UPDATE projects SET mount=? WHERE state=?";
-    pub const INSERT_INITIAL_SYNC: &str = "INSERT INTO initial_sync VALUES(?,?)";
-    pub const DELETE_INITIAL_SYNC: &str = "DELETE FROM initial_sync WHERE state=?";
     pub const UPSERT_PEER: &str = "INSERT INTO peers VALUES(?,?,?,?,?) ON CONFLICT(endpoint) DO UPDATE SET code=excluded.code,installation=excluded.installation,connections=excluded.connections,revision=excluded.revision";
     pub const DELETE_PEER: &str = "DELETE FROM peers WHERE endpoint=?";
     pub const SET_PAIRING: &str = "INSERT INTO settings VALUES('pairing',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
 
-    // Schema 1 (§9): side tables only.
-    pub const SCHEMA_1: &str = "CREATE TABLE IF NOT EXISTS folder_intents(state TEXT PRIMARY KEY,sync_enabled INTEGER NOT NULL,mount_enabled INTEGER NOT NULL,updated_ms INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS mount_gates(state TEXT PRIMARY KEY,source_installation TEXT,source_endpoint TEXT NOT NULL,created_ms INTEGER NOT NULL,override_ms INTEGER,satisfied_ms INTEGER);
-            CREATE TABLE IF NOT EXISTS peer_meta(installation TEXT PRIMARY KEY,last_seen_ms INTEGER,display_name TEXT,incompatible TEXT,revoked_ms INTEGER);
-            INSERT OR IGNORE INTO settings VALUES('verifier_generation','0');";
     pub const GET_SETTING: &str = "SELECT value FROM settings WHERE key=?";
     pub const SET_SETTING: &str =
         "INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
-    /// `initial_sync` rows without a `mount_gates` row: the schema-1 backfill,
-    /// and gates a downgraded binary created (legacy Receive).
-    pub const BACKFILL_GATES: &str = "INSERT OR IGNORE INTO mount_gates(state,source_installation,source_endpoint,created_ms) SELECT s.state,(SELECT p.installation FROM peers p WHERE p.endpoint=s.endpoint),s.endpoint,? FROM initial_sync s";
-    /// `mount_gates` rows whose `initial_sync` row is gone: gates a downgraded
-    /// binary cleared after its own gate rule was satisfied.
-    pub const PRUNE_GATES: &str =
-        "DELETE FROM mount_gates WHERE state NOT IN (SELECT state FROM initial_sync)";
     /// Resolves `source_endpoint → installation` through `peers` where unknown.
     pub const RESOLVE_GATES: &str = "UPDATE mount_gates SET source_installation=(SELECT p.installation FROM peers p WHERE p.endpoint=mount_gates.source_endpoint) WHERE source_installation IS NULL";
 
@@ -267,11 +156,9 @@ mod sql {
         "UPDATE mount_gates SET override_ms=COALESCE(override_ms,?) WHERE state=?";
     pub const DELETE_GATE: &str = "DELETE FROM mount_gates WHERE state=?";
     pub const RETARGET_GATE: &str = "UPDATE mount_gates SET source_installation=?,source_endpoint=?,satisfied_ms=NULL WHERE state=?";
-    pub const RETARGET_INITIAL_SYNC: &str = "UPDATE initial_sync SET endpoint=? WHERE state=?";
     pub const RECORD_PEER_SEEN: &str = "INSERT INTO peer_meta(installation,last_seen_ms,display_name,incompatible) VALUES(?,?,?,?) ON CONFLICT(installation) DO UPDATE SET last_seen_ms=MAX(COALESCE(last_seen_ms,0),excluded.last_seen_ms),display_name=COALESCE(excluded.display_name,display_name),incompatible=excluded.incompatible";
 
     // WP4.1 (§9): per-peer credentials, keyed by installation and side.
-    pub const CREDENTIALS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS peer_credentials(installation TEXT NOT NULL,side TEXT NOT NULL,secret_hash TEXT NOT NULL,created_ms INTEGER NOT NULL,revoked_ms INTEGER,PRIMARY KEY(installation,side));";
     pub const CREDENTIALS: &str = "SELECT installation,side,secret_hash,created_ms,revoked_ms FROM peer_credentials ORDER BY installation,side";
     pub const ENROLL: &str = "INSERT INTO peer_credentials(installation,side,secret_hash,created_ms,revoked_ms) VALUES(?,?,?,?,NULL) ON CONFLICT(installation,side) DO UPDATE SET secret_hash=excluded.secret_hash,created_ms=excluded.created_ms,revoked_ms=NULL";
     pub const REVOKE: &str = "UPDATE peer_credentials SET revoked_ms=? WHERE installation=? AND side=? AND revoked_ms IS NULL";
@@ -326,13 +213,14 @@ pub struct Catalog {
 
 impl Catalog {
     /// Starts the `tkfs-catalog` thread on `config.data_directory` and returns
-    /// once `orchestrator.lock` is held, the schema is migrated and the first
+    /// once `orchestrator.lock` is held, the current layout is ready and the first
     /// snapshot (generation 1) is published. Like the legacy
     /// `Supervisor::open`, it creates the data and default mount directories.
     ///
     /// Fails with `ALREADY_RUNNING…` while another orchestrator (or catalog)
     /// holds the lock (invariant 23).
     pub fn open(config: &Config) -> Result<Arc<Catalog>> {
+        format::preflight(&config.data_directory.join("folders.sqlite"))?;
         fs::create_dir_all(&config.data_directory)?;
         fs::create_dir_all(&config.default_mount_directory)?;
         let data_directory = config.data_directory.clone();
@@ -694,25 +582,14 @@ impl Actor {
     ) -> Result<Actor> {
         let lock = lock(&data.join("orchestrator.lock"))?;
         let database = data.join("folders.sqlite");
-        let mut conn = Connection::open(&database)?;
+        let mut conn = with_busy_retries(|| format::open(&database))?;
         owner_only(&database);
-        conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.set_prepared_statement_cache_capacity(64);
-        // Every step is idempotent, so a busy writer slot is retried like a
-        // command's.
-        with_busy_retries(|| {
-            conn.execute_batch(sql::LEGACY_SCHEMA)?;
-            conn.execute_batch(sql::LEGACY_INITIAL_SYNC)?;
-            conn.execute(sql::INSERT_INSTALLATION, [id()])?;
-            migrate(&mut conn, now_ms())
-        })?;
         let lease_incarnation = with_busy_retries(|| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let old = get_setting(&tx, keys::OBJECTS_INCARNATION)?
-                .map(|value| value.parse::<u64>())
-                .transpose()
-                .context("CATALOG_UNAVAILABLE: malformed object lease incarnation")?
-                .unwrap_or(0);
+            let old = required_setting(&tx, keys::OBJECTS_INCARNATION)?
+                .parse::<u64>()
+                .context("CATALOG_UNAVAILABLE: malformed object lease incarnation")?;
             let next = old
                 .checked_add(1)
                 .context("CATALOG_UNAVAILABLE: object lease incarnation exhausted")?;
@@ -878,54 +755,6 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
-/// Schema migration (guarded by `catalog_schema`) and the legacy reconcile
-/// (every open), in one transaction.
-fn migrate(conn: &mut Connection, now: u64) -> Result<()> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let schema = get_setting(&tx, keys::CATALOG_SCHEMA)?
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    if schema < SCHEMA_VERSION {
-        tx.execute_batch(sql::SCHEMA_1)?;
-        set_setting(&tx, keys::CATALOG_SCHEMA, &SCHEMA_VERSION.to_string())?;
-    }
-    // WP4.1: additive and idempotent, so it needs no schema version of its
-    // own (and `catalog_schema` keeps the value older binaries expect).
-    tx.execute_batch(sql::CREDENTIALS_SCHEMA)?;
-    reconcile_legacy(&tx, now)?;
-    tx.commit()?;
-    Ok(())
-}
-
-/// Folds what a downgraded binary may have changed into the side tables:
-/// gate rows it added or removed in `initial_sync`, peers it paired (which
-/// resolve gate sources), a pairing code it rotated (which bumps
-/// `verifier_generation`), and a generation it bumped itself without
-/// revoking the inbound per-peer credentials (WP4.INT re-review: a revamp
-/// build before WP4.1 records the new salt and generation, so only the
-/// generation the credentials were reconciled with,
-/// `credentials_generation`, shows it; invariant 21). Idempotent; also the
-/// schema-1 backfill.
-fn reconcile_legacy(tx: &Transaction<'_>, now: u64) -> Result<()> {
-    tx.execute(sql::BACKFILL_GATES, [ms(now)])?;
-    tx.execute(sql::PRUNE_GATES, [])?;
-    tx.execute(sql::RESOLVE_GATES, [])?;
-    if let Some(verifier) = read_verifier(tx)? {
-        let recorded = get_setting(tx, keys::VERIFIER_SALT)?;
-        if recorded.as_deref() != Some(verifier.salt.as_str()) {
-            bump_verifier_generation(tx, &verifier, now)?;
-        }
-    }
-    let generation = verifier_generation(tx)?;
-    let reconciled = get_setting(tx, keys::CREDENTIALS_GENERATION)?
-        .and_then(|value| value.trim().parse::<u64>().ok());
-    if reconciled != Some(generation) {
-        tx.prepare_cached(sql::REVOKE_INBOUND)?.execute([ms(now)])?;
-        set_setting(tx, keys::CREDENTIALS_GENERATION, &generation.to_string())?;
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Commands
 
@@ -968,8 +797,7 @@ fn apply_command(
                 .query_row([state], |r| {
                     Ok((r.get::<_, bool>(0)?, r.get::<_, bool>(1)?))
                 })
-                .optional()?
-                .unwrap_or((true, true));
+                .context("INVALID_CATALOG: missing folder intents")?;
             upsert_intents(
                 tx,
                 state,
@@ -986,8 +814,6 @@ fn apply_command(
         }
         CatalogCmd::ClearGate { state } => {
             require_folder(tx, state)?;
-            tx.prepare_cached(sql::DELETE_INITIAL_SYNC)?
-                .execute([state])?;
             tx.prepare_cached(sql::DELETE_GATE)?.execute([state])?;
             Ok(())
         }
@@ -1009,9 +835,6 @@ fn apply_command(
                 source_endpoint,
                 state
             ])?;
-            // Keep the legacy marker pointing at the same source for a downgrade.
-            tx.prepare_cached(sql::RETARGET_INITIAL_SYNC)?
-                .execute(params![source_endpoint, state])?;
             Ok(())
         }
         CatalogCmd::UpsertPeer { record } => upsert_peer(tx, record, current),
@@ -1148,8 +971,6 @@ fn create_folder(
         if gate.source_endpoint.is_empty() && gate.source_installation.is_none() {
             bail!("INVALID_REQUEST: a gate source needs an endpoint or an installation");
         }
-        tx.prepare_cached(sql::INSERT_INITIAL_SYNC)?
-            .execute(params![record.state, gate.source_endpoint])?;
         let installation = match &gate.source_installation {
             Some(installation) => Some(installation.clone()),
             None => peer_installation(tx, &gate.source_endpoint)?,
@@ -1227,11 +1048,12 @@ fn upsert_intents(
 /// with it (WP4.1, invariant 21: a rotation invalidates per-peer
 /// credentials as it does code sessions).
 fn bump_verifier_generation(tx: &Transaction<'_>, verifier: &Verifier, now: u64) -> Result<()> {
-    let next = verifier_generation(tx)?.saturating_add(1);
+    let next = verifier_generation(tx)?
+        .checked_add(1)
+        .context("CATALOG_UNAVAILABLE: verifier generation exhausted")?;
     set_setting(tx, keys::VERIFIER_GENERATION, &next.to_string())?;
     set_setting(tx, keys::VERIFIER_SALT, &verifier.salt)?;
     tx.prepare_cached(sql::REVOKE_INBOUND)?.execute([ms(now)])?;
-    set_setting(tx, keys::CREDENTIALS_GENERATION, &next.to_string())?;
     Ok(())
 }
 
@@ -1293,38 +1115,34 @@ fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn verifier_generation(conn: &Connection) -> Result<u64> {
-    Ok(get_setting(conn, keys::VERIFIER_GENERATION)?
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(0))
+fn required_setting(conn: &Connection, key: &str) -> Result<String> {
+    get_setting(conn, key)?
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("INVALID_CATALOG: missing required setting {key}"))
 }
 
-/// The stored pairing verifier. An unparseable value reads as "not set",
-/// which is what the legacy `verifier()` reports (`PAIRING_CODE_NOT_SET`).
+fn verifier_generation(conn: &Connection) -> Result<u64> {
+    required_setting(conn, keys::VERIFIER_GENERATION)?
+        .parse()
+        .context("INVALID_CATALOG: malformed verifier generation")
+}
+
+/// Absence means no code has been configured; malformed current data is an error.
 fn read_verifier(conn: &Connection) -> Result<Option<Verifier>> {
-    let Some(value) = get_setting(conn, keys::PAIRING)? else {
-        return Ok(None);
-    };
-    match serde_json::from_str(&value) {
-        Ok(verifier) => Ok(Some(verifier)),
-        Err(error) => {
-            event!(warn, "PAIRING_CODE_NOT_SET", {
-                "detail": "settings.pairing does not hold a valid verifier",
-                "error": error.to_string(),
-            });
-            Ok(None)
-        }
-    }
+    get_setting(conn, keys::PAIRING)?
+        .map(|value| {
+            serde_json::from_str(&value).context("INVALID_CATALOG: malformed pairing verifier")
+        })
+        .transpose()
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot
 
-/// Reads the whole catalog, sorted as the legacy queries are (folders by
-/// label then state, peers by endpoint). Folders without a `folder_intents`
-/// row (legacy rows) have both intents enabled.
+/// Reads current records: folders by label/state and peers by endpoint.
+/// Missing authoritative identities or intents are errors, never defaults.
 fn load_snapshot(conn: &Connection, generation: u64) -> Result<CatalogSnapshot> {
-    let installation = get_setting(conn, keys::INSTALLATION)?.unwrap_or_default();
+    let installation = required_setting(conn, keys::INSTALLATION)?;
     let folders = conn
         .prepare_cached(sql::FOLDERS)?
         .query_map([], |r| {
@@ -1336,8 +1154,8 @@ fn load_snapshot(conn: &Connection, generation: u64) -> Result<CatalogSnapshot> 
                 directory: PathBuf::from(r.get::<_, String>(4)?),
                 mount: r.get::<_, Option<String>>(5)?.map(PathBuf::from),
                 desired_running: r.get(6)?,
-                sync_enabled: r.get::<_, Option<bool>>(7)?.unwrap_or(true),
-                mount_enabled: r.get::<_, Option<bool>>(8)?.unwrap_or(true),
+                sync_enabled: r.get(7)?,
+                mount_enabled: r.get(8)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

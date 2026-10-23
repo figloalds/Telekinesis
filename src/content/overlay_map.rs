@@ -139,7 +139,7 @@ pub struct MapRoot {
 }
 impl MapRoot {
     pub(crate) fn validate(self, scope: Uuid, kind: MapKind) -> Result<()> {
-        ensure!(self.format == 1, "WRITE_JOURNAL_NEEDS_UPGRADE");
+        ensure!(self.format == 1, "UNSUPPORTED_WRITE_JOURNAL");
         ensure!(
             self.scope == scope && self.kind == kind,
             "CORRUPT_WRITE_JOURNAL"

@@ -406,20 +406,27 @@ fn same_descriptor_refresh_reuses_pin_and_cancelled_read_returns_no_success() {
     f.close(h);
 }
 #[test]
-fn legacy_zero_wait_and_stale_handle_keep_their_existing_meanings() {
+fn typed_empty_reads_honor_zero_wait_and_stale_handles() {
     let f = Fixture::new(17);
-    let legacy = {
+    let empty = {
         let mut e = tkfs::runtime::lock_engine(&f.shared);
-        e.store.create("legacy", "file").unwrap();
-        e.open("legacy", None, false).unwrap().0
+        e.store.create("empty", "file").unwrap();
+        e.open("empty", None, false).unwrap().0
     };
-    content_reads::prepare_open(&f.shared, legacy, ContentWait::fixed(Duration::ZERO)).unwrap();
-    assert!(
-        content_reads::read_mount_vec(&f.shared, legacy, 0, 10, ContentWait::fixed(Duration::ZERO))
-            .unwrap()
-            .is_none()
+    error(
+        content_reads::prepare_open(&f.shared, empty, ContentWait::fixed(Duration::ZERO)),
+        "CONTENT_DEADLINE",
     );
-    f.close(legacy);
+    error(
+        content_reads::read_mount_vec(&f.shared, empty, 0, 10, ContentWait::fixed(Duration::ZERO)),
+        "CONTENT_DEADLINE",
+    );
+    content_reads::prepare_open(&f.shared, empty, wait()).unwrap();
+    assert_eq!(
+        content_reads::read_mount_vec(&f.shared, empty, 0, 10, wait()).unwrap(),
+        Some(Vec::new())
+    );
+    f.close(empty);
     let h = f.open();
     tkfs::runtime::lock_engine(&f.shared).store.generation += 1;
     error(

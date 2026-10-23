@@ -639,42 +639,16 @@ fn startup_with_2k_objects_hashes_nothing_and_detects_changes() {
     assert_eq!(lazy.object_hashes(), 0);
 }
 
-/// The one-time pass after an upgrade: a legacy (6298d0b) state gets every
-/// index and marker, then restarts without hashing.
+/// An interrupted `repair:objects:ready` backfill resumes from its cursor.
 #[test]
-fn legacy_state_upgrades_once_then_restarts_without_hashing() {
-    let legacy = copy_legacy_worker();
-    let store = Store::open_existing(&legacy.state).unwrap();
-    for marker in ["availability_v1", "availability_v2", "event_objects_v1"] {
-        let value: Option<String> = store
-            .db
-            .query_row("SELECT value FROM config WHERE key=?", [marker], |r| {
-                r.get(0)
-            })
-            .ok();
-        assert_eq!(value.as_deref(), Some("1"), "{marker}");
-    }
-    assert_indexes_match(&store, "legacy");
-    assert_point_lookups_match(&store, "legacy");
-    drop(store);
-    // Rows recorded during the upgrade can be racy (files written moments
-    // before); after one more verification they are trusted.
-    std::thread::sleep(Duration::from_millis(3100));
-    drop(Store::open_existing(&legacy.state).unwrap());
-    let store = Store::open_existing(&legacy.state).unwrap();
-    assert_eq!(store.object_hashes(), 0);
-}
-
-/// An interrupted `event_objects_v1` backfill resumes from its cursor.
-#[test]
-fn event_objects_backfill_is_chunked_and_resumable() {
+fn current_event_reference_repair_is_chunked_and_resumable() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = Store::open(dir.path(), Some("backfill")).unwrap();
     for i in 0..30 {
         write_file(&mut store, &format!("f{i}"), format!("v{i}").as_bytes());
     }
     let expected = legacy_event_objects(&store);
-    // Simulate an older state: no index rows, no marker, and a cursor half-way.
+    // Resume a current derived-index repair from its committed half-way cursor.
     let middle: i64 = store
         .db
         .query_row(
@@ -687,8 +661,8 @@ fn event_objects_backfill_is_chunked_and_resumable() {
         .db
         .execute_batch(&format!(
             "DELETE FROM event_objects WHERE event IN (SELECT id FROM events WHERE rowid>{middle});
-             DELETE FROM config WHERE key='event_objects_v1';
-             INSERT INTO config VALUES('event_objects_v1:events','{middle}');"
+             DELETE FROM config WHERE key='repair:objects:ready';
+             INSERT INTO config VALUES('repair:objects:cursor:events','{middle}');"
         ))
         .unwrap();
     drop(store);
@@ -697,7 +671,7 @@ fn event_objects_backfill_is_chunked_and_resumable() {
     let cursor: Option<String> = store
         .db
         .query_row(
-            "SELECT value FROM config WHERE key='event_objects_v1:events'",
+            "SELECT value FROM config WHERE key='repair:objects:cursor:events'",
             [],
             |r| r.get(0),
         )

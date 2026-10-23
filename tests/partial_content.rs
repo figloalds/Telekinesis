@@ -1,3 +1,5 @@
+#[path = "support/current_reads.rs"]
+mod current_reads;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -125,63 +127,73 @@ fn missing_content_relays_metadata_across_three_origins_then_recovers() {
 
 #[test]
 fn read_wait_releases_engine_and_missing_content_has_a_deadline() {
+    use tkfs::runtime::{content::ContentWait, content_reads};
     let dir = tempfile::tempdir().unwrap();
     let mut a = engine(&dir.path().join("a"));
     let mut b = engine(&dir.path().join("b"));
-    let object = write(&mut a, "demand", b"downloaded");
+    write(&mut a, "demand", b"downloaded");
     exchange(&mut a, &mut b, true);
-    let (h, _) = b.open("demand", None, false).unwrap();
-    let shared = Arc::new(Mutex::new(b));
-    let reader = shared.clone();
-    let waiting =
-        std::thread::spawn(move || runtime::prepare_content(&reader, h, Duration::from_secs(2)));
-    for _ in 0..100 {
-        if shared
-            .lock()
-            .unwrap()
-            .store
-            .wanted_objects()
-            .unwrap()
-            .contains(&object)
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    {
-        let mut b = shared.lock().unwrap();
-        b.store.create("unrelated", "directory").unwrap();
-        b.store
-            .receive_parts(
-                BTreeMap::from([(
-                    object.clone(),
-                    ObjectPart {
-                        offset: 0,
-                        total: 10,
-                        hex: hex::encode(b"downloaded"),
-                    },
-                )]),
-                &[],
-                &BTreeSet::new(),
-            )
-            .unwrap();
-    }
-    waiting.join().unwrap().unwrap();
+    let fixture = current_reads::CurrentRead::from_shared(
+        Arc::new(Mutex::new(b)),
+        "demand",
+        b"downloaded".to_vec(),
+    );
+    let reader = fixture.shared.clone();
+    let h = fixture.handle;
+    let waiting = std::thread::spawn(move || {
+        content_reads::read_mount_vec(
+            &reader,
+            h,
+            0,
+            10,
+            ContentWait::fixed(Duration::from_secs(2)),
+        )
+    });
+    let demand = fixture.wait_pending().demand;
+    assert_eq!(demand.reference, fixture.reference_id);
     assert_eq!(
-        shared.lock().unwrap().session(h).unwrap().bytes,
-        b"downloaded"
+        demand.revision.entity,
+        runtime::lock_engine(&fixture.shared)
+            .store
+            .lookup("demand")
+            .unwrap()
+            .id
     );
-    let mut b = shared.lock().unwrap();
-    b.close(h).unwrap();
-    fs::remove_file(b.store.root.join("objects").join(&object)).unwrap();
-    let (h, _) = b.open("demand", None, false).unwrap();
-    drop(b);
+    assert_eq!(demand.range.offset, 0);
+    assert_eq!(demand.range.len, 10);
+    let started = std::time::Instant::now();
+    runtime::lock_engine(&fixture.shared)
+        .store
+        .create("unrelated", "directory")
+        .unwrap();
     assert!(
-        runtime::prepare_content(&shared, h, Duration::from_millis(25))
-            .unwrap_err()
-            .to_string()
-            .contains("CONTENT_UNAVAILABLE")
+        started.elapsed() < Duration::from_millis(300),
+        "waiting reader held Engine"
     );
+    fixture.feed(1, 1, Duration::from_millis(10));
+    assert_eq!(waiting.join().unwrap().unwrap().unwrap(), b"downloaded");
+    fixture.finish();
+    assert!(fixture.pending().is_empty());
+    fixture.remove_chunks(1);
+    let started = std::time::Instant::now();
+    let error = fixture
+        .read(
+            0,
+            10,
+            ContentWait {
+                stall: Duration::from_secs(1),
+                bound: Duration::from_millis(50),
+                slots: None,
+                cancelled: || false,
+            },
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("CONTENT_DEADLINE"),
+        "{error:#}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(fixture.pending().is_empty());
 }
 
 #[test]

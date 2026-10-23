@@ -292,11 +292,25 @@ impl Maintenance {
                 self.receipts = None;
             }
         }
-        if let Some(item) = store.content_candidates(1, true)?.into_iter().next()
-            && let Err(error) = store.expand_content_edge(provider, &item, &context)
-        {
-            store.defer_content_edge(&item, &error, 1000)?;
-            return Err(error);
+        let structural = store.content_candidates(1, true)?.into_iter().next();
+        let item = match structural {
+            Some(item) => Some(item),
+            None => store.content_candidates(1, false)?.into_iter().next(),
+        };
+        if let Some(item) = item {
+            // Heal installed local bytes even without a connected peer. This
+            // stays one bounded object per tick, outside Engine and SQL writes.
+            let result = if item.edge.level.is_some() {
+                store
+                    .expand_content_edge(provider, &item, &context)
+                    .map(|_| ())
+            } else {
+                store.verify_content_edge(provider, &item, &context)
+            };
+            if let Err(error) = result {
+                store.defer_content_edge(&item, &error, 1000)?;
+                return Err(error);
+            }
         }
         Ok(())
     }

@@ -1,5 +1,10 @@
 # Wave 6 supplement: TigerBeetle lessons for offline metadata sync
 
+Scope amendment, 2026-10-22: apply the [personal-use authority
+scope](../AUTHORITY_SCOPE.md). Authorized event sets and source-bound evidence
+enforce DVFS replication correctness; they imply no Users, ACLs or additional
+security mechanisms beyond those boundaries and the deployment guarantees.
+
 Planning update: [WAVE_6_PLAN.md](../WAVE_6_PLAN.md) owns current scope, package
 numbering and gates. WP6 labels below refer to the earlier exploratory plan.
 

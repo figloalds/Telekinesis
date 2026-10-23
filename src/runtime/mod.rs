@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     ops::{Deref, DerefMut},
-    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, TryLockError, Weak},
     time::{Duration, Instant},
 };
 
 pub mod content;
 mod content_base;
+pub mod content_inspection;
 pub mod content_reads;
 pub mod content_rpc;
 pub mod content_saves;
@@ -22,6 +22,7 @@ pub mod content_writes;
 pub mod control;
 pub mod ctx;
 pub mod engine;
+mod exit;
 pub mod export;
 pub mod notify;
 pub mod objects_effects;
@@ -30,7 +31,6 @@ pub mod published;
 pub mod server;
 pub mod sync_rpc;
 
-pub use content::prepare_content;
 pub use engine::{Engine, EngineVitals, Handle, Session};
 pub use notify::{deliver_notifications, namespace_notifications};
 pub use server::{RpcServer, start_rpc, start_rpc_ctx};
@@ -230,10 +230,9 @@ fn elapsed_ms(since: Instant) -> u64 {
 /// A poisoned engine (a thread panicked while holding it):
 /// * [`PoisonPolicy::Panic`] (the default; tests): panics with `ENGINE_POISONED`.
 /// * [`PoisonPolicy::Exit`] (set by `worker::run`): `into_inner`, then
-///   [`Engine::persist_after_poison`] (roll back an open transaction, then
-///   `retain_all_dirty`), then a fatal `ENGINE_POISONED` log line, then
-///   `exit(70)`. The recovered guard is held until the process exits, so no
-///   other thread sees the inconsistent engine.
+///   roll back an open transaction, checkpoint native files outside Engine,
+///   retain dirty sessions, log `ENGINE_POISONED`, then `exit(70)`. Other
+///   engine users wait for that exit; one owner performs retention.
 pub fn lock_engine(e: &Shared) -> EngineGuard<'_> {
     lock_engine_tracked(e)
 }
@@ -250,10 +249,16 @@ pub fn lock_engine_tracked(e: &Shared) -> EngineGuard<'_> {
 /// A non-blocking [`lock_engine_tracked`]: `None` while another thread holds
 /// the engine. A poisoned engine follows the poison policy.
 pub fn try_lock_engine(e: &Shared) -> Option<EngineGuard<'_>> {
-    match e.try_lock() {
+    exit::wait_if_exiting();
+    let result = e.try_lock();
+    if exit::started() {
+        drop(result);
+        exit::wait();
+    }
+    match result {
         Ok(guard) => Some(EngineGuard::new(guard, worker_of(e))),
         Err(TryLockError::WouldBlock) => None,
-        Err(TryLockError::Poisoned(poisoned)) => engine_poisoned(poisoned),
+        Err(TryLockError::Poisoned(poisoned)) => engine_poisoned(e, poisoned),
     }
 }
 
@@ -266,6 +271,7 @@ pub fn check_engine_poison(e: &Shared) {
 }
 
 fn acquire<'a>(e: &'a Shared, worker: Option<&ctx::WorkerCtx>) -> MutexGuard<'a, Engine> {
+    exit::wait_if_exiting();
     let started = Instant::now();
     let result = {
         let _waiting = worker.map(|worker| worker.gauges.begin_wait());
@@ -274,21 +280,29 @@ fn acquire<'a>(e: &'a Shared, worker: Option<&ctx::WorkerCtx>) -> MutexGuard<'a,
     if let Some(worker) = worker {
         worker.gauges.record_wait(elapsed_ms(started));
     }
+    if exit::started() {
+        drop(result);
+        exit::wait();
+    }
     match result {
         Ok(guard) => guard,
-        Err(poisoned) => engine_poisoned(poisoned),
+        Err(poisoned) => engine_poisoned(e, poisoned),
     }
 }
 
-fn engine_poisoned(poisoned: PoisonError<MutexGuard<'_, Engine>>) -> ! {
+fn engine_poisoned(shared: &Shared, poisoned: PoisonError<MutexGuard<'_, Engine>>) -> ! {
     match poison_policy() {
         PoisonPolicy::Panic => {
             panic!("ENGINE_POISONED: a thread panicked while holding the engine lock")
         }
         PoisonPolicy::Exit => {
-            let mut engine = poisoned.into_inner();
-            let outcome = catch_unwind(AssertUnwindSafe(|| engine.persist_after_poison()));
-            let (retained, error, hook_panicked) = match &outcome {
+            let engine = poisoned.into_inner();
+            if !exit::begin() {
+                drop(engine);
+                exit::wait();
+            }
+            let retained_state = exit::retain(shared, engine, &exit::context());
+            let (retained, error, hook_panicked) = match &retained_state.outcome {
                 Ok(Ok(retained)) => (Some(*retained), None, false),
                 Ok(Err(error)) => (None, Some(format!("{error:#}")), false),
                 Err(_) => (None, None, true),

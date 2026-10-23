@@ -1,5 +1,614 @@
 # Wave 6 contracts
 
+## Personal-use authority scope (2026-10-22)
+
+[Deployment assumptions and DVFS boundaries](AUTHORITY_SCOPE.md) govern the
+current target contracts, including the transport boundary below. Users, ACLs
+and untrusted-user service security are out of scope. Deployment supplies channel
+and host protection; DVFS retains its own pairing/route/reference, generation,
+ownership, integrity and filesystem checks. Earlier HMAC/credential-enrollment
+contracts describe existing or historical mechanisms, not requirements to
+reproduce them. Simplification targets the selected simple hashed pairing-code
+model. Historical qualification is preserved; this amendment changes no runtime
+or test result and introduces no security release gate.
+
+The hashed pairing-code challenge is the application admission boundary for an
+online server. Missing/incorrect codes grant no peer use; channel protection
+does not replace pairing. Successfully paired peers are trusted. Remaining
+reference, generation, ownership and integrity checks enforce DVFS correctness,
+not a hostile authenticated-user model. Unpair/reconnect must preserve admission.
+
+## Current scope amendment — CCR-WP6.G-1 (2026-10-21)
+
+The user confirmed a greenfield release with no prior-version support. The
+[WP6.G interlude](WAVE_6_PLAN.md#31-wp6g--greenfield-interlude-in-progress)
+has started after CCR-WP6.4-30. Its target removes legacy representations, save/transport
+fallbacks, promotion, prior store/journal upgrades, old-reader qualification,
+mixed-version interoperability, previous-executable fences and downgrade
+workflows from the target contract and release gates. These are scope removals,
+not unfinished compatibility gates. Fresh stores use a single current
+direct/manifest content path and selected current private-journal/protocol
+versions. Current-format recovery and clear unsupported-version refusal remain
+required, as do authorization, durability, ownership, retention and resource
+bounds. Current small-file direct objects are not legacy whole-file support.
+
+The sections below record implemented contracts and earlier CCRs. References
+there to mandatory legacy/migration/compatibility work are superseded only to
+the extent they support prior formats or versions. Their code descriptions and
+evidence are not claims that WP6.G has already removed those paths. WP6.G must
+replace the relevant normative codec/schema/API sections and golden fixtures
+with the selected current-only definitions as implementation lands; do not
+silently reuse an old encoding with a new meaning. Historical evidence remains
+intact. Production activation remains off, and all current-path correctness,
+platform, performance and failure gates remain required.
+
+## CCR-WP6.G-14: current file-content representations
+
+Only Direct (binary kind 1, representation 1) and Manifest (kind 2,
+representation 1) are supported file descriptors. Kind 0, representation 0 and
+JSON `legacy` descriptors are unsupported; their former encodings are never
+reinterpreted. Direct/Manifest bytes, SHA-256 domains, bounds and canonical empty
+identity retain their existing definitions below. An old binary vector is kept
+only to test refusal.
+
+The provider no longer reads/verifies whole-file legacy objects or converts them.
+Live and retained private saves use current chunk rebuilding without conversion
+caches or alternate converted providers. Save capture requires `content_ref`;
+it cannot infer a base from a bare hash and object size. Full replacement may
+omit old bytes/structure; unchanged subtrees may remain unhydrated. Required
+changed chunks/structural pages still fail on missing or corrupt bytes.
+
+This amendment supersedes positive legacy-descriptor/provider/conversion
+contracts in the historical sections below. Bare strings still exist in other
+metadata/projection/status/preview consumers and standalone/transport routes;
+those removals remain open, so this does not claim descriptor-only ingress or
+a complete single current path. G14 scoped evidence is
+[current-content-codec-checks.json](../../test-evidence/wave-6/current-content-codec-checks.json).
+
+## CCR-WP6.G-15: current Saved lifecycle accounting
+
+Heartbeat `pending_saves` includes current private Saved revisions awaiting
+publication, independent of buffered dirtiness and already adopted baselines.
+The current journal initializes an atomic count from its existing pending index.
+Checkpoint/adoption transactions compute the resulting count before COMMIT and
+publish it only after success. Failed commits keep the earlier durable count;
+new buffered edits cannot replace that count with zero. Heartbeat reads use no
+Engine, private-journal or SQLite lock. Existing wire fields and journal/store
+formats are unchanged. The old standalone table counter remains during removal
+of that execution path; this is not a new save scheduler.
+
+Fatal poison retention uses the shared off-lock helper after metadata rollback
+or connection replacement. The unused standalone `persist_after_poison` API is
+removed. Current native lifecycle, failed publication/retention, group/adoption
+and actual mount checks are scoped in
+[native-saved-lifecycle-checks.json](../../test-evidence/wave-6/native-saved-lifecycle-checks.json).
+Other standalone save/staging and transport fallback removals remain open.
+
+## CCR-WP6.G-16: one service at public mount attachment
+
+Public WinFsp attachment and FUSE `attach`/`attach_managed` initialize/reuse the
+current NativeWrites owner after path checks and before creating the OS mount or
+mountpoint. This includes convenience/library calls without RPC startup; an
+already active service is reused without a second executor. Unsupported private
+journals refuse that attachment. The application C/Rust `tk_mount_start` ABI no
+longer has an optional native-content argument; WinFsp capability/operation-guard
+selection uses the current native path on every volume. This adds no user setting
+and makes no prior-executable ABI compatibility promise.
+
+Scoped direct/RPC actual-mount and controller evidence is
+[mount-default-current-checks.json](../../test-evidence/wave-6/mount-default-current-checks.json).
+The new refusal case covers fresh valid metadata, unchanged unsupported journal
+bytes, absent sidecars and absent mountpoint. It does not establish refusal before
+recovery of unrelated pending directory metadata. Other adapter/Engine/staging
+fallbacks remain open in the inventory.
+
+## CCR-WP6.G-17: current handle reads and chunk-local mutation
+
+Regular-file staging requires a typed descriptor. Whole-file CAS references,
+cached whole-file handles, writable-copy conversion and object snapshots are
+removed from `Staged` and both adapters. Direct small-file objects still use
+the current provider; directories/control data and the remaining standalone
+memory/disk deferred-save route are separate and await consolidation.
+
+Read progress means verified progress in the requested range, with independent
+stall, total-deadline, cancellation and capacity outcomes. Feeding an unverified
+whole-file spool is not a current file-read progress signal. Immutable handle
+selections survive unrelated activation; a changed content head replaces the
+selection. Generic object-ID preview/fetch remains a separately audited caller.
+
+A native mutation marks its session dirty before off-lock preparation to fence
+checkout. If no visible byte sequence changes, completion restores only that
+operation's prior dirty marker, guarded by the same file and edit identity.
+Zero-byte writes and refused corrupt-chunk writes/truncation must not invent
+dirty bytes or change metadata. Earlier accepted edits remain dirty; partially
+accepted writes that lose their reply retain their progress and clocks.
+
+Scoped current-handle evidence and separate broader diagnostics are in
+[current-handle-content-checks.json](../../test-evidence/wave-6/current-handle-content-checks.json).
+This does not close the remaining standalone staging/table/transport inventory.
+
+## CCR-WP6.G-18: descriptor-only Core metadata
+
+Every accepted file-content register is a validated Direct/Manifest descriptor
+JSON object. Strings, null, numbers, booleans and arrays are refused as
+`INVALID_CONTENT`. This applies before the public nonlocal commit can expand
+whole-file objects, before bundle byte installation/provenance, before inbox
+staging and at feed precheck. An invalid content value cannot advance metadata
+admission, peer knowledge or outbox acknowledgement. A batch rejected before
+staging leaves no partially admitted event/root/source rows.
+
+Projection setters/getters no longer interpret strings as file content. The
+temporary `Entry.content` member encodes/decodes only null until its remaining
+consumers are removed; a non-null string is refused even beside a valid
+`content_ref`. Supported current projections keep their encoding and selected
+metadata schema/header 3. There is no old-data conversion or new migration.
+Regular-file metadata size comes from the validated descriptor's logical length,
+without the old `object_sizes` fallback; directory/control/session handling is
+separate. Missing local bytes/structure do not prevent this metadata lookup.
+
+Bulk fixtures exercise public Core commits and durable root handoff. They no
+longer fabricate old file-object catalogs or serialized projection/head rows.
+Their direct data is installed outside the metadata batch, and creation
+preconditions do not alter Core's ability to admit valid conflicting metadata.
+Scoped evidence, including full feed and current-store checks, is recorded in
+[descriptor-only-metadata-checks.json](../../test-evidence/wave-6/descriptor-only-metadata-checks.json).
+Status/preview/demand, old standalone saves/tables and transport consolidation
+remain separate open work.
+
+## CCR-WP6.G-19: current content status and folder details
+
+Content counts refer to distinct logical descriptors: active live file roots for
+current counts, and granted shared historical roots for shared counts. Physical
+chunks are not files. Canonical empty content needs no installed object. Reports
+follow typed verified jobs and canonical indexed manifest adjacency, with cached
+listings of data and manifest directories; no CAS file bytes are read or hashed
+for status. Present but unverified/unexpanded content is `indexing`, absent
+coverage is `missing`, and recorded corruption is `corrupt`. Missing bytes count
+logical occurrences, including repeated chunks and the full range of an absent
+manifest page. The bounded missing list carries entity/revision/reference,
+descriptor, path, state and missing_bytes, never a manifest digest as a file hash.
+
+A locally readable received root is shared-complete only when its pages/chunks
+also have public receipts. Private dedup verification does not manufacture those
+receipts. Local publishable roots retain their existing disclosure semantics.
+The cache follows database changes, branch and both directory listings, and
+never reuses a transactional computation. Status observes verified metadata and
+presence; normal verified reads/scrubbers discover hidden same-length in-place
+external corruption. It is not a synchronous integrity scrub.
+
+The worker samples current repository transfer reservations and live range
+waiters; unverified old spool growth is not progress. Local maintenance verifies
+one bounded data job per tick when no structural work is pending, without a peer
+or Engine lock. The actual folder-details RPC captures/rechecks view identity
+around a secondary SQLite snapshot outside Engine, retains conflict review tokens
+and pagination, and embeds the worker status claims. Uncached full summaries
+still walk roots/reachable indexed structure; large-store/load/build gates are
+not closed by this tranche. Scope and evidence:
+[current-status-checks.json](../../test-evidence/wave-6/current-status-checks.json).
+
+## CCR-WP6.G-20: reference preview and explicit range demand
+
+The worker/Folder control surface uses `preview-content`, `request-content` and
+`cancel-content-request`. `reference` is the registered event/entity reference ID,
+not a descriptor's digest or a file-byte SHA. GUI conflict alternatives derive it
+from their revision/entity. A granted reference resolves its immutable descriptor;
+withdrawn/unknown references refuse. The old `preview-object`/`request-object`
+file routes have no fallback or translation. Generic local `cat-object` remains
+a distinct artifact/debug consumer pending the rest of its catalog/transport audit.
+
+Preview reads/verifies at most the first 65,536 bytes and returns reference,
+descriptor, logical size, truncated flag and text/binary indication. It does not
+require unrelated chunks. Locally present private data can be read; private
+missing data does not enter peer demand. A shared missing/corrupt range waits
+through current typed demand. Provider I/O and waits hold neither Engine nor a
+metadata transaction. Pins, selected view and admission generations bound the
+operation; changed view/grant is checked again before delivery. JSON control
+keeps the existing 15s bound; session calls honor their shorter absolute deadline
+and cancellation while preserving large JSON reply body framing and the session.
+
+Explicit request takes reference, optional offset (default 0) and len (default
+the remaining prefix up to 1 MiB). The range must fit the descriptor and the
+1 MiB bound. Available data returns queued=false/available=true. Otherwise the
+worker owns a foreground range demand and pin and returns queued=true plus its
+cancellation token. Repeating the same reference/admission/view/range joins that
+owner; retries do not extend its fixed 24h lifetime. Cancel drops only that UUID.
+Completion, expiry, withdrawal, checkout and worker stop also release it. These
+are volatile priorities in the worker incarnation, not durable file-save or
+availability acknowledgements. Durable admitted roots/background replication
+remain the restart owner; no old object_requests/WANT/spool row is written.
+
+Calls reserve read capacity before allocating at most 1 MiB. At most two control
+byte calls run per worker, leaving loopback handlers for metadata and content
+completion. Sixteen process-wide explicit prefetches have a separate budget and
+release their read-call slots after acknowledgement. No per-request thread or
+new transport security/protocol negotiation is introduced. Scope and evidence:
+[reference-consumer-checks.json](../../test-evidence/wave-6/reference-consumer-checks.json).
+
+## CCR-WP6.G-23: validate private format before directory recovery
+
+Current service installation must validate/open the selected private journal
+before consuming pending directory dispositions or committing their namespace
+changes. Unsupported private input leaves those intents and canonical metadata
+untouched through both RPC startup and direct attachment. Recovery still completes
+before requests are accepted on a current store. This ordering uses the existing
+journal open; there is no prior-format reader or upgrade path.
+
+
+## CCR-WP6.G-22: canonical creation only
+
+Native creation commits typed empty content and its name before acknowledging
+the handle. It has no optional deferred-create mode, parallel pending-name map,
+first-save creation commit or late uncommitted namespace restoration. Lookup and
+enumeration use the canonical Store view; COW supplies dirty byte length. A new
+unflushed child therefore prevents directory removal without a second name index.
+Current creation/namespace receipts and private recovery preserve ownership and
+replay. Existing standalone stage recovery cannot introduce a missing file.
+
+Namespace operations own source/destination session handles even when a COW
+session already exists. Capture and retention share the short Engine lock;
+the final user close cannot evict them while entity gates are awaited. These
+readonly operation handles fence quiet/checkout and release on every outcome,
+including a request deadline. They do not authorize another writer's byte save.
+
+The local scenarios use current provider/range byte oracles. Explicit mounted
+invocation requires an actual WinFsp/FUSE mount. The 300-file copy and eight
+writers x150 files retain their original bounds; ordinary close/fsync uses the
+current executor/durability contract, replacing old spool scheduling assumptions.
+The report's 26-function retirement ledger identifies each current coverage owner.
+Remaining standalone staging/snapshot/pending-saves behavior is not removed or
+qualified by this creation tranche. Scope and evidence:
+[deferred-creation-checks.json](../../test-evidence/wave-6/deferred-creation-checks.json).
+
+
+## CCR-WP6.G-21: mounted mutation dispatch
+
+Attachment installs the current native write service before any callback.
+Ordinary mounted create/write/truncate/basic metadata/rename/delete must use
+current byte/namespace owners; an unavailable current helper cannot select a
+standalone memory/disk/deferred Engine implementation. Current shared savers
+remain responsible for flush/close and retained readonly writer semantics.
+Readonly descriptors have no byte save. Directory metadata/release/fsync and
+virtual root/discovery behavior are explicit: root permits only its no-op 0755
+mode, discovery reads its buffer, and neither accepts byte mutations. FUSE
+validates fsync handles and releases failed truncating opens. Closed/readonly
+immutable rename sources acquire a temporary current metadata owner without
+hydrating base bytes and then use the existing namespace executor/receipt.
+This does not remove
+the remaining standalone APIs/table or claim full-path/release qualification.
+Scope and evidence: [current-adapter-checks.json](../../test-evidence/wave-6/current-adapter-checks.json).
+
+
+## CCR-WP6.G-2: selected current private-journal layout
+
+The only supported existing private journal has SQLite application ID
+`0x544b5753` and `user_version=7`. Its existing v7 schema, sealed Working/Saved
+records, overlay maps, exact native clock pairs and causal/ownership identities
+keep their meaning. There is no v4/v5/v6 upgrade chain or matching-reader/export
+path. Descriptor/provider conversion was subsequently removed by G14 above;
+other runtime fallbacks remain separate items in the
+[removal/replacement inventory](notes/wp6-greenfield-inventory.md).
+
+An absent or genuinely empty database initializes directly in this layout.
+Schema, inventory and header commit atomically in a FULL SQLite transaction;
+an interrupted initialization leaves an empty or complete current database.
+The locator `write-sessions-v1.sqlite` does not select the accepted layout.
+
+A standalone input without a nonempty WAL first passes a fixed 100-byte SQLite
+header eligibility check through ordinary read-only file access. This refuses
+unsupported input before SQLite itself can create empty WAL/SHM sidecars. A
+nonempty WAL remains authoritative through read-only SQLite inspection; the
+main header may be stale or torn during checkpoint recovery. This eligibility
+check never substitutes for the transactional snapshot. The writer handle is
+checked again before any journal-mode change. Any other header,
+or any unmarked database containing schema objects or a nonzero schema cookie,
+returns `UNSUPPORTED_WRITE_JOURNAL`, classified `Incompatible`, with an actionable
+instruction to use a fresh store directory. Refusal must not rewrite the database,
+WAL or saved records or silently initialize/upgrade unsupported state. The
+bounded read-only snapshot pool enforces the same current-layout check.
+
+Prior-reader and prior-layout upgrade tests are removed as obsolete. Current
+restart preserves exact Saved record bytes and their checksums,
+operation/checkpoint identity and native/headless clocks. Resuming deliberately
+rotates the Working owner and advances its sequence to fence older handles;
+the mutable row seal changes with that ownership. A 104-case header/mode/clock
+matrix covers refusal
+without persistent-byte or directory-entry changes, plus malformed, previously
+used unmarked and empty non-ASCII locator cases. Three actual exit-86 children
+cover fresh
+initialization atomicity. All other current save/publication/adoption/recovery
+regressions remain required. Historical compatibility evidence remains intact.
+
+## CCR-WP6.G-3: selected current Core metadata layout
+
+`metadata.sqlite` accepts application ID `0x544b4d53`, `user_version=3`, or a
+genuinely empty input for initialization. `core/schema.sql` is the single fresh
+layout: 63 tables, 34 triggers and 17 explicit indexes. The independent fixture
+`tests/fixtures/store_v3/schema.json` retains all preceding definitions and adds
+the explicitly specified directory-disposition table/index. G5 added file
+dispositions; G7 adds directory dispositions with scoped current-path qualification.
+G3 used layout 1, and G5/G6 used layout 2; those results are historical evidence.
+There are no prior-layout readers or upgrades. Fresh creation
+commits that schema, selected branch, repository/device identities, generation,
+journal epoch and header together in one FULL transaction. A concurrent writer
+adopts the winner's committed identities; bounded `SQLITE_BUSY` remains permitted.
+No historical module stamps, ALTER chain or prior-format spool adoption runs.
+
+The shared standalone-header guard has the same WAL authority policy as the
+private journal above. Unsupported metadata returns `UNSUPPORTED_STORE_FORMAT`
+(`Incompatible`) before a writable open or creation of an objects directory.
+Current required identities and authoritative tables are validated together in
+one read snapshot (or the caller's existing writer transaction), never
+synthesized to hide damage. Secondary handles validate format, required schema
+and identity; they neither initialize nor repair. Existing extra nonconflicting
+schema objects are permitted, including the fault-injection triggers used by
+current durability tests.
+
+Missing performance indexes can be recreated. Only declared disposable object
+reference, feed-journal and journal-branch structures/triggers may be rebuilt.
+Their recreation and invalidation of the affected repair marker/cursor share
+one transaction. Bounded current-data scans persist `repair:objects`,
+`repair:feed` or `repair:journal` cursors and mark ready only when complete.
+Restart never clears accepted journal sequence, epoch, peer acknowledgements,
+receipts or authorization to manufacture an apparent clean store. Existing
+save/adoption and snapshot recovery retain their current-format semantics.
+
+This selects the Core layout only. Descriptor producers,
+default native execution and transport consolidation remain in WP6.G.
+
+## CCR-WP6.G-4: selected current catalog layout
+
+`folders.sqlite` selects application ID `0x544b4353`, version 1. Its seven-table
+layout is initialized directly from `orchestrator/catalog/schema.sql`; schema,
+installation, initial lease counter, initial verifier generation and header share
+one FULL transaction. The next durable lease incarnation is committed before any
+actor snapshot/worker ownership is exposed. Neither lease nor verifier generation
+may wrap or saturate into reuse.
+
+Validate unsupported input before creating a lock file or mount directory,
+changing permissions or opening a writer, using the shared standalone-header/WAL
+authority policy. Revalidate under the directory lock. Current required tables,
+installation/counters, verifier consistency and folder intents are authoritative;
+missing state is refused rather than synthesized. Current validation queries share
+one snapshot. Extra nonconflicting schema objects remain permitted for current
+fault-injection/diagnostic use.
+
+`mount_gates` is the only durable gate source. No `initial_sync` mirror,
+`catalog_schema` migration, older-writer reconciliation or
+`credentials_generation` ledger remains. A gate can legitimately outlive removal
+of its mount path while awaiting satisfaction/override and controller cleanup.
+Preserve that state across restart. A verifier's salt remains a current identity
+consistency check. `SetVerifier` commits the new verifier, checked generation and
+inbound credential revocation together. Current unpair/re-pair credential cleanup,
+bounded busy retries, actor panic rollback, unknown command outcomes and directory
+lock ownership retain their meaning. Invalid individual credential rows retain
+their existing fail-closed behavior; they are not a request to reset credentials.
+
+Current-format qualification and its staged test-only fixture rebase are recorded
+in the [implementation record](notes/wp6-progress.md#current-catalog-ccr-wp6g-4).
+This selects the catalog layout; descriptor, default execution and transport
+consolidation remain open.
+
+## CCR-WP6.G-5: native unlink ownership and durable dispositions
+
+Removing a native file's name is a namespace-only operation. A FULL private
+checkpoint precedes the tombstone and an exact retained-writer continuation;
+the tombstone, continuation and sealed `unlink:v1` receipt commit in the same
+metadata transaction. The request binds the operation, checkpoint, mutation ID,
+entity, observed path and parent identity. A lost reply is resolved by read-only
+exact receipt lookup, never by removing whatever later occupies that path.
+
+Open descriptors keep the same private bytes and may continue reading, writing
+and flushing the unnamed entity. Subsequent saves retain `alive=false`; a new
+file using the old name has a distinct entity and is unaffected by old handles,
+cleanup or receipt replay. Namespace retirement alone does not publish bytes or
+authorize private-map pruning. Current reference retention and permission rules
+remain in force. Unsupported/foreign ownership cannot grant this continuation.
+
+WinFsp `CanDelete` validates without removing anything. `Cleanup` with
+`FspCleanupDelete` performs the removal, including POSIX deletion while other
+handles remain open and creation with delete-on-close. The SDK's Cleanup is void:
+errors still retain/report failed work through the existing native save/adapter
+health path; it cannot provide a fallible Windows close reply. FUSE unlink and
+both adapters' checkpoint/commit work occur outside the Engine lock under the
+entity, adapter-mutation and bounded namespace ownership gates. Existing rename,
+replacement and retired-destination behavior keeps its contracts.
+
+The initial candidate's Saved-byte checkpoint is insufficient for Windows delete
+recovery: injected failure after disposition acceptance left the name visible.
+A pending removal must have durable ownership, observable cancellation and exact
+restart handling, rather than relying on the failed namespace transaction to
+store the only request. Bind the entity and handle/request identity through
+name reuse and rename; a canceled disposition must not delete on restart. Cover
+new-file delete-on-close as well as deletion of an existing file. This obligation
+was absent from the preserved initial candidate and is implemented by the
+correction below.
+
+The correction records each accepted file disposition in
+`content_delete_intents`, bounded to 64 records with 16-record read pages. Sealed
+records bind a fresh per-handle request UUID, repository/workspace, branch/view,
+entity and stable byte-operation UUID. `SetDelete` records or cancels that request
+in a FULL transaction before the fallible response; delete-on-close creation/open
+records it before acknowledging the open. Marking the file does not remove its
+name or force byte publication. Cancellation affects only the originating
+handle's exact request; its lost reply is resolved by read-only lookup.
+
+Unlink/replacement consumes the entity's matching dispositions in the same
+transaction as the tombstone and retained-writer successor. A failed namespace
+transaction leaves the separately durable request intact. A durable cleanup may
+replay that exact owned request; ordinary fallible unlink still never retries an
+unrecorded failed mutation. Pending requests fence checkout. At restart, validate
+workspace/view and writer ownership before journal-owner recovery; normalize
+committed byte continuations, preserve Saved bytes and resolve the current name
+by entity. Consume requests before normal Saved publication or mounting. A clean
+Working-only capture needs no byte publication and is left intact. Corrupt or
+superseded authority is an explicit error, never an invented request or reset.
+An existing request alone cannot resolve a failed staging reply: recheck current
+writer, live file, readonly policy and unpublished-byte eligibility in one read
+snapshot. Core repeats validation after insertion before commit. Proven byte
+publication is inspected only at its exact next, unowned generation; a later
+writer is refused before private-journal recovery.
+
+The scoped qualification is
+[native-unlink-durable-checks.json](../../test-evidence/wave-6/native-unlink-durable-checks.json):
+418 frozen inputs, strict release Clippy on both platforms, 512 Windows/520 Linux
+ordinary cases across 12 targets, and seven actual kernel parents per platform.
+All 13 harness/worker-CLI images per platform and source hashes stayed unchanged.
+The original failed candidate and subsequent development defects retain their
+exact source/log/image capsules; diagnostic repeats and exit children are not
+additional unique passing cases.
+
+This supplies required native file removal before default-path consolidation.
+It does not make typed writes the default, remove staging/old transport, implement
+all directory operations, or close the remaining Wave 6 gates.
+
+## CCR-WP6.G-6: native directory metadata (in progress)
+
+The first replacement moves directory creation out of Engine's semantic lock.
+`DirectoryCreateRequest` binds separate mutation/entity UUIDs, repository/workspace,
+branch/view, observed parent/path and initial basic metadata. A bounded namespace
+reservation and entity key precede one FULL pooled Core transaction. It commits
+only kind, location, alive and basic metadata, together with a sealed
+`directory-create:v1` exact receipt in `content_save_create_changes`. The table is
+creation authority shared with the separately sealed file-create records; it is
+not a directory byte owner. SQL layout remains version 2 and the private journal
+remains v7. No prior-layout reader or migration is added.
+Adapter/name/entity admission precedes opening the pooled connection and any
+workspace-identity initialization, so admission also bounds that preparation.
+
+Historical receipt replay cannot recreate a moved/deleted directory or overwrite
+a later occupant. Final transaction checks and pre-ACK validation bind the exact
+event, live initial entry, parent, workspace/view and metadata revisions. A failed
+open may leave an already committed directory, but attaches no invented handle
+and never silently retries an absent receipt. Initial POSIX mode and Windows
+attributes belong to creation; no follow-up mode setter fences a file owner.
+
+WinFsp directory Create and threaded FUSE MKDIR consume this coordinator when
+native execution is selected. A directory handle holds metadata and the existing
+enumeration cursor; it has no file content, private save, checkpoint or content
+publication. The installed SDK's FINE guard still holds one volume-wide exclusive
+lock across Create, deleting Cleanup and rename. Explicit native mounts now use
+the supported null Enter/Leave operation guards, relying on Rust's bounded
+namespace/entity ownership and transaction revalidation; kernel per-file
+serialization remains. The other unconverted execution retains FINE until its
+replacement. The scoped native namespace qualification below covers this change.
+
+The directory kernel parent separates Engine acquisition and existing-handle
+metadata progress from a same-parent named lookup. The initial named-lookup
+300 ms assertion failed under the injected 500 ms mkdir delay on both platforms.
+Linux sampling locates that caller in kernel `walk_component` with an idle FUSE
+dispatcher; a separate handle control passes. Windows handle metadata also waits
+under the SDK FINE guard, motivating the native guard change above. Preserve
+those exact failures and record named-lookup overlap separately. The 50 ms Engine
+and 300 ms existing-handle assertions remain; original load/cache/build gates are
+unchanged and are not qualified by this parent.
+A separate kernel parent must preserve entity and byte identity when a committed
+rename overlaps a new-name open and old-name recreation under the native guard.
+
+Directory rename/delete/basic metadata outside Engine, durable
+directory dispositions and complete namespace/lifetime/remote ordering remain
+required. Creation is qualified in the isolated native path and is not the default.
+
+Final scoped proof is
+[native-directory-create-checks.json](../../test-evidence/wave-6/native-directory-create-checks.json):
+422 frozen inputs, strict release Clippy on both platforms, 522 Windows/530 Linux
+ordinary cases across 12 targets/platform and nine actual kernel parents/platform.
+All 13 harness/worker-CLI images per platform stay unchanged through proof. The
+separate current-image Windows time-policy parent still fails with exit 101; its
+actual failed harness/CLI/source are archived. No timestamp, named-lookup/cache,
+load, directory-lifetime or other original release gate is waived.
+
+## CCR-WP6.G-7: directory mutations and dispositions (scoped qualification)
+
+Directories use exact metadata snapshots, never a file `SaveIntent` or byte
+journal owner. Each capture binds workspace/repository, branch/view generation,
+entity, kind/location/alive/basic selected heads and the complete observed entry.
+The FULL writer checks that capture, source path/parent when supplied, target
+parent/occupant, empty replacement/removal and bounded ancestor traversal before
+committing. Partial basic updates retain unspecified fresh fields. Sealed
+`directory-change:v1` receipts bind the exact command, immutable event and result;
+historical replay returns that receipt and never replays a later name.
+
+Fresh metadata layout 3 adds `directory_delete_intents` and an entity/request
+index. A `directory-delete:v1` record binds one handle's request to its exact
+live empty-directory snapshot. File and directory requests share the 64-request
+bound; public recovery pages contain at most 16 records and each record is
+bounded to 64 KiB. Owned basic/rename commands atomically advance every pending
+request; remove or empty-directory replacement consumes them. Cancellation
+removes only the exact handle's request. Pending deletion prevents native child
+creation or moving a child into that directory, checked inside the Core writer.
+Checkout refuses either kind of pending disposition.
+
+Directory recovery runs before opening the private byte journal or publishing
+Saved file checkpoints. It validates the exact snapshot and emptiness and uses
+the same durable removal command. Foreign changes cause refusal, not adoption,
+reset or deletion of a reused name. Adapter directory handles retain independent
+existence heads; owned commands can advance handles of that incarnation, while
+restoring the entity does not grant an older handle authority over the new one.
+Enumeration retains an existing cut; rewinding an obsolete incarnation refuses.
+
+The implementation routes native Windows basic/rename/disposition/Cleanup and FUSE
+basic/rename/rmdir through bounded metadata ownership and pooled connections
+outside Engine. The 429-input current source passes strict release Clippy,
+539 Windows/548 Linux ordinary cases across 12 targets/platform and eleven
+actual kernel parents/platform, retaining all 13 images/platform through proof.
+The independent schema fixture and current restart/refusal tests select layout 3.
+The proof is
+[native-directory-metadata-checks.json](../../test-evidence/wave-6/native-directory-metadata-checks.json).
+It covers the specified local handle/removal/replacement/restart cases, not all
+deadline/lost-observation or remote activation lifetimes. Default execution,
+transport simplification and all remaining Wave 6 gates stay open.
+
+CCR-WP6.G-9 adds scoped reconciliation of retained directory mutations/Cleanup
+after a post-commit observation deadline. It reads the existing exact receipt
+for the current removal head, checks its prior incarnation and scope, and reuses
+normal observation before continuing. Restorations remain fenced. Staged focused
+coverage passes 184 ordinary cases per platform; read-only enumeration and full
+remote lifetimes remain open. See
+[directory-observation-checks.json](../../test-evidence/wave-6/directory-observation-checks.json).
+
+CCR-WP6.G-10 also reconciles retained enumeration through the same observation
+method. It consults the existing receipt only on an existence-head mismatch and
+rechecks the current head before building the directory cursor. This performs
+bounded metadata reads/handle updates, without another durability commit or byte
+work. Both platforms pass 78 ordinary native-write cases and two actual directory
+kernel parents, with the unchanged standalone negative now passing. Full remote
+and concurrent-parent lifetimes remain open. Evidence:
+[directory-enumeration-checks.json](../../test-evidence/wave-6/directory-enumeration-checks.json).
+
+CCR-WP6.G-11 is implementing default native service initialization for current
+workers. Startup recovers/installs the service before accepting RPCs, without a
+fixture marker. Stop cancels its admissions after retention and process teardown
+uses the existing bounded executor drain outside Engine. The candidate remains
+failed/unqualified: new ordinary startup/recovery cases pass on both platforms
+and its FUSE mount passes, while fatal native retention, legacy-pending startup,
+duplicate fixture installation and retired gate expectations fail. Relevant
+recovery/integrity/routing tests stay required. Core producers, standalone legacy
+execution and transport remain pending, so this is not a claim of a complete
+single current path or release. Evidence:
+[native-default-candidate-checks.json](../../test-evidence/wave-6/native-default-candidate-checks.json).
+
+## Transport security boundary (2026-10-22)
+
+The user selected standard TLS/WSS or the enclosing VPN as the channel-security
+boundary. Transport consolidation must reuse that protection without a custom
+cryptographic channel, extra security negotiation or another transport-security
+layer. This supersedes any earlier proposal to expand channel-security scope.
+
+CCR-WP6.G-8 implements that simplification. Its scoped source removes
+the HMAC transcript, mutual MAC proofs, authentication nonces, scheme negotiation
+and custom enrollment wrapping. `AUTH` carries an ordinary application credential
+and whether it is a stored peer credential; `AUTH_OK` is an empty acknowledgement.
+Enrollment sends its secret on the selected protected channel. Existing catalog
+credentials, repository permissions, revocation, connection bounds and standard
+WSS certificate checks remain. No old authentication-format reader or optional
+HMAC fallback is retained. Scoped pairing/session/lifecycle coverage passes on
+Windows and Linux, including actual WSS and two peer/kernel parents/platform;
+the broader Windows receipt/readiness diagnostic failed and remains unwaived.
+Exact staged provenance and the preserved failure are in
+[basic-transport-auth-checks.json](../../test-evidence/wave-6/basic-transport-auth-checks.json).
+
+## Original freeze and implementation amendments
+
 2026-10-20. CCR-WP6.0-1. This freezes the new representation and ownership
 contracts before their consumers. It does not activate repository features or
 claim qualification. Runtime remains std/polling. Existing event strings retain
@@ -2330,8 +2939,464 @@ and partial timestamp requests must use fresh metadata/preconditions rather
 than overwrite unrelated fields from a stale full-register snapshot. The
 implementation record tracks these next steps and stage qualification.
 
+Evidence: [owned-basic-checks.json](../../test-evidence/wave-6/owned-basic-checks.json),
+381 frozen inputs (`6f40fb36…`), strict Clippy, 429/436 reported main
+passes in 13 selected targets, including ten new ordinary Core parents. Three
+actual child exits belong to one parent; repeated/child runs and the existing
+early-return receipt driver are not independent additional proofs. Three
+existing real-kernel parents/platform are regressions. Exact executable/source
+hashes and every source-archive member were verified. Earlier silent-write and
+classification failures are retained, not omitted or relabeled as successes.
+
 The additive metadata receipt table needs retention/storage qualification.
 The optional capture field is readable by new code from old captures; old
 strict readers cannot decode new policies. WP6.6 compatibility fencing remains
 required. Journal version 4 and canonical/wire/event encodings stay unchanged;
 activation, migration and live CAS deletion remain off.
+
+### CCR-WP6.4-21: native mutation clocks and private journal v5
+
+Working/Saved seal the actual mutating handle's write/change-time disable mask
+and mutation milliseconds at the existing NORMAL/FULL boundaries. Explicit
+automatic native writes differ from absent legacy/headless policies. Saved
+recovery restores its policy/clock independently of unacknowledged newer bytes.
+Ordinary writes gain no extra FULL checkpoint. Atomic sequence/time/length
+mirrors support local metadata observation without journal I/O under Engine.
+Only an actual new private sequence changes cached timestamps; partial commits
+remain visible despite a lost reply, and failed preflight cannot reset times.
+
+Core selection uses the mutation clock, not fsync clock, combining the saved
+handle mask with same-sequence explicit retention. Captures/successors retain
+base times until the selected byte policy determines their update. A recovered
+older capture can add basic info without parenting a new remote competitor.
+The writer test alternates two handle masks and three publications and checks
+exact basic-info equality across delayed fsync; it does not call the setter.
+
+Private journal version 5 is required before new policies are stored. A valid
+v4 inventory upgrades atomically under FULL WAL without rewriting records,
+payloads, seals or checkpoint identities. Unknown/older incompatible layouts
+still refuse to open. Actual process exits before/during/after header commit
+exercise rollback/retry; this does not replace the full power-loss matrix.
+
+Explicit compatibility qualification executes the exact attested CCR20 v4
+reader, requires upgrade refusal, and verifies unchanged v5 records/header and
+old image hashes. It does not establish legacy executable workspace isolation,
+capability negotiation, launcher fencing, downgrade/export or production
+migration. Those remain WP6.6 requirements; activation stays off.
+
+Native set-basic callbacks, checkpoint-bound rebasing of failed selected saves,
+partial-field freshness and timestamp-disable/reset requests still need full
+integration. No existing namespace, lifecycle, retention, aggregate resource,
+build-performance or release gate is waived by these timestamp primitives.
+
+Evidence: [native-times-checks.json](../../test-evidence/wave-6/native-times-checks.json),
+381 frozen inputs (`b57d63f1…`), strict Clippy, 433/440 reported main
+passes in 13 selected targets, three existing kernel regressions and one
+actual-v4-reader parent/platform. Child exits, repeated runs and the ordinary
+early-return receipt driver are not independent additional proofs. All source
+members, 26 new executable images and the two old reference images were hashed
+and checked. The visibility case reads cached handle/session basic info, not
+every path/inode getter; those renderers and invalidations remain required.
+
+### CCR-WP6.4-22 — native attribute rendering and cleanup boundary
+
+In the isolated native path, FUSE stat uses typed descriptor length before
+open and native COW session basic info while a private session exists. The
+getter performs no provider/CAS work to determine a typed file's declared size.
+Metadata queries must expose an acknowledged private write's timestamp without
+publishing unrelated uncheckpointed bytes.
+
+Read-only native cleanup/close cannot create a new durability promise for
+another handle's buffered writes. It may finish an already FULL Saved recovery
+or failed save. The recoverability decision is made under the per-file mutation
+gate and remains protected through publication/adoption. WinFsp cleanup, FUSE
+flush and common release use this boundary. Explicit fsync/FlushFileBuffers and
+volume flush remain durability points, including fsync through a read-only
+handle; writable native close retains its existing FULL recovery promise.
+Legacy save behavior is unchanged.
+
+The implementation record preserves the actual getter/cleanup failures and the
+first skip's unchanged recovery-test failure. The local path/handle scenario
+does not establish remote metadata activation ordering, all directory/cache/
+notification surfaces, native set-basic or native namespace integration. No
+Wave 6 gate or production activation requirement is waived.
+
+Evidence: [native-attrs-checks.json](../../test-evidence/wave-6/native-attrs-checks.json),
+381 frozen inputs (`781885a4…`), strict Clippy, 435/442 main harness cases
+in 13 selected targets, three actual kernel parents and one actual-v4-reader
+parent/platform. The unchanged crash-recovery parent and the new concurrent
+cleanup parent passed. Source archives and executable hashes were verified;
+default ignores, early-return drivers and child/repeated invocations retain
+their stated counting limits.
+
+### CCR-WP6.4-23 — exact resulting clocks in private v6
+
+One native byte revision records its actual resulting write/change FILETIMEs,
+the mutating handle's mask and mutation milliseconds. A disabled field keeps
+the prior visible value, including an earlier buffered write; it cannot be
+reconstructed from the final mask and one mutation clock. Working, FULL Saved,
+adoption and recovery carry the exact pair. Core uses the recorded fields with
+same-sequence explicit metadata retention taking precedence. Ordinary writes
+keep their existing NORMAL transaction; no new FULL boundary is introduced.
+
+Length/sequence mirrors remain atomic. Clock caches use short memory-only
+mutexes with no guard spanning journal/provider/fsync/Engine work. Recovered
+native sessions expose Saved clocks before publication. Native set-basic and
+remote activation ordering remain separate unfinished integration requirements.
+
+V6 recognizes byte-compatible headless v4/v5 records and upgrades only the
+header under FULL WAL. Native v5 records are refused with upgrade-required:
+they need matching-reader recovery/export because their missing per-field
+history cannot be inferred safely. This is conservative development-format
+handling, not a complete production migration/export path. Actual attested
+v4/v5 reader compatibility is qualified separately; full WP6.6 remains required.
+
+Evidence: [native-clock-checks.json](../../test-evidence/wave-6/native-clock-checks.json),
+381 frozen inputs (`5be800d3…`), strict Clippy, 438/445 main harness cases
+in 13 selected targets, three kernel parents and two actual-reader compatibility
+parents/platform. The explicit old v5 native fixture is refused without changing
+records/header or physical DB/WAL hashes. Cargo builds without running tests;
+the main counts come from one hash-attested direct run. Default ignores,
+ordinary helper drivers and child/repeated invocations retain their stated
+counting limits. Source and executable identity checks passed.
+
+### CCR-WP6.4-24: partial native basic metadata (development)
+
+`ContentBasicUpdate` carries only requested fields. Core reads current basic
+metadata under its writer, overlays those fields and commits one metadata
+event with an exact request receipt. A FULL private checkpoint binds the
+unpublished byte revision; an unpublished selection can be rebound without
+publishing or rewriting its byte event. Final transaction readbacks must
+verify capture, selection and receipt. Explicit write/change times and
+attributes remain effective for that exact byte revision and expire after a
+later byte mutation. Ordinary local metadata outside this command still fences
+save ownership; remote alternatives remain causal competitors.
+
+The native mutation gate orders metadata with writes/truncates/saves. Before
+metadata, bounded executor adoption may finish a previously committed save,
+but adoption-only work cannot checkpoint or publish newer private bytes.
+Reply loss uses read-only exact receipt reconciliation. No receipt means the
+failed command is discarded, never automatically reapplied. An expired reply
+after commit keeps pending observation until the next mutation can reconcile
+it. Core durable capture/receipt state supplies restart recovery even though
+the runtime observation is memory-only.
+
+Native basic observation includes exact clocks, the last byte revision and
+whether unpublished changes remain. Owner fence increments are not byte
+revisions. Recovery and activation apply the canonical published/adopted floor
+before overlaying private clocks. A read-only cleanup may finish an orphaned
+FULL Saved revision, but must not publish that revision while an active writer
+remains. Metadata-only temporary FUSE handles release without invoking save.
+
+Current WinFsp op14 and threaded FUSE SETATTR use this coordinator. Focused
+actual-kernel checks cover set_times on both platforms and chmod on Linux,
+with no canonical byte publication before fsync. FUSE size requests retain
+their earlier immediate save boundary; buffered truncate and related
+performance gates remain required.
+
+Actual WinFsp 2.1 disable/reset is **not qualified**: a retained kernel probe
+fails because the driver converts -1 to zero before SetBasicInfo, erasing the
+distinction from unchanged. See the [driver implementation](https://github.com/winfsp/winfsp/blob/v2.1/src/sys/fileinfo.c#L1223-L1230).
+The separate ignored Windows probe retains its original failure assertion.
+Direct native decoder tests cannot substitute for that required OS contract.
+Production activation stays off; no waiver or heuristic inference from zero
+is authorized. Complete remote/cache/namespace/lifecycle, batching, aggregate
+resource, build/load/storage and production compatibility gates remain open.
+
+### CCR-WP6.4-25: native open-handle truncate stays buffered
+
+The native FUSE SETATTR size branch no longer invokes an immediate byte save.
+A size change through an open handle waits for fsync/close to reach its durability
+boundary. A path-only truncate still closes its temporary native handle before
+success. Legacy size handling is unchanged. This supersedes CCR24's interim
+native size limitation, without qualifying batching or build performance.
+
+The actual WinFsp/FUSE kernel parent now installs a failing private checkpoint
+hook during File.set_len, requires no hook hits and no canonical publication,
+then appends/fsyncs and verifies exact bytes, reopen and the derived-state oracle.
+An actual pre-fix Linux failure and exact source are retained. Targeted proof is
+in [buffered-truncate-checks.json](../../test-evidence/wave-6/buffered-truncate-checks.json):
+25 ordinary native parents/platform,124 Linux library parents and one explicit
+kernel parent/platform, with stable image hashes and exact archive readback.
+The earlier full selected-target report is not relabeled at this new source.
+The required failing WinFsp time-policy gate and all other Wave6 release gates
+remain open; activation stays off.
+
+### CCR-WP6.4-26: live private reads through short WAL snapshots
+
+A private journal has up to four lazy read-only SQLite connections, each with
+512 KiB page-cache limits. Live reads use short transaction snapshots for
+headers, map/payload extraction and final validation. No snapshot/connection
+permit spans provider or network I/O. Owner/sequence fences, map authentication
+and payload verification remain active; a changed owner can still produce
+scoped stale-read contention. This is not universal adoption/read/GC closure.
+
+SaveFile mirrors its active session Arc through a short memory-only mutex so
+checkpointing under file state does not prevent read selection. Durable adoption
+finishes this mirror without a fallible deadline acquisition. Native reads keep
+the byte-mutation gate, which writes/truncates acquire after ownership. Save and
+metadata durability work retain ownership without taking that byte gate.
+The existing started-write/read ordering and adapter-capacity regression stays.
+
+Two real FULL-WAL regressions stall before checkpoint commit for 1,500 ms,
+requiring independent-file and native same-file reads under 300 ms, correct
+private bytes, no canonical publication and a still-stalled writer. Pool tests
+exercise capacity, cancellation/deadline/reuse and error/panic cleanup without
+poisoning writer authority. [private-reader-checks.json](../../test-evidence/wave-6/private-reader-checks.json)
+records all samples and exact source/image/archive identities:462 Windows/470
+Linux ordinary cases across15 targets, plus separate kernel/compatibility parents.
+The actual Windows disable/reset probe still fails and remains required.
+Physical slow-disk, full load/resource/retention, every ownership interleaving,
+production activation and the complete release gates are not established here.
+
+### CCR-WP6.4-27: owned existing-file rename
+
+`apply_content_checkpoint_rename` binds a raw rename request to an owned save
+intent and its exact FULL Saved checkpoint, or a clean operation. It commits
+only namespace metadata, its receipt and the updated capture/selection under
+FULL Core WAL. Operation identity and byte/alive parents remain exact. The
+opaque owner exempts only the source; a replaced Core entity retains ordinary
+save-generation fencing. Ordinary local namespace mutations still fence saves.
+
+The exact receipt replays before current-owner/path resolution, so a later
+rename, parent-directory move or byte publication cannot cause an old reply
+retry to move the file back. Silent capture, selection or receipt changes must
+fail the final readback and roll the namespace transaction back. Remote location
+and content alternatives remain unreviewed. A changed same-sequence checkpoint
+and the reserved byte event identity cannot be accepted as a rename.
+
+Native rename takes adapter capacity before the file gate, adopts only already
+committed bytes, and anchors current private bytes without publishing them.
+Pending observation uses read-only receipt lookup; absence never retries an
+uncommitted move. Later write/truncate/save/basic changes reconcile first.
+Activation updates name/parent/location revision on the stable private file,
+keeping content/alive ancestry. Mounted Windows uses bounded root invalidation
+without retaining a whole pre-commit directory projection.
+
+WinFsp op12 and threaded FUSE12/45 support existing-file rename. Actual kernel
+roundtrips read private bytes via the new name and keep the open operation,
+then write/fsync/read/reopen with no byte publication caused by rename. Native
+replacement of an existing destination is still explicitly refused. A raced-in
+destination yields collision through Core no-replace, never implicit overwrite.
+This is a required continuation toward full atomic replace/open-handle lifetime,
+not a waiver. Native create, unlink/delete-on-close, complete lifetime/recovery,
+root retirement, build/load/resource and production compatibility gates remain.
+
+### CCR-WP6.4-28: retired destination save ownership (Core/private foundation)
+
+`apply_content_checkpoint_replace` requires the source's owned FULL checkpoint
+(or clean intent) and the exact destination intent/checkpoint. It revalidates
+both owners and the resolved destination under one FULL Core writer. Namespace
+replacement fences the old destination, then atomically installs its successor
+and an independently checked namespace handoff. Raw request/event receipts and
+both captures/selections/owners are read back before success. A same-name race,
+reserved byte-event UUID or silent continuation write cannot acknowledge a move.
+
+The retired capture keeps the base content/content parent, takes the removal
+event as its alive parent and uses a distinct event-identity domain. Its byte
+publications and later successors carry `alive=false`; they retain historical
+content/admission roots without restoring the removed name. Ordinary local
+restore/metadata still fences publication. Earlier published successor replay
+recognizes a namespace transition rather than requiring a nonexistent byte
+publication of the replaced generation. Owned basic updates may target this
+verified retired entity and cannot make it alive. Newer source/destination
+checkpoints use the same transactional clock/policy selection as byte saves.
+
+`NamespaceContinuation` is opaque Core proof, queried read-only after restart
+or a lost reply. It is not a byte receipt or deletion authority. Private adoption
+uses FULL WAL, rotates the owner and records an exact replay marker. It preserves
+all Working/Saved/pending maps, base visibility, lengths, native clocks and byte
+sequences, including newer buffered bytes. It neither substitutes the base nor
+prunes patches. Old handles are fenced; a lost private reply can recover the new
+handle without repeating namespace work or overwriting later buffered bytes.
+
+Private journal v7 explicitly fences earlier readers. Headless v4/v5 and all
+exact-clock v6 records can upgrade by an atomic header change with exact record
+identities; native v5 clock ambiguity still requires explicit matching-reader
+recovery/export. Reference v6 executables are preserved from CCR27 before new
+builds. This private fence does not replace the required actual legacy workspace
+fence, production launcher/migration/export or downgrade rehearsal.
+
+Native replacement remains refused until dual-file ordering, handle observation,
+lost-reply reconciliation and automatic recovery of retired Saved records are
+integrated and qualified on actual WinFsp/FUSE mounts. These remain mandatory,
+as do native create/unlink/delete-on-close, complete lifetime/remote/cache
+behavior, root and receipt retirement, batching, aggregate budgets, matched
+build/load/storage, production compatibility and all Wave6 integration gates.
+Content activation stays off; no physical CAS deletion is authorized here.
+
+Final scoped proof is [retired-destination-checks.json](../../test-evidence/wave-6/retired-destination-checks.json):
+393 frozen inputs,487 Windows/495 Linux ordinary cases across16 targets,
+plus three actual kernel and three actual-reader compatibility parents/platform.
+All selected image hashes stayed stable. Ten new ordinary namespace/retirement
+parents include one nine-exit recovery parent. The source/error-code audit and
+strict release Clippy passed. Actual v6 writer recovery/upgrade preserved its
+exact checkpoint/clocks/bytes; actual v4/v5/v6 readers refused7 unchanged.
+
+The original250ms structural gate was missed once on Windows (251.2949ms);
+that exact failure remains archived despite later passing repetitions and the
+final94.9796ms sample. Broader scheduler/load stability remains required.
+The current-image actual Windows time-policy probe still fails and remains a
+required driver-contract gap. Neither is waived by this headless foundation.
+Native replacement remains guarded pending the required adapter/lifetime/recovery
+integration and all other Wave6 release gates.
+
+
+### CCR-WP6.4-29: native replacement and retained destination handles
+
+This sequential integration extends CCR28's Core/private foundation to existing
+typed native files. Acquire adapter capacity before either entity wait; acquire
+source/destination entity keys and adapter mutation gates in sorted entity order.
+Promote a read-only/unopened typed destination before the dual-file ownership
+phase. FULL checkpoint both operations and commit the exact destination proof;
+rename does not publish either byte revision. An absent observed destination
+uses Core no-replace, so a raced-in canonical entity cannot be overwritten.
+
+Observe `lookup_visible` and reserve the branch/parent/folded-name together under
+Engine before off-lock durability. The memory map holds at most SAVE_QUEUE64
+reservations, identified by operation UUID; Drop removes only that exact owner.
+Deferred creates, immediate creates and legacy adapter renames reject a reserved
+destination promptly. Unrelated names remain available. The reservation does
+not substitute for transaction validation: `NamespaceTarget` captures the parent
+identity, and `apply_content_checkpoint_rename_at` revalidates it under the Core
+writer. Exact receipt lookup includes that observation even after the parent
+moves. The request's optional omitted `expected_parent` preserves older request
+serialization; no historical event/receipt is rewritten. No schema/wire/private
+format increment is introduced by this extension.
+
+Destination namespace checking is marked before the Core command. Its next
+mutation reconciles a namespace handoff independently of source observation.
+A cached previous intent survives lost private adoption replies; adopt memory
+immediately, then retry Engine observation without repeating the private rebase.
+Only an unpublished Saved checkpoint participates in handoff equality: a clean,
+already-published Saved record is retained unchanged. Byte reads with a stale
+private owner reconcile and retry once. Normal private reads do no Core lookup.
+
+Startup accepts an unnamed Saved operation only with Core retirement proof,
+adopts its private continuation, installs a dirty reference-zero native session
+and queues bounded background retry. No canonical preparation is performed under
+Engine as an unavailable-queue fallback. Existing saver backoff retains failures;
+abandoned source operations are also swept. This reuses the historical saver
+queue and does not qualify final global queue/shutdown/byte budgets.
+
+FUSE retained open inode metadata reports nlink0; fd-originated setattr without
+FATTR_FH binds an existing open handle for the unnamed inode. Unsupported STATX
+must return ENOSYS before checking dead namespace liveness, enabling GETATTR
+fallback. WinFsp's SupportsPosixUnlinkRename is true only when NativeWrites was
+explicitly installed in an isolated fixture. POSIX flags are forwarded; legacy
+fallback rejects POSIX rename. Ordinary unlink/delete-on-close is still rejected
+before disposition/open ACK. Cleanup of a destination already removed by rename
+requires Core retirement proof and durably saves without deleting the new path.
+
+Final scoped proof is
+[native-replacement-checks.json](../../test-evidence/wave-6/native-replacement-checks.json):
+395 inputs frozen at
+`39ed1695f6be2e20560819d34cac6f5dbaffa907ef97deafa8e4c83c5e62f656`,
+strict release Clippy/format/diff checks,501 Windows/509 Linux ordinary cases
+across16 targets/platform, plus four actual-kernel and three actual-reader
+compatibility parents/platform. All selected executable hashes stayed stable.
+Fourteen new ordinary parents include13 runtime cases (one drives nine actual
+exit86 children) and one Core observed-parent case. Children/repetitions are
+not extra unique passes. There are20 Windows/19 Linux default ignores.
+The initial frozen pending-name test failure on both platforms is archived;
+its fixture now settles the legacy save before raw Core deletion, matching the
+adapter's required ordering. Collision/reservation assertions remain unchanged.
+The current-image Windows time-policy probe still fails and is separately
+archived; no passing count or activation waiver includes it. Earlier observed
+Windows structural251.2949ms remains a broader stability/load gap despite final
+93.3811ms Windows/54.622432ms Linux samples under the unchanged250ms bound.
+Native create, legacy migration, unlink/delete-on-close, full lifecycle/remote/
+cache/GC/retirement/storage/global-budget/build/compatibility/integration gates
+remain mandatory. Production activation stays off; the full Wave6 goal is active.
+
+
+### CCR-WP6.4-30: typed native file creation and initial save ownership
+
+In explicitly installed NativeWrites fixtures, new regular files use canonical
+typed empty content from creation. NativeWrites installs/verifies and pins that
+single empty root outside Engine. `ContentCreateRequest` binds independent
+creation mutation/entity/byte-operation UUIDs, branch/view generation, observed
+parent/path and initial basic metadata. One FULL Core writer commits the kind,
+location, alive, empty descriptor and basic fields, durable admission, initial
+byte-owner capture and sealed exact receipt in `content_save_create_changes`.
+No private-journal/provider byte work runs under that writer. The existing save
+capture logic is factored into a transaction-only helper; selection and fencing
+semantics for existing files remain unchanged.
+
+Read-only creation receipt lookup verifies exact request/event/intent identities
+and raw immutable event payload. Replay is checked before current parent/name
+resolution and cannot recreate a subsequently moved/deleted file. The receipt
+is not current byte-owner authority. New writes still require the usual owner
+and generation checks. Nil/reused/reserved identities, wrong parent/view, name
+collisions and silently ignored/deleted capture/owner/receipt writes fail before
+creation ACK and roll back the namespace event with ownership.
+
+Runtime creation reserves adapter capacity, the branch/parent/folded-name and
+new entity key before durability outside Engine. FUSE binds its original inode
+parent even if the path changes before reservation. Private session creation
+follows Core commit; recheck ownership after private preparation before attaching
+a SaveFile/handle. A failed or expired reply may leave the canonical empty name,
+but cannot invent a successful open or silently retry an absent receipt. An
+already committed receipt may reconcile the same command without duplicate
+creation. Existing read-only empty selections can share the attached session.
+No bytes were acknowledged before this attachment.
+
+WinFsp regular-file create and threaded FUSE MKNOD/CREATE use this coordinator.
+Initial attributes/times/POSIX mode are part of creation, avoiding a later
+ordinary metadata setter fencing its new byte owner. A creating writable handle
+can retain access to its newly created readonly file; later writable opens obey
+readonly permissions. Writes remain buffered; native fsync and writable close
+retain FULL Saved/canonical guarantees. Empty clean close does not manufacture
+a byte publication. This immediate durable empty namespace event is stronger
+than the legacy deferred-create visibility guarantee; compatible durability
+batching and measured build budgets remain required. Legacy raw Engine/Core
+creation is retained for the default non-activated path and old fixture seams.
+
+Initial diagnostic release proof at399-input source
+`27246339e7ca79d7b832aa7b05ca1077eec44ea737583ebc4a498d01002e6fa6`
+passed Linux4 Core creation parents,8 runtime parents (including nine actual
+exit86 children) and an actual FUSE create/close/replacement kernel parent.
+Strict Clippy passed on both platforms. That source later failed the valid-capture
+audit below; its earlier passes remain diagnostics. The corrected final source
+and image qualification are recorded below. This does not establish production activation, legacy promotion/migration, native unlink/
+delete-on-close, full namespace/remote/cache/lifetime/GC/root/create-receipt
+retirement, global budgets/batching/shutdown, cache/change journal, build or
+compatibility/integration release gates. All remain mandatory.
+
+
+The additional valid-capture audit found that intent/shape equality alone was
+insufficient: a valid sealed capture with a changed access time could acknowledge
+creation at both capture-insert and receipt-insert boundaries. Exact negative
+probes and the initially passing513/521 matrix are retained in the implementation
+record. The helper now returns and checks the complete expected Capture, and
+creation compares it again after receipt insertion. A permanent fifth Core
+parent covers both valid substitutions. The runtime owner-fence parent also
+covers a readonly open before private-session attachment, and the kernel parent
+creates its manifest under a new directory. Corrected399-input source
+`7c15299df8e908600e49f93eb310a816f1ed86e4ac3d70525b8f5f445a9fc150`
+passed the full scoped qualification; earlier source272 results remain diagnostics.
+Directory namespace mutation under Engine, receipt/root retirement and every
+other original Wave6 budget/performance/compatibility/integration gate remain
+mandatory. No physical CAS deletion or production activation occurred.
+
+
+Final CCR30 proof is
+[native-create-checks.json](../../test-evidence/wave-6/native-create-checks.json):
+399 frozen inputs at the corrected7c15299d identity above, strict release Clippy,
+format/diff checks,514 Windows/522 Linux ordinary cases across16 targets/platform,
+plus five actual-kernel and three actual-reader compatibility parents/platform.
+Thirteen new ordinary parents compared with CCR29 are8 runtime cases (one drives
+nine exit86 children) and5 Core creation cases. There are22 Windows/21 Linux
+default ignores. The explicit probes against the preserved old and corrected
+optimized Core images reproduce then reject both valid-capture substitutions;
+these are separate probes, not additional ordinary case counts.
+
+The exact current-image Windows time-policy probe still fails and remains
+required. Final structural samples92.5753ms Windows/50.920146ms Linux meet the
+unchanged250ms scenario bound; earlier observed251.2949ms remains an aggregate
+stability/load gap. No bound, assertion or original release gate was waived.
+Creation/namespace/root receipt retirement, legacy promotion/migration, native
+unlink/delete-on-close, directory metadata ownership outside broad locks,
+complete lifecycle/remote/cache/GC/global-budget/batching/shutdown/cache/journal/
+build/compatibility/activation/export/downgrade and the full platform/peer/outage/
+storage/power-loss/load/soak integration scope remain mandatory.

@@ -496,147 +496,16 @@ mod journal {
 }
 use journal::JournalHash;
 
-pub(super) fn initialize(db: &Connection) -> Result<()> {
-    // The first step of `Store::open`: fixes the instant from which the
-    // verified set (`commit::verified`) counts availability rows as this
-    // process's, before the process installs anything.
-    super::commit::verified::epoch_ms();
-    // Triggers also cover writes by older executables and repair tools. Sequence
-    // numbers are local acceptance order, never CRDT version precedence.
-    db.execute_batch("SAVEPOINT snapshot_schema;
-        CREATE TABLE IF NOT EXISTS startup_snapshots(branch TEXT PRIMARY KEY,cursor INTEGER NOT NULL,payload TEXT NOT NULL,checksum TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS journal_sequence(seq INTEGER PRIMARY KEY AUTOINCREMENT,event TEXT NOT NULL UNIQUE);
-        INSERT INTO journal_sequence(event) SELECT id FROM events e WHERE NOT EXISTS(SELECT 1 FROM journal_sequence s WHERE s.event=e.id) ORDER BY rowid;
-        CREATE TRIGGER IF NOT EXISTS snapshot_event_insert AFTER INSERT ON events BEGIN
-            INSERT INTO journal_sequence(event) VALUES(NEW.id);
-        END;
-        CREATE TRIGGER IF NOT EXISTS snapshot_event_delete AFTER DELETE ON events BEGIN
-            DELETE FROM startup_snapshots;
-            DELETE FROM journal_sequence WHERE event=OLD.id;
-        END;
-        CREATE TRIGGER IF NOT EXISTS snapshot_event_update AFTER UPDATE ON events BEGIN
-            DELETE FROM startup_snapshots;
-            UPDATE journal_sequence SET event=NEW.id WHERE event=OLD.id;
-        END;
-        RELEASE snapshot_schema;")?;
-    projection_version_schema(db)?;
-    incremental_schema(db)
-}
-
-/// `schema:snapshot` stamp of the format-2 side tables.
-const SCHEMA_VERSION: i64 = 2;
-
-/// Journal rows indexed per transaction by the `journal_branch` backfill.
+/// Current derived branch-index repair, independent of schema creation.
 const JOURNAL_BRANCH_CHUNK: i64 = 10_000;
-/// Config key: the `journal_branch` backfill is complete.
-const JOURNAL_BRANCH_MARKER: &str = "snapshot_journal_branch_v1";
-/// Config key: the last `journal_sequence.seq` the backfill covered.
-const JOURNAL_BRANCH_CURSOR: &str = "snapshot_journal_branch_v1_cursor";
+const JOURNAL_BRANCH_MARKER: &str = "repair:journal:ready";
+const JOURNAL_BRANCH_CURSOR: &str = "repair:journal:cursor";
 
-/// The format-2 side tables (module docs): sealed rows, change marks and
-/// their triggers, the stored projection's header, and the per-branch
-/// journal index. New tables only (§9); idempotent; its own savepoint. A
-/// mark is inserted only when absent (`WHERE NOT EXISTS`, not `INSERT OR
-/// IGNORE`: inside a trigger, the conflict policy of the statement that
-/// fired it, such as an upsert's abort, would override the trigger's own).
-///
-/// `journal_branch(seq, branch)` names each journal row's branch, indexed
-/// by `(branch, seq)`, so an incremental seal hashes the rows of its own
-/// branch since its previous seal with one range scan, however many rows
-/// other branches added in between (a large catch-up on `main` before an
-/// idle branch's next seal). It is built as `feed_journal` is (WP2.5,
-/// WP2.INT): triggers on `journal_sequence` maintain it for writes by any
-/// executable, and a new table is filled from the journal by a chunked,
-/// resumable backfill (`backfill_journal_branch`) before the store is
-/// usable. Readers join it to the journal and the event's branch, so a
-/// stale row is never hashed; a missing one would only change the hash,
-/// which startup checks against the journal itself (reconstruction).
-fn incremental_schema(db: &Connection) -> Result<()> {
-    let indexed: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal_branch')",
-        [],
-        |r| r.get(0),
-    )?;
-    in_savepoint(db, || {
-        db.execute_batch("
-        CREATE TABLE IF NOT EXISTS journal_branch(seq INTEGER PRIMARY KEY,branch TEXT NOT NULL);
-        CREATE INDEX IF NOT EXISTS journal_branch_order ON journal_branch(branch,seq);
-        CREATE TRIGGER IF NOT EXISTS journal_branch_insert AFTER INSERT ON journal_sequence BEGIN
-            INSERT OR REPLACE INTO journal_branch(seq,branch) SELECT NEW.seq,e.branch FROM events e WHERE e.id=NEW.event;
-        END;
-        CREATE TRIGGER IF NOT EXISTS journal_branch_update AFTER UPDATE ON journal_sequence BEGIN
-            DELETE FROM journal_branch WHERE seq=OLD.seq;
-            INSERT OR REPLACE INTO journal_branch(seq,branch) SELECT NEW.seq,e.branch FROM events e WHERE e.id=NEW.event;
-        END;
-        CREATE TRIGGER IF NOT EXISTS journal_branch_delete AFTER DELETE ON journal_sequence BEGIN
-            DELETE FROM journal_branch WHERE seq=OLD.seq;
-        END;
-        CREATE TABLE IF NOT EXISTS snapshot_entries(branch TEXT NOT NULL,entity TEXT NOT NULL,entry TEXT NOT NULL,heads TEXT NOT NULL,PRIMARY KEY(branch,entity));
-        CREATE TABLE IF NOT EXISTS snapshot_conflicts(branch TEXT NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,resolved_by TEXT,PRIMARY KEY(branch,id));
-        CREATE TABLE IF NOT EXISTS snapshot_dirty(branch TEXT NOT NULL,kind INTEGER NOT NULL,key TEXT NOT NULL,PRIMARY KEY(branch,kind,key));
-        CREATE TABLE IF NOT EXISTS current_meta(branch TEXT PRIMARY KEY,payload TEXT NOT NULL);
-        CREATE TRIGGER IF NOT EXISTS snapshot_dirty_parts_insert AFTER INSERT ON current_parts BEGIN
-            INSERT INTO snapshot_dirty(branch,kind,key) SELECT NEW.branch,0,NEW.entity
-                WHERE NOT EXISTS(SELECT 1 FROM snapshot_dirty WHERE branch=NEW.branch AND kind=0 AND key=NEW.entity);
-        END;
-        CREATE TRIGGER IF NOT EXISTS snapshot_dirty_parts_update AFTER UPDATE ON current_parts BEGIN
-            INSERT INTO snapshot_dirty(branch,kind,key) SELECT NEW.branch,0,NEW.entity
-                WHERE NOT EXISTS(SELECT 1 FROM snapshot_dirty WHERE branch=NEW.branch AND kind=0 AND key=NEW.entity);
-        END;
-        CREATE TRIGGER IF NOT EXISTS snapshot_dirty_conflicts_insert AFTER INSERT ON conflicts BEGIN
-            INSERT INTO snapshot_dirty(branch,kind,key) SELECT NEW.branch,1,NEW.id
-                WHERE NOT EXISTS(SELECT 1 FROM snapshot_dirty WHERE branch=NEW.branch AND kind=1 AND key=NEW.id);
-        END;
-        CREATE TRIGGER IF NOT EXISTS snapshot_dirty_conflicts_update AFTER UPDATE ON conflicts BEGIN
-            INSERT INTO snapshot_dirty(branch,kind,key) SELECT NEW.branch,1,NEW.id
-                WHERE NOT EXISTS(SELECT 1 FROM snapshot_dirty WHERE branch=NEW.branch AND kind=1 AND key=NEW.id);
-        END;
-        CREATE TRIGGER IF NOT EXISTS snapshot_dirty_conflicts_delete AFTER DELETE ON conflicts BEGIN
-            INSERT INTO snapshot_dirty(branch,kind,key) SELECT OLD.branch,1,OLD.id
-                WHERE NOT EXISTS(SELECT 1 FROM snapshot_dirty WHERE branch=OLD.branch AND kind=1 AND key=OLD.id);
-        END;
-        CREATE TRIGGER IF NOT EXISTS projection_version_meta_insert AFTER INSERT ON current_meta BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS projection_version_meta_update AFTER UPDATE ON current_meta BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS projection_version_meta_delete AFTER DELETE ON current_meta BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        ")?;
-        if !indexed {
-            // A new (or dropped) index: build it from the whole journal. In
-            // the same savepoint as the table (WP4.INT, WP4.4 review minor):
-            // a crash after creating the table never leaves it without its
-            // backfill keys (an index missing every older row).
-            db.execute("DELETE FROM config WHERE key=?1", [JOURNAL_BRANCH_MARKER])?;
-            db.execute(
-                "INSERT INTO config(key,value) VALUES(?1,'0') ON CONFLICT(key) DO UPDATE SET value='0'",
-                [JOURNAL_BRANCH_CURSOR],
-            )?;
-        }
-        db.execute(
-            "INSERT INTO config(key,value) VALUES('schema:snapshot',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(config.value AS INTEGER)<?1",
-            [SCHEMA_VERSION],
-        )?;
-        Ok(())
-    })?;
-    backfill_journal_branch(db)
+pub(super) fn repair_journal_index(db: &Connection) -> Result<()> {
+    repair_journal_index_with(db, JOURNAL_BRANCH_CHUNK, &mut |_| Ok(()))
 }
 
-/// The chunked, resumable `journal_branch` build (`incremental_schema`):
-/// [`JOURNAL_BRANCH_CHUNK`] journal rows per transaction from the cursor
-/// key, with startup progress after each chunk, then the marker. The
-/// triggers already cover every row written since the table was created.
-fn backfill_journal_branch(db: &Connection) -> Result<()> {
-    backfill_journal_branch_with(db, JOURNAL_BRANCH_CHUNK, &mut |_| Ok(()))
-}
-
-/// `backfill_journal_branch` in chunks of `chunk` rows; `after_chunk` runs
-/// after each committed chunk with its upper sequence (tests: an error there
-/// stands for a crash between chunks).
-fn backfill_journal_branch_with(
+fn repair_journal_index_with(
     db: &Connection,
     chunk: i64,
     after_chunk: &mut dyn FnMut(i64) -> Result<()>,
@@ -646,16 +515,21 @@ fn backfill_journal_branch_with(
             .query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
             .optional()?)
     };
-    if value(JOURNAL_BRANCH_MARKER)?.is_some() {
+    if value(JOURNAL_BRANCH_MARKER)?.as_deref() == Some("1") {
         return Ok(());
     }
-    // No marker: the build is due, from the cursor or, with no cursor either
-    // (a crash of an earlier build between creating the table and writing
-    // its keys), from the start (WP4.INT; the inserts are idempotent).
     {
-        let mut cursor: i64 = value(JOURNAL_BRANCH_CURSOR)?
-            .and_then(|cursor| cursor.parse().ok())
-            .unwrap_or(0);
+        let mut cursor: i64 = if let Some(cursor) = value(JOURNAL_BRANCH_CURSOR)? {
+            cursor.parse().context("INVALID_STORE_METADATA")?
+        } else {
+            in_savepoint(db, || {
+                db.execute("DELETE FROM journal_branch", [])?;
+                db.execute("INSERT INTO config VALUES(?,'0')", [JOURNAL_BRANCH_CURSOR])?;
+                Ok(())
+            })?;
+            0
+        };
+        ensure!(cursor >= 0, "INVALID_STORE_METADATA");
         loop {
             let upper: Option<i64> = db.query_row(
                 "SELECT max(seq) FROM (SELECT seq FROM journal_sequence WHERE seq>?1 ORDER BY seq LIMIT ?2)",
@@ -678,6 +552,7 @@ fn backfill_journal_branch_with(
                 )?;
                 Ok(())
             })?;
+            crate::util::fault::trigger("store.index.journal.page")?;
             cursor = upper;
             crate::startup::progress("indexing the journal");
             after_chunk(upper)?;
@@ -716,32 +591,6 @@ fn in_savepoint(db: &Connection, f: impl FnOnce() -> Result<()>) -> Result<()> {
 /// fresh instead of reloading the whole projection (O(entries)) after every
 /// such commit. A side table (§9): nothing is ALTERed, and a downgraded
 /// binary's writes keep it exact through the triggers.
-fn projection_version_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("SAVEPOINT projection_version_schema;
-        CREATE TABLE IF NOT EXISTS projection_version(id INTEGER PRIMARY KEY CHECK(id=1),version INTEGER NOT NULL);
-        INSERT OR IGNORE INTO projection_version(id,version) VALUES(1,0);
-        CREATE TRIGGER IF NOT EXISTS projection_version_state_insert AFTER INSERT ON current_state BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS projection_version_state_update AFTER UPDATE ON current_state BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS projection_version_state_delete AFTER DELETE ON current_state BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS projection_version_parts_insert AFTER INSERT ON current_parts BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS projection_version_parts_update AFTER UPDATE ON current_parts BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        CREATE TRIGGER IF NOT EXISTS projection_version_parts_delete AFTER DELETE ON current_parts BEGIN
-            UPDATE projection_version SET version=version+1 WHERE id=1;
-        END;
-        RELEASE projection_version_schema;")?;
-    Ok(())
-}
-
 /// The projection tables' change counter as `db` sees it now (`None` if the
 /// table is missing: a handle on a store no current binary opened yet).
 pub(super) fn projection_version(db: &Connection) -> Option<i64> {
@@ -2618,12 +2467,12 @@ mod tests {
             .unwrap()
         };
         db.execute_batch(
-            "DELETE FROM journal_branch; DELETE FROM config WHERE key LIKE 'snapshot_journal_branch%';",
+            "DELETE FROM journal_branch; DELETE FROM config WHERE key LIKE 'repair:journal:%';",
         )
         .unwrap();
         // A crash after the first chunk of 10 rows.
         let mut first = None;
-        let crashed = backfill_journal_branch_with(db, 10, &mut |upper| {
+        let crashed = repair_journal_index_with(db, 10, &mut |upper| {
             first = Some(upper);
             anyhow::bail!("crash after a chunk")
         });
@@ -2637,7 +2486,7 @@ mod tests {
         assert_eq!(indexed(db).len(), 10);
         // The resumed build starts after the recorded cursor.
         let mut chunks = vec![];
-        backfill_journal_branch_with(db, 10, &mut |upper| {
+        repair_journal_index_with(db, 10, &mut |upper| {
             chunks.push(upper);
             Ok(())
         })
@@ -2723,15 +2572,7 @@ mod tests {
     #[test]
     fn branch_journal_reads_only_the_branchs_range() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE config(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            CREATE TABLE events(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL);
-            CREATE TABLE current_state(branch TEXT PRIMARY KEY, payload TEXT NOT NULL);
-            CREATE TABLE current_parts(branch TEXT NOT NULL,entity TEXT NOT NULL,entry TEXT NOT NULL,heads TEXT NOT NULL,PRIMARY KEY(branch,entity));
-            CREATE TABLE conflicts(id TEXT PRIMARY KEY, branch TEXT NOT NULL, payload TEXT NOT NULL, resolved_by TEXT);",
-        )
-        .unwrap();
-        initialize(&db).unwrap();
+        db.execute_batch(include_str!("schema.sql")).unwrap();
         // Two branches, interleaved, through the triggers.
         for i in 0..200 {
             let branch = if i % 10 == 0 { "own" } else { "other" };

@@ -1743,7 +1743,7 @@ fn a_seal_hashes_only_its_own_branchs_journal_rows() {
 /// as the triggers keep it (inserts, a changed event, a deleted event), and
 /// seals incrementally from it.
 #[test]
-fn the_journal_index_is_built_for_an_older_store() {
+fn the_current_journal_index_is_rebuilt_after_derived_table_loss() {
     let _layout = Layout::rows();
     let dir = tempfile::tempdir().unwrap();
     let mut s = open(dir.path());
@@ -1763,7 +1763,7 @@ fn the_journal_index_is_built_for_an_older_store() {
     db.execute_batch(
         "DROP TRIGGER journal_branch_insert; DROP TRIGGER journal_branch_update;
         DROP TRIGGER journal_branch_delete; DROP TABLE journal_branch;
-        DELETE FROM config WHERE key LIKE 'snapshot_journal_branch%';",
+        DELETE FROM config WHERE key LIKE 'repair:journal:%';",
     )
     .unwrap();
     drop(db);
@@ -1778,11 +1778,8 @@ fn the_journal_index_is_built_for_an_older_store() {
             .optional()
             .unwrap()
     };
-    assert_eq!(
-        config(&s, "snapshot_journal_branch_v1").as_deref(),
-        Some("1")
-    );
-    assert_eq!(config(&s, "snapshot_journal_branch_v1_cursor"), None);
+    assert_eq!(config(&s, "repair:journal:ready").as_deref(), Some("1"));
+    assert_eq!(config(&s, "repair:journal:cursor"), None);
     let before = s.seal_stats();
     for i in 0..MIN_SEAL_INTERVAL {
         save(&mut s, "f000", format!("{i}").as_bytes());
@@ -1829,7 +1826,7 @@ fn a_journal_index_without_its_keys_is_rebuilt() {
     let db = Connection::open(dir.path().join("metadata.sqlite")).unwrap();
     db.execute_batch(
         "DELETE FROM journal_branch;
-        DELETE FROM config WHERE key LIKE 'snapshot_journal_branch%';",
+        DELETE FROM config WHERE key LIKE 'repair:journal:%';",
     )
     .unwrap();
     drop(db);
@@ -1841,7 +1838,7 @@ fn a_journal_index_without_its_keys_is_rebuilt() {
     );
     let marker: Option<String> =
         s.db.query_row(
-            "SELECT value FROM config WHERE key='snapshot_journal_branch_v1'",
+            "SELECT value FROM config WHERE key='repair:journal:ready'",
             [],
             |r| r.get(0),
         )

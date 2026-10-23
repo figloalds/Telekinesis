@@ -33,6 +33,7 @@ pub struct ContentWorker {
     pub provider: Arc<LocalContent>,
     pub scheduler: Arc<ContentScheduler>,
     pending: Mutex<BTreeMap<Uuid, Pending>>,
+    pub(super) requests: Mutex<super::content_inspection::Requests>,
     cancel: Cancel,
 }
 
@@ -77,15 +78,10 @@ pub(super) fn connection(ctx: &WorkerCtx) -> Result<Connection> {
     Ok(Connection { store, timeout })
 }
 
-pub fn capabilities(store: &crate::core::Store) -> Result<wire::Capabilities> {
-    let active = store.db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM config WHERE key='fixture:content_v1' AND value='1')",
-        [],
-        |r| r.get(0),
-    )?;
+pub fn capabilities(_store: &crate::core::Store) -> Result<wire::Capabilities> {
     Ok(wire::Capabilities {
         version: wire::VERSION,
-        active,
+        active: true,
         frame_bytes: wire::FRAME_BYTES,
     })
 }
@@ -122,6 +118,7 @@ pub(super) fn state_for_read(
         provider: Arc::new(LocalContent::open(&ctx.root)?),
         scheduler: Arc::new(ContentScheduler::default()),
         pending: Mutex::new(BTreeMap::new()),
+        requests: Mutex::default(),
         cancel: Cancel::new(),
     });
     let mut objects = lock(&ctx.inflight_objects);
@@ -159,6 +156,7 @@ pub fn reap(ctx: &WorkerCtx) {
     let state = lock(&ctx.inflight_objects).content.clone();
     if let Some(state) = state {
         lock(&state.pending).retain(|_, item| item.until > Instant::now());
+        super::content_inspection::reap(ctx, &state);
     }
 }
 
@@ -169,6 +167,7 @@ pub fn stop(ctx: &WorkerCtx) {
     if let Some(state) = state {
         state.cancel.cancel();
         lock(&state.pending).clear();
+        lock(&state.requests).clear();
     }
 }
 

@@ -111,6 +111,52 @@ impl Fixture {
 }
 
 #[test]
+fn independent_private_read_finishes_while_another_files_full_checkpoint_is_stalled() {
+    let f = Fixture::new();
+    let writer = f.file("writer");
+    let reader = f.file("reader");
+    writer.write_at(0, b"slow-private", &context()).unwrap();
+    reader.write_at(0, b"reader-private", &context()).unwrap();
+    let pool = Arc::new(SaveExecutor::start(&f.shared, f.journal.clone(), &context()).unwrap());
+    let reset = arm(
+        "content.write.before_checkpoint_commit",
+        FaultAction::Hang,
+        1500,
+        1,
+    );
+    let saves = pool.clone();
+    let saving = std::thread::spawn(move || saves.flush(writer, &context()));
+    fired(1);
+    let mut bytes = [0u8; 14];
+    let began = Instant::now();
+    let read = reader.read_range(0, &mut bytes, &short(500));
+    let elapsed = began.elapsed();
+    let still_checkpointing = !saving.is_finished();
+    let publications_when_read_finished = f.publications();
+    let receipt = saving.join().unwrap();
+    drop(reset);
+    receipt.unwrap();
+    read.expect("an independent private reader must not wait on the FULL journal writer");
+    assert_eq!(&bytes, b"reader-private");
+    assert!(still_checkpointing);
+    assert_eq!(publications_when_read_finished, 0);
+    assert!(elapsed < Duration::from_millis(300), "{elapsed:?}");
+    println!(
+        "WAVE6_PRIVATE_READER {}",
+        serde_json::json!({
+            "scenario":"independent_file", "read_ms":elapsed.as_secs_f64()*1000.0,
+            "bound_ms":300, "deadline_ms":500, "checkpoint_stall_ms":1500,
+            "writer_still_checkpointing":still_checkpointing, "private_bytes_equal":true,
+            "publications_when_read_finished":publications_when_read_finished,
+            "real_full_wal_transaction":true, "physical_disk_stall":false
+        })
+    );
+    assert_eq!(f.publications(), 1);
+    pool.flush(reader, &context()).unwrap();
+    pool.shutdown(&context()).unwrap();
+    f.oracle();
+}
+#[test]
 fn real_pipeline_reuses_file_identity_and_flushes_edits_made_during_preparation() {
     let f = Fixture::new();
     let file = f.file("file");
@@ -150,7 +196,15 @@ fn sixty_four_files_share_one_private_checkpoint_before_independent_publications
         .collect();
     let pool = SaveExecutor::start(&f.shared, f.journal.clone(), &context()).unwrap();
     let before = f.journal.checkpoint_work();
+    let reset = arm("content.write.checkpointed", FaultAction::Hang, 400, 1);
+    let journal = f.journal.clone();
+    let observer = std::thread::spawn(move || {
+        fired(1);
+        assert_eq!(journal.pending_count(), 64);
+    });
     let tickets = pool.enqueue_batch(&files, &context()).unwrap();
+    observer.join().unwrap();
+    drop(reset);
     let after = f.journal.checkpoint_work();
     assert_eq!(after.commits - before.commits, 1);
     assert_eq!(after.sessions - before.sessions, 64);
@@ -159,6 +213,7 @@ fn sixty_four_files_share_one_private_checkpoint_before_independent_publications
         ticket.unwrap().wait(&context()).unwrap();
     }
     assert_eq!(f.publications(), 64);
+    assert_eq!(f.journal.pending_count(), 0);
     for (i, file) in files.iter().enumerate() {
         assert_eq!(f.bytes(file, 8), (i as u64).to_le_bytes());
     }
@@ -192,6 +247,7 @@ fn a_failed_group_retains_working_and_releases_every_reservation_before_retry() 
     drop(reset);
     assert_eq!(pool.stats().outstanding, 0);
     assert_eq!(f.journal.checkpoint_work().commits, 0);
+    assert_eq!(f.journal.pending_count(), 0);
     assert!(f.journal.pending(None, 256, &context()).unwrap().is_empty());
     for file in &files {
         assert_eq!(f.bytes(file, 3), b"new");
@@ -248,6 +304,59 @@ fn batch_limits_duplicates_foreign_files_and_pending_pipelines_do_not_partially_
     pool.shutdown(&context()).unwrap();
 }
 
+#[test]
+fn adoption_only_does_not_checkpoint_or_publish_newer_buffered_bytes() {
+    let f = Fixture::new();
+    let file = f.file("file");
+    let pool = SaveExecutor::start(&f.shared, f.journal.clone(), &context()).unwrap();
+    file.write_at(0, b"first", &context()).unwrap();
+    let reset = arm("content.executor.published", FaultAction::Fail, 0, 1);
+    error(pool.flush(file.clone(), &context()), "FAULT_INJECTED");
+    drop(reset);
+    assert_eq!(f.publications(), 1);
+    assert_eq!(f.journal.pending_count(), 1);
+    file.write_at(0, b"second", &context()).unwrap();
+    assert_eq!(f.journal.pending_count(), 1);
+    let reset = arm(
+        "content.write.before_checkpoint_commit",
+        FaultAction::Fail,
+        0,
+        1,
+    );
+    assert!(pool.adopt_committed(file.clone(), &context()).unwrap());
+    assert_eq!(
+        fault::fired(),
+        0,
+        "adoption-only cannot checkpoint newer Working"
+    );
+    assert_eq!(f.bytes(&file, 6), b"second");
+    assert!(f.journal.pending(None, 64, &context()).unwrap().is_empty());
+    assert_eq!(
+        f.journal.pending_count(),
+        0,
+        "new buffered bytes are not a Saved revision"
+    );
+    assert_eq!(f.publications(), 1);
+    assert!(!pool.adopt_committed(file.clone(), &context()).unwrap());
+    assert_eq!(fault::fired(), 0);
+    drop(reset);
+    let reference = tkfs::runtime::lock_engine(&f.shared)
+        .store
+        .lookup("file")
+        .unwrap()
+        .content_ref
+        .unwrap();
+    let pin = f.native.pin(&reference).unwrap();
+    let mut canonical = vec![0; 5];
+    f.native
+        .read_range(&pin, 0, &mut canonical, &context())
+        .unwrap();
+    assert_eq!(canonical, b"first");
+    pool.flush(file.clone(), &context()).unwrap();
+    assert_eq!(f.publications(), 2);
+    f.oracle();
+    pool.shutdown(&context()).unwrap();
+}
 #[test]
 fn lost_replies_at_publication_and_adoption_replay_exactly_once() {
     for point in [
@@ -326,6 +435,7 @@ fn restart_adopts_a_committed_parent_before_publishing_a_newer_saved_checkpoint(
     drop(reset);
     assert_eq!(f.publications(), 1);
     let operation = file.operation();
+    assert_eq!(f.journal.pending_count(), 1);
     pool.shutdown(&context()).unwrap();
     drop(pool);
     drop(file);
@@ -344,8 +454,10 @@ fn restart_adopts_a_committed_parent_before_publishing_a_newer_saved_checkpoint(
     let journal = WriteJournal::open(dir.path()).unwrap();
     let native = Arc::new(LocalContent::open(dir.path()).unwrap());
     let file = SaveFile::new(journal.resume(operation, native, &context()).unwrap());
+    assert_eq!(journal.pending_count(), 1);
     let pool = SaveExecutor::start(&shared, journal.clone(), &context()).unwrap();
     pool.flush(file.clone(), &context()).unwrap();
+    assert_eq!(journal.pending_count(), 0);
     let mut bytes = [0; 6];
     file.read_range(0, &mut bytes, &context()).unwrap();
     assert_eq!(&bytes, b"newest");
@@ -506,6 +618,8 @@ fn a_blocked_metadata_publication_leaves_engine_reads_and_other_private_writes_l
     let file = f.file("file");
     let other = f.file("other");
     let pool = SaveExecutor::start(&f.shared, f.journal.clone(), &context()).unwrap();
+    let initial = independent_engine(&f.shared).store.lookup("file").unwrap();
+    assert_eq!(initial.content_ref.as_ref().unwrap().total_len, 0);
     file.write_at(0, b"durable", &context()).unwrap();
     let revision = independent_engine(&f.shared).vitals.store_revision();
     let reset = arm("content.save.event_written", FaultAction::Hang, 1000, 1);
@@ -514,7 +628,7 @@ fn a_blocked_metadata_publication_leaves_engine_reads_and_other_private_writes_l
     let began = Instant::now();
     {
         let engine = independent_engine(&f.shared);
-        assert!(engine.store.lookup("file").unwrap().content_ref.is_none());
+        assert_eq!(engine.store.lookup("file").unwrap(), initial);
         assert_eq!(
             engine
                 .store

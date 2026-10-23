@@ -891,7 +891,7 @@ pub mod tokens {
     pub fn matches(presented: Option<&tungstenite::http::HeaderValue>, expected: &str) -> bool {
         let presented = presented.map_or(&b""[..], |value| value.as_bytes());
         // Compared even when absent, so timing does not tell the two apart.
-        crate::util::hmac::ct_eq(presented, expected.as_bytes()) && !expected.is_empty()
+        crate::util::secret::ct_eq(presented, expected.as_bytes()) && !expected.is_empty()
     }
 
     fn register(

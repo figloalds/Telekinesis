@@ -11,16 +11,17 @@
 //! | [`log`] | `event!` JSON-line logging with per-code rate limits |
 //! | [`time`] | `Clock`, `SystemClock`, `ManualClock` |
 //! | [`fault`] | env-driven fault injection (`TKFS_FAULT_POINT` and friends) |
-//! | [`hmac`] | RFC 2104 HMAC-SHA256 and constant-time comparison |
+//! | [`secret`] | Application credential comparison |
 pub mod backoff;
 pub mod cancel;
 pub mod fault;
-pub mod hmac;
 pub mod lock;
 pub mod log;
 pub mod notify;
 pub mod phases;
+pub mod secret;
 pub mod snapshot;
+pub(crate) mod sqlite_format;
 pub mod time;
 
 pub use backoff::Backoff;

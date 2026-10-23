@@ -12,7 +12,7 @@ pub struct ContentEdge {
     pub key: ObjectKey,
     pub offset: u64,
     pub len: u64,
-    /// None for data, including legacy whole-file objects.
+    /// None for a data chunk or direct small-file object.
     pub level: Option<u8>,
 }
 
