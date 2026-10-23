@@ -94,3 +94,30 @@ fn remote_apply_invalidates_cached_paths_without_changing_open_version()->Result
     let mut old=[0;5];engine.read(h,0,&mut old)?;assert_eq!(&old,b"local");
     let new=engine.open_file("file",false,false,false)?;engine.read(new,0,&mut old)?;assert_eq!(&old,b"other");engine.close(h)?;engine.close(new)?;engine.shutdown()?;Ok(())
 }
+
+#[test]
+fn hydrate_missing_chunk_over_authenticated_session()->Result<()> {
+    use crate::{session,model::{protocol::{LaneRole,frame::ClientHello},errors::ErrorWire},pairing_code::Verifier};
+    use std::sync::Arc;
+    struct Policy(Verifier);
+    impl session::AcceptPolicy for Policy {
+        fn installation(&self)->String{"source-peer".into()}
+        fn verifier(&self)->Option<(Verifier,u64)>{Some((self.0.clone(),1))}
+        fn admit(&self,_:&ClientHello)->std::result::Result<(),ErrorWire>{Ok(())}
+        fn legacy_attempt(&self,_:std::net::SocketAddr,_:&serde_json::Value){}
+    }
+    let aroot=tempfile::tempdir()?;let broot=tempfile::tempdir()?;
+    let a=super::engine::Engine::open(aroot.path(),Some("repo"))?;let b=super::engine::Engine::open(broot.path(),Some("repo"))?;
+    let h=a.open_file("remote",true,false,true)?;let mut payload=vec![9;65536];payload.extend_from_slice(b"tail");a.write(h,0,&payload,false,false)?;a.flush(Some(h))?;a.close(h)?;
+    let listener=std::net::TcpListener::bind("127.0.0.1:0")?;let endpoint=format!("ws://{}",listener.local_addr()?);let(code,verifier)=Verifier::generate();
+    let serve=a.clone();let server=std::thread::spawn(move||->Result<session::Conn>{let(stream,_)=listener.accept()?;let(conn,_)=session::accept(stream,Arc::new(Policy(verifier)),session::ConnOptions::default()).map_err(|e|anyhow::anyhow!("{e}"))?;conn.serve(Arc::new(super::sync::Service{engine:serve}));Ok(conn)});
+    let(conn,_)=session::dial(&endpoint,session::client_hello("target-peer",LaneRole::Control,None,1),&session::CodeAuth{code},None,session::ConnOptions::default()).map_err(|e|anyhow::anyhow!("{e}"))?;
+    let server=server.join().unwrap()?;
+    let fetch=super::sync::DigestFetch::new(b.working.content().packs.clone());fetch.add("source-peer".into(),Arc::new(super::sync::SessionSource{conn:conn.clone(),repo:"repo".into()}));b.working.content().set_fetcher(fetch);
+    let mut cursor=super::sync::FeedCursor::default();super::sync::exchange(&b,&conn,&mut cursor)?;
+    assert!(b.lookup("remote").is_ok());
+    let content=b.lookup("remote")?.content.unwrap();assert!(!b.working.content().packs.contains(content.digest)?);
+    let h=b.open_file("remote",false,false,false)?;let mut tail=[0;4];b.read(h,65536,&mut tail)?;assert_eq!(&tail,b"tail");
+    let chunks=b.working.content().chunks(&content)?;assert!(!b.working.content().packs.contains(chunks[0])?);assert!(b.working.content().packs.contains(chunks[1])?);
+    b.close(h)?;conn.close();server.close();a.shutdown()?;b.shutdown()?;Ok(())
+}

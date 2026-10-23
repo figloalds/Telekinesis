@@ -4,5 +4,6 @@ pub mod working;
 pub mod store;
 pub mod seal;
 pub mod engine;
+pub mod sync;
 #[cfg(windows)] pub mod mount_windows;
 #[cfg(test)] mod tests;

@@ -304,19 +304,31 @@ fn read_exact_at(file: &File, mut out: &mut [u8], mut offset: u64) -> std::io::R
 
 /// Immutable range provider used to hydrate scratch files. Missing chunks can
 /// be fetched independently without downloading the rest of the file.
+pub trait ObjectFetcher: Send+Sync {fn fetch(&self,objects:&[(Digest,Kind)])->Result<()>;}
 #[derive(Clone)]
-pub struct LocalContent { pub packs: PackStore }
+pub struct LocalContent { pub packs: PackStore,fetcher:Arc<Mutex<Option<Arc<dyn ObjectFetcher>>>> }
 impl LocalContent {
-    pub fn open(root: &Path) -> Result<Self> { Ok(Self { packs: PackStore::open(root)? }) }
+    pub fn open(root: &Path) -> Result<Self> { Ok(Self { packs: PackStore::open(root)?,fetcher:Arc::new(Mutex::new(None)) }) }
+    pub fn set_fetcher(&self,fetcher:Arc<dyn ObjectFetcher>) {*guard(&self.fetcher)=Some(fetcher);}
+    pub fn ensure(&self,objects:&[(Digest,Kind)])->Result<()> {
+        let missing=objects.iter().filter_map(|(d,k)|match self.packs.get(*d){Ok(_)=>None,Err(_)=>Some((*d,*k))}).collect::<Vec<_>>();
+        if !missing.is_empty(){let fetcher=guard(&self.fetcher).clone().context("OBJECT_MISSING")?;fetcher.fetch(&missing)?;}
+        Ok(())
+    }
+    fn object(&self,digest:Digest,kind:Kind)->Result<Arc<Vec<u8>>> {
+        if let Ok(bytes)=self.packs.get(digest){return Ok(bytes);}
+        self.ensure(&[(digest,kind)])?;self.packs.get(digest)
+    }
     pub fn chunks(&self, reference: &FileContentRef) -> Result<Vec<Digest>> {
         reference.validate()?;
         if reference.kind == ContentKind::Direct { return Ok(vec![reference.digest]); }
-        let manifest = Manifest::decode(&self.packs.get(reference.digest)?)?;
+        let manifest = Manifest::decode(&self.object(reference.digest,Kind::Manifest)?)?;
         ensure!(manifest.len == reference.total_len, "INVALID_MANIFEST_LENGTH"); Ok(manifest.chunks)
     }
     pub fn read_range(&self, reference: &FileContentRef, offset: u64, out: &mut [u8]) -> Result<()> {
         ensure!(offset.checked_add(out.len() as u64).is_some_and(|n| n <= reference.total_len), "READ_PAST_EOF");
         let chunks = self.chunks(reference)?;
+        if !out.is_empty(){let wanted=(offset/CHUNK_SIZE..=(offset+out.len() as u64-1)/CHUNK_SIZE).map(|i|(chunks[i as usize],Kind::Chunk)).collect::<Vec<_>>();self.ensure(&wanted)?;}
         let mut done = 0;
         while done < out.len() {
             let pos = offset + done as u64;
