@@ -9,6 +9,8 @@
 !/test-evidence/build-sync-20261019/
 !/test-evidence/wave-5-handoff/
 !/test-evidence/wave-6/
+# ...and the benchmark gate reports (docs/revamp/WAVE_6_REPLACEMENT.md section 8).
+!/test-evidence/bench/
 # Legacy report locations (current harnesses use the directories above).
 /VALIDATION.json
 /*-VALIDATION.json

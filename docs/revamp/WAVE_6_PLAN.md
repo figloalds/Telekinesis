@@ -1,5 +1,11 @@
 # Wave 6: chunked content, independent engines and fast local builds
 
+Superseded, 2026-10-23: the scope below is replaced by
+[WAVE_6_REPLACEMENT.md](WAVE_6_REPLACEMENT.md) (passthrough working layer,
+seal on close, pack store, per-entity conflicts, one benchmark gate). This
+file is kept as the historical record of the chunked-journal design and its
+evidence; do not continue its packages.
+
 Status: implementation in progress, 2026-10-21. Content activation remains off;
 see the [implementation record](notes/wp6-progress.md) for completed work,
 verification and outstanding gates. The package and release requirements below
