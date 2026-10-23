@@ -616,6 +616,9 @@ impl Store {
                 pending.push(serde_json::from_slice(&row?)?);
             }
         }
+        if pending.is_empty() && receipts.is_empty() {
+            return Ok(applied);
+        }
         // Validate against earlier events in the same batch through a temporary
         // transaction. All projections are rebuilt from per-entity deltas below.
         for event in events {

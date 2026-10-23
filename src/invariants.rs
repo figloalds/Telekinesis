@@ -183,6 +183,50 @@ fn remote_apply_invalidates_cached_paths_without_changing_open_version() -> Resu
 }
 
 #[test]
+fn committed_notifications_retry_without_invalidating_echoed_events() -> Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let h = engine.open_file("file", true, false, true)?;
+    engine.close(h)?;
+    // Drive retries explicitly so the test does not depend on thread timing.
+    engine.stopping.store(true, Ordering::Release);
+    let ready = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (r, c) = (ready.clone(), calls.clone());
+    engine.set_invalidator(Arc::new(move |_, _| {
+        c.fetch_add(1, Ordering::AcqRel);
+        anyhow::ensure!(r.load(Ordering::Acquire), "NOTIFY_BUSY");
+        Ok(())
+    }));
+    let event = {
+        let mut store = lock(&engine.store);
+        let state = store.lookup("file")?;
+        let parent = store.basis(&state.id)?.version;
+        let mut event = store.event(MAIN, state, vec![parent], Operation::Times);
+        event.author = "peer".into();
+        event
+    };
+    assert_eq!(
+        engine
+            .apply_remote(std::slice::from_ref(&event))?
+            .as_slice(),
+        std::slice::from_ref(&event.id)
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    ready.store(true, Ordering::Release);
+    engine.apply_remote(&[])?;
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert!(engine.apply_remote(&[event])?.is_empty());
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn hydrate_missing_chunk_over_authenticated_session() -> Result<()> {
     use crate::{
         model::{

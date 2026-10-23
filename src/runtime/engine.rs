@@ -30,6 +30,7 @@ pub struct Engine {
     handles: RwLock<BTreeMap<u64, Arc<Handle>>>,
     next: AtomicU64,
     invalidate: RwLock<Option<Invalidate>>,
+    notifications: Mutex<BTreeMap<String, u32>>,
     pub stopping: AtomicBool,
     pub error: Mutex<Option<String>>,
     _owner: File,
@@ -66,6 +67,7 @@ impl Engine {
             handles: RwLock::new(BTreeMap::new()),
             next: AtomicU64::new(1),
             invalidate: RwLock::new(None),
+            notifications: Mutex::new(BTreeMap::new()),
             stopping: AtomicBool::new(false),
             error: Mutex::new(None),
             _owner: owner,
@@ -97,7 +99,11 @@ impl Engine {
                     let _publication = lock(&engine.publication);
                     let result =
                         seal::seal_batch(&engine.store, &engine.working, &files).map(|_| ());
+                    drop(_publication);
                     if let Err(error) = result {
+                        *lock(&engine.error) = Some(format!("{error:#}"));
+                    }
+                    if let Err(error) = engine.retry_notifications() {
                         *lock(&engine.error) = Some(format!("{error:#}"));
                     }
                     if std::time::Instant::now() >= next_reap {
@@ -112,6 +118,24 @@ impl Engine {
     }
     pub fn set_invalidator(&self, callback: Invalidate) {
         *self.invalidate.write().unwrap() = Some(callback);
+    }
+    pub fn invalidate_paths(&self, paths: impl IntoIterator<Item = String>) -> Result<()> {
+        lock(&self.notifications).extend(paths.into_iter().map(|path| (path, 3)));
+        self.retry_notifications()
+    }
+    fn retry_notifications(&self) -> Result<()> {
+        let Some(callback) = self.invalidate.read().unwrap().clone() else {
+            return Ok(());
+        };
+        let pending = std::mem::take(&mut *lock(&self.notifications));
+        let mut result = Ok(());
+        for (path, action) in pending {
+            if let Err(error) = callback(&path, action) {
+                lock(&self.notifications).entry(path).or_insert(action);
+                result = Err(error);
+            }
+        }
+        result
     }
     pub fn lookup(&self, path: &str) -> Result<Entry> {
         let (mut entry, branch, anchor) = {
@@ -416,28 +440,26 @@ impl Engine {
             }
         }
         let applied = store.apply(events)?;
-        let mut notifications = BTreeMap::new();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         for id in &applied {
             if let Some(event) = store.version(id)? {
-                lock(&self.last_applied).insert(event.entity, stamp);
-            }
-        }
-        for event in events.iter().filter(|e| e.branch == store.active) {
-            if let Some(path) = before.get(&event.entity) {
-                notifications.insert(path.clone(), 3);
-            }
-            if let Ok(path) = store.projection().path(&event.entity) {
-                notifications.insert(path, if event.state.deleted { 2 } else { 3 });
+                lock(&self.last_applied).insert(event.entity.clone(), stamp);
+                if event.branch == store.active {
+                    let mut notifications = lock(&self.notifications);
+                    if let Some(path) = before.get(&event.entity) {
+                        notifications.insert(path.clone(), 3);
+                    }
+                    if let Ok(path) = store.projection().path(&event.entity) {
+                        notifications.insert(path, if event.state.deleted { 2 } else { 3 });
+                    }
+                }
             }
         }
         drop(store);
-        if let Some(callback) = self.invalidate.read().unwrap().as_ref() {
-            for (path, action) in notifications {
-                callback(&path, action)?;
-            }
+        if let Err(error) = self.retry_notifications() {
+            *lock(&self.error) = Some(format!("{error:#}"));
         }
         Ok(applied)
     }

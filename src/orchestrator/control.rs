@@ -104,6 +104,8 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
         "resolve" => {
             let event = lock(&engine.store).resolve(text("entity")?, text("version")?)?;
             engine.flush(None)?;
+            let path = lock(&engine.store).projection().path(&event.entity)?;
+            engine.invalidate_paths([path])?;
             Ok(serde_json::to_value(event)?)
         }
         "checkpoint" => {
@@ -122,12 +124,28 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
         }
         "checkout" => {
             engine.flush(None)?;
-            lock(&engine.store).checkout(text("branch")?)?;
+            let paths = {
+                let mut store = lock(&engine.store);
+                let paths = |s: &crate::core::Store| {
+                    s.projection()
+                        .entries
+                        .keys()
+                        .filter_map(|id| s.projection().path(id).ok())
+                        .collect::<Vec<_>>()
+                };
+                let mut changed = paths(&store);
+                store.checkout(text("branch")?)?;
+                changed.extend(paths(&store));
+                changed
+            };
+            engine.invalidate_paths(paths)?;
             Ok(json!({"checked_out":true}))
         }
-        "mkdir" => Ok(serde_json::to_value(
-            lock(&engine.store).create(text("path")?, EntryKind::Directory)?,
-        )?),
+        "mkdir" => {
+            let entry = lock(&engine.store).create(text("path")?, EntryKind::Directory)?;
+            engine.invalidate_paths([format!("/{}", text("path")?.trim_start_matches('/'))])?;
+            Ok(serde_json::to_value(entry)?)
+        }
         "rename" => {
             let mut s = lock(&engine.store);
             let entity = s.lookup(text("path")?)?.id;
@@ -136,12 +154,19 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
                 text("target")?,
                 p["replace"].as_bool().unwrap_or(false),
             )?;
+            drop(s);
+            engine.invalidate_paths([
+                format!("/{}", text("path")?.trim_start_matches('/')),
+                format!("/{}", text("target")?.trim_start_matches('/')),
+            ])?;
             Ok(json!({}))
         }
         "delete" => {
             let mut s = lock(&engine.store);
             let entity = s.lookup(text("path")?)?.id;
             s.delete(&entity)?;
+            drop(s);
+            engine.invalidate_paths([format!("/{}", text("path")?.trim_start_matches('/'))])?;
             Ok(json!({}))
         }
         "import" => {
@@ -166,6 +191,7 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
             let closed = engine.close(h);
             result?;
             closed?;
+            engine.invalidate_paths([format!("/{}", path.trim_start_matches('/'))])?;
             Ok(json!({}))
         }
         "cat" => {
