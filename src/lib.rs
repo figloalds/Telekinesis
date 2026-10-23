@@ -12,6 +12,7 @@ pub mod orchestrator;
 pub mod paired_sync;
 pub mod pairing_code;
 pub mod runtime;
+pub mod replacement;
 pub mod session;
 pub mod staging;
 pub mod startup;
