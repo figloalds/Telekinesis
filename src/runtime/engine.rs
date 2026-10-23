@@ -219,6 +219,15 @@ impl Engine {
             .cloned()
             .context("INVALID_HANDLE")
     }
+    pub fn writable_tokens(&self) -> Vec<u64> {
+        self.handles
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, h)| h.writable && !h.closed.load(Ordering::Acquire))
+            .map(|(token, _)| *token)
+            .collect()
+    }
     pub fn info(&self, token: u64) -> Result<(Entry, u64)> {
         let h = self.handle(token)?;
         let e = lock(&h.entry).clone();
@@ -302,9 +311,18 @@ impl Engine {
         s.truncate(size)
     }
     pub fn flush(&self, token: Option<u64>) -> Result<()> {
+        self.flush_impl(token, false)
+    }
+    /// The native volume flush has already delivered cached pages to scratch.
+    pub fn flush_native_volume(&self) -> Result<()> {
+        self.flush_impl(None, true)
+    }
+    fn flush_impl(&self, token: Option<u64>, native_drained: bool) -> Result<()> {
         let _publication = lock(&self.publication);
         let files = if let Some(token) = token {
             self.handle(token)?.scratch.clone().into_iter().collect()
+        } else if native_drained {
+            self.working.materialized_dirty()
         } else {
             self.working.pending(true)
         };

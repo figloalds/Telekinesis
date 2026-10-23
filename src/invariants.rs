@@ -227,6 +227,31 @@ fn committed_notifications_retry_without_invalidating_echoed_events() -> Result<
 }
 
 #[test]
+fn native_cache_drain_precedes_sealing_a_sparse_extension() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let h = engine.open_file("file", true, false, true)?;
+    engine.truncate(h, 4096, false)?;
+    let scratch = engine.handle(h)?.scratch.clone().unwrap();
+    lock(&scratch).cache_pending = true;
+    engine.cleanup(h, false)?;
+    let before = lock(&engine.store).events_after(0, 4096)?.len();
+    engine.flush(None)?;
+    assert_eq!(lock(&engine.store).events_after(0, 4096)?.len(), before);
+    let bytes = vec![7; 4096];
+    engine.write(h, 0, &bytes, false, false)?;
+    engine.flush_native_volume()?;
+    assert_eq!(
+        engine.lookup("file")?.content.unwrap().digest,
+        crate::model::content::Digest::bytes(&bytes)
+    );
+    lock(&scratch).cache_pending = false;
+    engine.close(h)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn hydrate_missing_chunk_over_authenticated_session() -> Result<()> {
     use crate::{
         model::{

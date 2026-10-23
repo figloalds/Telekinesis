@@ -249,6 +249,7 @@ def matrix(args):
                 "--root", str(root), "--compare", str(base), *common])
             if mounted.returncode:
                 failures.append("mounted")
+            (home / "mounted-stats.json").write_text(json.dumps(cli(state, "rpc", "mount-stats", "{}")))
             peer = start("peer", args.matrix_peer_mount)
             endpoint = json.loads((home / "mounted.log").read_text().splitlines()[0])["peer"]
             cli(peer, "pair", endpoint, cli(state, "pairing-code")["code"])
@@ -261,6 +262,7 @@ def matrix(args):
                 "--tkfs", str(exe), "--mount-prefix", "bench", "--compare", str(base), *common])
             if idle.returncode:
                 failures.append("idle-peer")
+            (home / "idle-stats.json").write_text(json.dumps(cli(state, "rpc", "mount-stats", "{}")))
         finally:
             for state, proc, log in reversed(processes):
                 try:
@@ -272,7 +274,7 @@ def matrix(args):
                 log.close()
             saved = ROOT / "test-runs/bench" / f"{args.label}-daemon-logs"
             saved.mkdir(parents=True, exist_ok=True)
-            for log_path in home.glob("*.log"):
+            for log_path in [*home.glob("*.log"), *home.glob("*-stats.json")]:
                 shutil.copyfile(log_path, saved / log_path.name)
     print("Matrix failures:", failures)
     return int(bool(failures))

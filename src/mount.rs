@@ -1,18 +1,94 @@
 //! WinFsp callbacks use host scratch files and the pathname-shared Windows cache.
 use crate::{
-    content::working::lock,
+    content::working::{PENDING_BUDGET, Scratch, WRITEBACK_DELAY, lock},
     core::{Entry, EntryKind},
     runtime::Engine,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
     sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 static ENGINE: RwLock<Option<Arc<Engine>>> = RwLock::new(None);
-static MOUNT: Mutex<Option<(usize, PathBuf)>> = Mutex::new(None);
+static MOUNT: Mutex<Option<(usize, PathBuf, u64)>> = Mutex::new(None);
+static CACHE_DRAIN: Mutex<()> = Mutex::new(());
+type CachedClose = (Instant, u64, Arc<Mutex<Scratch>>);
+static CACHED_CLOSES: Mutex<BTreeMap<String, CachedClose>> = Mutex::new(BTreeMap::new());
+
+fn cache_close(engine: &Engine, token: u64, modified: bool) -> Result<()> {
+    let handle = engine.handle(token)?;
+    if !handle.writable {
+        return Ok(());
+    }
+    if let Some(scratch) = &handle.scratch {
+        let (id, generation) = {
+            let mut s = lock(scratch);
+            if !modified && !s.cache_pending {
+                return Ok(());
+            }
+            s.cache_pending = true;
+            s.cache_generation = s.cache_generation.wrapping_add(1);
+            (s.record.id.clone(), s.cache_generation)
+        };
+        lock(&CACHED_CLOSES).insert(id, (Instant::now(), generation, scratch.clone()));
+    }
+    Ok(())
+}
+fn cache_flushed(engine: &Engine, scratch: &Arc<Mutex<Scratch>>, expected: Option<u64>) {
+    let (id, generation) = {
+        let mut s = lock(scratch);
+        if expected.is_some_and(|g| g != s.cache_generation) {
+            return;
+        }
+        s.cache_pending = false;
+        if s.writers == 0 && s.changed {
+            s.closed_at = Instant::now().checked_sub(WRITEBACK_DELAY);
+        }
+        (s.record.id.clone(), s.cache_generation)
+    };
+    let mut pending = lock(&CACHED_CLOSES);
+    if pending.get(&id).is_some_and(|(_, g, _)| *g == generation) {
+        pending.remove(&id);
+    }
+    drop(pending);
+    engine.working.schedule(scratch);
+}
+/// A root-directory flush synchronously drains the Windows volume cache,
+/// including read-only files, then seals its materialized bytes as one batch.
+pub fn flush_cached(force: bool) -> Result<()> {
+    let _drain = lock(&CACHE_DRAIN);
+    let Some(engine) = ENGINE.read().unwrap().clone() else {
+        return Ok(());
+    };
+    if force {
+        for token in engine.writable_tokens() {
+            cache_close(&engine, token, true)?;
+        }
+    }
+    let pending = lock(&CACHED_CLOSES).clone();
+    let bytes: u64 = pending.values().map(|(_, _, s)| lock(s).length).sum();
+    let due = force
+        || pending.values().any(|(closed, _, scratch)| {
+            lock(scratch).writers == 0
+                && (bytes > PENDING_BUDGET || closed.elapsed() >= WRITEBACK_DELAY)
+        });
+    if !due || pending.is_empty() {
+        return Ok(());
+    }
+    let root = lock(&MOUNT).as_ref().map(|(_, _, root)| *root);
+    if let Some(root) = root {
+        let status = unsafe { tk_cache_flush(root) };
+        ensure!(status == 0, "CACHE_DRAIN_FAILED: {status:08x}");
+    }
+    for (_, generation, scratch) in pending.values() {
+        cache_flushed(&engine, scratch, Some(*generation));
+    }
+    Ok(())
+}
 static CALLS: [std::sync::atomic::AtomicU64; 16] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 static NANOS: [std::sync::atomic::AtomicU64; 16] =
@@ -36,6 +112,9 @@ unsafe extern "C" {
     fn tk_mount_start(path: *const u16, out: *mut usize, threads: u32, timeout: u32) -> u32;
     fn tk_mount_stop(native: usize);
     fn tk_mount_notify(native: usize, path: *const u16, action: u32) -> u32;
+    fn tk_cache_open(path: *const u16, out: *mut u64) -> u32;
+    fn tk_cache_flush(root: u64) -> u32;
+    fn tk_cache_close(root: u64);
 }
 fn fill(entry: &Entry, size: u64) -> Info {
     let size = entry.working_len.unwrap_or(size);
@@ -76,14 +155,42 @@ pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
         *ENGINE.write().unwrap() = None;
         anyhow::bail!("MOUNT_FAILED: {status:08x}");
     }
-    *mount = Some((native, path.to_owned()));
+    let mut root = 0;
+    let status = unsafe { tk_cache_open(wide.as_ptr(), &mut root) };
+    if status != 0 {
+        unsafe { tk_mount_stop(native) };
+        *ENGINE.write().unwrap() = None;
+        anyhow::bail!("CACHE_ROOT_OPEN_FAILED: {status:08x}");
+    }
+    *mount = Some((native, path.to_owned(), root));
     engine.set_invalidator(Arc::new(notify));
+    let weak = Arc::downgrade(&engine);
+    std::thread::Builder::new()
+        .name("tkfs-cache-drain".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(25));
+                let Some(engine) = weak.upgrade() else {
+                    break;
+                };
+                if engine.stopping.load(Ordering::Acquire) {
+                    break;
+                }
+                if let Err(error) = flush_cached(false) {
+                    *lock(&engine.error) = Some(format!("{error:#}"));
+                }
+            }
+        })?;
     Ok(())
 }
 pub fn detach() -> Result<()> {
+    flush_cached(true)?;
     let mut mount = lock(&MOUNT);
-    if let Some((native, _)) = mount.take() {
-        unsafe { tk_mount_stop(native) };
+    if let Some((native, _, root)) = mount.take() {
+        unsafe {
+            tk_cache_close(root);
+            tk_mount_stop(native)
+        };
     }
     if let Some(engine) = ENGINE.write().unwrap().take() {
         engine.flush(None)?;
@@ -92,7 +199,7 @@ pub fn detach() -> Result<()> {
 }
 pub fn notify(path: &str, action: u32) -> Result<()> {
     let mount = lock(&MOUNT);
-    if let Some((native, _)) = mount.as_ref() {
+    if let Some((native, _, _)) = mount.as_ref() {
         let path = path.replace('/', "\\").to_uppercase();
         let wide: Vec<_> = path.encode_utf16().chain(Some(0)).collect();
         let status = unsafe { tk_mount_notify(*native, wide.as_ptr(), action) };
@@ -234,7 +341,16 @@ pub unsafe extern "C" fn tk_call(
                 unsafe { *info = fill(&e, len) };
             }
             7 => {
-                engine.flush((h != 0).then_some(h))?;
+                if h != 0
+                    && let Some(scratch) = &engine.handle(h)?.scratch
+                {
+                    cache_flushed(&engine, scratch, None);
+                }
+                if h == 0 {
+                    engine.flush_native_volume()?;
+                } else {
+                    engine.flush(Some(h))?;
+                }
                 if h != 0 {
                     let (e, len) = engine.info(h)?;
                     unsafe { *info = fill(&e, len) };
@@ -244,7 +360,12 @@ pub unsafe extern "C" fn tk_call(
                 let (e, len) = engine.info_visible(h)?;
                 unsafe { *info = fill(&e, len) };
             }
-            9 => engine.cleanup(h, flags & 1 != 0)?,
+            9 => {
+                if flags & 1 == 0 {
+                    cache_close(&engine, h, flags & 2 != 0)?;
+                }
+                engine.cleanup(h, flags & 1 != 0)?;
+            }
             10 => engine.close(h)?,
             11 => {
                 let handle = engine.handle(h)?;

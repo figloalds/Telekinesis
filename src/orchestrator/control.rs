@@ -74,6 +74,13 @@ pub fn start(engine: Arc<Engine>, catalog: Arc<Catalog>) -> Result<String> {
     Ok(endpoint)
 }
 pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -> Result<Value> {
+    #[cfg(windows)]
+    if matches!(
+        operation,
+        "flush" | "gc" | "checkpoint" | "fork" | "checkout" | "shutdown"
+    ) {
+        crate::mount::flush_cached(true)?;
+    }
     let text = |key: &str| -> Result<&str> { p[key].as_str().context("ARGUMENT_REQUIRED") };
     match operation {
         #[cfg(windows)]

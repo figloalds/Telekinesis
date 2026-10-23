@@ -1,5 +1,6 @@
 """Real WinFsp smoke and two-peer cached-update test using disposable stores."""
 import json
+import hashlib
 import argparse
 import os
 from pathlib import Path
@@ -87,6 +88,19 @@ def main():
         cli(b, "pair", peer, code)
         remote = other / "folder/renamed.txt"
         wait_for(lambda: remote.read_bytes() == b"oriXYnal")
+        automatic = b"a" * 65536 + b"automatic close"
+        (mount / "folder/automatic.txt").write_bytes(automatic)
+        os.chmod(mount / "folder/automatic.txt", 0o444)
+        wait_for(lambda: (other / "folder/automatic.txt").read_bytes() == automatic, timeout=3)
+        with (mount / "folder/open-writer.txt").open("wb") as writer:
+            writer.write(b"open writer data")
+            writer.flush()
+            cli(a, "flush")
+            sealed = bytes(cli(a, "rpc", "cat", json.dumps({"path":"folder/open-writer.txt"}))["bytes"])
+            assert sealed == b"open writer data", sealed
+            head = cli(a, "rpc", "lookup", json.dumps({"path":"folder/open-writer.txt"}))
+            assert head["entry"]["content"]["digest"] == hashlib.sha256(b"open writer data").hexdigest(), head
+        print("automatic close seal and explicit flush of an open writer passed", flush=True)
         # Prime both data and attribute caches before a remote update.
         assert remote.stat().st_size == 8
         assert remote.read_bytes() == b"oriXYnal"
@@ -94,6 +108,10 @@ def main():
         assert old_reader.read()==b"oriXYnal"
         (mount / "folder/renamed.txt").write_bytes(b"remote replacement")
         cli(a, "flush")
+        sealed = bytes(cli(a, "rpc", "cat", json.dumps({"path":"folder/renamed.txt"}))["bytes"])
+        assert sealed == b"remote replacement", f"explicit flush missed cached bytes: {sealed!r}"
+        head = cli(a, "rpc", "lookup", json.dumps({"path":"folder/renamed.txt"}))
+        assert head["entry"]["content"]["digest"] == hashlib.sha256(b"remote replacement").hexdigest(), head
         started = time.monotonic()
         wait_for(lambda: remote.read_bytes() == b"remote replacement")
         elapsed = (time.monotonic() - started) * 1000

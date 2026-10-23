@@ -19,7 +19,12 @@ the benchmark command in `docs/VALIDATION.md`.
 # Windows cache follow-up
 
 WinFsp now uses `FileInfoTimeout=INFINITE`, the setting required to enable
-Windows data caching, and flushes cached writes to scratch on cleanup. Remote
+Windows data caching. Closed writable files queue a volume cache drain at the
+one-second/64 MiB seal boundary. A persistent root handle permits a synchronous
+`FlushFileBuffers` without raw-volume privileges; WinFsp drains cached pages
+before one batched durable seal. Explicit file/volume/control flushes remain
+immediate. System volume flushes can also checkpoint open writers. Drafts with
+pending native pages cannot be sealed as sparse zero-filled data. Remote
 notifications use normalized names; paging reads and metadata follow the
 visible entity head after invalidation. Per the user's decision, existing
 Windows readers may see remote updates. Their local edit parent still binds

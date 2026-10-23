@@ -44,7 +44,7 @@ static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs
 static NTSTATUS create(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,PSECURITY_DESCRIPTOR sd,UINT64 allocation,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,attrs,2,context,fi);}
 static NTSTATUS open_file(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,0,3,context,fi);}
 static NTSTATUS overwrite(FSP_FILE_SYSTEM *fs,PVOID context,UINT32 attrs,BOOLEAN replace,UINT64 allocation,FSP_FSCTL_FILE_INFO *fi) {return call(6,0,context,0,0,0,0,fi,0);}
-static void cleanup(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name,ULONG flags) {call(9,name,context,0,0,0,(flags&FspCleanupDelete)?1:0,0,0);}
+static void cleanup(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name,ULONG flags) {call(9,name,context,0,0,0,((flags&FspCleanupDelete)?1:0)|((flags&(FspCleanupSetAllocationSize|FspCleanupSetArchiveBit|FspCleanupSetLastWriteTime))?2:0),0,0);}
 static void close_file(FSP_FILE_SYSTEM *fs,PVOID context) {call(10,0,context,0,0,0,0,0,0);free(context);}
 static NTSTATUS read_file(FSP_FILE_SYSTEM *fs,PVOID context,PVOID buffer,UINT64 offset,ULONG length,PULONG count) {return call(4,0,context,offset,buffer,length,0,0,count);}
 static NTSTATUS write_file(FSP_FILE_SYSTEM *fs,PVOID context,PVOID buffer,UINT64 offset,ULONG length,BOOLEAN append,BOOLEAN constrained,PULONG count,FSP_FSCTL_FILE_INFO *fi) {return call(5,0,context,offset,buffer,length,(append?1:0)|(constrained?2:0),fi,count);}
@@ -120,7 +120,7 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
     /* WinFsp enables the Windows data cache only for the infinity sentinel.
        Directories retain a finite metadata lifetime; remote changes notify. */
     p.MaxComponentLength=255;p.FileInfoTimeout=INFINITE;p.DirInfoTimeoutValid=1;p.DirInfoTimeout=1000;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
-    p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=1;p.UmFileContextIsUserContext2=1;
+    p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=0;p.UmFileContextIsUserContext2=1;
     /* Every mount uses native retirement for open destination handles. */
     p.SupportsPosixUnlinkRename=1;
     if(irp_timeout_ms)p.IrpTimeout=irp_timeout_ms;
@@ -138,6 +138,15 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
     if(!NT_SUCCESS(status)){FspFileSystemDelete(*out);*out=0;}return status;
 }
 void tk_mount_stop(FSP_FILE_SYSTEM *fs) {FspFileSystemStopDispatcher(fs);FspFileSystemDelete(fs);}
+UINT32 tk_cache_open(PWSTR path,UINT64 *out) {
+    WCHAR root[32768];if(swprintf_s(root,32768,L"%s\\",path)<0)return STATUS_NAME_TOO_LONG;
+    HANDLE handle=CreateFileW(root,GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+        0,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,0);
+    if(handle==INVALID_HANDLE_VALUE)return FspNtStatusFromWin32(GetLastError());
+    *out=(UINT64)(UINT_PTR)handle;return STATUS_SUCCESS;
+}
+UINT32 tk_cache_flush(UINT64 handle) {return FlushFileBuffers((HANDLE)(UINT_PTR)handle)?STATUS_SUCCESS:FspNtStatusFromWin32(GetLastError());}
+void tk_cache_close(UINT64 handle) {CloseHandle((HANDLE)(UINT_PTR)handle);}
 UINT32 tk_mount_notify(FSP_FILE_SYSTEM *fs,PWSTR path,UINT32 action) {
     SIZE_T bytes=sizeof(FSP_FSCTL_NOTIFY_INFO)+wcslen(path)*sizeof(WCHAR);
     if(bytes>65535)return STATUS_NAME_TOO_LONG;
