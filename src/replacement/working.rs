@@ -1,0 +1,234 @@
+//! Mutable host files. The byte path never opens SQLite or computes a digest.
+use super::objects::{LocalContent, Pin};
+use crate::model::content::{CHUNK_SIZE, FileContentRef};
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use uuid::Uuid;
+
+pub const DIRTY_PAGE: u64 = 4096;
+pub const WRITEBACK_DELAY: Duration = Duration::from_secs(1);
+pub const PENDING_BUDGET: u64 = 64 * 1024 * 1024;
+pub(crate) fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_,T> { value.lock().unwrap_or_else(std::sync::PoisonError::into_inner) }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Basis {
+    pub entity: String,
+    pub branch: String,
+    pub version: String,
+    pub content: FileContentRef,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScratchRecord { pub operation: String, pub basis: Basis, pub modified_ns: u128, pub hydrated: BTreeSet<u64> }
+#[derive(Default)]
+pub struct DirtyBitmap { bits: Vec<u64> }
+impl DirtyBitmap {
+    pub fn mark(&mut self, offset: u64, len: u64) {
+        if len == 0 { return; }
+        let first = offset / DIRTY_PAGE;
+        let last = (offset + len - 1) / DIRTY_PAGE;
+        self.bits.resize(self.bits.len().max((last/64+1) as usize),0);
+        for page in first..=last { self.bits[(page/64) as usize] |= 1 << (page%64); }
+    }
+    pub fn intersects(&self, offset: u64, len: u64) -> bool {
+        if len == 0 { return false; }
+        (offset/DIRTY_PAGE..=(offset+len-1)/DIRTY_PAGE).any(|page| self.bits.get((page/64) as usize).is_some_and(|bits|bits & (1<<(page%64))!=0))
+    }
+    pub fn clear(&mut self) { self.bits.clear(); }
+}
+
+pub struct Scratch {
+    pub record: ScratchRecord,
+    pub path: PathBuf,
+    pub file: File,
+    pub dirty: DirtyBitmap,
+    pub changed: bool,
+    pub writers: usize,
+    pub handles: usize,
+    pub closed_at: Option<Instant>,
+    pub hydrated: BTreeSet<u64>,
+    pub base_visible_len: u64,
+    pub pin: Pin,
+}
+impl Scratch {
+    pub fn len(&self) -> Result<u64> { Ok(self.file.metadata()?.len()) }
+    pub fn is_empty(&self) -> Result<bool> { Ok(self.len()? == 0) }
+    pub fn persist_record(&self) -> Result<()> {
+        self.write_record(false)
+    }
+    fn write_record(&self,durable:bool) -> Result<()> {
+        let path = self.path.with_extension("json");
+        let temp = self.path.with_extension("json.tmp");
+        let mut file = File::create(&temp)?;
+        file.write_all(&serde_json::to_vec(&self.record)?)?;
+        if durable {file.sync_all()?;}
+        // Replace atomically on both supported platforms.
+        #[cfg(windows)] {
+            use std::os::windows::ffi::OsStrExt;
+            unsafe extern "system" { fn MoveFileExW(old: *const u16,new: *const u16,flags:u32)->i32; }
+            let old: Vec<_> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
+            let new: Vec<_> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            ensure!(unsafe { MoveFileExW(old.as_ptr(),new.as_ptr(),1|if durable {8}else{0}) } != 0,"SCRATCH_RECORD_REPLACE: {}",std::io::Error::last_os_error());
+        }
+        #[cfg(unix)] { fs::rename(&temp,&path)?; if durable {File::open(path.parent().unwrap())?.sync_all()?;} }
+        Ok(())
+    }
+    /// Fetch only chunks touched by this operation. Entire overwritten chunks
+    /// need no base data; partial writes must preserve the rest of their chunk.
+    fn hydrate(&mut self, content: &LocalContent, offset: u64, len: u64, overwrite: bool) -> Result<()> {
+        if len == 0 { return Ok(()); }
+        let file_len = self.len()?;
+        for index in offset/CHUNK_SIZE..=(offset+len-1)/CHUNK_SIZE {
+            if self.hydrated.contains(&index) { continue; }
+            let start = index*CHUNK_SIZE;
+            if overwrite && offset <= start && offset+len >= (start+CHUNK_SIZE).min(file_len) {
+                self.hydrated.insert(index);
+                if start < self.base_visible_len { self.persist_hydration()?; }
+                continue;
+            }
+            let count = self.base_visible_len.saturating_sub(start).min(CHUNK_SIZE).min(file_len.saturating_sub(start));
+            if count > 0 {
+                let mut bytes = vec![0;count as usize];
+                content.read_range(&self.record.basis.content,start,&mut bytes)?;
+                self.file.seek(SeekFrom::Start(start))?;
+                self.file.write_all(&bytes)?;
+            }
+            self.hydrated.insert(index);
+            if start < self.base_visible_len { self.persist_hydration()?; }
+        } Ok(())
+    }
+    fn persist_hydration(&mut self) -> Result<()> {
+        // Only demand hydration needs a recovery marker. Ordinary local writes
+        // have no sidecar writes, hashing, or database work.
+        self.file.sync_all()?;
+        self.record.hydrated = self.hydrated.clone();
+        self.write_record(true)
+    }
+    pub fn read(&mut self, content: &LocalContent, offset: u64, out: &mut [u8]) -> Result<usize> {
+        let len = self.len()?.saturating_sub(offset).min(out.len() as u64) as usize;
+        self.hydrate(content,offset,len as u64,false)?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.read_exact(&mut out[..len])?; Ok(len)
+    }
+    pub fn write(&mut self, content: &LocalContent, offset: u64, bytes: &[u8], append: bool, constrained: bool) -> Result<usize> {
+        let old_len = self.len()?;
+        let offset = if append { old_len } else { offset };
+        let count = if constrained { old_len.saturating_sub(offset).min(bytes.len() as u64) as usize } else { bytes.len() };
+        if count == 0 { return Ok(0); }
+        let end = offset.checked_add(count as u64).context("FILE_TOO_LARGE")?;
+        ensure!(end <= crate::model::content::MAX_FILE_SIZE,"FILE_TOO_LARGE");
+        self.hydrate(content,offset,count as u64,true)?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(&bytes[..count])?;
+        self.dirty.mark(offset,count as u64);
+        self.changed = true; self.closed_at = None; Ok(count)
+    }
+    pub fn truncate(&mut self, size: u64) -> Result<()> {
+        ensure!(size <= crate::model::content::MAX_FILE_SIZE,"FILE_TOO_LARGE");
+        let old = self.len()?;
+        if old == size { return Ok(()); }
+        ensure!(self.hydrated.len() as u64 >= old.min(self.base_visible_len).div_ceil(CHUNK_SIZE), "TRUNCATE_REQUIRES_HYDRATION");
+        self.file.set_len(size)?;
+        self.base_visible_len = self.base_visible_len.min(size);
+        self.hydrated.retain(|index| *index*CHUNK_SIZE < size);
+        self.dirty.mark(old.min(size),old.abs_diff(size));
+        self.changed = true; self.closed_at = None; Ok(())
+    }
+    pub fn hydrate_chunk(&mut self, content: &LocalContent, index: u64) -> Result<()> {
+        self.hydrate(content,index*CHUNK_SIZE,self.len()?.saturating_sub(index*CHUNK_SIZE).min(CHUNK_SIZE),false)
+    }
+}
+
+pub struct WorkingLayer { root: PathBuf, content: LocalContent, files: Mutex<BTreeMap<(String,String,String),Arc<Mutex<Scratch>>>> }
+impl WorkingLayer {
+    pub fn new(root: &Path, content: LocalContent) -> Result<Self> {
+        let root = root.join("scratch"); fs::create_dir_all(&root)?;
+        Ok(Self { root,content,files:Mutex::new(BTreeMap::new()) })
+    }
+    pub fn open(&self, basis: Basis, writable: bool) -> Result<Arc<Mutex<Scratch>>> {
+        let mut files = lock(&self.files);
+        let key = (basis.branch.clone(),basis.entity.clone(),basis.version.clone());
+        let existing=files.get(&key).cloned().or_else(||files.values().find(|file|{let s=lock(file);s.record.basis.branch==basis.branch && s.record.basis.entity==basis.entity && s.record.basis.version==basis.version}).cloned());
+        if let Some(existing) = existing {
+            let mut scratch = lock(&existing);
+            scratch.handles += 1; scratch.writers += usize::from(writable); scratch.closed_at = None;
+            return Ok(existing.clone());
+        }
+        let operation = Uuid::new_v4().to_string();
+        let path = self.root.join(format!("{operation}.scratch"));
+        let pin = self.content.pin(&basis.content)?;
+        let mut file = OpenOptions::new().create_new(true).read(true).write(true).open(&path)?;
+        file.set_len(basis.content.total_len)?;
+        let mut hydrated = BTreeSet::new();
+        for (index,digest) in self.content.chunks(&basis.content)?.into_iter().enumerate() {
+            if let Ok(bytes) = self.content.packs.get(digest) {
+                file.seek(SeekFrom::Start(index as u64*CHUNK_SIZE))?; file.write_all(&bytes)?; hydrated.insert(index as u64);
+            }
+        }
+        let scratch = Scratch { record:ScratchRecord { operation,basis:basis.clone(),modified_ns:modified_ns(&file)?,hydrated:hydrated.clone() },path,file,dirty:DirtyBitmap::default(),changed:false,writers:usize::from(writable),handles:1,closed_at:None,hydrated,base_visible_len:basis.content.total_len,pin };
+        scratch.persist_record()?;
+        let scratch = Arc::new(Mutex::new(scratch)); files.insert(key,scratch.clone()); Ok(scratch)
+    }
+    pub fn close(&self, scratch: &Arc<Mutex<Scratch>>, writable: bool) {
+        let mut scratch = lock(scratch);
+        scratch.handles = scratch.handles.saturating_sub(1);
+        if writable { scratch.writers = scratch.writers.saturating_sub(1); }
+        if scratch.writers == 0 && scratch.changed { scratch.closed_at = Some(Instant::now()); }
+    }
+    pub fn pending(&self, force: bool) -> Vec<Arc<Mutex<Scratch>>> {
+        let files = lock(&self.files);
+        let pending_bytes: u64 = files.values().map(|file| { let s=lock(file); if s.changed && s.writers==0 { s.len().unwrap_or(0) } else {0} }).sum();
+        files.values().filter(|file| { let s=lock(file); s.changed && (force || s.writers==0 && (pending_bytes>PENDING_BUDGET || s.closed_at.is_some_and(|t|t.elapsed()>=WRITEBACK_DELAY))) }).cloned().collect()
+    }
+    pub fn reap_clean(&self) -> Result<()> {
+        let mut files = lock(&self.files);
+        let keys: Vec<_> = files.iter().filter(|(_,file)|{let s=lock(file); s.handles==0 && !s.changed}).map(|(k,_)|k.clone()).collect();
+        for key in keys {
+            let scratch = files.remove(&key).unwrap(); let s=lock(&scratch);
+            fs::remove_file(&s.path)?; fs::remove_file(s.path.with_extension("json"))?;
+        } Ok(())
+    }
+    pub fn records(&self) -> Result<Vec<(PathBuf,ScratchRecord)>> {
+        let mut records = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e|e=="json") {
+                let record: ScratchRecord = serde_json::from_slice(&fs::read(&path)?)?;
+                ensure!(Uuid::parse_str(&record.operation).is_ok() && path.file_stem().and_then(|s|s.to_str())==Some(record.operation.as_str()),"INVALID_SCRATCH_RECORD");
+                records.push((path.with_extension("scratch"),record));
+            }
+        } Ok(records)
+    }
+    pub fn content(&self) -> &LocalContent { &self.content }
+}
+pub fn modified_ns(file: &File) -> Result<u128> { Ok(file.metadata()?.modified()?.duration_since(std::time::UNIX_EPOCH)?.as_nanos()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scratch_passthrough_append_truncate_and_version_isolation() -> Result<()> {
+        let root=tempfile::tempdir()?; let content=LocalContent::open(root.path())?;
+        let reference=content.import(b"abcdef")?;
+        let layer=WorkingLayer::new(root.path(),content.clone())?;
+        let basis=Basis{entity:"file".into(),branch:"main".into(),version:"v1".into(),content:reference};
+        let first=layer.open(basis.clone(),true)?;
+        { let mut s=lock(&first); s.write(&content,2,b"XY",false,false)?; s.write(&content,0,b"!",true,false)?; }
+        let second=layer.open(basis.clone(),false)?; assert!(Arc::ptr_eq(&first,&second));
+        let mut new_basis=basis; new_basis.version="v2".into(); new_basis.content=content.import(b"remote")?;
+        let remote=layer.open(new_basis,false)?;
+        let mut bytes=[0;7]; assert_eq!(lock(&first).read(&content,0,&mut bytes)?,7); assert_eq!(&bytes,b"abXYef!");
+        let mut other=[0;6]; lock(&remote).read(&content,0,&mut other)?; assert_eq!(&other,b"remote");
+        lock(&first).truncate(2)?; lock(&first).truncate(7)?;
+        lock(&first).read(&content,0,&mut bytes)?; assert_eq!(&bytes,b"ab\0\0\0\0\0");
+        layer.close(&first,true); layer.close(&second,false);
+        assert_eq!(layer.pending(true).len(),1); Ok(())
+    }
+}
