@@ -110,7 +110,7 @@ fn run() -> Result<()> {
                 json!({"device":store.device,"repo":store.repo,"state":root})
             };
             engine.shutdown()?;
-            println!("{}", result);
+            println!("{result}");
             Ok(())
         }
         Command::Daemon {

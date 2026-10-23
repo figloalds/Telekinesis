@@ -16,6 +16,25 @@ use std::{
 };
 
 type Invalidate = Arc<dyn Fn(&str, u32) -> Result<()> + Send + Sync>;
+static OPEN_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static OPEN_NANOS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+fn open_timing(stage: usize, started: std::time::Instant) {
+    OPEN_COUNTS[stage].fetch_add(1, Ordering::Relaxed);
+    OPEN_NANOS[stage].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+pub fn open_stats() -> serde_json::Value {
+    serde_json::Value::Array(
+        ["metadata_wait", "metadata_total", "scratch", "handle"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, stage)| {
+                serde_json::json!({"stage":stage,
+            "calls":OPEN_COUNTS[i].load(Ordering::Relaxed),
+            "ms":OPEN_NANOS[i].load(Ordering::Relaxed) as f64/1e6})
+            })
+            .collect(),
+    )
+}
 pub struct Handle {
     pub entry: Mutex<Entry>,
     pub scratch: Option<Arc<Mutex<Scratch>>>,
@@ -97,8 +116,8 @@ impl Engine {
                     next_seal = std::time::Instant::now() + Duration::from_millis(50);
                     let files = engine.working.pending(false);
                     let _publication = lock(&engine.publication);
-                    let result =
-                        seal::seal_batch(&engine.store, &engine.working, &files).map(|_| ());
+                    let result = seal::seal_batch(&engine.store, &engine.working, &files)
+                        .and_then(|stats| engine.queue_sealed(&files, stats.entities));
                     drop(_publication);
                     if let Err(error) = result {
                         *lock(&engine.error) = Some(format!("{error:#}"));
@@ -167,8 +186,10 @@ impl Engine {
         attributes: Option<u32>,
     ) -> Result<u64> {
         ensure!(!self.stopping.load(Ordering::Acquire), "STOPPING");
+        let started = std::time::Instant::now();
         let (entry, basis) = {
             let mut store = lock(&self.store);
+            open_timing(0, started);
             let e = if create {
                 store.create_with_attributes(
                     path,
@@ -193,9 +214,38 @@ impl Engine {
             };
             (e, basis)
         };
+        open_timing(1, started);
+        self.insert_handle(entry, basis, writable, false)
+    }
+    pub fn open_bound(&self, entry: Entry, basis: Basis, writable: bool) -> Result<u64> {
+        ensure!(!self.stopping.load(Ordering::Acquire), "STOPPING");
+        ensure!(
+            entry.kind == EntryKind::File
+                && entry.id == basis.entity
+                && entry.content.as_ref() == Some(&basis.content),
+            "INVALID_BOUND_OPEN"
+        );
+        self.insert_handle(entry, Some(basis), writable, true)
+    }
+    fn insert_handle(
+        &self,
+        entry: Entry,
+        basis: Option<Basis>,
+        writable: bool,
+        bound: bool,
+    ) -> Result<u64> {
+        let started = std::time::Instant::now();
         let scratch = basis
-            .map(|basis| self.working.open(basis, writable))
+            .map(|basis| {
+                if bound {
+                    self.working.open_bound(basis, writable)
+                } else {
+                    self.working.open(basis, writable)
+                }
+            })
             .transpose()?;
+        open_timing(2, started);
+        let started = std::time::Instant::now();
         let token = self.next.fetch_add(1, Ordering::Relaxed);
         self.handles.write().unwrap().insert(
             token,
@@ -208,6 +258,7 @@ impl Engine {
                 directory: Mutex::new(None),
             }),
         );
+        open_timing(3, started);
         Ok(token)
     }
     pub fn handle(&self, token: u64) -> Result<Arc<Handle>> {
@@ -350,7 +401,8 @@ impl Engine {
         } else {
             self.working.pending(true)
         };
-        seal::seal_batch(&self.store, &self.working, &files)?;
+        let stats = seal::seal_batch(&self.store, &self.working, &files)?;
+        self.queue_sealed(&files, stats.entities)?;
         // Also covers namespace-only fsyncs with no dirty content event.
         {
             let mut store = lock(&self.store);
@@ -358,6 +410,24 @@ impl Engine {
             store.db.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
         }
         *lock(&self.error) = None;
+        Ok(())
+    }
+    fn queue_sealed(&self, files: &[Arc<Mutex<Scratch>>], count: usize) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if count != 0 {
+            let entities: Vec<_> = files.iter().map(|s| lock(s).record.basis.clone()).collect();
+            let paths = {
+                let store = lock(&self.store);
+                entities
+                    .iter()
+                    .filter(|b| b.branch == store.active)
+                    .filter_map(|b| store.projection().path(&b.entity).ok())
+                    .collect::<Vec<_>>()
+            };
+            lock(&self.notifications).extend(paths.into_iter().map(|path| (path, 3)));
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (files, count);
         Ok(())
     }
     pub fn cleanup(&self, token: u64, delete: bool) -> Result<()> {

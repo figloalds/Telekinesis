@@ -269,11 +269,13 @@ impl Scratch {
 
 type ScratchFiles = BTreeMap<(String, String, String), Arc<Mutex<Scratch>>>;
 type LatestFiles = BTreeMap<(String, String), Weak<Mutex<Scratch>>>;
+type BoundFiles = BTreeMap<(String, String, String), Weak<Mutex<Scratch>>>;
 pub struct WorkingLayer {
     root: PathBuf,
     content: LocalContent,
     files: Mutex<ScratchFiles>,
     latest: Mutex<LatestFiles>,
+    bindings: Mutex<BoundFiles>,
     pending: Mutex<BTreeMap<String, Weak<Mutex<Scratch>>>>,
 }
 impl WorkingLayer {
@@ -285,10 +287,17 @@ impl WorkingLayer {
             content,
             files: Mutex::new(BTreeMap::new()),
             latest: Mutex::new(BTreeMap::new()),
+            bindings: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
         })
     }
     pub fn open(&self, basis: Basis, writable: bool) -> Result<Arc<Mutex<Scratch>>> {
+        self.open_impl(basis, writable, false)
+    }
+    pub fn open_bound(&self, basis: Basis, writable: bool) -> Result<Arc<Mutex<Scratch>>> {
+        self.open_impl(basis, writable, true)
+    }
+    fn open_impl(&self, basis: Basis, writable: bool, bound: bool) -> Result<Arc<Mutex<Scratch>>> {
         let mut files = lock(&self.files);
         let key = (
             basis.branch.clone(),
@@ -296,18 +305,25 @@ impl WorkingLayer {
             basis.version.clone(),
         );
         let entity_key = (basis.branch.clone(), basis.entity.clone());
-        let existing = lock(&self.latest)
-            .get(&entity_key)
-            .and_then(Weak::upgrade)
-            .filter(|file| {
-                let s = lock(file);
-                s.record.basis.anchor == basis.anchor && s.record.basis.content == basis.content
+        let existing = bound
+            .then(|| lock(&self.bindings).get(&key).and_then(Weak::upgrade))
+            .flatten()
+            .or_else(|| {
+                lock(&self.latest)
+                    .get(&entity_key)
+                    .and_then(Weak::upgrade)
+                    .filter(|file| {
+                        let s = lock(file);
+                        s.record.basis.anchor == basis.anchor
+                            && s.record.basis.content == basis.content
+                    })
             });
         if let Some(existing) = existing {
             let mut scratch = lock(&existing);
             scratch.handles += 1;
             scratch.writers += usize::from(writable);
             scratch.closed_at = None;
+            lock(&self.bindings).insert(key, Arc::downgrade(&existing));
             return Ok(existing.clone());
         }
         let operation = Uuid::new_v4().to_string();
@@ -352,6 +368,7 @@ impl WorkingLayer {
         };
         scratch.create_record()?;
         let scratch = Arc::new(Mutex::new(scratch));
+        lock(&self.bindings).insert(key.clone(), Arc::downgrade(&scratch));
         files.insert(key, scratch.clone());
         lock(&self.latest).insert(entity_key, Arc::downgrade(&scratch));
         Ok(scratch)
@@ -426,6 +443,8 @@ impl WorkingLayer {
             .collect()
     }
     pub fn reap_clean(&self) -> Result<()> {
+        lock(&self.bindings).retain(|_, file| file.strong_count() != 0);
+        lock(&self.latest).retain(|_, file| file.strong_count() != 0);
         let mut files = lock(&self.files);
         let pressure = files.len() > 4096;
         let keys: Vec<_> = files
@@ -499,6 +518,15 @@ impl WorkingLayer {
             .and_then(Weak::upgrade)?;
         let state = lock(&file);
         (state.record.basis.anchor == anchor).then_some(state.length)
+    }
+    pub fn bound_len(&self, basis: &Basis) -> Option<u64> {
+        let key = (
+            basis.branch.clone(),
+            basis.entity.clone(),
+            basis.version.clone(),
+        );
+        let file = lock(&self.bindings).get(&key).and_then(Weak::upgrade)?;
+        Some(lock(&file).length)
     }
 }
 fn write_at(file: &File, mut bytes: &[u8], mut offset: u64) -> std::io::Result<()> {

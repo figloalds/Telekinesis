@@ -94,7 +94,9 @@ static CALLS: [std::sync::atomic::AtomicU64; 16] =
 static NANOS: [std::sync::atomic::AtomicU64; 16] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 pub fn stats() -> Vec<serde_json::Value> {
-    (1..16).map(|i|serde_json::json!({"operation":i,"calls":CALLS[i].load(Ordering::Relaxed),"ms":NANOS[i].load(Ordering::Relaxed) as f64/1e6})).collect()
+    let mut stats: Vec<_> = (1..16).map(|i|serde_json::json!({"operation":i,"calls":CALLS[i].load(Ordering::Relaxed),"ms":NANOS[i].load(Ordering::Relaxed) as f64/1e6})).collect();
+    stats.push(serde_json::json!({"operation":"open_stages", "stages":crate::runtime::engine::open_stats()}));
+    stats
 }
 #[repr(C)]
 #[derive(Default)]

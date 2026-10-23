@@ -31,3 +31,9 @@ Windows readers may see remote updates. Their local edit parent still binds
 conflict detection. A paired, cached-reader smoke test passed in 62 ms;
 the full performance gate remains open.
 
+Linux invalidation writes no longer serialize replies behind a blocking kernel
+notification. File inodes distinguish content versions, so new opens get the
+remote head while existing readers keep their original data cache. Lookup/open
+references retire obsolete inode bindings. The paired real-mount smoke covers
+this with a reader held open across the update, plus read-only automatic saves.
+

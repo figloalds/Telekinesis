@@ -314,6 +314,47 @@ fn pathname_cache_refills_from_a_recreated_entity() -> Result<()> {
 }
 
 #[test]
+fn bound_lookup_reuses_its_locally_saved_draft_after_remote_apply() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let h = engine.open_file("file", true, false, true)?;
+    engine.write(h, 0, b"first", false, false)?;
+    engine.flush(Some(h))?;
+    let (entry, basis) = {
+        let store = lock(&engine.store);
+        let entry = store.lookup("file")?;
+        let basis = store.basis(&entry.id)?;
+        (entry, basis)
+    };
+    let alias = engine.open_bound(entry.clone(), basis.clone(), false)?;
+    engine.close(alias)?;
+    engine.write(h, 0, b"local", false, false)?;
+    engine.flush(Some(h))?;
+    engine.close(h)?;
+    let event = {
+        let mut store = lock(&engine.store);
+        let mut state = store.lookup("file")?;
+        let parent = store.basis(&state.id)?.version;
+        state.content = Some(store.content.import(b"other")?);
+        let mut event = store.event(MAIN, state, vec![parent], Operation::Content);
+        event.author = "peer".into();
+        event
+    };
+    engine.apply_remote(&[event])?;
+    let old = engine.open_bound(entry, basis, false)?;
+    let new = engine.open_file("file", false, false, false)?;
+    let mut bytes = [0; 5];
+    engine.read(old, 0, &mut bytes)?;
+    assert_eq!(&bytes, b"local");
+    engine.read(new, 0, &mut bytes)?;
+    assert_eq!(&bytes, b"other");
+    engine.close(old)?;
+    engine.close(new)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn hydrate_missing_chunk_over_authenticated_session() -> Result<()> {
     use crate::{
         model::{

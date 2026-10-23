@@ -1,6 +1,6 @@
 //! Linux FUSE 7.31 adapter with kernel caching and explicit invalidation.
 use crate::{
-    content::working::lock,
+    content::working::{Basis, lock},
     core::{Entry, EntryKind, ROOT},
     runtime::Engine,
 };
@@ -100,6 +100,10 @@ static MOUNT: Mutex<Option<(PathBuf, Arc<AtomicBool>)>> = Mutex::new(None);
 struct Nodes {
     entities: BTreeMap<u64, String>,
     inodes: BTreeMap<String, u64>,
+    versions: BTreeMap<(String, String, String), u64>,
+    bindings: BTreeMap<u64, (Entry, Basis)>,
+    lookups: BTreeMap<u64, u64>,
+    opens: BTreeMap<u64, usize>,
     next: u64,
 }
 impl Nodes {
@@ -113,11 +117,61 @@ impl Nodes {
         self.inodes.insert(entity.into(), ino);
         ino
     }
+    fn file_inode(&mut self, entry: Entry, basis: Basis) -> u64 {
+        let key = (
+            basis.branch.clone(),
+            basis.entity.clone(),
+            basis.anchor.clone(),
+        );
+        if let Some(ino) = self.versions.get(&key) {
+            let ino = *ino;
+            self.inodes.insert(entry.id.clone(), ino);
+            return ino;
+        }
+        self.next += 1;
+        let ino = self.next;
+        self.entities.insert(ino, entry.id.clone());
+        self.inodes.insert(entry.id.clone(), ino);
+        self.versions.insert(key, ino);
+        self.bindings.insert(ino, (entry, basis));
+        ino
+    }
+    fn retire(&mut self, ino: u64) {
+        if ino == 1
+            || self.lookups.get(&ino).copied().unwrap_or(0) != 0
+            || self.opens.get(&ino).copied().unwrap_or(0) != 0
+        {
+            return;
+        }
+        if let Some(entity) = self.entities.remove(&ino) {
+            if self.inodes.get(&entity) == Some(&ino) {
+                self.inodes.remove(&entity);
+            }
+        }
+        if let Some((_, basis)) = self.bindings.remove(&ino) {
+            self.versions
+                .remove(&(basis.branch, basis.entity, basis.anchor));
+        }
+        self.lookups.remove(&ino);
+        self.opens.remove(&ino);
+    }
+    fn forget(&mut self, ino: u64, count: u64) {
+        if let Some(n) = self.lookups.get_mut(&ino) {
+            *n = n.saturating_sub(count);
+        }
+        self.retire(ino);
+    }
+    fn close(&mut self, ino: u64) {
+        if let Some(n) = self.opens.get_mut(&ino) {
+            *n = n.saturating_sub(1);
+        }
+        self.retire(ino);
+    }
 }
 struct Fs {
     engine: Arc<Engine>,
     nodes: Mutex<Nodes>,
-    device: Mutex<File>,
+    device: File,
 }
 fn p32(bytes: &mut Vec<u8>, n: u32) {
     bytes.extend(n.to_le_bytes());
@@ -169,10 +223,13 @@ impl Fs {
         p32(&mut bytes, error as u32);
         p64(&mut bytes, id);
         bytes.extend(body);
-        if let Err(error) = lock(&self.device).write_all(&bytes) {
-            if id != 0 || error.raw_os_error() != Some(libc::ENOENT) {
-                return Err(error.into());
-            }
+        // /dev/fuse consumes one complete reply per write. Invalidation can
+        // wait for outstanding inode operations, whose replies must remain
+        // able to write concurrently with the notification.
+        match (&self.device).write(&bytes) {
+            Ok(n) => ensure!(n == bytes.len(), "SHORT_FUSE_REPLY"),
+            Err(error) if id == 0 && error.raw_os_error() == Some(libc::ENOENT) => {}
+            Err(error) => return Err(error.into()),
         }
         Ok(())
     }
@@ -191,9 +248,31 @@ impl Fs {
     fn child(&self, inode: u64, name: &str) -> Result<String> {
         Ok(format!("{}/{}", self.path(inode)?, name))
     }
-    fn attr(&self, e: &Entry, len: u64) -> Vec<u8> {
+    fn node(&self, entry: &Entry, lookup: bool) -> Result<(Entry, u64)> {
+        let (mut current, basis) = {
+            let store = lock(&self.engine.store);
+            let current = store.entry(&entry.id)?;
+            let basis = (current.kind == EntryKind::File)
+                .then(|| store.basis(&current.id))
+                .transpose()?;
+            (current, basis)
+        };
+        if current.content == entry.content {
+            current.working_len = entry.working_len;
+        }
+        let mut nodes = lock(&self.nodes);
+        let ino = if let Some(basis) = basis {
+            nodes.file_inode(current.clone(), basis)
+        } else {
+            nodes.inode(&current.id)
+        };
+        if lookup {
+            *nodes.lookups.entry(ino).or_default() += 1;
+        }
+        Ok((current, ino))
+    }
+    fn attr(&self, e: &Entry, len: u64, ino: u64) -> Vec<u8> {
         let len = e.working_len.unwrap_or(len);
-        let ino = lock(&self.nodes).inode(&e.id);
         let mut b = Vec::new();
         p64(&mut b, ino);
         p64(&mut b, len);
@@ -232,23 +311,28 @@ impl Fs {
         p32(&mut b, 0);
         b
     }
-    fn entry_out(&self, e: &Entry) -> Vec<u8> {
+    fn entry_out(&self, entry: &Entry) -> Result<Vec<u8>> {
+        let (e, ino) = self.node(entry, true)?;
         let mut b = Vec::new();
-        p64(&mut b, lock(&self.nodes).inode(&e.id));
+        p64(&mut b, ino);
         p64(&mut b, 1);
         p64(&mut b, 1);
         p64(&mut b, 1);
         p32(&mut b, 0);
         p32(&mut b, 0);
-        b.extend(self.attr(e, e.content.as_ref().map(|c| c.total_len).unwrap_or(0)));
-        b
+        b.extend(self.attr(
+            &e,
+            e.content.as_ref().map(|c| c.total_len).unwrap_or(0),
+            ino,
+        ));
+        Ok(b)
     }
-    fn attr_out(&self, e: &Entry, len: u64) -> Vec<u8> {
+    fn attr_out(&self, e: &Entry, len: u64, ino: u64) -> Vec<u8> {
         let mut b = Vec::new();
         p64(&mut b, 1);
         p32(&mut b, 0);
         p32(&mut b, 0);
-        b.extend(self.attr(e, len));
+        b.extend(self.attr(e, len, ino));
         b
     }
     fn open_out(&self, h: u64) -> Vec<u8> {
@@ -263,7 +347,11 @@ impl Fs {
         let (entity, parent_id) = {
             let store = lock(&self.engine.store);
             (
-                store.lookup(path).ok().map(|e| e.id),
+                store
+                    .lookup(path)
+                    .ok()
+                    .filter(|e| e.kind == EntryKind::Directory)
+                    .map(|e| e.id),
                 store.lookup(parent).ok().map(|e| e.id),
             )
         };
@@ -278,7 +366,7 @@ impl Fs {
             p64(&mut b, 0);
             self.send(0, 2, &b)?;
         }
-        if let Some(parent) = parent {
+        if let Some(parent) = parent.filter(|_| !name.is_empty()) {
             let mut b = Vec::new();
             p64(&mut b, parent);
             p32(&mut b, name.len() as u32);
@@ -334,6 +422,7 @@ impl Fs {
             }
             18 | 29 => {
                 self.engine.close(n64(p, 0)?)?;
+                lock(&self.nodes).close(inode);
                 return Ok(Vec::new());
             }
             20 | 30 => {
@@ -360,22 +449,53 @@ impl Fs {
         match op {
             1 => {
                 let e = self.engine.lookup(&self.child(inode, name(p)?)?)?;
-                Ok(self.entry_out(&e))
+                self.entry_out(&e)
             }
             3 => {
                 if p.len() >= 16 && n32(p, 0)? & 1 != 0 {
                     let (e, len) = self.engine.info(n64(p, 8)?)?;
-                    return Ok(self.attr_out(&e, len));
+                    return Ok(self.attr_out(&e, len, inode));
+                }
+                let binding = { lock(&self.nodes).bindings.get(&inode).cloned() };
+                if let Some((mut entry, basis)) = binding {
+                    {
+                        let store = lock(&self.engine.store);
+                        if store.projection().anchors.get(&entry.id) == Some(&basis.anchor) {
+                            entry = store.entry(&entry.id)?;
+                        }
+                    }
+                    let len = self
+                        .engine
+                        .working
+                        .bound_len(&basis)
+                        .unwrap_or(basis.content.total_len);
+                    return Ok(self.attr_out(&entry, len, inode));
                 }
                 let e = self.engine.lookup(&self.path(inode)?)?;
                 let len = e.content.as_ref().map(|c| c.total_len).unwrap_or(0);
-                Ok(self.attr_out(&e, len))
+                Ok(self.attr_out(&e, len, inode))
             }
             14 | 27 => {
-                let path = self.path(inode)?;
                 let flags = n32(p, 0)?;
                 let writable = flags & libc::O_ACCMODE as u32 != 0;
-                let h = self.engine.open_file(&path, false, op == 27, writable)?;
+                let binding = {
+                    let mut nodes = lock(&self.nodes);
+                    *nodes.opens.entry(inode).or_default() += 1;
+                    nodes.bindings.get(&inode).cloned()
+                };
+                let opened = if let Some((entry, basis)) = binding {
+                    self.engine.open_bound(entry, basis, writable)
+                } else {
+                    self.engine
+                        .open_file(&self.path(inode)?, false, op == 27, writable)
+                };
+                let h = match opened {
+                    Ok(h) => h,
+                    Err(e) => {
+                        lock(&self.nodes).close(inode);
+                        return Err(e);
+                    }
+                };
                 if flags & libc::O_TRUNC as u32 != 0 {
                     self.engine.truncate(h, 0, false)?;
                 }
@@ -385,14 +505,15 @@ impl Fs {
                 let path = self.child(inode, name(p.get(16..).context("INVALID_REQUEST")?)?)?;
                 let h = self.engine.open_file(&path, true, false, true)?;
                 let (e, _) = self.engine.info(h)?;
-                let mut b = self.entry_out(&e);
+                let mut b = self.entry_out(&e)?;
+                *lock(&self.nodes).opens.entry(n64(&b, 0)?).or_default() += 1;
                 b.extend(self.open_out(h));
                 Ok(b)
             }
             9 => {
                 let path = self.child(inode, name(p.get(8..).context("INVALID_REQUEST")?)?)?;
                 let e = lock(&self.engine.store).create(&path, EntryKind::Directory)?;
-                Ok(self.entry_out(&e))
+                self.entry_out(&e)
             }
             10 | 11 => {
                 let path = self.child(inode, name(p)?)?;
@@ -432,7 +553,7 @@ impl Fs {
                         break;
                     }
                     let at = b.len();
-                    p64(&mut b, lock(&self.nodes).inode(&e.id));
+                    p64(&mut b, self.node(e, false)?.1);
                     p64(&mut b, index as u64 + 1);
                     p32(&mut b, name.len() as u32);
                     p32(&mut b, if e.kind == EntryKind::Directory { 4 } else { 8 });
@@ -444,10 +565,10 @@ impl Fs {
             4 => {
                 let valid = n32(p, 0)?;
                 ensure!(valid & ((1 << 1) | (1 << 2)) == 0, "UNSUPPORTED_OWNERSHIP");
-                let path = self.path(inode)?;
                 let temporary = valid & (1 << 6) == 0;
                 let h = if temporary {
-                    self.engine.open_file(&path, false, false, true)?
+                    self.engine
+                        .open_file(&self.path(inode)?, false, false, true)?
                 } else {
                     n64(p, 8)?
                 };
@@ -476,12 +597,16 @@ impl Fs {
                 } else {
                     None
                 };
-                lock(&self.engine.store).set_times(&e.id, times, mode, None)?;
+                {
+                    let mut store = lock(&self.engine.store);
+                    store.set_times(&e.id, times, mode, None)?;
+                    *lock(&self.engine.handle(h)?.entry) = store.entry(&e.id)?;
+                }
                 let (e, len) = self.engine.info(h)?;
                 if temporary {
                     self.engine.close(h)?;
                 }
-                Ok(self.attr_out(&e, len))
+                Ok(self.attr_out(&e, len, inode))
             }
             _ => anyhow::bail!("UNSUPPORTED_FUSE_OPCODE: {op}"),
         }
@@ -496,7 +621,7 @@ pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
     let fs = Arc::new(Fs {
         engine: engine.clone(),
         nodes: Mutex::new(Nodes::default()),
-        device: Mutex::new(device.try_clone()?),
+        device: device.try_clone()?,
     });
     lock(&fs.nodes).inode(ROOT);
     let notify = Arc::downgrade(&fs);
@@ -526,6 +651,17 @@ pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
                 Err(_) => continue,
             };
             if matches!(op, 2 | 42) {
+                if op == 2 {
+                    if let (Ok(ino), Ok(count)) = (n64(&bytes[..n], 16), n64(&bytes[..n], 40)) {
+                        lock(&fs.nodes).forget(ino, count);
+                    }
+                } else if let Ok(count) = n32(&bytes[..n], 40) {
+                    for item in bytes[48..n].chunks_exact(16).take(count as usize) {
+                        if let (Ok(ino), Ok(count)) = (n64(item, 0), n64(item, 8)) {
+                            lock(&fs.nodes).forget(ino, count);
+                        }
+                    }
+                }
                 continue;
             }
             while inflight.load(Ordering::Acquire) >= 64 {
