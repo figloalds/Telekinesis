@@ -264,31 +264,6 @@ fn committed_notifications_retry_without_invalidating_echoed_events() -> Result<
 }
 
 #[test]
-fn native_cache_drain_precedes_sealing_a_sparse_extension() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let engine = crate::runtime::Engine::open(root.path(), None)?;
-    let h = engine.open_file("file", true, false, true)?;
-    engine.truncate(h, 4096, false)?;
-    let scratch = engine.handle(h)?.scratch.clone().unwrap();
-    lock(&scratch).cache_pending = true;
-    engine.cleanup(h, false)?;
-    let before = lock(&engine.store).events_after(0, 4096)?.len();
-    engine.flush(None)?;
-    assert_eq!(lock(&engine.store).events_after(0, 4096)?.len(), before);
-    let bytes = vec![7; 4096];
-    engine.write(h, 0, &bytes, false, false)?;
-    engine.flush_native_volume()?;
-    assert_eq!(
-        engine.lookup("file")?.content.unwrap().digest,
-        crate::model::content::Digest::bytes(&bytes)
-    );
-    lock(&scratch).cache_pending = false;
-    engine.close(h)?;
-    engine.shutdown()?;
-    Ok(())
-}
-
-#[test]
 fn pathname_cache_refills_from_a_recreated_entity() -> Result<()> {
     let root = tempfile::tempdir()?;
     let engine = crate::runtime::Engine::open(root.path(), None)?;
@@ -526,5 +501,82 @@ fn a_late_seal_of_a_deleted_entity_cannot_remove_a_recreated_name() -> Result<()
     let event = store.event(MAIN, old, vec![parent], Operation::Delete);
     store.apply(&[event])?;
     assert_eq!(store.lookup("file")?.id, current.id);
+    Ok(())
+}
+
+#[test]
+fn paging_writes_are_accepted_on_a_read_only_handle() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let writer = engine.open_file("file", true, false, true)?;
+    engine.write(writer, 0, b"12345", false, false)?;
+    let reader = engine.open_file("file", false, false, false)?;
+    // An ordinary write through a read-only handle is still refused.
+    let refused = engine.write(reader, 0, b"abc", false, false);
+    assert!(format!("{:#}", refused.unwrap_err()).contains("ACCESS_DENIED"));
+    // The Cache Manager writes back through whichever file object initialised
+    // caching; WinFsp checked access at Create, so paging writes must land.
+    assert_eq!(engine.write(reader, 0, b"abc", false, true)?, 3);
+    // Constrained writes never extend the file.
+    assert_eq!(engine.write(reader, 3, b"XYZW", false, true)?, 2);
+    let mut bytes = [0; 8];
+    assert_eq!(engine.read(writer, 0, &mut bytes)?, 5);
+    assert_eq!(&bytes[..5], b"abcXY");
+    engine.close(reader)?;
+    engine.close(writer)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_paging_write_after_cleanup_is_sealed_again() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let h = engine.open_file("file", true, false, true)?;
+    engine.write(h, 0, b"a", false, false)?;
+    engine.cleanup(h, false)?;
+    engine.flush(None)?;
+    assert_eq!(
+        engine.lookup("file")?.content.unwrap().digest,
+        crate::model::content::Digest::bytes(b"a")
+    );
+    // A mapped section can write back between Cleanup and Close.
+    engine.write(h, 0, b"b", false, true)?;
+    engine.flush(None)?;
+    assert_eq!(
+        engine.lookup("file")?.content.unwrap().digest,
+        crate::model::content::Digest::bytes(b"b")
+    );
+    engine.close(h)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_failed_flush_still_stops_the_daemon_and_keeps_recoverable_scratch() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let h = engine.open_file("file", true, false, true)?;
+    engine.write(h, 0, b"unsaved", false, false)?;
+    let scratch_path = lock(engine.handle(h)?.scratch.as_ref().unwrap())
+        .path
+        .clone();
+    engine.inject_fault("flush");
+    let result = crate::orchestrator::control::execute(
+        &engine,
+        &catalog,
+        "shutdown",
+        &serde_json::json!({}),
+    );
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("FAULT_INJECTED: flush"), "{error}");
+    assert!(engine.stopping.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        *lock(&engine.error) == Some(error.clone()),
+        "{:?}",
+        lock(&engine.error)
+    );
+    assert!(scratch_path.exists(), "recoverable scratch was removed");
     Ok(())
 }

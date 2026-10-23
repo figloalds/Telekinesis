@@ -26,6 +26,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_build  # noqa: E402  (the .NET harness generator and build runner)
+from mount_lifecycle import stop_all  # noqa: E402  (bounded daemon shutdown)
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = ("copy_small", "build", "seq_1g", "random_4k", "git_status_50k", "remote_visibility")
@@ -231,7 +232,7 @@ def matrix(args):
             if mount:
                 command += ["--mount", mount]
             proc = subprocess.Popen(command, stdout=log, stderr=log, creationflags=flags)
-            processes.append((state, proc, log))
+            processes.append((state, proc, log, mount))
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 if proc.poll() is not None:
@@ -264,17 +265,19 @@ def matrix(args):
                 failures.append("idle-peer")
             (home / "idle-stats.json").write_text(json.dumps(cli(state, "rpc", "mount-stats", "{}")))
         finally:
-            for state, proc, log in reversed(processes):
-                try:
-                    cli(state, "stop")
-                    proc.wait(timeout=30)
-                except Exception:
-                    proc.kill()
-                    proc.wait()
-                log.close()
+            # Bounded graceful stop, bounded kill, stranded daemons fail the
+            # run (W6-P0-MOUNT-LIFECYCLE). Never wait forever on a deleting process.
+            try:
+                stop_all([(lambda s=state: cli(s, "stop"), proc, home / f"{state.name}.log", mnt)
+                          for state, proc, log, mnt in processes], )
+            except RuntimeError as error:
+                failures.append(f"stranded-daemon: {error}")
+            finally:
+                for _, _, log, _ in processes:
+                    log.close()
             saved = ROOT / "test-runs/bench" / f"{args.label}-daemon-logs"
             saved.mkdir(parents=True, exist_ok=True)
-            for log_path in [*home.glob("*.log"), *home.glob("*-stats.json")]:
+            for log_path in [*home.glob("*.log"), *home.glob("*-stats.json"), *home.glob("*-exit-state.json")]:
                 shutil.copyfile(log_path, saved / log_path.name)
     print("Matrix failures:", failures)
     return int(bool(failures))

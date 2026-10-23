@@ -4,8 +4,18 @@
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+python scripts/mount_lifecycle.py
 python scripts/replacement_smoke.py --binary target/release/tkfs.exe
 ```
+
+Mounted runs belong in an isolated Windows VM until
+[W6-P0-MOUNT-LIFECYCLE](revamp/WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md) closes.
+`scripts/mount_lifecycle.py` bounds every daemon stop (20 s graceful, 10 s
+after kill) and writes `*-exit-state.json` next to each daemon log; a daemon
+that survives the kill fails the run. `replacement_smoke.py --forced-kill`
+adds the blocker's forced-exit check, and the smoke fails on any logged
+`mount I/O operation` error. `tkfs rpc inject-fault '{"name":"flush"}'`
+arms a one-shot seal failure for the failure-safe shutdown check.
 
 The trimmed suite retains transport framing/authentication/TLS tests and exact
 filesystem invariants: receipt-based exactly-once sealing, recovery of unsealed

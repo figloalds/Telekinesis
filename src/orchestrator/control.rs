@@ -74,13 +74,6 @@ pub fn start(engine: Arc<Engine>, catalog: Arc<Catalog>) -> Result<String> {
     Ok(endpoint)
 }
 pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -> Result<Value> {
-    #[cfg(windows)]
-    if matches!(
-        operation,
-        "flush" | "gc" | "checkpoint" | "fork" | "checkout" | "shutdown"
-    ) {
-        crate::mount::flush_cached(true)?;
-    }
     let text = |key: &str| -> Result<&str> { p[key].as_str().context("ARGUMENT_REQUIRED") };
     match operation {
         #[cfg(windows)]
@@ -230,9 +223,19 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
             Ok(json!({}))
         }
         "shutdown" => {
-            engine.flush(None)?;
+            // A failed final seal is a reported durability failure; it never
+            // keeps the daemon (and its mount) alive.
+            let flushed = engine.flush(None);
             engine.stopping.store(true, Ordering::Release);
+            if let Err(error) = &flushed {
+                *lock(&engine.error) = Some(format!("{error:#}"));
+            }
+            flushed?;
             Ok(json!({"stopping":true}))
+        }
+        "inject-fault" => {
+            engine.inject_fault(text("name")?);
+            Ok(json!({}))
         }
         _ => anyhow::bail!("UNSUPPORTED_OPERATION"),
     }

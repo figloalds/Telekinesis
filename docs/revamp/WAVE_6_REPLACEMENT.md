@@ -2,9 +2,23 @@
 
 Status: implementation in progress, 2026-10-23. Supersedes the scope of [WAVE_6_PLAN.md](WAVE_6_PLAN.md)
 and the WP6.G interlude. Steps 1–6 have implementation commits; runtime cutover
-and benchmark qualification are in progress. See the replacement step notes. The
+and benchmark qualification are blocked by W6-P0-MOUNT-LIFECYCLE. See the
+replacement step notes. The
 [authority scope](AUTHORITY_SCOPE.md) (personal use, pairing is the admission
 boundary, TLS/WSS or VPN for the channel) is unchanged.
+
+## 0. Immediate blocking demand
+
+**W6-P0-MOUNT-LIFECYCLE is OPEN and takes precedence over all remaining Wave 6
+work.** [Fix the kernel cleanup hang](WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md) before
+new feature work, runtime cutover or mounted benchmark qualification. The daemon
+can remain permanently deleting while Windows cleans up a mounted-root handle.
+The demand contains the dump evidence, unsafe shutdown/test sequence and the
+small mandatory exit/responsiveness checks. Reproduction belongs in an isolated
+Windows VM until those checks pass; folder mounts do not bypass this gate.
+The no-self-handle fix is implemented ([note](notes/mount-lifecycle-fix.md),
+invariants in section 3a); VM acceptance and the purge-cost measurement are
+still open.
 
 ## 1. Why
 
@@ -75,9 +89,50 @@ boundaries and to present a snapshot as a directory. It is not a block device.
 - Directory listing and lookup are served from the in-memory projection of the
   current snapshot, backed by the cached tree objects. No history replay.
 
+## 3a. Windows cache and mount lifecycle invariants
+
+These rules come from [W6-P0-MOUNT-LIFECYCLE](WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md).
+They hold for drive-letter and directory mounts alike.
+
+- **No self-handles.** The server process never opens a path under its own
+  mount and never issues I/O against it: no root handle, no `FlushFileBuffers`
+  on the volume, no helper spawned to do it on the server's behalf. Windows
+  closes a dying process's handles one at a time and synchronously; a cleanup
+  that needs the dead server's own dispatcher never completes, and the process
+  can neither finish exiting nor be killed. The native shim refuses Create/Open
+  requests originating from the server's PID so a regression fails loudly.
+- **Cached bytes reach the server through the driver.** With
+  `FileInfoTimeout = INFINITE` the Windows data cache is shared per pathname and
+  dirty pages stay in the cache after a handle closes. `FlushAndPurgeOnCleanup`
+  makes the FSD deliver them as Write callbacks before Cleanup, which is what
+  "seal on close" relies on. Its purge cost is measured against the gate in the
+  VM; the fallback, if that cost fails the gate, is to seal at Close after the
+  Cache Manager's own lazy writes, never a volume flush from the server.
+- **Paging writes are accepted on any handle.** The Cache Manager writes back
+  through the file object it initialised caching with, which may be a read-only
+  handle. WinFsp checked access at Create; the adapter accepts `ConstrainedIo`
+  writes on every handle and keeps the access check for ordinary writes.
+- **fsync is the durability point.** WinFsp flushes a file's cache before
+  posting Flush, so a per-handle flush seals with no server-side volume I/O.
+  Dirty cached pages of handles still open when the daemon is killed are lost,
+  as they would be on NTFS without fsync.
+- **Shutdown releases the mount regardless of seal or flush failure.** The
+  control `shutdown` sets `stopping` before it reports a flush error; `detach()`
+  stops the dispatcher and only then returns the final seal error; the daemon
+  loop runs both and reports the first failure. A failed seal is a reported
+  durability failure, not a reason to leave the dispatcher running; recoverable
+  scratch files stay on disk for the startup re-seal.
+- **Harnesses bound every wait.** Graceful stop, diagnostic capture and the
+  post-kill wait each have a deadline. A process still alive afterwards is a
+  failed run with its PID, mount, log and exit state preserved next to the
+  daemon log; no further mounts are started over it.
+
 ## 4. Seal on close
 
-- A writable handle's close marks the entity **pending seal**. A flush or
+- The last Cleanup of a writable handle marks the entity **pending seal**. On
+  Windows the driver has flushed and purged that file's cached pages into Write
+  callbacks before Cleanup is delivered (section 3a), so the scratch file is
+  complete at that point. A flush or
   fsync seals immediately and returns only after the event is committed. Otherwise
   a sealer thread seals entities whose last writable close is older than the
   write-back delay (default 1 s) or when the pending set exceeds a size budget.
@@ -140,7 +195,7 @@ Survives, with the noted changes:
 | `src/content/local.rs` | provider interface, pins, counters | Loose files become pack segments; no per-chunk fsync |
 | `src/core/{commit,inbox}.rs`, `src/orchestrator/meta_exchange.rs`, feed tables | event journal and replication | Events gain explicit parent versions; projection is a cached tree, not cone replay |
 | `src/session/*`, `src/pairing_code.rs`, `src/orchestrator/catalog.rs` | pairing, TLS sessions, catalog | None required |
-| `native/mount.c`, `src/mount.rs`, `src/fuse_linux.rs` | adapters | Passthrough handles, caching on, notify on remote change |
+| `native/mount.c`, `src/mount.rs`, `src/fuse_linux.rs` | adapters | Passthrough handles, caching on with flush-and-purge on cleanup, notify on remote change, no self-handles (section 3a) |
 | `src/gui.rs`, `src/ui_model.rs` | GUI | Conflicts view reads entity heads |
 
 Removed:
@@ -187,10 +242,13 @@ files 1,439 ms; 1 GiB write 399 ms, read 387 ms; 10,000 random 4 KiB writes
 Correctness gates stay small and exact: seal exactly-once across restart,
 conflict detection for concurrent edits of one version, snapshot fork isolation,
 hydrate-on-demand with a missing remote chunk, pack GC never removing a pinned
-object, and notify invalidation after a remote update.
+object, notify invalidation after a remote update, and the mount lifecycle
+checks of the blocker (bounded graceful and forced exit with no stranded
+process, a reader opened before a writer with no access error).
 
 ## 9. Order of work
 
+0. Close [W6-P0-MOUNT-LIFECYCLE](WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md) before proceeding.
 1. Benchmark script and the native baseline numbers.
 2. Pack store with the digest index and LRU; port `LocalContent` reads.
 3. Scratch-file working layer and passthrough adapters with caching on.

@@ -1,6 +1,7 @@
 /* Native WinFsp ABI shim. Storage, handles and conflict policy belong to Rust. */
 #include <winfsp/winfsp.h>
 #include <sddl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
 typedef struct {UINT64 size, creation_time, access_time, write_time, change_time, index; UINT32 attributes;} TK_INFO;
@@ -8,6 +9,8 @@ typedef struct {UINT64 token, directory_ordinal;WCHAR directory_marker[256];BOOL
 extern UINT32 tk_call(UINT32,const WCHAR*,UINT64*,UINT64,void*,UINT32,UINT32,TK_INFO*,UINT32*);
 static PSECURITY_DESCRIPTOR Security;
 static ULONG SecuritySize;
+static volatile LONG SelfOpenRefusals;
+UINT32 tk_self_open_refusals(void) {return (UINT32)SelfOpenRefusals;}
 static void fill(FSP_FSCTL_FILE_INFO *out, TK_INFO *in) {
     if (!out) return;
     memset(out,0,sizeof *out);out->FileAttributes=in->attributes;out->FileSize=in->size;
@@ -34,6 +37,13 @@ static NTSTATUS security_name(FSP_FILE_SYSTEM *fs,PWSTR name,PUINT32 attrs,PSECU
     if(!NT_SUCCESS(result))return result;if(attrs)*attrs=info.attributes;return sec(sd,size);
 }
 static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,UINT32 op,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {
+    /* W6-P0-MOUNT-LIFECYCLE: this server must never hold a handle into its
+       own namespace. Windows sweeps a dying process's handles one at a time;
+       a cleanup that needs this (dead) dispatcher never completes. */
+    if(FspFileSystemOperationProcessId()==GetCurrentProcessId()){
+        if(InterlockedIncrement(&SelfOpenRefusals)==1)fwprintf(stderr,L"mount: refused self-open of %s (W6-P0-MOUNT-LIFECYCLE)\n",name);
+        return STATUS_ACCESS_DENIED;
+    }
     TK_HANDLE *handle=calloc(1,sizeof *handle);if(!handle)return STATUS_INSUFFICIENT_RESOURCES;
     TK_INFO info={0};UINT32 flags=((options&FILE_DIRECTORY_FILE)?1:0)|((access&(FILE_WRITE_DATA|FILE_APPEND_DATA))?2:0)|((options&FILE_DELETE_ON_CLOSE)?4:0);
     NTSTATUS result=tk_call(op,name,&handle->token,0,op==2?&attrs:0,op==2?sizeof attrs:0,flags,&info,0);
@@ -118,9 +128,12 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
     Interface.CanDelete=can_delete;Interface.SetDelete=set_delete;Interface.Rename=rename_file;Interface.GetSecurity=get_security;Interface.ReadDirectory=read_dir;
     FSP_FSCTL_VOLUME_PARAMS p={0};p.Version=sizeof p;p.SectorSize=4096;p.SectorsPerAllocationUnit=1;
     /* WinFsp enables the Windows data cache only for the infinity sentinel.
-       Directories retain a finite metadata lifetime; remote changes notify. */
+       Directories retain a finite metadata lifetime; remote changes notify.
+       FlushAndPurgeOnCleanup makes the FSD deliver a file's dirty cached
+       pages as Write callbacks before Cleanup, so seal-on-close needs no
+       volume flush from this process (W6-P0-MOUNT-LIFECYCLE). */
     p.MaxComponentLength=255;p.FileInfoTimeout=INFINITE;p.DirInfoTimeoutValid=1;p.DirInfoTimeout=1000;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
-    p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=0;p.UmFileContextIsUserContext2=1;
+    p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=1;p.UmFileContextIsUserContext2=1;
     /* Every mount uses native retirement for open destination handles. */
     p.SupportsPosixUnlinkRename=1;
     if(irp_timeout_ms)p.IrpTimeout=irp_timeout_ms;
@@ -138,15 +151,6 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
     if(!NT_SUCCESS(status)){FspFileSystemDelete(*out);*out=0;}return status;
 }
 void tk_mount_stop(FSP_FILE_SYSTEM *fs) {FspFileSystemStopDispatcher(fs);FspFileSystemDelete(fs);}
-UINT32 tk_cache_open(PWSTR path,UINT64 *out) {
-    WCHAR root[32768];if(swprintf_s(root,32768,L"%s\\",path)<0)return STATUS_NAME_TOO_LONG;
-    HANDLE handle=CreateFileW(root,GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-        0,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,0);
-    if(handle==INVALID_HANDLE_VALUE)return FspNtStatusFromWin32(GetLastError());
-    *out=(UINT64)(UINT_PTR)handle;return STATUS_SUCCESS;
-}
-UINT32 tk_cache_flush(UINT64 handle) {return FlushFileBuffers((HANDLE)(UINT_PTR)handle)?STATUS_SUCCESS:FspNtStatusFromWin32(GetLastError());}
-void tk_cache_close(UINT64 handle) {CloseHandle((HANDLE)(UINT_PTR)handle);}
 UINT32 tk_mount_notify(FSP_FILE_SYSTEM *fs,PWSTR path,UINT32 action) {
     SIZE_T bytes=sizeof(FSP_FSCTL_NOTIFY_INFO)+wcslen(path)*sizeof(WCHAR);
     if(bytes>65535)return STATUS_NAME_TOO_LONG;

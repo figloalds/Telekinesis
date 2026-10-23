@@ -55,6 +55,7 @@ pub struct Engine {
     _owner: File,
     pub last_applied: Mutex<BTreeMap<String, u128>>,
     publication: Mutex<()>,
+    faults: Mutex<std::collections::BTreeSet<String>>,
 }
 impl Engine {
     pub fn open(root: &Path, repo: Option<&str>) -> Result<Arc<Self>> {
@@ -92,6 +93,7 @@ impl Engine {
             _owner: owner,
             last_applied: Mutex::new(BTreeMap::new()),
             publication: Mutex::new(()),
+            faults: Mutex::new(Default::default()),
         });
         let weak = Arc::downgrade(&engine);
         std::thread::Builder::new()
@@ -361,7 +363,10 @@ impl Engine {
         constrained: bool,
     ) -> Result<usize> {
         let h = self.handle(token)?;
-        ensure!(h.writable, "ACCESS_DENIED");
+        // Paging (constrained) writes come through whichever file object the
+        // Cache Manager initialised caching with, possibly a read-only handle.
+        // The kernel checked access at Create; refusing them strands dirty pages.
+        ensure!(h.writable || constrained, "ACCESS_DENIED");
         let s = h.scratch.as_ref().context("IS_A_DIRECTORY")?;
         let count = lock(s).write(self.working.content(), offset, bytes, append, constrained)?;
         if h.closed.load(Ordering::Acquire) {
@@ -392,7 +397,17 @@ impl Engine {
     pub fn flush_native_volume(&self) -> Result<()> {
         self.flush_impl(None, true)
     }
+    /// Arms a one-shot failure at the named point (`flush`), for lifecycle
+    /// checks that must release the mount although durability failed.
+    pub fn inject_fault(&self, name: &str) {
+        lock(&self.faults).insert(name.to_owned());
+    }
+    fn fault(&self, name: &str) -> Result<()> {
+        ensure!(!lock(&self.faults).remove(name), "FAULT_INJECTED: {name}");
+        Ok(())
+    }
     fn flush_impl(&self, token: Option<u64>, native_drained: bool) -> Result<()> {
+        self.fault("flush")?;
         let _publication = lock(&self.publication);
         let files = if let Some(token) = token {
             self.handle(token)?.scratch.clone().into_iter().collect()

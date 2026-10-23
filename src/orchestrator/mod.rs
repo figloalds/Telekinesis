@@ -9,7 +9,7 @@ use crate::{
     runtime::Engine,
     session::{self, Conn, ConnOptions},
 };
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use std::{
     collections::BTreeMap,
     net::TcpListener,
@@ -191,9 +191,24 @@ pub fn run(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result
     for session in sessions {
         session.close();
     }
-    engine.shutdown()?;
+    // Both run whatever the other reports: a failed final seal is a durability
+    // failure to report, never a reason to leave the mount attached
+    // (W6-P0-MOUNT-LIFECYCLE).
+    let shutdown = engine.shutdown();
     #[cfg(any(windows, target_os = "linux"))]
-    crate::mount::detach()?;
+    let detach = crate::mount::detach();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let detach: Result<()> = Ok(());
+    let errors: Vec<String> = [shutdown.err(), detach.err()]
+        .into_iter()
+        .flatten()
+        .map(|error| format!("{error:#}"))
+        .collect();
+    ensure!(
+        errors.is_empty(),
+        "SHUTDOWN_INCOMPLETE: {}",
+        errors.join("; ")
+    );
     let root = lock(&engine.store).root.clone();
     let _ = std::fs::remove_file(root.join("control.json"));
     Ok(())

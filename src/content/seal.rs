@@ -280,8 +280,6 @@ pub fn recover(store: &Mutex<Store>, layer: &WorkingLayer) -> Result<usize> {
             hydrated.insert(index);
         }
         let scratch = Arc::new(Mutex::new(Scratch {
-            cache_pending: false,
-            cache_generation: 0,
             length: file.metadata()?.len(),
             base_visible_len: record.basis.content.total_len,
             hydrated,

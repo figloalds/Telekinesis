@@ -5,7 +5,11 @@ import argparse
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mount_lifecycle import stop_all  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = ROOT / "target/debug/tkfs.exe"
@@ -52,15 +56,20 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--binary",type=Path,default=EXE)
     parser.add_argument("--home",type=Path,default=HOME)
+    parser.add_argument("--forced-kill",action="store_true",
+        help="W6-P0-MOUNT-LIFECYCLE: after the body passes, kill peer A while a cached "
+             "write and a retained reader are open; the daemon must exit within 10 s and "
+             "the host must stay responsive. Run only in an isolated Windows VM.")
     args=parser.parse_args()
     EXE=args.binary.resolve();HOME=args.home
     HOME.mkdir(parents=True)
-    processes = []
+    processes = []  # (state, proc, log, mount)
     try:
         a = HOME / "a"
         mount=Path("X:/") if os.name=="nt" else HOME/"mount-a"
         other=Path("Y:/") if os.name=="nt" else HOME/"mount-b"
-        processes.append((a, *daemon(a, "X:" if os.name=="nt" else str(mount), "replacement-smoke")))
+        mount_a = "X:" if os.name=="nt" else str(mount)
+        processes.append((a, *daemon(a, mount_a, "replacement-smoke"), mount_a))
         (mount / "folder").mkdir()
         empty=mount / "folder/empty"
         empty.mkdir()
@@ -82,7 +91,8 @@ def main():
         assert sealed == b"oriXYnal", f"sealed bytes differ from the kernel cache: {sealed!r}"
         print("single-mount create/read/write/fsync/rename passed", flush=True)
         b = HOME / "b"
-        processes.append((b, *daemon(b, "Y:" if os.name=="nt" else str(other), "replacement-smoke")))
+        mount_b = "Y:" if os.name=="nt" else str(other)
+        processes.append((b, *daemon(b, mount_b, "replacement-smoke"), mount_b))
         peer = json.loads((a / "daemon.log").read_text().splitlines()[0])["peer"]
         code = cli(a, "pairing-code")["code"]
         cli(b, "pair", peer, code)
@@ -121,16 +131,77 @@ def main():
         expected=b"remote replacement" if os.name=="nt" else b"oriXYnal"
         assert retained==expected, f"unexpected existing-handle bytes: {retained!r}"
         print(f"paired cached update visible in {elapsed:.1f} ms", flush=True)
+        held = remote.open("rb", buffering=0)
+        assert held.read() == b"remote replacement"
+        source = mount / "folder/renamed.txt"
+        source.unlink()
+        source.write_bytes(b"recreated remote entity")
+        cli(a, "flush")
+        wait_for(lambda: remote.read_bytes() == b"recreated remote entity")
+        with remote.open("wb") as writer:
+            writer.write(b"edited after recreation")
+            writer.flush()
+            os.fsync(writer.fileno())
+        head = cli(b, "rpc", "lookup", json.dumps({"path":"folder/renamed.txt"}))
+        assert head["entry"]["content"]["digest"] == hashlib.sha256(b"edited after recreation").hexdigest(), head
+        wait_for(lambda: source.read_bytes() == b"edited after recreation")
+        held.seek(0)
+        expected = b"edited after recreation" if os.name=="nt" else b"remote replacement"
+        assert held.read() == expected
+        held.close()
+        print("cached remote delete/recreate and subsequent local write passed", flush=True)
         print(json.dumps({"home": str(HOME), "visibility_ms": elapsed}), flush=True)
+        if args.forced_kill:
+            forced_kill_check(processes, mount)
     finally:
-        for state, proc, log in reversed(processes):
-            try:
-                cli(state, "stop")
-                proc.wait(timeout=20)
-            except Exception:
-                proc.kill()
-                proc.wait()
-            log.close()
+        # Bounded graceful stop, bounded kill, stranded daemons fail the run
+        # (W6-P0-MOUNT-LIFECYCLE). Never wait forever on a deleting process.
+        try:
+            stop_all([(lambda s=state: cli(s, "stop"), proc, state / "daemon.log", mnt)
+                      for state, proc, log, mnt in processes])
+        finally:
+            for _, _, log, _ in processes:
+                log.close()
+        # Paging writes on a reader-first open must not be refused (blocker).
+        refused = [line for state, *_ in processes
+                   for line in (state / "daemon.log").read_text(errors="replace").splitlines()
+                   if "mount I/O operation" in line or "refused self-open" in line]
+        if refused:
+            raise RuntimeError("mount I/O errors logged: " + "; ".join(refused))
+
+
+def forced_kill_check(processes, mount):
+    """Kill peer A mid-write with a retained reader. With no self-handle the
+    process must finish exiting within 10 s, the mount must disappear and a
+    fresh PowerShell must still enumerate drives (W6-P0-MOUNT-LIFECYCLE)."""
+    state, proc, log, letter = processes[0]
+    target = mount / "folder/forced-kill.txt"
+    target.write_bytes(b"before kill")
+    reader = target.open("rb", buffering=0)
+    writer = target.open("r+b", buffering=0)
+    writer.write(b"dirty cached bytes " * 4096)  # stays in the Windows cache
+    started = time.monotonic()
+    proc.kill()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"forced kill: daemon pid {proc.pid} still deleting after 10 s")
+    exited = time.monotonic() - started
+    for handle in (writer, reader):
+        try:
+            handle.close()
+        except OSError:
+            pass
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and mount.exists():
+        time.sleep(.1)
+    assert not mount.exists(), f"stale usable mount {mount} after forced kill"
+    if os.name == "nt":
+        shell = subprocess.run(["powershell", "-NoProfile", "-Command", "(Get-PSDrive -PSProvider FileSystem).Count"],
+                               capture_output=True, text=True, timeout=10)
+        assert shell.returncode == 0, shell.stderr
+    processes.pop(0)
+    print(json.dumps({"forced_kill_exit_s": round(exited, 3), "mount_gone": True}), flush=True)
 
 
 if __name__ == "__main__":

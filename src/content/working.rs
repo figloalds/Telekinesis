@@ -78,8 +78,6 @@ pub struct Scratch {
     pub dirty: DirtyBitmap,
     pub changed: bool,
     /// A native data cache still owns bytes that have not reached this file.
-    pub cache_pending: bool,
-    pub cache_generation: u64,
     pub writers: usize,
     pub handles: usize,
     pub closed_at: Option<Instant>,
@@ -356,8 +354,6 @@ impl WorkingLayer {
             length: basis.content.total_len,
             dirty: DirtyBitmap::default(),
             changed: false,
-            cache_pending: false,
-            cache_generation: 0,
             writers: usize::from(writable),
             handles: 1,
             closed_at: None,
@@ -408,10 +404,7 @@ impl WorkingLayer {
         if force {
             return lock(&self.files)
                 .values()
-                .filter(|f| {
-                    let s = lock(f);
-                    s.changed && !s.cache_pending
-                })
+                .filter(|f| lock(f).changed)
                 .cloned()
                 .collect();
         }
@@ -428,13 +421,13 @@ impl WorkingLayer {
             .into_iter()
             .filter(|file| {
                 let s = lock(file);
-                !s.cache_pending
-                    && (bytes > PENDING_BUDGET
-                        || s.closed_at.is_some_and(|t| t.elapsed() >= WRITEBACK_DELAY))
+                bytes > PENDING_BUDGET
+                    || s.closed_at.is_some_and(|t| t.elapsed() >= WRITEBACK_DELAY)
             })
             .collect()
     }
-    /// Used only after the native volume cache has synchronously drained.
+    /// Every changed scratch, open writers included. Used after a native
+    /// volume flush issued by another process delivered their cached pages.
     pub fn materialized_dirty(&self) -> Vec<Arc<Mutex<Scratch>>> {
         lock(&self.files)
             .values()
@@ -453,7 +446,6 @@ impl WorkingLayer {
                 let s = lock(file);
                 s.handles == 0
                     && !s.changed
-                    && !s.cache_pending
                     && (pressure || s.idle_at.elapsed() >= Duration::from_secs(30))
             })
             .map(|(k, _)| k.clone())
