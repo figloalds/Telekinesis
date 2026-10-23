@@ -98,6 +98,17 @@ impl Scratch {
     pub fn persist_record(&self) -> Result<()> {
         self.write_record(false)
     }
+    fn create_record(&self) -> Result<()> {
+        // No caller can edit this scratch until initialization returns. A
+        // partial initial record is quarantined on recovery; later updates
+        // still use atomic replacement.
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path.with_extension("json"))?;
+        file.write_all(&serde_json::to_vec(&self.record)?)?;
+        Ok(())
+    }
     fn write_record(&self, durable: bool) -> Result<()> {
         let path = self.path.with_extension("json");
         let temp = self.path.with_extension("json.tmp");
@@ -339,7 +350,7 @@ impl WorkingLayer {
             base_visible_len: basis.content.total_len,
             pin,
         };
-        scratch.persist_record()?;
+        scratch.create_record()?;
         let scratch = Arc::new(Mutex::new(scratch));
         files.insert(key, scratch.clone());
         lock(&self.latest).insert(entity_key, Arc::downgrade(&scratch));
@@ -446,7 +457,13 @@ impl WorkingLayer {
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
             if path.extension().is_some_and(|e| e == "json") {
-                let record: ScratchRecord = serde_json::from_slice(&fs::read(&path)?)?;
+                let record: ScratchRecord = match serde_json::from_slice(&fs::read(&path)?) {
+                    Ok(record) => record,
+                    Err(_) => {
+                        self.quarantine(&path.with_extension("scratch"))?;
+                        continue;
+                    }
+                };
                 ensure!(
                     Uuid::parse_str(&record.operation).is_ok()
                         && Uuid::parse_str(&record.id).is_ok()
@@ -457,6 +474,17 @@ impl WorkingLayer {
             }
         }
         Ok(records)
+    }
+    pub(crate) fn quarantine(&self, scratch: &Path) -> Result<()> {
+        let destination = self.root.join("quarantine");
+        fs::create_dir_all(&destination)?;
+        for path in [scratch.to_owned(), scratch.with_extension("json")] {
+            if path.exists() {
+                let name = path.file_name().context("INVALID_SCRATCH_PATH")?;
+                fs::rename(&path, destination.join(name))?;
+            }
+        }
+        Ok(())
     }
     pub fn content(&self) -> &LocalContent {
         &self.content

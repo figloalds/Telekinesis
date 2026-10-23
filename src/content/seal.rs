@@ -232,6 +232,17 @@ pub fn recover(store: &Mutex<Store>, layer: &WorkingLayer) -> Result<usize> {
         if !path.exists() {
             continue;
         }
+        // Namespace transactions may still be inside the short write-back
+        // window. A missing metadata-only successor can rebase to its content
+        // anchor; an uncommitted new entity is preserved for manual recovery.
+        if lock(store).version(&record.basis.version)?.is_none() {
+            if lock(store).version(&record.basis.anchor)?.is_some() {
+                record.basis.version = record.basis.anchor.clone();
+            } else {
+                layer.quarantine(&path)?;
+                continue;
+            }
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
