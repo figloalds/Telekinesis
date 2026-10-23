@@ -220,6 +220,28 @@ def print_table(summary, compare):
         print(line)
 
 
+def gate(report, compare):
+    """A missing measurement or incompatible baseline cannot pass the gate."""
+    failures = []
+    if compare:
+        dimensions = ("runs", "copy_files", "large_mib", "random_ops", "git_files",
+                      "projects", "files", "jobs", "framework")
+        for key in dimensions:
+            if report["args"][key] != compare["args"][key]:
+                failures.append(f"incompatible baseline: {key}")
+        for key, row in report["summary"].items():
+            if key in TARGETS:
+                base = compare["summary"].get(key, {}).get("median_ms", 0)
+                if base <= 0 or row["median_ms"] > base * TARGETS[key]:
+                    failures.append(f"{key}: exceeds {TARGETS[key]}x native")
+    if "remote_visibility" in report["summary"]:
+        if report["summary"]["remote_visibility"]["median_ms"] > 250:
+            failures.append("remote_visibility: exceeds 250 ms")
+    failures.extend(f"{key}: {reason}" for key, reason in report["skipped"].items()
+                    if key != "remote_visibility" or report["args"].get("peer_root"))
+    return failures
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -242,10 +264,15 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--framework", default="net10.0")
     args = parser.parse_args()
+    if args.runs < 1 or min(args.copy_files, args.large_mib, args.random_ops,
+                           args.git_files, args.projects, args.files, args.jobs) < 1:
+        parser.error("runs and workload sizes must be positive")
 
     bench_home = Path("C:/tkfs-bench") if os.name == "nt" else Path.home() / "tkfs-bench"
     root = (args.root or bench_home / args.label).resolve()
     stage = (args.stage or bench_home / "stage").resolve()
+    if root == stage or root in stage.parents or stage in root.parents:
+        parser.error("--root and --stage must be separate, non-nested directories")
     output = args.output or ROOT / "test-evidence/bench" / f"{args.label}.json"
     selected = set(args.only.split(",")) if args.only else set(WORKLOADS)
     unknown = selected - set(WORKLOADS)
@@ -255,7 +282,7 @@ def main():
     log_dir = ROOT / "test-runs/bench" / f"{args.label}-{datetime.now():%Y%m%dT%H%M%S}"
     log_dir.mkdir(parents=True)
 
-    if "copy_small" in selected and not (stage / "d00").exists():
+    if "copy_small" in selected:
         tree_rm(stage)
         for relative, payload in small_files(1, args.copy_files):
             path = stage / relative
@@ -304,6 +331,8 @@ def main():
     finally:
         report["summary"] = summarize(samples)
         report["finished"] = datetime.now(timezone.utc).isoformat()
+        compare = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
+        report["failures"] = gate(report, compare)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=1), encoding="utf-8")
     compare = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
@@ -312,7 +341,8 @@ def main():
     for name, reason in report["skipped"].items():
         print(f"skipped {name}: {reason[:200]}")
     print(f"\nreport: {output}")
+    return 1 if report["failures"] else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
