@@ -191,7 +191,6 @@ impl Engine {
             } else {
                 None
             };
-            store.flush_metadata()?;
             (e, basis)
         };
         let scratch = basis
@@ -248,10 +247,18 @@ impl Engine {
     pub fn read_visible(&self, token: u64, offset: u64, out: &mut [u8]) -> Result<usize> {
         let h = self.handle(token)?;
         let original = h.scratch.as_ref().context("IS_A_DIRECTORY")?;
-        let entity = lock(&h.entry).id.clone();
+        let bound = lock(&h.entry).clone();
         let basis = {
             let store = lock(&self.store);
-            store.basis(&entity)?
+            let current = Self::cached_entry(&store, &bound)?;
+            if current.deleted || !store.projection().entries.contains_key(&current.id) {
+                None
+            } else {
+                Some(store.basis(&current.id)?)
+            }
+        };
+        let Some(basis) = basis else {
+            return lock(original).read(self.working.content(), offset, out);
         };
         if lock(original).record.basis.anchor == basis.anchor {
             return lock(original).read(self.working.content(), offset, out);
@@ -264,18 +271,35 @@ impl Engine {
     }
     pub fn info_visible(&self, token: u64) -> Result<(Entry, u64)> {
         let h = self.handle(token)?;
-        let entity = lock(&h.entry).id.clone();
+        let bound = lock(&h.entry).clone();
         let (mut entry, branch, anchor) = {
             let store = lock(&self.store);
-            let entry = store.entry(&entity)?;
-            let anchor = store.projection().anchors.get(&entity).cloned();
+            let entry = Self::cached_entry(&store, &bound)?;
+            let anchor = store.projection().anchors.get(&entry.id).cloned();
             (entry, store.active.clone(), anchor)
         };
+        if entry.deleted || (anchor.is_none() && h.scratch.is_some()) {
+            return self.info(token);
+        }
         let len = anchor
-            .and_then(|anchor| self.working.visible_len(&branch, &entity, &anchor))
+            .and_then(|anchor| self.working.visible_len(&branch, &entry.id, &anchor))
             .unwrap_or_else(|| entry.content.as_ref().map_or(0, |c| c.total_len));
         entry.working_len = Some(len);
         Ok((entry, len))
+    }
+    fn cached_entry(store: &Store, bound: &Entry) -> Result<Entry> {
+        if bound.id == ROOT {
+            return Ok(Entry::root());
+        }
+        // A Windows cache file object can outlive a remote delete/recreate of
+        // this name. Its old user context must refill from the current pathname.
+        if let Ok(parent) = store.projection().path(&bound.parent) {
+            let path = format!("{parent}/{}", bound.name);
+            if let Ok(entry) = store.lookup(&path) {
+                return Ok(entry);
+            }
+        }
+        Ok(store.entry(&bound.id).unwrap_or_else(|_| bound.clone()))
     }
     pub fn write(
         &self,

@@ -84,6 +84,43 @@ fn recovery_seals_surviving_dirty_scratch_once() -> Result<()> {
 }
 
 #[test]
+fn recovery_preserves_partial_initial_records_and_uncommitted_entities() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let orphan;
+    {
+        let mut store = Store::open(root.path(), None)?;
+        let entry = store.create("not-yet-committed", EntryKind::File)?;
+        let layer = WorkingLayer::new(root.path(), store.content.clone())?;
+        let scratch = layer.open(store.basis(&entry.id)?, true)?;
+        lock(&scratch).write(layer.content(), 0, b"preserved orphan", false, false)?;
+        orphan = lock(&scratch).path.file_name().unwrap().to_owned();
+        store.db.execute_batch("ROLLBACK;")?;
+    }
+    let partial = root
+        .path()
+        .join("scratch")
+        .join(format!("{}.scratch", id()));
+    std::fs::write(&partial, b"partial initialization")?;
+    std::fs::write(partial.with_extension("json"), b"{\"id\":")?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    assert!(engine.lookup("not-yet-committed").is_err());
+    assert_eq!(
+        std::fs::read(root.path().join("scratch/quarantine").join(orphan))?,
+        b"preserved orphan"
+    );
+    assert_eq!(
+        std::fs::read(
+            root.path()
+                .join("scratch/quarantine")
+                .join(partial.file_name().unwrap())
+        )?,
+        b"partial initialization"
+    );
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn snapshot_fork_isolation_and_cached_tree_reopen() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut store = Store::open(root.path(), None)?;
@@ -247,6 +284,31 @@ fn native_cache_drain_precedes_sealing_a_sparse_extension() -> Result<()> {
     );
     lock(&scratch).cache_pending = false;
     engine.close(h)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn pathname_cache_refills_from_a_recreated_entity() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let first = engine.open_file("file", true, false, true)?;
+    engine.write(first, 0, b"old", false, false)?;
+    engine.flush(Some(first))?;
+    let old_id = engine.lookup("file")?.id;
+    lock(&engine.store).delete(&old_id)?;
+    let next = engine.open_file("file", true, false, true)?;
+    engine.write(next, 0, b"recreated bytes", false, false)?;
+    engine.flush(Some(next))?;
+    let mut bytes = [0; 15];
+    assert_eq!(engine.read_visible(first, 0, &mut bytes)?, 15);
+    assert_eq!(&bytes, b"recreated bytes");
+    assert_eq!(engine.info_visible(first)?.1, 15);
+    assert_ne!(engine.info_visible(first)?.0.id, old_id);
+    assert_eq!(engine.read(first, 0, &mut bytes)?, 3);
+    assert_eq!(&bytes[..3], b"old");
+    engine.close(first)?;
+    engine.close(next)?;
     engine.shutdown()?;
     Ok(())
 }
