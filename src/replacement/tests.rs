@@ -63,3 +63,34 @@ fn snapshot_fork_isolation_and_cached_tree_reopen()->Result<()> {
     store.rename(&entity,"fork-only",false)?;store.checkout(MAIN)?;assert!(store.lookup("directory/renamed").is_ok());assert!(store.lookup("fork-only").is_err());
     drop(store);let mut store=Store::open(root.path(),None)?;store.checkout("fork")?;assert!(store.lookup("fork-only").is_ok());Ok(())
 }
+
+#[test]
+fn entity_conflicts_keep_local_head_and_resolution_converges()->Result<()> {
+    let left=tempfile::tempdir()?;let right=tempfile::tempdir()?;
+    let mut a=Store::open(left.path(),Some("repo"))?;let mut b=Store::open(right.path(),Some("repo"))?;
+    let entity=a.create("file",EntryKind::File)?.id;
+    let create=a.events_after(0,10)?[0].1.clone();b.apply(&[create.clone()])?;
+    let mut a_state=a.entry(&entity)?;a_state.content=Some(a.content.import(b"local")?);
+    let local=a.event(MAIN,a_state,vec![create.id.clone()],Operation::Content);a.apply(std::slice::from_ref(&local))?;
+    let mut b_state=b.entry(&entity)?;b_state.content=Some(b.content.import(b"remote")?);
+    let remote=b.event(MAIN,b_state,vec![create.id],Operation::Content);b.apply(std::slice::from_ref(&remote))?;
+    a.apply(std::slice::from_ref(&remote))?;b.apply(std::slice::from_ref(&local))?;
+    assert_eq!(a.projection().visible[&entity],local.id);assert_eq!(b.projection().visible[&entity],remote.id);
+    assert_eq!(a.conflicts(false)?[0].heads.len(),2);assert_eq!(a.projection().children(ROOT).len(),1);
+    let resolution=a.resolve(&entity,&remote.id)?;b.apply(&[resolution])?;
+    assert!(a.conflicts(false)?.is_empty());assert!(b.conflicts(false)?.is_empty());
+    assert_eq!(a.lookup("file")?,b.lookup("file")?);
+    assert_eq!(a.conflicts(true)?[0].heads.len(),2);
+    assert!(a.live_objects(32)?.contains(&local.state.content.unwrap().digest));Ok(())
+}
+
+#[test]
+fn remote_apply_invalidates_cached_paths_without_changing_open_version()->Result<()> {
+    let root=tempfile::tempdir()?;let engine=super::engine::Engine::open(root.path(),Some("repo"))?;
+    let h=engine.open_file("file",true,false,true)?;engine.write(h,0,b"local",false,false)?;engine.flush(Some(h))?;
+    let observed=std::sync::Arc::new(Mutex::new(Vec::new()));let sink=observed.clone();engine.set_invalidator(std::sync::Arc::new(move|path,action|{lock(&sink).push((path.to_string(),action));Ok(())}));
+    let event={let mut s=lock(&engine.store);let entity=s.lookup("file")?.id;let base=s.basis(&entity)?;let mut state=s.entry(&entity)?;state.content=Some(s.content.import(b"other")?);let mut event=s.event(MAIN,state,vec![base.version],Operation::Content);event.author="remote".into();event};
+    engine.apply_remote(&[event])?;assert!(lock(&observed).iter().any(|(path,_)|path=="/file"));
+    let mut old=[0;5];engine.read(h,0,&mut old)?;assert_eq!(&old,b"local");
+    let new=engine.open_file("file",false,false,false)?;engine.read(new,0,&mut old)?;assert_eq!(&old,b"other");engine.close(h)?;engine.close(new)?;engine.shutdown()?;Ok(())
+}

@@ -41,6 +41,8 @@ pub struct Snapshot { pub id:String,pub root:Digest,pub frontier:BTreeMap<String
 pub struct TreeEntry { pub name:String,pub entity:String,pub kind:EntryKind,pub content:Option<FileContentRef>,pub tree:Option<Digest>,pub times:Times,pub mode:u32,pub attributes:u32 }
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct Tree { pub entries:Vec<TreeEntry> }
+#[derive(Clone,Debug,Serialize,Deserialize)]
+pub struct Conflict {pub entity:String,pub branch:String,pub visible:String,pub heads:Vec<Event>,pub resolved:bool}
 impl Tree {
     pub fn encode(&self)->Result<Vec<u8>> { self.validate()?; let mut b=b"TKTR\x01".to_vec(); b.extend(serde_json::to_vec(self)?); Ok(b) }
     pub fn decode(bytes:&[u8])->Result<Self> { ensure!(bytes.starts_with(b"TKTR\x01"),"INVALID_TREE"); let tree:Self=serde_json::from_slice(&bytes[5..])?; tree.validate()?; Ok(tree) }
@@ -175,7 +177,7 @@ impl Store {
         name_key(&event.state.name)?;
         ensure!(event.state.mode & !0o7777==0 && event.parents.len()<=1024,"INVALID_EVENT");
         match event.state.kind {EntryKind::File=>event.state.content.as_ref().context("CONTENT_REQUIRED")?.validate()?,EntryKind::Directory=>ensure!(event.state.content.is_none(),"DIRECTORY_HAS_CONTENT")}
-        ensure!((event.operation==Operation::Delete)==event.state.deleted,"INVALID_DELETION");
+        ensure!((event.operation!=Operation::Delete || event.state.deleted) && (!event.state.deleted || matches!(event.operation,Operation::Delete|Operation::Resolve)),"INVALID_DELETION");
         let mut parents=BTreeSet::new();
         for parent in &event.parents {
             ensure!(parents.insert(parent),"DUPLICATE_PARENT");
@@ -217,7 +219,8 @@ impl Store {
                     tx.execute("INSERT INTO heads VALUES(?1,?2,?3)",params![event.branch,event.entity,event.id])?;
                     let heads:usize=tx.query_row("SELECT count(*) FROM heads WHERE branch=?1 AND entity=?2",params![event.branch,event.entity],|r|r.get(0))?;
                     let old:Option<String>=tx.query_row("SELECT visible FROM current WHERE branch=?1 AND entity=?2",params![event.branch,event.entity],|r|r.get(0)).optional()?;
-                    let visible=if heads>1 {old.or_else(||self.views.get(&event.branch).and_then(|p|p.visible.get(&event.entity).cloned())).unwrap_or_else(||event.id.clone())}else{event.id.clone()};
+                    let candidate=old.or_else(||self.views.get(&event.branch).and_then(|p|p.visible.get(&event.entity).cloned()));
+                    let visible=if heads>1 {candidate.filter(|old|!event.parents.contains(old)).unwrap_or_else(||event.id.clone())}else{event.id.clone()};
                     let state=if visible==event.id {event.state.clone()}else{self.version(&visible)?.context("VISIBLE_VERSION_MISSING")?.state};
                     tx.execute("INSERT OR REPLACE INTO current VALUES(?1,?2,?3,?4)",params![event.branch,event.entity,serde_json::to_vec(&state)?,visible])?;
                     if heads>1 {tx.execute("INSERT OR IGNORE INTO conflict_history SELECT branch,entity,version FROM heads WHERE branch=?1 AND entity=?2",params![event.branch,event.entity])?;}
@@ -293,4 +296,31 @@ impl Store {
     pub fn fork(&mut self,snapshot:&Snapshot,name:&str)->Result<String> {ensure!(!name.is_empty(),"INVALID_BRANCH");let branch=id();self.db.execute("INSERT INTO branches VALUES(?1,?2,?3)",params![branch,name,snapshot.id])?;Ok(branch)}
     pub fn checkout(&mut self,branch:&str)->Result<()> {let branch:String=self.db.query_row("SELECT id FROM branches WHERE id=?1 OR name=?1",[branch],|r|r.get(0))?;self.load_view(&branch)?;self.db.execute("UPDATE config SET value=?1 WHERE key='active'",[&branch])?;self.active=branch;Ok(())}
     pub fn events_after(&self,after:u64,limit:usize)->Result<Vec<(u64,Event)>> {ensure!(limit<=4096,"FEED_BATCH_TOO_LARGE");let mut q=self.db.prepare("SELECT seq,event FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2")?;let rows=q.query_map(params![after,limit],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,Vec<u8>>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;rows.into_iter().map(|(seq,event)|Ok((seq,serde_json::from_slice(&event)?))).collect()}
+    pub fn conflicts(&self,include_resolved:bool)->Result<Vec<Conflict>> {
+        let mut versions:BTreeMap<String,BTreeSet<String>>=self.projection().heads.iter().filter(|(_,heads)|heads.len()>1).map(|(e,h)|(e.clone(),h.clone())).collect();
+        if include_resolved {let mut q=self.db.prepare("SELECT entity,version FROM conflict_history WHERE branch=?1")?;for row in q.query_map([&self.active],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?{let(e,v)=row?;versions.entry(e).or_default().insert(v);}}
+        versions.into_iter().map(|(entity,heads)|{let resolved=self.projection().heads.get(&entity).is_none_or(|h|h.len()<2);let visible=self.projection().visible.get(&entity).cloned().unwrap_or_default();let heads=heads.iter().map(|h|self.version(h)?.context("CONFLICT_VERSION_MISSING")).collect::<Result<Vec<_>>>()?;Ok(Conflict{entity,branch:self.active.clone(),visible,heads,resolved})}).collect()
+    }
+    pub fn resolve(&mut self,entity:&str,selected:&str)->Result<Event> {
+        let heads=self.projection().heads.get(entity).context("CONFLICT_NOT_FOUND")?.clone();
+        ensure!(heads.len()>1 && heads.contains(selected),"INVALID_RESOLUTION");
+        let state=self.version(selected)?.context("VERSION_MISSING")?.state;
+        let event=self.event(&self.active.clone(),state,heads.into_iter().collect(),Operation::Resolve);
+        self.apply(std::slice::from_ref(&event))?;Ok(event)
+    }
+    /// Snapshot history, every current entity head, and reviewed conflict
+    /// alternatives are retention roots. The pack layer adds active handle pins.
+    pub fn live_objects(&self,history_depth:usize)->Result<BTreeSet<Digest>> {
+        let mut pending=Vec::new();
+        for view in self.views.values(){for heads in view.heads.values(){for head in heads{if let Some(event)=self.version(head)?{if let Some(content)=event.state.content{pending.push((content.digest,if content.kind==crate::model::content::ContentKind::Direct{ObjectKind::Chunk}else{ObjectKind::Manifest}));}}}}}
+        let mut q=self.db.prepare("SELECT root FROM snapshots ORDER BY rowid DESC LIMIT ?1")?;for row in q.query_map([history_depth],|r|r.get::<_,Vec<u8>>(0))?{let digest=row?;pending.push((Digest(digest.as_slice().try_into()?),ObjectKind::Tree));}
+        // Branch bases cannot age out merely because another branch checkpoints.
+        let mut q=self.db.prepare("SELECT s.root FROM snapshots s JOIN branches b ON b.snapshot=s.id")?;for row in q.query_map([],|r|r.get::<_,Vec<u8>>(0))?{let digest=row?;pending.push((Digest(digest.as_slice().try_into()?),ObjectKind::Tree));}
+        let mut q=self.db.prepare("SELECT DISTINCT version FROM conflict_history UNION SELECT version FROM heads")?;
+        for row in q.query_map([],|r|r.get::<_,String>(0))?{if let Some(event)=self.version(&row?)?{if let Some(c)=event.state.content{pending.push((c.digest,if c.kind==crate::model::content::ContentKind::Direct{ObjectKind::Chunk}else{ObjectKind::Manifest}));}}}
+        let mut live=BTreeSet::new();while let Some((digest,kind))=pending.pop(){if !live.insert(digest){continue;}if !self.content.packs.contains(digest)?{continue;}let bytes=self.content.packs.get(digest)?;match kind{
+            ObjectKind::Chunk=>{},ObjectKind::Manifest=>{for chunk in super::objects::Manifest::decode(&bytes)?.chunks{pending.push((chunk,ObjectKind::Chunk));}},
+            ObjectKind::Tree=>{for entry in Tree::decode(&bytes)?.entries{if let Some(tree)=entry.tree{pending.push((tree,ObjectKind::Tree));}if let Some(c)=entry.content{pending.push((c.digest,if c.kind==crate::model::content::ContentKind::Direct{ObjectKind::Chunk}else{ObjectKind::Manifest}));}}}
+        }}Ok(live)
+    }
 }
