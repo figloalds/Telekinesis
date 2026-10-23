@@ -1,1415 +1,1280 @@
-//! Durable semantic journal and deterministic multi-value registers.
-//! Receipt order is never used to choose a version. Ordinary edits parent only
-//! their actual visible/base revision; only explicit review can parent competitors.
-//!
-//! The root keeps the data model, helpers, `Store`, its view cache, opening and
-//! recovery phases, branches/events/projection access, rebuilds and every local
-//! filesystem or branch operation. Per-concern `impl Store` blocks live in the
-//! submodules; `pub use` keeps every historical `tkfs::core::*` path.
-use anyhow::{Context, Result, bail, ensure};
+//! Authoritative version journal and cached current namespace. No cone replay.
+use crate::content::local::{Kind as ObjectKind, LocalContent};
+use crate::content::working::Basis;
+use crate::model::content::{Digest, FileContentRef};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
-    cell::{Ref, RefCell},
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
-pub mod admission;
-pub mod commit;
-pub(crate) mod content;
-pub mod content_objects;
-pub mod content_saves;
-pub mod demand;
-pub mod derive;
-mod export;
-pub mod inbox;
-pub mod objects;
-mod schema;
-pub mod sharing;
-mod snapshot;
-pub mod status;
-pub mod transfer;
-pub mod verify;
-
-use derive::{activated_ids, persist_projection};
-use inbox::{validate_direct_links, validate_known_links};
-
-pub use derive::project;
-pub use export::SharedExport;
-pub use objects::ScrubOutcome;
-pub(crate) use objects::install_object;
-pub use objects::{ObjectLocks, VerifyMode};
-/// The startup-snapshot seal cadence (CCR-WP2.4-3, applied by WP3.INT): read
-/// by the activator's seal forecast with the store's own rule.
-pub use snapshot::{MAX_SEAL_INTERVAL, MIN_SEAL_INTERVAL, SEALED_SQL, seal_interval};
-pub use transfer::{Bundle, ObjectPart, PartOutcome};
-pub use verify::DerivedDiff;
-
 pub const ROOT: &str = "root";
-pub const MAX_FILE: usize = 16 * 1024 * 1024;
-/// Streaming file ceiling; buffered object APIs retain their 16 MiB bound.
-pub const MAX_CONTENT: u64 = 16 * 1024 * 1024 * 1024;
-pub const IO_CHUNK: usize = 1024 * 1024;
-pub const MAX_EVENT: usize = 8 * 1024 * 1024;
-pub const MAX_NAMESPACE_CUTS: usize = 4096;
-pub const FILETIME_EPOCH: u64 = 116_444_736_000_000_000;
-pub const BASIC_ATTRIBUTES: u32 = 0x1 | 0x2 | 0x4 | 0x10 | 0x20 | 0x80;
-/// Format 6 acknowledges metadata independently and carries content descriptors.
-pub const PEER_FORMAT: u32 = 6;
-pub fn filetime(ms: u64) -> u64 {
-    ms.saturating_mul(10_000).saturating_add(FILETIME_EPOCH)
-}
-/// One bounded atomic metadata register, separate from content revision clocks.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct BasicInfo {
-    /// Portable permission bits; Windows retains these without interpreting execute.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub posix_mode: Option<u32>,
-    pub attributes: u32,
-    pub creation_time: u64,
-    pub access_time: u64,
-    pub write_time: u64,
-    pub change_time: u64,
-}
-impl BasicInfo {
-    pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.posix_mode.is_none_or(|mode| mode & !0o777 == 0),
-            "UNSUPPORTED_POSIX_MODE"
-        );
-        ensure!(
-            self.attributes & !BASIC_ATTRIBUTES == 0,
-            "UNSUPPORTED_ATTRIBUTES"
-        );
-        ensure!(
-            self.attributes & 0x80 == 0 || self.attributes == 0x80,
-            "INVALID_ATTRIBUTES"
-        );
-        ensure!(
-            [
-                self.creation_time,
-                self.access_time,
-                self.write_time,
-                self.change_time
-            ]
-            .iter()
-            .all(|v| *v <= i64::MAX as u64),
-            "INVALID_TIMESTAMP"
-        );
-        Ok(())
-    }
-    pub fn attributes(kind: &str, attributes: u32) -> Result<u32> {
-        ensure!(
-            attributes & !BASIC_ATTRIBUTES == 0,
-            "UNSUPPORTED_ATTRIBUTES"
-        );
-        // DIRECTORY is an immutable type fact; NORMAL is the absence of flags.
-        let attributes = attributes & !(0x10 | 0x80);
-        Ok(if kind == "directory" {
-            attributes | 0x10
-        } else if attributes == 0 {
-            0x80
-        } else {
-            attributes
-        })
-    }
-}
-#[derive(Debug)]
-struct CausalPrerequisitesPending;
-impl std::fmt::Display for CausalPrerequisitesPending {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CAUSAL_PREREQUISITES_PENDING")
-    }
-}
-impl std::error::Error for CausalPrerequisitesPending {}
+pub const MAIN: &str = "main";
 pub fn id() -> String {
     Uuid::new_v4().to_string()
 }
-pub fn hash(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+pub fn now() -> u64 {
+    crate::util::time::now_ms()
 }
-pub(crate) fn valid_object(object: &str) -> Result<()> {
-    ensure!(
-        object.len() == 64 && object.bytes().all(|c| c.is_ascii_hexdigit()),
-        "INVALID_OBJECT_ID"
-    );
-    Ok(())
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    File,
+    Directory,
 }
-fn object_error(error: std::io::Error) -> anyhow::Error {
-    let label = if error.kind() == std::io::ErrorKind::NotFound {
-        "OFFLINE_OBJECT_MISSING"
-    } else {
-        "OBJECT_IO_ERROR"
-    };
-    anyhow::Error::new(error).context(label)
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Times {
+    pub created: u64,
+    pub accessed: u64,
+    pub modified: u64,
+    pub changed: u64,
 }
-pub(crate) fn stream_hash(reader: &mut impl Read) -> Result<String> {
-    stream_hash_checked(reader, &mut || Ok(()))
-}
-
-/// Check a caller's lifetime between bounded reads, including the last read.
-/// A cancelled verification never yields a digest that could become trusted.
-pub(crate) fn stream_hash_checked(
-    reader: &mut impl Read,
-    check: &mut impl FnMut() -> Result<()>,
-) -> Result<String> {
-    let mut digest = Sha256::new();
-    let mut bytes = [0; 64 * 1024];
-    loop {
-        check()?;
-        let count = reader.read(&mut bytes)?;
-        if count > 0 {
-            crate::util::fault::trigger("core.hash.after_chunk")?;
-        }
-        check()?;
-        if count == 0 {
-            break;
-        }
-        digest.update(&bytes[..count]);
-        crate::startup::progress("verifying objects");
-    }
-    check()?;
-    Ok(hex::encode(digest.finalize()))
-}
-
-#[cfg(test)]
-mod bounded_hash_tests {
-    use super::*;
-    use crate::{content::ReadContext, util::Cancel};
-    use std::time::{Duration, Instant};
-
-    struct InterruptingReader {
-        context: ReadContext,
-        reads: usize,
-        largest: usize,
-        eof: bool,
-    }
-    impl Read for InterruptingReader {
-        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-            self.reads += 1;
-            self.largest = self.largest.max(bytes.len());
-            bytes.fill(7);
-            self.context.cancel.cancel();
-            Ok(if self.eof { 0 } else { bytes.len() })
+impl Default for Times {
+    fn default() -> Self {
+        let t = now().saturating_mul(10_000) + 116_444_736_000_000_000;
+        Self {
+            created: t,
+            accessed: t,
+            modified: t,
+            changed: t,
         }
     }
-
-    #[test]
-    fn cancellation_during_hash_read_or_eof_never_returns_a_digest() {
-        for eof in [false, true] {
-            let mut reader = InterruptingReader {
-                context: ReadContext {
-                    deadline: Instant::now() + Duration::from_secs(1),
-                    cancel: Cancel::new(),
-                },
-                reads: 0,
-                largest: 0,
-                eof,
-            };
-            let context = ReadContext {
-                deadline: reader.context.deadline,
-                cancel: reader.context.cancel.clone(),
-            };
-            let error = stream_hash_checked(&mut reader, &mut || context.check()).unwrap_err();
-            assert_eq!(crate::model::errors::code_of(&error), "CONTENT_CANCELLED");
-            assert_eq!(reader.reads, 1, "read again after cancellation");
-            assert_eq!(reader.largest, 65536, "unbounded verification buffer");
-        }
-    }
-
-    #[test]
-    fn expired_hash_request_reads_nothing_and_live_request_keeps_whole_file_identity() {
-        let mut reader = InterruptingReader {
-            context: ReadContext {
-                deadline: Instant::now(),
-                cancel: Cancel::new(),
-            },
-            reads: 0,
-            largest: 0,
-            eof: false,
-        };
-        let context = ReadContext {
-            deadline: reader.context.deadline,
-            cancel: reader.context.cancel.clone(),
-        };
-        let error = stream_hash_checked(&mut reader, &mut || context.check()).unwrap_err();
-        assert_eq!(crate::model::errors::code_of(&error), "CONTENT_DEADLINE");
-        assert_eq!(reader.reads, 0);
-        let bytes = vec![11; 200_013];
-        assert_eq!(
-            stream_hash_checked(&mut &bytes[..], &mut || Ok(())).unwrap(),
-            hash(&bytes)
-        );
-    }
 }
-pub fn time() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Branch {
-    pub id: String,
-    pub name: String,
-    pub shared: bool,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Change {
-    pub entity: String,
-    pub field: String,
-    pub parents: Vec<String>,
-    pub value: Value,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Event {
-    pub id: String,
-    pub repo: String,
-    pub branch: Branch,
-    pub device: String,
-    pub created_ms: u64,
-    pub changes: Vec<Change>,
-    #[serde(default)]
-    pub dependencies: Vec<String>,
-    #[serde(default)]
-    pub reviewed: Vec<String>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub object_sizes: BTreeMap<String, u64>,
-}
-impl Event {
-    pub fn objects(&self) -> BTreeSet<String> {
-        self.changes
-            .iter()
-            .filter(|c| c.field == "content")
-            .filter_map(|c| c.value.as_str().map(str::to_owned))
-            .collect()
-    }
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Version {
-    pub revision: String,
-    pub device: String,
-    pub created_ms: u64,
-    pub parents: Vec<String>,
-    pub value: Value,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Conflict {
-    pub id: String,
-    pub branch: String,
-    pub entity: String,
-    pub field: String,
-    pub reason: String,
-    pub alternatives: Vec<Version>,
-    pub bases: Vec<Version>,
-    pub resolved_by: Option<String>,
-}
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub id: String,
-    pub kind: String,
     pub parent: String,
     pub name: String,
-    /// Retained until the remaining status/artifact consumers are consolidated.
-    /// Supported projections never carry a whole-file string here.
-    #[serde(
-        default,
-        serialize_with = "serialize_empty_content",
-        deserialize_with = "deserialize_empty_content"
-    )]
-    pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_ref: Option<crate::model::content::FileContentRef>,
-    pub alive: bool,
-    pub revisions: BTreeMap<String, String>,
-    pub modified_ms: u64,
-    #[serde(default)]
-    pub created_ms: u64,
-    #[serde(default)]
-    pub basic: Option<BasicInfo>,
-}
-fn deserialize_empty_content<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Option<String>, D::Error> {
-    let value = Option::<String>::deserialize(deserializer)?;
-    if value.is_some() {
-        return Err(serde::de::Error::custom(
-            "INVALID_CONTENT: whole-file projection strings are unsupported",
-        ));
-    }
-    Ok(None)
-}
-fn serialize_empty_content<S: serde::Serializer>(
-    value: &Option<String>,
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    if value.is_some() {
-        return Err(serde::ser::Error::custom(
-            "INVALID_CONTENT: whole-file projection strings are unsupported",
-        ));
-    }
-    serializer.serialize_none()
+    pub kind: EntryKind,
+    pub content: Option<FileContentRef>,
+    pub times: Times,
+    pub mode: u32,
+    pub attributes: u32,
+    pub deleted: bool,
+    #[serde(skip)]
+    pub working_len: Option<u64>,
 }
 impl Entry {
-    /// A projected file-content register is always a validated descriptor.
-    pub(crate) fn set_content_value(&mut self, value: &Value) -> Result<()> {
-        ensure!(value.is_object(), "INVALID_CONTENT");
-        let reference: crate::model::content::FileContentRef =
-            serde_json::from_value(value.clone()).context("INVALID_CONTENT")?;
-        reference.validate()?;
-        self.content = None;
-        self.content_ref = Some(reference);
+    pub fn root() -> Self {
+        Self {
+            id: ROOT.into(),
+            parent: String::new(),
+            name: String::new(),
+            kind: EntryKind::Directory,
+            content: None,
+            times: Times {
+                created: 0,
+                accessed: 0,
+                modified: 0,
+                changed: 0,
+            },
+            mode: 0o755,
+            attributes: 0x10,
+            deleted: false,
+            working_len: None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Operation {
+    Create,
+    Content,
+    Rename,
+    Delete,
+    Mkdir,
+    Times,
+    Resolve,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Event {
+    pub id: String,
+    pub entity: String,
+    pub parents: Vec<String>,
+    pub operation: Operation,
+    pub state: Entry,
+    pub branch: String,
+    pub author: String,
+    pub clock: u64,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub id: String,
+    pub root: Digest,
+    pub frontier: BTreeMap<String, Vec<String>>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TreeEntry {
+    pub name: String,
+    pub entity: String,
+    pub kind: EntryKind,
+    pub content: Option<FileContentRef>,
+    pub tree: Option<Digest>,
+    pub times: Times,
+    pub mode: u32,
+    pub attributes: u32,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Tree {
+    pub entries: Vec<TreeEntry>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Conflict {
+    pub entity: String,
+    pub branch: String,
+    pub visible: String,
+    pub heads: Vec<Event>,
+    pub resolved: bool,
+}
+impl Tree {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut b = b"TKTR\x01".to_vec();
+        b.extend(serde_json::to_vec(self)?);
+        Ok(b)
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(bytes.starts_with(b"TKTR\x01"), "INVALID_TREE");
+        let tree: Self = serde_json::from_slice(&bytes[5..])?;
+        tree.validate()?;
+        Ok(tree)
+    }
+    fn validate(&self) -> Result<()> {
+        let mut last = None;
+        for e in &self.entries {
+            let key = name_key(&e.name)?;
+            ensure!(last.as_ref().is_none_or(|old| old < &key), "UNSORTED_TREE");
+            last = Some(key);
+            ensure!(!e.entity.is_empty() && e.entity != ROOT, "INVALID_ENTITY");
+            ensure!(
+                match e.kind {
+                    EntryKind::File => e.content.is_some() && e.tree.is_none(),
+                    EntryKind::Directory => e.content.is_none() && e.tree.is_some(),
+                },
+                "INVALID_TREE_ENTRY"
+            );
+            if let Some(content) = &e.content {
+                content.validate()?;
+            }
+        }
         Ok(())
     }
-
-    pub fn content_value(&self) -> Option<Value> {
-        self.content_ref.as_ref().map(|reference| json!(reference))
-    }
-
-    pub fn basic_info(&self) -> BasicInfo {
-        let mut basic = self.basic.unwrap_or(BasicInfo {
-            posix_mode: None,
-            attributes: if self.kind == "directory" { 0x10 } else { 0x20 },
-            creation_time: filetime(self.created_ms),
-            access_time: filetime(self.created_ms),
-            write_time: filetime(self.modified_ms),
-            change_time: filetime(self.modified_ms),
-        });
-        // The register cannot change the projected entry's immutable type.
-        basic.attributes &= !(0x10 | 0x80);
-        if self.kind == "directory" {
-            basic.attributes |= 0x10;
-        } else if basic.attributes == 0 {
-            basic.attributes = 0x80;
-        }
-        basic
-    }
 }
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default)]
 pub struct Projection {
-    pub entries: BTreeMap<String, Entry>,
-    pub heads: BTreeMap<String, Vec<Version>>,
-    pub conflicts: Vec<Conflict>,
-    pub pending: Vec<String>,
+    pub entries: Arc<BTreeMap<String, Entry>>,
+    pub heads: Arc<BTreeMap<String, BTreeSet<String>>>,
+    pub visible: Arc<BTreeMap<String, String>>,
+    pub anchors: Arc<BTreeMap<String, String>>,
+    children: Arc<BTreeMap<String, BTreeMap<String, String>>>,
+    trees: BTreeMap<String, Digest>,
+    dirty: BTreeSet<String>,
 }
-pub fn register(entity: &str, field: &str) -> String {
-    format!("{entity}/{field}")
+impl Projection {
+    fn empty() -> Self {
+        let mut p = Self::default();
+        Arc::make_mut(&mut p.entries).insert(ROOT.into(), Entry::root());
+        p.dirty.insert(ROOT.into());
+        p
+    }
+    fn index(&mut self, entry: Entry) -> Result<()> {
+        if let Some(old) = self.entries.get(&entry.id) {
+            if let Some(children) = Arc::make_mut(&mut self.children).get_mut(&old.parent) {
+                children.remove(&name_key(&old.name)?);
+            }
+            self.dirty.insert(old.parent.clone());
+        }
+        if !entry.deleted && entry.id != ROOT {
+            let children = Arc::make_mut(&mut self.children)
+                .entry(entry.parent.clone())
+                .or_default();
+            let key = name_key(&entry.name)?;
+            // Path collisions remain in entity history/conflicts, never spawn
+            // synthesized sibling files. Stable entity ordering is deterministic.
+            if children.get(&key).is_none_or(|other| other >= &entry.id) {
+                children.insert(key, entry.id.clone());
+            }
+            self.dirty.insert(entry.parent.clone());
+        }
+        Arc::make_mut(&mut self.entries).insert(entry.id.clone(), entry);
+        Ok(())
+    }
+    pub fn lookup(&self, path: &str) -> Result<Entry> {
+        let mut entry = self.entries.get(ROOT).unwrap();
+        for name in components(path)? {
+            ensure!(
+                entry.kind == EntryKind::Directory && !entry.deleted,
+                "NOT_A_DIRECTORY"
+            );
+            let entity = self
+                .children
+                .get(&entry.id)
+                .and_then(|c| c.get(&name_key(name).ok()?))
+                .context("NOT_FOUND")?;
+            entry = self.entries.get(entity).context("NOT_FOUND")?;
+        }
+        ensure!(!entry.deleted, "NOT_FOUND");
+        Ok(entry.clone())
+    }
+    pub fn children(&self, entity: &str) -> Vec<Entry> {
+        self.children
+            .get(entity)
+            .into_iter()
+            .flat_map(|c| c.values())
+            .filter_map(|id| self.entries.get(id))
+            .filter(|e| !e.deleted)
+            .cloned()
+            .collect()
+    }
+    pub fn path(&self, entity: &str) -> Result<String> {
+        let mut names = Vec::new();
+        let mut current = entity;
+        let mut seen = BTreeSet::new();
+        while current != ROOT {
+            ensure!(seen.insert(current), "DIRECTORY_CYCLE");
+            let e = self.entries.get(current).context("NOT_FOUND")?;
+            names.push(e.name.as_str());
+            current = &e.parent;
+        }
+        names.reverse();
+        Ok(format!("/{}", names.join("/")))
+    }
+}
+fn components(path: &str) -> Result<Vec<&str>> {
+    let components: Vec<_> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    for name in &components {
+        name_key(name)?;
+    }
+    Ok(components)
 }
 pub fn name_key(name: &str) -> Result<String> {
     ensure!(
-        !name.eq_ignore_ascii_case(".tkfs-runtime.json"),
-        "INVALID_NAME: reserved runtime discovery path"
-    );
-    ensure!(
-        !name.is_empty() && name.encode_utf16().count() <= 255,
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && !name.contains(['/', '\\', '\0'])
+            && name.encode_utf16().count() <= 255,
         "INVALID_NAME"
     );
-    ensure!(
-        !name.ends_with(['.', ' ']) && !name.chars().any(|c| c < ' ' || "<>:\"/\\|?*".contains(c)),
-        "INVALID_NAME"
-    );
-    let upper = name.split('.').next().unwrap().to_uppercase();
-    ensure!(
-        !["CON", "PRN", "AUX", "NUL"].contains(&upper.as_str())
-            && !(upper.len() == 4
-                && (upper.starts_with("COM") || upper.starts_with("LPT"))
-                && upper.ends_with(['1', '2', '3', '4', '5', '6', '7', '8', '9'])),
-        "INVALID_NAME"
-    );
-    Ok(name
-        .nfc()
-        .flat_map(char::to_lowercase)
-        .collect::<String>()
-        .nfc()
-        .collect())
-}
-
-/// How `Store::open_existing_with` runs the recovery phases of `Store::open`.
-/// `VerifyMode::default()` is `Changed` (WP1.8): objects whose recorded size
-/// and mtime still match are trusted without hashing, changed ones are
-/// hashed, and a one-time full verify runs after an upgrade; `Lazy` skips
-/// hashing; `Full` hashes everything. Activation is never deferred yet
-/// (`startup_drain` still activates staged events). CCR-WP1.8-1.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OpenOptions {
-    /// Leave staged incoming events to a background activator (classify only).
-    pub defer_activation: bool,
-    /// Startup verification of referenced, locally present objects.
-    pub verify: VerifyMode,
+    Ok(name.nfc().flat_map(char::to_lowercase).collect())
 }
 
 pub struct Store {
-    pub db: Connection,
     pub root: PathBuf,
-    pub repo: String,
     pub device: String,
+    pub repo: String,
     pub active: String,
-    pub generation: u64,
-    /// A failed rollback quarantines this handle; recover through a fresh Store.
-    pub(crate) save_connection_failed: bool,
-    view_cache: RefCell<Option<ViewCache>>,
-    /// Module-owned derived caches; see `StoreCaches`.
-    #[allow(dead_code)]
-    pub(crate) caches: StoreCaches,
+    pub content: LocalContent,
+    pub(crate) db: Connection,
+    views: BTreeMap<String, Projection>,
+    clock: u64,
+    pending_since: Option<std::time::Instant>,
 }
-/// One projection view. It is fresh only while all of these are unchanged:
-/// the branch, this connection's own `total_changes`, `PRAGMA data_version`
-/// (bumped only by commits of *other* connections, so secondary handles see
-/// engine commits) and whether a transaction is open.
-struct ViewCache {
-    branch: String,
-    changes: u64,
-    data_version: i64,
-    transactional: bool,
-    /// `projection_version` when the view was loaded or last patched by this
-    /// connection's own commit (`None`: unknown, never adopted).
-    projection_version: Option<i64>,
-    projection: Projection,
-    slots: BTreeMap<(String, String), String>,
-}
-/// Module-owned derived caches. Correctness state such as a quarantined
-/// connection lives directly on `Store`, rather than in disposable caches.
-#[derive(Default)]
-#[allow(dead_code)]
-pub(crate) struct StoreCaches {
-    pub(crate) objects: objects::Cache,
-    pub(crate) inbox: inbox::Cache,
-    pub(crate) commit: commit::Cache,
-    pub(crate) derive: derive::Cache,
-    pub(crate) sharing: sharing::Cache,
-    pub(crate) status: status::Cache,
-}
+const SCHEMA:&str="
+CREATE TABLE config(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT UNIQUE NOT NULL,branch TEXT NOT NULL,entity TEXT NOT NULL,event BLOB NOT NULL);
+CREATE INDEX entity_versions ON events(entity,seq);
+CREATE TABLE waiting(id TEXT PRIMARY KEY,event BLOB NOT NULL);
+CREATE TABLE branches(id TEXT PRIMARY KEY,name TEXT UNIQUE NOT NULL,snapshot TEXT);
+CREATE TABLE current(branch TEXT NOT NULL,entity TEXT NOT NULL,state BLOB NOT NULL,visible TEXT NOT NULL,PRIMARY KEY(branch,entity));
+CREATE TABLE heads(branch TEXT NOT NULL,entity TEXT NOT NULL,version TEXT NOT NULL,PRIMARY KEY(branch,entity,version));
+CREATE TABLE snapshots(id TEXT PRIMARY KEY,root BLOB NOT NULL,frontier BLOB NOT NULL);
+CREATE TABLE seal_receipts(operation TEXT PRIMARY KEY,event TEXT NOT NULL,modified_ns TEXT NOT NULL);
+CREATE TABLE conflict_history(branch TEXT NOT NULL,entity TEXT NOT NULL,version TEXT NOT NULL,PRIMARY KEY(branch,entity,version));
+PRAGMA application_id=1414223440; PRAGMA user_version=1;
+";
 impl Store {
-    /// Initialize an operation-owned new store with identities chosen by its caller.
-    /// Repeated initialization verifies the same identities; it never replaces them.
-    pub fn initialize(root: &Path, repo: &str, device: &str) -> Result<Self> {
-        ensure!(
-            !repo.is_empty() && !device.is_empty(),
-            "INVALID_STORE_IDENTITY"
-        );
-        Self::open_selected(root, Some(repo), Some(device), OpenOptions::default(), true)
-    }
-
-    /// Open only an initialized current-format store, never invent identities.
-    pub fn open_existing(root: &Path) -> Result<Self> {
-        Self::open_existing_with(root, OpenOptions::default())
-    }
-    pub fn open_existing_with(root: &Path, options: OpenOptions) -> Result<Self> {
-        Self::open_selected(root, None, None, options, false)
-    }
-
     pub fn open(root: &Path, repo: Option<&str>) -> Result<Self> {
-        Self::open_with(root, repo, OpenOptions::default())
-    }
-    /// Recovery as named phases, in their historical order. Every phase runs
-    /// on the opening thread, so startup progress stays truthful (invariant 28),
-    /// and the RPC listener can only open after all of them (invariant 24).
-    fn open_with(root: &Path, repo: Option<&str>, options: OpenOptions) -> Result<Self> {
-        Self::open_selected(root, repo, None, options, true)
-    }
-    fn open_selected(
-        root: &Path,
-        repo: Option<&str>,
-        device: Option<&str>,
-        options: OpenOptions,
-        create: bool,
-    ) -> Result<Self> {
-        commit::verified::epoch_ms();
-        let db = schema::open(root, repo, device, create)?;
-        let mut store = Self::open_identity(db, root)?;
-        objects::repair_indexes(&mut store)?;
-        sharing::repair_feed(&mut store)?;
-        snapshot::repair_journal_index(&store.db)?;
-        content_objects::reset_reconciliation(&store.db)?;
-        objects::startup_object_check(&mut store, options.verify)?;
-        crate::startup::progress("validating journal");
-        store.evacuate_unvalidated_journal()?;
-        crate::startup::progress("rebuilding frontiers");
-        store.rebuild_frontiers()?;
-        store.resume_or_rebuild()?;
-        inbox::startup_drain(&mut store, options.defer_activation)?;
-        if create {
-            crate::content::LocalContent::open(&store.root)?.import(
-                &mut [].as_slice(),
-                0,
-                &content::import_context(),
-            )?;
+        std::fs::create_dir_all(root)?;
+        let content = LocalContent::open(root)?;
+        let db = Connection::open(root.join("metadata.sqlite"))?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        )?;
+        let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+        if app == 0 {
+            let count: i64 =
+                db.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
+            ensure!(count == 0, "UNSUPPORTED_METADATA_FORMAT");
+            let tx = db.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA)?;
+            for (key, value) in [
+                ("device", id()),
+                ("repo", repo.map(str::to_owned).unwrap_or_else(id)),
+                ("active", MAIN.into()),
+                ("clock", "0".into()),
+            ] {
+                tx.execute("INSERT INTO config VALUES(?1,?2)", params![key, value])?;
+            }
+            tx.execute("INSERT INTO branches VALUES(?1,?1,NULL)", [MAIN])?;
+            tx.commit()?;
+        } else {
+            ensure!(
+                app == 1414223440
+                    && db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))? == 1,
+                "UNSUPPORTED_METADATA_FORMAT"
+            );
         }
+        let config = |key: &str| -> Result<String> {
+            Ok(db.query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))?)
+        };
+        let device = config("device")?;
+        let repository = config("repo")?;
+        let active = config("active")?;
+        if let Some(repo) = repo {
+            ensure!(repo == repository, "REPOSITORY_MISMATCH");
+        }
+        let mut store = Self {
+            root: root.to_owned(),
+            device,
+            repo: repository,
+            active,
+            content,
+            db,
+            views: BTreeMap::new(),
+            clock: 0,
+            pending_since: None,
+        };
+        store.load_view(&store.active.clone())?;
+        store.clock = store
+            .db
+            .query_row("SELECT value FROM config WHERE key='clock'", [], |r| {
+                r.get::<_, String>(0)
+            })?
+            .parse()?;
         Ok(store)
     }
-    /// The current schema initializer owns identity creation. Reopening only
-    /// reads committed identities and never fills a missing field.
-    fn open_identity(db: Connection, root: &Path) -> Result<Self> {
-        let get = |key: &str| -> Result<String> {
-            db.query_row("SELECT value FROM config WHERE key=?", [key], |r| r.get(0))
-                .context("INVALID_STORE_METADATA")
-        };
-        let repo_id = get("repo")?;
-        let device = get("device")?;
-        let active = get("active")?;
-        let generation: u64 = get("generation")?
-            .parse()
-            .context("INVALID_STORE_METADATA")?;
-        Ok(Self {
-            db,
-            root: root.to_owned(),
-            repo: repo_id,
-            device,
-            active,
-            generation,
-            save_connection_failed: false,
-            view_cache: RefCell::new(None),
-            caches: StoreCaches::default(),
-        })
-    }
-    /// Phase 7: resume each branch from its startup snapshot, else rebuild it.
-    fn resume_or_rebuild(&mut self) -> Result<()> {
-        for branch in self.branches()? {
-            if !self.resume_snapshot(&branch)? {
-                crate::startup::progress("reconstructing snapshot");
-                self.rebuild(&branch.id)?;
+    fn load_tree(
+        &self,
+        digest: Digest,
+        parent: &str,
+        projection: &mut Projection,
+        depth: usize,
+    ) -> Result<()> {
+        ensure!(depth < 256, "TREE_TOO_DEEP");
+        let tree = Tree::decode(&self.content.packs.get(digest)?)?;
+        projection.trees.insert(parent.into(), digest);
+        for e in tree.entries {
+            ensure!(
+                !projection.entries.contains_key(&e.entity),
+                "DUPLICATE_TREE_ENTITY"
+            );
+            let entry = Entry {
+                id: e.entity.clone(),
+                parent: parent.into(),
+                name: e.name,
+                kind: e.kind,
+                content: e.content,
+                times: e.times,
+                mode: e.mode,
+                attributes: e.attributes,
+                deleted: false,
+                working_len: None,
+            };
+            projection.index(entry)?;
+            if let Some(child) = e.tree {
+                self.load_tree(child, &e.entity, projection, depth + 1)?;
             }
         }
         Ok(())
     }
-    /// Separate connection for bulk I/O. No replay, projection rebuild or engine
-    /// mutex; accepted metadata remains owned by the worker's semantic engine.
-    pub fn transfer_view(&self) -> Result<Self> {
-        Self::open_transfer(&self.root, &self.repo, &self.device)
-    }
-    pub(crate) fn open_transfer(root: &Path, repo: &str, device: &str) -> Result<Self> {
-        Self::open_transfer_timeout(root, repo, device, std::time::Duration::from_secs(5))
-    }
-    pub(crate) fn open_transfer_nowait(root: &Path, repo: &str, device: &str) -> Result<Self> {
-        Self::open_transfer_timeout(root, repo, device, std::time::Duration::ZERO)
-    }
-    fn open_transfer_timeout(
-        root: &Path,
-        repo: &str,
-        device: &str,
-        timeout: std::time::Duration,
-    ) -> Result<Self> {
-        let db = schema::secondary(root, repo, device, timeout)?;
-        let active = db.query_row("SELECT value FROM config WHERE key='active'", [], |row| {
-            row.get(0)
-        })?;
-        Ok(Self {
-            db,
-            root: root.to_owned(),
-            repo: repo.to_owned(),
-            device: device.to_owned(),
-            active,
-            generation: 0,
-            save_connection_failed: false,
-            view_cache: RefCell::new(None),
-            caches: StoreCaches::default(),
-        })
-    }
-    /// Public secondary handle: an alias of the bulk transfer view. It runs no
-    /// schema work, recovery or replay; its view cache follows other
-    /// connections' commits through `PRAGMA data_version`.
-    pub fn open_secondary(root: &Path, repo: &str, device: &str) -> Result<Store> {
-        Self::open_transfer(root, repo, device)
-    }
-    pub fn branches(&self) -> Result<Vec<Branch>> {
-        Ok(self
-            .db
-            .prepare("SELECT id,name,shared FROM branches ORDER BY name,id")?
-            .query_map([], |r| {
-                Ok(Branch {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    shared: r.get(2)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?)
-    }
-    pub fn branch(&self, name_or_id: &str) -> Result<Branch> {
-        let branches = self.branches()?;
-        if let Some(b) = branches.iter().find(|b| b.id == name_or_id) {
-            return Ok(b.clone());
-        }
-        let matching: Vec<_> = branches
-            .into_iter()
-            .filter(|b| b.name == name_or_id)
-            .collect();
-        ensure!(
-            matching.len() <= 1,
-            "AMBIGUOUS_BRANCH: use stable branch ID"
-        );
-        matching.into_iter().next().context("BRANCH_NOT_FOUND")
-    }
-    pub fn events(&self) -> Result<Vec<Event>> {
-        let payloads = self
-            .db
-            .prepare("SELECT payload FROM events ORDER BY id")?
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        payloads
-            .into_iter()
-            .map(|s| Ok(serde_json::from_str(&s)?))
-            .collect()
-    }
-    pub fn projection(&self, branch: &str) -> Result<Projection> {
-        Ok(self.view(branch)?.projection.clone())
-    }
-    /// Changes only when another connection commits; a connection's own
-    /// commits leave it unchanged (those are covered by `total_changes`).
-    fn data_version(&self) -> Result<i64> {
-        Ok(self
-            .db
-            .prepare_cached("PRAGMA data_version")?
-            .query_row([], |r| r.get(0))?)
-    }
-    /// Keeps the cached view across other connections' commits that changed
-    /// no projection row (WP3.INT): when `PRAGMA data_version` moved but the
-    /// projection tables' counter (`snapshot::projection_version`) is the
-    /// one the view was built at, the view is re-keyed to the current
-    /// `data_version` instead of being reloaded in full (O(entries)) at its
-    /// next use. Read after `data_version`, so a projection change that
-    /// lands in between only costs a reload. Own writes are still keyed by
-    /// `total_changes` and the transaction state, as before.
-    pub(super) fn adopt_foreign_commits(&self) {
-        let Ok(data_version) = self.data_version() else {
-            return;
-        };
-        let stale = self.view_cache.try_borrow().is_ok_and(|cache| {
-            cache
-                .as_ref()
-                .is_some_and(|v| v.data_version != data_version && v.projection_version.is_some())
-        });
-        if !stale {
-            return;
-        }
-        let current = snapshot::projection_version(&self.db);
-        if current.is_none() {
-            return;
-        }
-        if let Ok(mut cache) = self.view_cache.try_borrow_mut()
-            && let Some(view) = cache.as_mut()
-            && view.data_version != data_version
-            && view.projection_version == current
-        {
-            view.data_version = data_version;
-        }
-    }
-    fn view(&self, branch: &str) -> Result<Ref<'_, ViewCache>> {
-        // CCR-WP2.4-6 (WP2.INT): a caller's rollback (`ROLLBACK`, `ROLLBACK
-        // TO`) can undo a commit of this connection without moving the
-        // freshness key below; drop such a view before any reader sees it.
-        self.drop_rolled_back_view();
-        self.adopt_foreign_commits();
-        let changes = self.db.total_changes();
-        let data_version = self.data_version()?;
-        let transactional = !self.db.is_autocommit();
-        let fresh = self.view_cache.borrow().as_ref().is_some_and(|v| {
-            v.branch == branch
-                && v.changes == changes
-                && v.data_version == data_version
-                && v.transactional == transactional
-        });
-        if !fresh {
-            // Read before the projection: a projection change that lands in
-            // between makes the recorded counter older (a later reload),
-            // never newer than what was loaded.
-            let projection_version = snapshot::projection_version(&self.db);
-            let projection = snapshot::load_projection(&self.db, branch)?;
-            self.count_view_load();
-            let slots = projection
-                .entries
-                .values()
-                .filter(|e| e.alive)
-                .map(|e| Ok(((e.parent.clone(), name_key(&e.name)?), e.id.clone())))
-                .collect::<Result<_>>()?;
-            *self.view_cache.borrow_mut() = Some(ViewCache {
-                branch: branch.into(),
-                changes,
-                data_version,
-                transactional,
-                projection_version,
-                projection,
-                slots,
-            });
-        }
-        Ok(Ref::map(self.view_cache.borrow(), |v| v.as_ref().unwrap()))
-    }
-    pub fn entry(&self, entity: &str) -> Result<Entry> {
-        self.view(&self.active)?
-            .projection
-            .entries
-            .get(entity)
-            .cloned()
-            .context("FILE_NOT_FOUND")
-    }
-    fn rebuild(&mut self, branch: &str) -> Result<()> {
-        let events: Vec<_> = self
-            .events()?
-            .into_iter()
-            .filter(|e| e.branch.id == branch)
-            .collect();
-        let projection = project(branch, &events)?;
-        let tx = self.db.savepoint()?;
-        persist_projection(&tx, branch, &projection, &events, None)?;
-        snapshot::persist(&tx, branch)?;
-        tx.commit()?;
-        Ok(())
-    }
-    fn rebuild_frontiers(&mut self) -> Result<()> {
-        let events = self.events()?;
-        let referenced: BTreeSet<_> = events
-            .iter()
-            .flat_map(|e| {
-                e.dependencies
-                    .iter()
-                    .chain(e.changes.iter().flat_map(|c| c.parents.iter()))
-            })
-            .collect();
-        let tx = self.db.savepoint()?;
-        tx.execute("DELETE FROM event_frontier", [])?;
-        for e in events.iter().filter(|e| !referenced.contains(&e.id)) {
-            tx.execute(
-                "INSERT INTO event_frontier VALUES(?,?)",
-                params![e.branch.id, e.id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-    fn evacuate_unvalidated_journal(&mut self) -> Result<()> {
-        // Upgrade older PoC journals that acknowledged incomplete events. Keep
-        // their payloads/objects inspectable in the durable inbox, but remove
-        // them from accepted inventories, local dependency frontiers and outbox.
-        let events = self.events()?;
-        let known: BTreeMap<_, _> = events.iter().map(|e| (e.id.clone(), e.clone())).collect();
-        let mut rejected: BTreeMap<String, String> = BTreeMap::new();
-        for e in &events {
-            crate::startup::progress("validating journal");
-            if let Err(error) = validate_direct_links(e, &known, &BTreeSet::new()) {
-                rejected.insert(e.id.clone(), format!("{error:#}"));
-            }
-        }
-        let candidates: Vec<_> = events
-            .iter()
-            .filter(|e| !rejected.contains_key(&e.id))
-            .cloned()
-            .collect();
-        let valid = activated_ids(&candidates);
-        // Only legacy unresolved nodes need cycle/ancestor traversal. Ordinary
-        // long accepted chains validate once per direct edge, not per ancestor.
-        for e in events.iter().filter(|e| !valid.contains(&e.id)) {
-            if let Err(error) = validate_known_links(e, &known, &rejected.keys().cloned().collect())
-            {
-                rejected.insert(e.id.clone(), format!("{error:#}"));
-            }
-        }
-        let deferred: Vec<_> = events.iter().filter(|e| !valid.contains(&e.id)).collect();
-        if deferred.is_empty() {
+    fn load_view(&mut self, branch: &str) -> Result<()> {
+        if self.views.contains_key(branch) {
             return Ok(());
         }
-        let tx = self.db.savepoint()?;
-        let mut branches = BTreeSet::new();
-        for e in deferred {
-            let payload = serde_json::to_string(e)?;
-            let old: Option<String> = tx
-                .query_row(
-                    "SELECT payload FROM incoming_events WHERE id=?",
-                    [&e.id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            ensure!(old.is_none_or(|old| old == payload), "EVENT_ID_REUSED");
-            tx.execute("INSERT INTO incoming_events(id,payload,error) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET error=excluded.error", params![e.id,payload,rejected.get(&e.id)])?;
-            tx.execute("DELETE FROM outbox WHERE event=?", [&e.id])?;
-            tx.execute("DELETE FROM peer_known WHERE event=?", [&e.id])?;
-            tx.execute("DELETE FROM events WHERE id=?", [&e.id])?;
-            branches.insert(e.branch.id.clone());
+        let snapshot: Option<String> = self
+            .db
+            .query_row("SELECT snapshot FROM branches WHERE id=?1", [branch], |r| {
+                r.get(0)
+            })
+            .context("BRANCH_NOT_FOUND")?;
+        let mut projection = Projection::empty();
+        if let Some(snapshot) = snapshot {
+            let snapshot = self.snapshot(&snapshot)?;
+            self.load_tree(snapshot.root, ROOT, &mut projection, 0)?;
+            projection.heads = Arc::new(
+                snapshot
+                    .frontier
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.iter().cloned().collect()))
+                    .collect(),
+            );
+            projection.visible = Arc::new(
+                snapshot
+                    .frontier
+                    .iter()
+                    .filter_map(|(k, v)| v.first().map(|v| (k.clone(), v.clone())))
+                    .collect(),
+            );
         }
-        // Rebuild valid history/reviews in this SAME transaction. In particular,
-        // a cut-budget failure must roll back migration and preserve old records.
-        // Invalid event evidence remains in incoming_events and immutable CAS.
-        for branch in branches {
-            let accepted: Vec<_> = events
-                .iter()
-                .filter(|e| e.branch.id == branch && valid.contains(&e.id))
-                .cloned()
-                .collect();
-            let projection = project(&branch, &accepted)?;
-            tx.execute("DELETE FROM conflicts WHERE branch=?", [&branch])?;
-            persist_projection(&tx, &branch, &projection, &accepted, None)?;
+        let rows = {
+            let mut q = self
+                .db
+                .prepare("SELECT entity,state,visible FROM current WHERE branch=?1")?;
+            q.query_map([branch], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (entity, state, visible) in rows {
+            projection.index(serde_json::from_slice(&state)?)?;
+            Arc::make_mut(&mut projection.visible).insert(entity, visible);
         }
-        tx.commit()?;
+        let rows = {
+            let mut q = self
+                .db
+                .prepare("SELECT entity,version FROM heads WHERE branch=?1")?;
+            q.query_map([branch], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut overlaid = BTreeSet::new();
+        for (entity, version) in rows {
+            let heads = Arc::make_mut(&mut projection.heads);
+            if overlaid.insert(entity.clone()) {
+                heads.insert(entity.clone(), BTreeSet::new());
+            }
+            heads.entry(entity).or_default().insert(version);
+        }
+        for (entity, visible) in &*projection.visible {
+            Arc::make_mut(&mut projection.anchors)
+                .insert(entity.clone(), self.content_anchor(visible)?);
+        }
+        self.views.insert(branch.into(), projection);
         Ok(())
     }
-    pub fn children(&self, parent: &str) -> Result<Vec<Entry>> {
-        let view = self.view(&self.active)?;
-        // Keep the original projection-based enumeration for conflicted cuts;
-        // do not make the lookup index an additional choice of alternatives.
-        if !view.projection.conflicts.is_empty() {
-            return Ok(view
-                .projection
-                .entries
-                .values()
-                .filter(|entry| entry.alive && entry.parent == parent)
-                .cloned()
-                .collect());
-        }
-        // The existing live namespace index groups each parent's names. Avoid
-        // walking unrelated entries for every directory enumeration ordinal.
-        Ok(view
-            .slots
-            .range((parent.to_owned(), String::new())..)
-            .take_while(|((p, _), _)| p == parent)
-            .map(|(_, entity)| view.projection.entries[entity].clone())
-            .collect())
+    pub fn projection(&self) -> &Projection {
+        &self.views[&self.active]
     }
-    pub fn event(&self, branch: &Branch, changes: Vec<Change>) -> Event {
-        // Order observed namespace prerequisites without claiming an old writer
-        // reviewed other file revisions. Registers still use their actual bases.
-        let dependencies = self
-            .db
-            .prepare("SELECT event FROM event_frontier WHERE branch=? ORDER BY event")
-            .and_then(|mut statement| {
-                statement
-                    .query_map([&branch.id], |r| r.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()
-            })
-            .expect("CAUSAL_FRONTIER_UNAVAILABLE");
-        let object_sizes = changes
-            .iter()
-            .filter(|c| c.field == "content")
-            .filter_map(|c| c.value.as_str())
-            .filter_map(|h| self.object_size(h).ok().map(|size| (h.to_owned(), size)))
-            .collect();
-        Event {
-            object_sizes,
-            id: id(),
-            repo: self.repo.clone(),
-            branch: branch.clone(),
-            device: self.device.clone(),
-            created_ms: time(),
-            changes,
-            dependencies,
-            reviewed: vec![],
-        }
+    pub fn lookup(&self, path: &str) -> Result<Entry> {
+        self.projection().lookup(path)
     }
-    pub fn current_change(&self, entity: &str, field: &str, value: Value) -> Result<Change> {
-        let view = self.view(&self.active)?;
-        let parents = view
-            .projection
+    pub fn entry(&self, entity: &str) -> Result<Entry> {
+        self.projection()
             .entries
             .get(entity)
-            .and_then(|e| e.revisions.get(field))
+            .cloned()
+            .context("NOT_FOUND")
+    }
+    pub fn basis(&self, entity: &str) -> Result<Basis> {
+        let entry = self.entry(entity)?;
+        Ok(Basis {
+            entity: entity.into(),
+            branch: self.active.clone(),
+            version: self
+                .projection()
+                .visible
+                .get(entity)
+                .cloned()
+                .context("VERSION_MISSING")?,
+            anchor: self
+                .projection()
+                .anchors
+                .get(entity)
+                .cloned()
+                .context("VERSION_MISSING")?,
+            content: entry.content.context("IS_A_DIRECTORY")?,
+        })
+    }
+    pub fn content_anchor(&self, version: &str) -> Result<String> {
+        let mut current = self.version(version)?.context("VERSION_MISSING")?;
+        for _ in 0..4096 {
+            if current.author != self.device
+                || !matches!(
+                    current.operation,
+                    Operation::Times | Operation::Rename | Operation::Delete
+                )
+                || current.parents.len() != 1
+            {
+                return Ok(current.id);
+            }
+            let parent = self
+                .version(&current.parents[0])?
+                .context("VERSION_MISSING")?;
+            if current.state.content != parent.state.content {
+                return Ok(current.id);
+            }
+            current = parent;
+        }
+        anyhow::bail!("METADATA_CHAIN_TOO_DEEP")
+    }
+    pub fn event(
+        &mut self,
+        branch: &str,
+        state: Entry,
+        parents: Vec<String>,
+        operation: Operation,
+    ) -> Event {
+        self.clock += 1;
+        Event {
+            id: id(),
+            entity: state.id.clone(),
+            parents,
+            operation,
+            state,
+            branch: branch.into(),
+            author: self.device.clone(),
+            clock: self.clock,
+        }
+    }
+    fn validate_event(&self, event: &Event) -> Result<bool> {
+        ensure!(
+            Uuid::parse_str(&event.id).is_ok()
+                && event.entity == event.state.id
+                && event.entity != ROOT
+                && !event.author.is_empty()
+                && event.clock > 0,
+            "INVALID_EVENT"
+        );
+        name_key(&event.state.name)?;
+        ensure!(
+            event.state.mode & !0o7777 == 0 && event.parents.len() <= 1024,
+            "INVALID_EVENT"
+        );
+        match event.state.kind {
+            EntryKind::File => event
+                .state
+                .content
+                .as_ref()
+                .context("CONTENT_REQUIRED")?
+                .validate()?,
+            EntryKind::Directory => ensure!(event.state.content.is_none(), "DIRECTORY_HAS_CONTENT"),
+        }
+        ensure!(
+            (event.operation != Operation::Delete || event.state.deleted)
+                && (!event.state.deleted
+                    || matches!(event.operation, Operation::Delete | Operation::Resolve)),
+            "INVALID_DELETION"
+        );
+        let mut parents = BTreeSet::new();
+        for parent in &event.parents {
+            ensure!(parents.insert(parent), "DUPLICATE_PARENT");
+            let Some(prior) = self.version(parent)? else {
+                return Ok(false);
+            };
+            ensure!(
+                prior.entity == event.entity && prior.clock < event.clock,
+                "INVALID_PARENT"
+            );
+        }
+        ensure!(
+            !event.parents.is_empty()
+                || matches!(event.operation, Operation::Create | Operation::Mkdir),
+            "VERSION_PARENT_REQUIRED"
+        );
+        Ok(true)
+    }
+    pub fn version(&self, id: &str) -> Result<Option<Event>> {
+        let value: Option<Vec<u8>> = self
+            .db
+            .query_row("SELECT event FROM events WHERE id=?1", [id], |r| r.get(0))
+            .optional()?;
+        value.map(|v| Ok(serde_json::from_slice(&v)?)).transpose()
+    }
+    /// One metadata transaction per batch. Projection changes become visible
+    /// only after commit, and missing parents remain in the bounded inbox.
+    pub fn apply(&mut self, events: &[Event]) -> Result<Vec<String>> {
+        self.apply_batch(events, &[])
+    }
+    pub fn apply_batch(
+        &mut self,
+        events: &[Event],
+        receipts: &[(String, String, u128)],
+    ) -> Result<Vec<String>> {
+        let mut applied = Vec::new();
+        let mut pending: Vec<Event> = events.to_vec();
+        {
+            let mut q = self.db.prepare("SELECT event FROM waiting LIMIT 4096")?;
+            for row in q.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
+                pending.push(serde_json::from_slice(&row?)?);
+            }
+        }
+        // Validate against earlier events in the same batch through a temporary
+        // transaction. All projections are rebuilt from per-entity deltas below.
+        for event in events {
+            let exists: bool = self.db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM branches WHERE id=?1)",
+                [&event.branch],
+                |r| r.get(0),
+            )?;
+            if exists {
+                self.load_view(&event.branch)?;
+            }
+        }
+        let mut affected = BTreeSet::new();
+        if !receipts.is_empty() {
+            self.flush_metadata()?;
+            self.db.execute_batch("PRAGMA synchronous=FULL;")?;
+        }
+        if self.db.is_autocommit() {
+            self.db.execute_batch("BEGIN IMMEDIATE;")?;
+            self.pending_since = Some(std::time::Instant::now());
+        }
+        self.db.execute_batch("SAVEPOINT apply_events;")?;
+        let tx = &self.db;
+        let result = (|| -> Result<()> {
+            let mut progress = true;
+            while progress {
+                progress = false;
+                let mut remain = Vec::new();
+                for event in pending.drain(..) {
+                    if let Some(existing) = self.version(&event.id)? {
+                        ensure!(existing == event, "EVENT_ID_COLLISION");
+                        tx.execute("DELETE FROM waiting WHERE id=?1", [&event.id])?;
+                        continue;
+                    }
+                    if !self.validate_event(&event)? {
+                        remain.push(event);
+                        continue;
+                    }
+                    let exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM branches WHERE id=?1)",
+                        [&event.branch],
+                        |r| r.get(0),
+                    )?;
+                    if !exists {
+                        tx.execute("INSERT INTO branches VALUES(?1,?1,NULL)", [&event.branch])?;
+                    }
+                    // Seed inherited heads when a branch receives its first edit.
+                    let inherited = self
+                        .views
+                        .get(&event.branch)
+                        .and_then(|p| p.heads.get(&event.entity));
+                    let explicit: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM heads WHERE branch=?1 AND entity=?2)",
+                        params![event.branch, event.entity],
+                        |r| r.get(0),
+                    )?;
+                    if !explicit && let Some(heads) = inherited {
+                        for head in heads {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO heads VALUES(?1,?2,?3)",
+                                params![event.branch, event.entity, head],
+                            )?;
+                        }
+                    }
+                    for parent in &event.parents {
+                        tx.execute(
+                            "DELETE FROM heads WHERE branch=?1 AND entity=?2 AND version=?3",
+                            params![event.branch, event.entity, parent],
+                        )?;
+                    }
+                    tx.execute(
+                        "INSERT INTO events(id,branch,entity,event) VALUES(?1,?2,?3,?4)",
+                        params![
+                            event.id,
+                            event.branch,
+                            event.entity,
+                            serde_json::to_vec(&event)?
+                        ],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO heads VALUES(?1,?2,?3)",
+                        params![event.branch, event.entity, event.id],
+                    )?;
+                    let heads: usize = tx.query_row(
+                        "SELECT count(*) FROM heads WHERE branch=?1 AND entity=?2",
+                        params![event.branch, event.entity],
+                        |r| r.get(0),
+                    )?;
+                    let old: Option<String> = tx
+                        .query_row(
+                            "SELECT visible FROM current WHERE branch=?1 AND entity=?2",
+                            params![event.branch, event.entity],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let candidate = old.or_else(|| {
+                        self.views
+                            .get(&event.branch)
+                            .and_then(|p| p.visible.get(&event.entity).cloned())
+                    });
+                    let visible = if heads > 1 {
+                        candidate
+                            .filter(|old| !event.parents.contains(old))
+                            .unwrap_or_else(|| event.id.clone())
+                    } else {
+                        event.id.clone()
+                    };
+                    let state = if visible == event.id {
+                        event.state.clone()
+                    } else {
+                        self.version(&visible)?
+                            .context("VISIBLE_VERSION_MISSING")?
+                            .state
+                    };
+                    tx.execute(
+                        "INSERT OR REPLACE INTO current VALUES(?1,?2,?3,?4)",
+                        params![
+                            event.branch,
+                            event.entity,
+                            serde_json::to_vec(&state)?,
+                            visible
+                        ],
+                    )?;
+                    if heads > 1 {
+                        tx.execute("INSERT OR IGNORE INTO conflict_history SELECT branch,entity,version FROM heads WHERE branch=?1 AND entity=?2",params![event.branch,event.entity])?;
+                    }
+                    tx.execute("DELETE FROM waiting WHERE id=?1", [&event.id])?;
+                    affected.insert((event.branch.clone(), event.entity.clone()));
+                    applied.push(event.id.clone());
+                    progress = true;
+                }
+                pending = remain;
+            }
+            ensure!(pending.len() <= 4096, "INBOX_FULL");
+            for event in &pending {
+                tx.execute(
+                    "INSERT OR IGNORE INTO waiting VALUES(?1,?2)",
+                    params![event.id, serde_json::to_vec(event)?],
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tx.execute_batch("ROLLBACK TO apply_events; RELEASE apply_events;")?;
+            if !receipts.is_empty() {
+                tx.execute_batch("ROLLBACK;PRAGMA synchronous=NORMAL;")?;
+                self.pending_since = None;
+            }
+            return Err(error);
+        }
+        let clock = events
+            .iter()
+            .map(|e| e.clock)
+            .max()
+            .unwrap_or(0)
+            .max(self.clock);
+        tx.execute(
+            "UPDATE config SET value=?1 WHERE key='clock'",
+            [clock.to_string()],
+        )?;
+        for (operation, event, stamp) in receipts {
+            tx.execute(
+                "INSERT OR IGNORE INTO seal_receipts VALUES(?1,?2,?3)",
+                params![operation, event, stamp.to_string()],
+            )?;
+        }
+        tx.execute_batch("RELEASE apply_events;")?;
+        if !receipts.is_empty() {
+            self.flush_metadata()?;
+            self.db.execute_batch("PRAGMA synchronous=NORMAL;")?;
+        } else if self
+            .pending_since
+            .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(5))
+        {
+            self.flush_metadata()?;
+        }
+        for (branch, entity) in affected {
+            if !self.views.contains_key(&branch) {
+                self.load_view(&branch)?;
+                continue;
+            }
+            let (state, visible): (Vec<u8>, String) = self.db.query_row(
+                "SELECT state,visible FROM current WHERE branch=?1 AND entity=?2",
+                params![branch, entity],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let heads = {
+                let mut q = self
+                    .db
+                    .prepare("SELECT version FROM heads WHERE branch=?1 AND entity=?2")?;
+                q.query_map(params![branch, entity], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<BTreeSet<_>>>()?
+            };
+            let anchor = self.content_anchor(&visible)?;
+            let p = self.views.get_mut(&branch).unwrap();
+            p.index(serde_json::from_slice(&state)?)?;
+            Arc::make_mut(&mut p.visible).insert(entity.clone(), visible);
+            Arc::make_mut(&mut p.anchors).insert(entity.clone(), anchor);
+            Arc::make_mut(&mut p.heads).insert(entity, heads);
+        }
+        if let Some(clock) = events.iter().map(|e| e.clock).max() {
+            self.clock = self.clock.max(clock);
+        }
+        Ok(applied)
+    }
+    pub fn flush_metadata(&mut self) -> Result<()> {
+        if !self.db.is_autocommit() {
+            self.db.execute_batch("COMMIT;")?;
+        }
+        self.pending_since = None;
+        Ok(())
+    }
+    pub fn commit_due(&mut self) -> Result<()> {
+        if self
+            .pending_since
+            .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(5))
+        {
+            self.flush_metadata()?;
+        }
+        Ok(())
+    }
+    fn local(&mut self, state: Entry, operation: Operation) -> Result<Event> {
+        let parents = self
+            .projection()
+            .visible
+            .get(&state.id)
             .cloned()
             .into_iter()
             .collect();
-        Ok(Change {
-            entity: entity.into(),
-            field: field.into(),
-            parents,
-            value,
-        })
+        let event = self.event(&self.active.clone(), state, parents, operation);
+        self.apply(std::slice::from_ref(&event))?;
+        Ok(event)
     }
-    pub fn lookup(&self, path: &str) -> Result<Entry> {
-        let view = self.view(&self.active)?;
-        let mut entry = Entry {
-            id: ROOT.into(),
-            kind: "directory".into(),
-            alive: true,
-            ..Default::default()
-        };
-        for component in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
-            let key = (entry.id, name_key(component)?);
-            let entity = view.slots.get(&key).context("FILE_NOT_FOUND")?;
-            entry = view.projection.entries[entity].clone();
-        }
-        Ok(entry)
-    }
-    pub fn create(&mut self, path: &str, kind: &str) -> Result<Entry> {
+    pub fn create(&mut self, path: &str, kind: EntryKind) -> Result<Entry> {
         self.create_with_attributes(path, kind, None)
     }
     pub fn create_with_attributes(
         &mut self,
         path: &str,
-        kind: &str,
+        kind: EntryKind,
         attributes: Option<u32>,
     ) -> Result<Entry> {
-        let (parent, name) = split_path(path)?;
-        let dir = self.lookup(&parent)?;
-        ensure!(dir.kind == "directory", "NOT_DIRECTORY");
-        ensure!(self.lookup(path).is_err(), "NAME_COLLISION");
-        let entity = id();
-        let mut changes = vec![
-            Change {
-                entity: entity.clone(),
-                field: "kind".into(),
-                parents: vec![],
-                value: json!(kind),
+        let names = components(path)?;
+        let name = names.last().context("INVALID_NAME")?;
+        ensure!(self.lookup(path).is_err(), "ALREADY_EXISTS");
+        let parent = self.lookup(&names[..names.len() - 1].join("/"))?;
+        ensure!(parent.kind == EntryKind::Directory, "NOT_A_DIRECTORY");
+        let content = if kind == EntryKind::File {
+            let content = self.content.import(&[])?;
+            self.content.packs.flush()?;
+            Some(content)
+        } else {
+            None
+        };
+        let entry = Entry {
+            id: id(),
+            parent: parent.id,
+            name: name.to_string(),
+            kind,
+            content,
+            times: Times::default(),
+            mode: if kind == EntryKind::Directory {
+                0o755
+            } else {
+                0o644
             },
-            Change {
-                entity: entity.clone(),
-                field: "location".into(),
-                parents: vec![],
-                value: json!({"parent":dir.id,"name":name}),
+            attributes: attributes.unwrap_or(if kind == EntryKind::Directory {
+                0x10
+            } else {
+                0x80
+            }) | if kind == EntryKind::Directory {
+                0x10
+            } else {
+                0
             },
-            Change {
-                entity: entity.clone(),
-                field: "alive".into(),
-                parents: vec![],
-                value: json!(true),
+            deleted: false,
+            working_len: None,
+        };
+        self.local(
+            entry.clone(),
+            if kind == EntryKind::Directory {
+                Operation::Mkdir
+            } else {
+                Operation::Create
             },
-        ];
-        if kind == "file" {
-            self.check_content_write()?;
-            changes.push(Change {
-                entity: entity.clone(),
-                field: "content".into(),
-                parents: vec![],
-                value: json!(crate::model::content::FileContentRef::new(
-                    crate::model::content::ContentKind::Direct,
-                    crate::model::content::Digest::bytes(&[]),
-                    0
-                )?),
-            });
-        }
-        let branch = self.branch(&self.active)?;
-        let mut event = self.event(&branch, changes);
-        if let Some(attributes) = attributes {
-            let now = filetime(event.created_ms);
-            let basic = BasicInfo {
-                posix_mode: None,
-                attributes: BasicInfo::attributes(kind, attributes)?,
-                creation_time: now,
-                access_time: now,
-                write_time: now,
-                change_time: now,
-            };
-            event.changes.push(Change {
-                entity,
-                field: "basic".into(),
-                parents: vec![],
-                value: json!(basic),
-            });
-        }
-        self.commit(event, true)?;
-        self.lookup(path)
-    }
-    pub fn set_basic(&mut self, entity: &str, basic: BasicInfo) -> Result<()> {
-        basic.validate()?;
-        let entry = self.entry(entity)?;
-        ensure!(
-            basic.attributes == BasicInfo::attributes(&entry.kind, basic.attributes)?,
-            "INVALID_ATTRIBUTES"
-        );
-        if entry.basic_info() == basic {
-            return Ok(());
-        }
-        let change = self.current_change(entity, "basic", json!(basic))?;
-        self.commit(self.event(&self.branch(&self.active)?, vec![change]), true)
+        )?;
+        Ok(entry)
     }
     pub fn rename(&mut self, entity: &str, target: &str, replace: bool) -> Result<()> {
-        let (parent, name) = split_path(target)?;
-        let dir = self.lookup(&parent)?;
-        ensure!(dir.kind == "directory", "NOT_DIRECTORY");
-        let p = self.projection(&self.active)?;
-        let source = p.entries.get(entity).context("FILE_NOT_FOUND")?;
-        let mut ancestor = dir.id.clone();
+        let mut entry = self.entry(entity)?;
+        ensure!(entity != ROOT, "ROOT_IMMUTABLE");
+        let names = components(target)?;
+        let name = names.last().context("INVALID_NAME")?;
+        let parent = self.lookup(&names[..names.len() - 1].join("/"))?;
+        ensure!(parent.kind == EntryKind::Directory, "NOT_A_DIRECTORY");
+        let mut ancestor = parent.id.as_str();
         while ancestor != ROOT {
             ensure!(ancestor != entity, "DIRECTORY_CYCLE");
-            ancestor = p
+            ancestor = &self
+                .projection()
                 .entries
-                .get(&ancestor)
-                .context("FILE_NOT_FOUND")?
-                .parent
-                .clone();
+                .get(ancestor)
+                .context("NOT_FOUND")?
+                .parent;
         }
-        let mut changes =
-            vec![self.current_change(entity, "location", json!({"parent":dir.id,"name":name}))?];
+        let mut events = Vec::new();
         if let Ok(existing) = self.lookup(target)
             && existing.id != entity
         {
+            ensure!(replace && existing.kind == entry.kind, "ALREADY_EXISTS");
             ensure!(
-                replace && existing.kind == "file" && source.kind == "file",
-                "NAME_COLLISION"
+                existing.kind != EntryKind::Directory
+                    || self.projection().children(&existing.id).is_empty(),
+                "DIRECTORY_NOT_EMPTY"
             );
-            changes.push(self.current_change(&existing.id, "alive", json!(false))?);
+            let mut dead = existing.clone();
+            dead.deleted = true;
+            events.push(self.event(
+                &self.active.clone(),
+                dead,
+                vec![self.projection().visible[&existing.id].clone()],
+                Operation::Delete,
+            ));
         }
-        let b = self.branch(&self.active)?;
-        self.commit(self.event(&b, changes), true)
-    }
-    pub fn delete(&mut self, entity: &str) -> Result<()> {
-        let p = self.projection(&self.active)?;
-        ensure!(
-            !p.entries.values().any(|e| e.alive && e.parent == entity),
-            "DIRECTORY_NOT_EMPTY"
+        entry.parent = parent.id;
+        entry.name = name.to_string();
+        entry.times.changed = Times::default().changed;
+        let event = self.event(
+            &self.active.clone(),
+            entry,
+            vec![self.projection().visible[entity].clone()],
+            Operation::Rename,
         );
-        let b = self.branch(&self.active)?;
-        self.commit(
-            self.event(
-                &b,
-                vec![self.current_change(entity, "alive", json!(false))?],
-            ),
-            true,
-        )
-    }
-    /// Fork/publish only the currently visible cut. Neither source event IDs nor
-    /// private conflict alternatives/ancestry appear in the resulting root event.
-    pub fn fork(&mut self, name: &str, shared: bool) -> Result<Branch> {
-        name_key(name)?;
-        ensure!(
-            !self
-                .branches()?
-                .iter()
-                .any(|b| b.name == name && b.shared == shared),
-            "BRANCH_EXISTS"
-        );
-        let source = self.projection(&self.active)?;
-        ensure!(source.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
-        let b = Branch {
-            id: id(),
-            name: name.into(),
-            shared,
-        };
-        let mut changes = vec![];
-        for entry in source.entries.values().filter(|e| e.alive) {
-            for (field, value) in [
-                ("kind", json!(entry.kind)),
-                ("location", json!({"parent":entry.parent,"name":entry.name})),
-                ("alive", json!(true)),
-                ("basic", json!(entry.basic_info())),
-            ] {
-                changes.push(Change {
-                    entity: entry.id.clone(),
-                    field: field.into(),
-                    parents: vec![],
-                    value,
-                });
-            }
-            if let Some(value) = entry.content_value() {
-                changes.push(Change {
-                    entity: entry.id.clone(),
-                    field: "content".into(),
-                    parents: vec![],
-                    value,
-                });
-            }
-        }
-        if changes.is_empty() {
-            self.db.execute(
-                "INSERT INTO branches VALUES(?,?,?)",
-                params![b.id, b.name, b.shared],
-            )?;
-            self.rebuild(&b.id)?;
-        } else {
-            self.commit(self.event(&b, changes), true)?;
-        }
-        Ok(b)
-    }
-    pub fn checkout(&mut self, branch: &str) -> Result<()> {
-        let b = self.branch(branch)?;
-        let p = self.projection(&b.id)?;
-        ensure!(p.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
-        let generation = self.generation + 1;
-        let tx = self.db.savepoint()?;
-        ensure!(
-            !tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM content_delete_intents) OR EXISTS(SELECT 1 FROM directory_delete_intents)",
-                [],
-                |r| r.get::<_, bool>(0)
-            )?,
-            "RECOVERY_REQUIRED: pending native deletion"
-        );
-        tx.execute("UPDATE config SET value=? WHERE key='active'", [&b.id])?;
-        tx.execute(
-            "UPDATE config SET value=? WHERE key='generation'",
-            [generation.to_string()],
-        )?;
-        tx.commit()?;
-        self.active = b.id;
-        self.generation = generation;
+        events.push(event);
+        self.apply(&events)?;
         Ok(())
     }
-    pub fn conflicts(&self) -> Result<Vec<Conflict>> {
-        let mut s = self
-            .db
-            .prepare("SELECT payload,resolved_by FROM conflicts WHERE branch=? ORDER BY id")?;
-        let rows = s.query_map([&self.active], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-        })?;
-        rows.map(|r| {
-            let (s, resolved) = r?;
-            let mut c: Conflict = serde_json::from_str(&s)?;
-            c.resolved_by = resolved;
-            Ok(c)
-        })
-        .collect()
-    }
-    pub fn resolve(&mut self, conflicts: &[String], selected: &str) -> Result<String> {
-        ensure!(!conflicts.is_empty(), "EXPLICIT_REVIEW_REQUIRED");
-        let all = self.conflicts()?;
-        let mut groups: BTreeMap<String, Vec<&Conflict>> = BTreeMap::new();
-        for requested in conflicts {
-            let c = all
-                .iter()
-                .find(|c| &c.id == requested && c.resolved_by.is_none())
-                .context("CONFLICT_NOT_FOUND")?;
-            ensure!(
-                ["content", "alive", "location", "kind", "basic"].contains(&c.field.as_str()),
-                "NAMESPACE_RESOLUTION_REQUIRES_RENAME_OR_DELETE"
-            );
-            groups
-                .entry(register(&c.entity, &c.field))
-                .or_default()
-                .push(c);
-        }
-        let mut changes = vec![];
-        for group in groups.values() {
-            let c = group[0];
-            let alternatives: Vec<_> = group.iter().flat_map(|c| c.alternatives.iter()).collect();
-            let value = alternatives
-                .iter()
-                .find(|v| v.revision == selected)
-                .context("REVISION_NOT_IN_REVIEW")?
-                .value
-                .clone();
-            let parents = alternatives
-                .iter()
-                .map(|v| v.revision.clone())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            changes.push(Change {
-                entity: c.entity.clone(),
-                field: c.field.clone(),
-                parents,
-                value,
-            });
-        }
-        let b = self.branch(&self.active)?;
-        let mut event = self.event(&b, changes);
-        event.reviewed = conflicts.to_vec();
-        let revision = event.id.clone();
-        self.commit(event, true)?;
-        Ok(revision)
-    }
-    /// Move an explicitly reviewed displaced namespace entry to a free path.
-    /// Only reviewed location revisions are parented; unseen competitors remain.
-    pub fn recover(&mut self, entity: &str, target: &str, reviewed: &[String]) -> Result<String> {
-        ensure!(!reviewed.is_empty(), "EXPLICIT_REVIEW_REQUIRED");
-        let p = self.projection(&self.active)?;
-        let entry = p.entries.get(entity).context("ENTRY_NOT_FOUND")?;
+    pub fn delete(&mut self, entity: &str) -> Result<()> {
+        let mut e = self.entry(entity)?;
+        ensure!(entity != ROOT, "ROOT_IMMUTABLE");
         ensure!(
-            p.heads[&register(entity, "alive")]
-                .last()
-                .is_some_and(|v| v.value == true),
-            "EXPLICIT_EXISTENCE_RESOLUTION_REQUIRED"
+            e.kind != EntryKind::Directory || self.projection().children(entity).is_empty(),
+            "DIRECTORY_NOT_EMPTY"
         );
-        let conflicts = self.conflicts()?;
-        let events = self.events()?;
-        let mut parents = BTreeSet::new();
-        for requested in reviewed {
-            let c = conflicts
-                .iter()
-                .find(|c| &c.id == requested && c.resolved_by.is_none())
-                .context("CONFLICT_NOT_FOUND")?;
-            ensure!(
-                (c.field == "namespace" || c.field == "location")
-                    && c.entity.split(',').any(|e| e == entity),
-                "REVIEW_SCOPE_MISMATCH"
-            );
-            for v in &c.alternatives {
-                if events.iter().find(|e| e.id == v.revision).is_some_and(|e| {
-                    e.changes.iter().any(|ch| {
-                        ch.entity == entity && ch.field == "location" && ch.value == v.value
-                    })
-                }) {
-                    parents.insert(v.revision.clone());
-                }
-            }
+        e.deleted = true;
+        self.local(e, Operation::Delete)?;
+        Ok(())
+    }
+    pub fn set_times(
+        &mut self,
+        entity: &str,
+        times: Times,
+        mode: Option<u32>,
+        attributes: Option<u32>,
+    ) -> Result<()> {
+        let mut e = self.entry(entity)?;
+        e.times = times;
+        if let Some(mode) = mode {
+            e.mode = mode;
         }
-        ensure!(!parents.is_empty(), "REVIEW_HAS_NO_ENTRY_LOCATION");
-        let (parent, name) = split_path(target)?;
-        let dir = self.lookup(&parent)?;
-        ensure!(dir.kind == "directory", "NOT_DIRECTORY");
-        ensure!(self.lookup(target).is_err(), "NAME_COLLISION");
-        let branch = self.branch(&self.active)?;
-        let mut event = self.event(
-            &branch,
-            vec![Change {
-                entity: entity.into(),
-                field: "location".into(),
-                parents: parents.into_iter().collect(),
-                value: json!({"parent":dir.id,"name":name}),
-            }],
-        );
-        event.reviewed = reviewed.to_vec();
-        let revision = event.id.clone();
-        let mut candidate: Vec<_> = events
-            .into_iter()
-            .filter(|e| e.branch.id == self.active)
-            .collect();
-        candidate.push(event.clone());
-        let projected = project(&self.active, &candidate)?;
-        ensure!(
-            lookup(&projected, target).is_ok_and(|e| e.id == entry.id),
-            "RECOVERY_NOT_VISIBLE: review remaining location competitors"
-        );
-        self.commit(event, true)?;
-        Ok(revision)
+        if let Some(a) = attributes {
+            e.attributes = (a & !0x10)
+                | if e.kind == EntryKind::Directory {
+                    0x10
+                } else {
+                    0
+                };
+        }
+        self.local(e, Operation::Times)?;
+        Ok(())
     }
-    pub fn history(&self) -> Result<Value> {
-        let records = self
-            .db
-            .prepare("SELECT id,branch,object,message FROM checkpoints ORDER BY rowid")?
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(json!(records.into_iter().map(|(id,branch,object,message)|json!({"id":id,"branch":branch,"object":object,"message":message})).collect::<Vec<_>>()))
-    }
-    /// Restore creates a fresh PRIVATE branch; it never rewinds shared history.
-    pub fn restore(&mut self, checkpoint: &str, name: &str) -> Result<Branch> {
-        name_key(name)?;
-        ensure!(
-            !self.branches()?.iter().any(|b| b.name == name),
-            "BRANCH_EXISTS"
-        );
-        let object: String = self
+    pub fn receipt(&self, operation: &str) -> Result<Option<(String, u128)>> {
+        let row: Option<(String, String)> = self
             .db
             .query_row(
-                "SELECT object FROM checkpoints WHERE id=?",
-                [checkpoint],
-                |r| r.get(0),
-            )
-            .context("CHECKPOINT_NOT_FOUND")?;
-        let snapshot: Value = serde_json::from_slice(&self.read_object(&object)?)?;
-        ensure!(
-            ["tkfs-snapshot-1", "tkfs-snapshot-2"]
-                .iter()
-                .any(|f| snapshot["format"] == *f),
-            "INVALID_SNAPSHOT"
-        );
-        let p: Projection = serde_json::from_value(snapshot["state"].clone())?;
-        let branch = Branch {
-            id: id(),
-            name: name.into(),
-            shared: false,
-        };
-        let mut changes = vec![];
-        for entry in p.entries.values().filter(|e| e.alive) {
-            for (field, value) in [
-                ("kind", json!(entry.kind)),
-                ("alive", json!(true)),
-                ("location", json!({"parent":entry.parent,"name":entry.name})),
-                ("basic", json!(entry.basic_info())),
-            ] {
-                changes.push(Change {
-                    entity: entry.id.clone(),
-                    field: field.into(),
-                    parents: vec![],
-                    value,
-                });
-            }
-            if let Some(value) = entry.content_value() {
-                changes.push(Change {
-                    entity: entry.id.clone(),
-                    field: "content".into(),
-                    parents: vec![],
-                    value,
-                });
-            }
-        }
-        if changes.is_empty() {
-            self.db.execute(
-                "INSERT INTO branches VALUES(?,?,0)",
-                params![branch.id, branch.name],
-            )?;
-            self.rebuild(&branch.id)?;
-        } else {
-            self.commit(self.event(&branch, changes), true)?;
-        }
-        Ok(branch)
-    }
-    pub fn checkpoint(&mut self, message: &str) -> Result<String> {
-        let snapshot = self.projection(&self.active)?;
-        ensure!(snapshot.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
-        let bytes = serde_json::to_vec(
-            &json!({"format":"tkfs-snapshot-2","branch":self.active,"state":snapshot}),
-        )?;
-        let object = self.put_object(&bytes)?;
-        let checkpoint = id();
-        self.db.execute(
-            "INSERT INTO checkpoints VALUES(?,?,?,?)",
-            params![checkpoint, self.active, object, message],
-        )?;
-        Ok(checkpoint)
-    }
-    pub fn receipt(&self, request: &str, payload: &Value) -> Result<Option<Value>> {
-        self.receipt_fingerprint(request, &hash(&serde_json::to_vec(payload)?))
-    }
-    pub(crate) fn receipt_fingerprint(
-        &self,
-        request: &str,
-        fingerprint: &str,
-    ) -> Result<Option<Value>> {
-        let old: Option<(String, String)> = self
-            .db
-            .query_row(
-                "SELECT payload_hash,result FROM receipts WHERE id=?",
-                [request],
+                "SELECT event,modified_ns FROM seal_receipts WHERE operation=?1",
+                [operation],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some((h, result)) = old {
-            ensure!(h == fingerprint, "REQUEST_ID_REUSED");
-            Ok(Some(serde_json::from_str(&result)?))
-        } else {
-            Ok(None)
+        row.map(|(e, t)| Ok((e, t.parse()?))).transpose()
+    }
+    fn tree_for(
+        content: &LocalContent,
+        p: &mut Projection,
+        entity: &str,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<Digest> {
+        ensure!(seen.insert(entity.into()), "DIRECTORY_CYCLE");
+        if !p.dirty.contains(entity)
+            && let Some(digest) = p.trees.get(entity)
+        {
+            seen.remove(entity);
+            return Ok(*digest);
         }
+        let mut entries = Vec::new();
+        for e in p.children(entity) {
+            let tree = if e.kind == EntryKind::Directory {
+                Some(Self::tree_for(content, p, &e.id, seen)?)
+            } else {
+                None
+            };
+            entries.push(TreeEntry {
+                name: e.name,
+                entity: e.id,
+                kind: e.kind,
+                content: e.content,
+                tree,
+                times: e.times,
+                mode: e.mode,
+                attributes: e.attributes,
+            });
+        }
+        entries.sort_by_key(|e| name_key(&e.name).unwrap());
+        let digest = content
+            .packs
+            .put(ObjectKind::Tree, &Tree { entries }.encode()?)?;
+        p.trees.insert(entity.into(), digest);
+        p.dirty.remove(entity);
+        seen.remove(entity);
+        Ok(digest)
     }
-}
-pub fn lookup(p: &Projection, path: &str) -> Result<Entry> {
-    let mut entry = Entry {
-        id: ROOT.into(),
-        kind: "directory".into(),
-        alive: true,
-        ..Default::default()
-    };
-    for component in path.split(['\\', '/']).filter(|s| !s.is_empty()) {
-        let key = name_key(component)?;
-        entry = p
-            .entries
-            .values()
-            .find(|e| {
-                e.alive && e.parent == entry.id && name_key(&e.name).ok().as_ref() == Some(&key)
+    pub fn checkpoint(&mut self) -> Result<Snapshot> {
+        let p = self.views.get_mut(&self.active).unwrap();
+        let dirty: Vec<_> = p.dirty.iter().cloned().collect();
+        for entity in dirty {
+            let mut at = entity;
+            for _ in 0..256 {
+                if at == ROOT || at.is_empty() {
+                    break;
+                }
+                p.dirty.insert(at.clone());
+                at = p
+                    .entries
+                    .get(&at)
+                    .map(|e| e.parent.clone())
+                    .unwrap_or_default();
+            }
+            p.dirty.insert(ROOT.into());
+        }
+        let root = Self::tree_for(&self.content, p, ROOT, &mut BTreeSet::new())?;
+        self.content.packs.flush()?;
+        let snapshot = Snapshot {
+            id: id(),
+            root,
+            frontier: p
+                .heads
+                .iter()
+                .map(|(e, heads)| {
+                    let visible = p.visible.get(e);
+                    let mut heads: Vec<_> = heads.iter().cloned().collect();
+                    heads.sort_by_key(|h| Some(h) != visible);
+                    (e.clone(), heads)
+                })
+                .collect(),
+        };
+        self.db.execute(
+            "INSERT INTO snapshots VALUES(?1,?2,?3)",
+            params![
+                snapshot.id,
+                &root.0[..],
+                serde_json::to_vec(&snapshot.frontier)?
+            ],
+        )?;
+        Ok(snapshot)
+    }
+    pub fn snapshot(&self, id: &str) -> Result<Snapshot> {
+        let (root, frontier): (Vec<u8>, Vec<u8>) = self.db.query_row(
+            "SELECT root,frontier FROM snapshots WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(Snapshot {
+            id: id.into(),
+            root: Digest(root.as_slice().try_into()?),
+            frontier: serde_json::from_slice(&frontier)?,
+        })
+    }
+    pub fn fork(&mut self, snapshot: &Snapshot, name: &str) -> Result<String> {
+        ensure!(!name.is_empty(), "INVALID_BRANCH");
+        let branch = id();
+        self.db.execute(
+            "INSERT INTO branches VALUES(?1,?2,?3)",
+            params![branch, name, snapshot.id],
+        )?;
+        Ok(branch)
+    }
+    pub fn checkout(&mut self, branch: &str) -> Result<()> {
+        let branch: String = self.db.query_row(
+            "SELECT id FROM branches WHERE id=?1 OR name=?1",
+            [branch],
+            |r| r.get(0),
+        )?;
+        self.load_view(&branch)?;
+        self.db
+            .execute("UPDATE config SET value=?1 WHERE key='active'", [&branch])?;
+        self.active = branch;
+        Ok(())
+    }
+    pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Event)>> {
+        ensure!(limit <= 4096, "FEED_BATCH_TOO_LARGE");
+        let mut q = self
+            .db
+            .prepare("SELECT seq,event FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2")?;
+        let rows = q
+            .query_map(params![after, limit], |r| {
+                Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(seq, event)| Ok((seq, serde_json::from_slice(&event)?)))
+            .collect()
+    }
+    pub fn conflicts(&self, include_resolved: bool) -> Result<Vec<Conflict>> {
+        let mut versions: BTreeMap<String, BTreeSet<String>> = self
+            .projection()
+            .heads
+            .iter()
+            .filter(|(_, heads)| heads.len() > 1)
+            .map(|(e, h)| (e.clone(), h.clone()))
+            .collect();
+        if include_resolved {
+            let mut q = self
+                .db
+                .prepare("SELECT entity,version FROM conflict_history WHERE branch=?1")?;
+            for row in q.query_map([&self.active], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })? {
+                let (e, v) = row?;
+                versions.entry(e).or_default().insert(v);
+            }
+        }
+        versions
+            .into_iter()
+            .map(|(entity, heads)| {
+                let resolved = self
+                    .projection()
+                    .heads
+                    .get(&entity)
+                    .is_none_or(|h| h.len() < 2);
+                let visible = self
+                    .projection()
+                    .visible
+                    .get(&entity)
+                    .cloned()
+                    .unwrap_or_default();
+                let heads = heads
+                    .iter()
+                    .map(|h| self.version(h)?.context("CONFLICT_VERSION_MISSING"))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Conflict {
+                    entity,
+                    branch: self.active.clone(),
+                    visible,
+                    heads,
+                    resolved,
+                })
             })
-            .cloned()
-            .context("FILE_NOT_FOUND")?;
+            .collect()
     }
-    Ok(entry)
+    pub fn resolve(&mut self, entity: &str, selected: &str) -> Result<Event> {
+        let heads = self
+            .projection()
+            .heads
+            .get(entity)
+            .context("CONFLICT_NOT_FOUND")?
+            .clone();
+        ensure!(
+            heads.len() > 1 && heads.contains(selected),
+            "INVALID_RESOLUTION"
+        );
+        let state = self.version(selected)?.context("VERSION_MISSING")?.state;
+        let event = self.event(
+            &self.active.clone(),
+            state,
+            heads.into_iter().collect(),
+            Operation::Resolve,
+        );
+        self.apply(std::slice::from_ref(&event))?;
+        Ok(event)
+    }
+    /// Snapshot history, every current entity head, and reviewed conflict
+    /// alternatives are retention roots. The pack layer adds active handle pins.
+    pub fn live_objects(&self, history_depth: usize) -> Result<BTreeSet<Digest>> {
+        let mut pending = Vec::new();
+        for view in self.views.values() {
+            for heads in view.heads.values() {
+                for head in heads {
+                    if let Some(event) = self.version(head)?
+                        && let Some(content) = event.state.content
+                    {
+                        pending.push((
+                            content.digest,
+                            if content.kind == crate::model::content::ContentKind::Direct {
+                                ObjectKind::Chunk
+                            } else {
+                                ObjectKind::Manifest
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        let mut q = self
+            .db
+            .prepare("SELECT root FROM snapshots ORDER BY rowid DESC LIMIT ?1")?;
+        for row in q.query_map([history_depth], |r| r.get::<_, Vec<u8>>(0))? {
+            let digest = row?;
+            pending.push((Digest(digest.as_slice().try_into()?), ObjectKind::Tree));
+        }
+        // Branch bases cannot age out merely because another branch checkpoints.
+        let mut q = self
+            .db
+            .prepare("SELECT s.root FROM snapshots s JOIN branches b ON b.snapshot=s.id")?;
+        for row in q.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
+            let digest = row?;
+            pending.push((Digest(digest.as_slice().try_into()?), ObjectKind::Tree));
+        }
+        let mut q = self.db.prepare(
+            "SELECT DISTINCT version FROM conflict_history UNION SELECT version FROM heads",
+        )?;
+        for row in q.query_map([], |r| r.get::<_, String>(0))? {
+            if let Some(event) = self.version(&row?)?
+                && let Some(c) = event.state.content
+            {
+                pending.push((
+                    c.digest,
+                    if c.kind == crate::model::content::ContentKind::Direct {
+                        ObjectKind::Chunk
+                    } else {
+                        ObjectKind::Manifest
+                    },
+                ));
+            }
+        }
+        let mut live = BTreeSet::new();
+        while let Some((digest, kind)) = pending.pop() {
+            if !live.insert(digest) {
+                continue;
+            }
+            if !self.content.packs.contains(digest)? {
+                continue;
+            }
+            let bytes = self.content.packs.get(digest)?;
+            match kind {
+                ObjectKind::Chunk => {}
+                ObjectKind::Manifest => {
+                    for chunk in crate::content::local::Manifest::decode(&bytes)?.chunks {
+                        pending.push((chunk, ObjectKind::Chunk));
+                    }
+                }
+                ObjectKind::Tree => {
+                    for entry in Tree::decode(&bytes)?.entries {
+                        if let Some(tree) = entry.tree {
+                            pending.push((tree, ObjectKind::Tree));
+                        }
+                        if let Some(c) = entry.content {
+                            pending.push((
+                                c.digest,
+                                if c.kind == crate::model::content::ContentKind::Direct {
+                                    ObjectKind::Chunk
+                                } else {
+                                    ObjectKind::Manifest
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(live)
+    }
 }
-pub fn split_path(path: &str) -> Result<(String, String)> {
-    let path = path.replace('\\', "/");
-    let path = path.trim_end_matches('/');
-    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    name_key(name)?;
-    Ok((parent.into(), name.into()))
-}
-pub fn fault(point: &str) {
-    if std::env::var("TKFS_FAULT").as_deref() == Ok(point) {
-        std::process::exit(86);
+impl Drop for Store {
+    fn drop(&mut self) {
+        let _ = self.flush_metadata();
     }
 }

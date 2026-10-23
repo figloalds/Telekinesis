@@ -1,4 +1,0 @@
-# Byte-exact baseline fixtures: never convert line endings or diff as text.
-* -text -diff
-*.json text=auto eol=lf diff
-*.md text=auto eol=lf diff

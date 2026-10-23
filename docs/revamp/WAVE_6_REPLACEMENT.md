@@ -1,7 +1,8 @@
 # Wave 6 replacement: objects, snapshots and a passthrough working layer
 
-Status: design, 2026-10-23. Supersedes the scope of [WAVE_6_PLAN.md](WAVE_6_PLAN.md)
-and the WP6.G interlude. Nothing here is implemented. The
+Status: implementation in progress, 2026-10-23. Supersedes the scope of [WAVE_6_PLAN.md](WAVE_6_PLAN.md)
+and the WP6.G interlude. Steps 1–6 have implementation commits; runtime cutover
+and benchmark qualification are in progress. See the replacement step notes. The
 [authority scope](AUTHORITY_SCOPE.md) (personal use, pairing is the admission
 boundary, TLS/WSS or VPN for the channel) is unchanged.
 

@@ -1,0 +1,33 @@
+import {Button, ScrollView, VerticalBox, HorizontalBox} from "std-widgets.slint";
+export struct VersionRow {entity:string,version:string,author:string,description:string,resolved:bool}
+export component App inherits Window {
+    title:"Telekinesis"; width:920px; height:640px; background:#101722;
+    in property<string> status:"Connecting…";
+    in property<string> error;
+    in property<[VersionRow]> versions;
+    callback resolve(string,string);
+    VerticalBox {
+        padding:24px;spacing:16px;
+        Text {text:"Telekinesis";font-size:28px;color:#eef4ff;}
+        Text {text:root.status;color:#aabbd1;wrap:word-wrap;}
+        Text {text:"Conflicts and retained alternatives";font-size:20px;color:#eef4ff;}
+        Text {text:"Choose the version to keep. Other versions remain available in history.";color:#aabbd1;}
+        ScrollView {
+            VerticalBox {spacing:12px;
+                for row in root.versions: Rectangle {
+                    background:#1c293b;border-radius:8px;min-height:110px;
+                    HorizontalBox {padding:16px;spacing:16px;
+                        VerticalBox {
+                            Text {text:row.description;color:#eef4ff;wrap:word-wrap;}
+                            Text {text:row.author;color:#aabbd1;}
+                            Text {text:row.version;color:#aabbd1;font-size:11px;}
+                        }
+                        Button {text:row.resolved?"Retained in history":"Keep this version";enabled:!row.resolved;clicked=>{root.resolve(row.entity,row.version);}}
+                    }
+                }
+            }
+        }
+        Text {text:root.versions.length==0?"No conflicts":"";color:#82cbb2;}
+        Text {text:root.error;color:#ffad9e;wrap:word-wrap;}
+    }
+}

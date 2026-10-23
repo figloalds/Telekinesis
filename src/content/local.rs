@@ -1,1306 +1,671 @@
-//! Verified 64 KiB CAS and indexed manifests. All byte work is independent of
-//! metadata locks and SQLite. This module is not a network authorization surface.
-use super::provider::{Availability, ContentProvider, PinnedContent, ReadContext};
-use super::walk::{ContentEdge, ContentWalk, WalkBatch};
-use crate::{
-    model::{content::*, workspace::ByteRange},
-    util::{
-        lock::lock,
-        phases::{Phase, PhaseCounters},
-    },
-};
+//! Append-only packs. No per-object flush, rename, or separate loose files.
+use crate::model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef};
 use anyhow::{Context, Result, ensure};
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
 };
-use uuid::Uuid;
 
-pub use crate::model::content::{ObjectKey, ObjectKind};
+pub const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+pub const CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Verified immutable import, pinned until its metadata publication finishes.
-#[derive(Clone)]
-pub struct PreparedContent {
-    pin: PinnedContent,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum Kind {
+    Chunk = 1,
+    Manifest = 2,
+    Tree = 3,
 }
-impl PreparedContent {
-    pub fn content(&self) -> &FileContentRef {
-        self.pin.reference()
-    }
-    pub fn pin(&self) -> &PinnedContent {
-        &self.pin
-    }
-    pub(crate) fn check_store(&self, root: &Path) -> Result<()> {
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Manifest {
+    pub len: u64,
+    pub chunks: Vec<Digest>,
+}
+impl Manifest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
         ensure!(
-            self.pin.provider() == LocalContent::open(root)?.identity(),
-            "CONTENT_SAVE_WRONG_STORE"
+            self.len > CHUNK_SIZE && self.chunks.len() as u64 == self.len.div_ceil(CHUNK_SIZE),
+            "INVALID_MANIFEST"
         );
-        Ok(())
-    }
-}
-impl std::fmt::Debug for PreparedContent {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedContent")
-            .field("content", self.content())
-            .finish()
-    }
-}
-
-#[derive(Debug)]
-enum ContentError {
-    Missing(ObjectKey),
-    Corrupt(ObjectKey),
-}
-
-impl std::fmt::Display for ContentError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Missing(key) => write!(f, "CONTENT_UNAVAILABLE: {}", key.digest),
-            Self::Corrupt(key) => write!(f, "CORRUPT_CONTENT: {}", key.digest),
+        let mut bytes = b"TKFM\x02".to_vec();
+        bytes.extend_from_slice(&self.len.to_le_bytes());
+        for chunk in &self.chunks {
+            bytes.extend_from_slice(&chunk.0);
         }
+        ensure!(bytes.len() <= MAX_OBJECT_BYTES, "MANIFEST_TOO_LARGE");
+        Ok(bytes)
     }
-}
-impl std::error::Error for ContentError {}
-
-#[derive(Default)]
-struct Lifetimes {
-    generation: u64,
-    pins: BTreeMap<[u8; 48], (FileContentRef, usize)>,
-}
-
-struct PinLease {
-    owner: Arc<ContentOwner>,
-    key: [u8; 48],
-}
-
-impl Drop for PinLease {
-    fn drop(&mut self) {
-        let mut state = lock(&self.owner.lifetimes);
-        if let Some((_, count)) = state.pins.get_mut(&self.key) {
-            *count -= 1;
-            if *count == 0 {
-                state.pins.remove(&self.key);
-            }
-        }
-        state.generation = state.generation.wrapping_add(1);
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() >= 13
+                && &bytes[..5] == b"TKFM\x02"
+                && (bytes.len() - 13).is_multiple_of(32),
+            "INVALID_MANIFEST"
+        );
+        let len = u64::from_le_bytes(bytes[5..13].try_into()?);
+        ensure!(
+            len > CHUNK_SIZE && (bytes.len() - 13) as u64 / 32 == len.div_ceil(CHUNK_SIZE),
+            "INVALID_MANIFEST"
+        );
+        Ok(Self {
+            len,
+            chunks: bytes[13..]
+                .chunks_exact(32)
+                .map(|b| Digest(b.try_into().unwrap()))
+                .collect(),
+        })
     }
-}
-
-struct ContentOwner {
-    id: Uuid,
-    lifetimes: Mutex<Lifetimes>,
-    install_locks: crate::core::objects::ObjectLocks,
-    buffers: Mutex<BufferState>,
-    counters: Arc<PhaseCounters>,
 }
 
 #[derive(Clone, Copy)]
-enum BufferClass {
-    Foreground,
-    Background,
-    Structural,
+struct Location {
+    segment: u64,
+    offset: u64,
+    len: usize,
+    kind: Kind,
 }
-
-#[derive(Default)]
-struct BufferState {
-    foreground: usize,
-    background: usize,
-    structural: bool,
-    peak: usize,
+struct Cached {
+    bytes: Arc<Vec<u8>>,
+    stamp: u64,
 }
-
-static OWNERS: Mutex<BTreeMap<PathBuf, Weak<ContentOwner>>> = Mutex::new(BTreeMap::new());
-
-/// Handles to one canonical store share installation gates, budgets and pins.
-/// Pins keep that owner alive even after the last LocalContent handle drops.
-/// The existing worker store lock must exclude other writing processes.
-/// This constructor does not open or migrate a metadata database.
-pub struct LocalContent {
+struct State {
+    db: Connection,
+    segment: u64,
+    writer: File,
+    offset: u64,
+    pending: BTreeMap<Digest, Location>,
+    readers: BTreeMap<u64, Arc<File>>,
+    cache: BTreeMap<Digest, Cached>,
+    order: BTreeSet<(u64, Digest)>,
+    cache_len: usize,
+    stamp: u64,
+    pins: BTreeMap<Digest, usize>,
+    verified_reads: u64,
+}
+struct Inner {
     root: PathBuf,
-    owner: Arc<ContentOwner>,
-    pub counters: Arc<PhaseCounters>,
+    state: Mutex<State>,
+    cache_limit: usize,
+    segment_limit: u64,
 }
-
-/// Private save preparation. The caller retains and revalidates the selected
-/// checkpoint; these classifications confer neither publication nor permission.
-pub(crate) enum EditSpan {
-    Unchanged,
-    Zero,
-    Changed,
+#[derive(Clone)]
+pub struct PackStore {
+    inner: Arc<Inner>,
 }
-pub(crate) trait EditSource {
-    fn check(&self, context: &ReadContext) -> Result<()>;
-    fn span(&mut self, offset: u64, len: u64, context: &ReadContext) -> Result<EditSpan>;
-    fn read(&mut self, offset: u64, out: &mut [u8], context: &ReadContext) -> Result<()>;
+static STORES: Mutex<BTreeMap<PathBuf, Weak<Inner>>> = Mutex::new(BTreeMap::new());
+fn guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-
-#[derive(Debug)]
-struct RebuildRange(ByteRange);
-impl std::fmt::Display for RebuildRange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "immutable base path at {}", self.0.offset)
-    }
+pub struct Pin {
+    store: PackStore,
+    digests: Vec<Digest>,
 }
-impl std::error::Error for RebuildRange {}
-
-/// One authenticated path, not a cache proportional to the base file. Repeated
-/// sequential lookups keep one page at each level, including on depth changes.
-struct BaseCursor<'a> {
-    provider: &'a LocalContent,
-    root: Option<ContentEdge>,
-    pages: Vec<Option<(ContentEdge, ManifestNode)>>,
-}
-impl BaseCursor<'_> {
-    fn find(
-        &mut self,
-        offset: u64,
-        level: Option<u8>,
-        context: &ReadContext,
-    ) -> Result<Option<ContentEdge>> {
-        let Some(mut edge) = self.root.clone() else {
-            return Ok(None);
-        };
-        if offset >= edge.len {
-            return Ok(None);
-        }
-        loop {
-            context.check()?;
-            if edge.level == level {
-                return Ok((edge.offset == offset).then_some(edge));
-            }
-            if edge.level < level {
-                return Ok(None);
-            }
-            let old_level = edge.level.context("INVALID_MANIFEST_ENCODING")?;
-            let slot = &mut self.pages[old_level as usize];
-            if slot.as_ref().is_none_or(|(cached, _)| cached != &edge) {
-                let node = self
-                    .provider
-                    .node(edge.key.digest, edge.len, old_level, context)
-                    .map_err(|error| error.context(RebuildRange(ByteRange { offset, len: 1 })))?;
-                *slot = Some((edge.clone(), node));
-            }
-            let node = &slot.as_ref().unwrap().1;
-            let capacity = ManifestNode::child_capacity(old_level)?;
-            let index = ((offset - edge.offset) / capacity) as usize;
-            let child = node.children.get(index).context("MANIFEST_COVERAGE")?;
-            edge = ContentEdge {
-                key: ObjectKey {
-                    kind: if old_level == 0 {
-                        ObjectKind::Bytes
-                    } else {
-                        ObjectKind::Manifest
-                    },
-                    digest: child.digest,
-                },
-                offset: edge.offset + index as u64 * capacity,
-                len: child.len,
-                level: old_level.checked_sub(1),
-            };
-        }
-    }
-}
-
-impl LocalContent {
-    pub(crate) fn rebuild_range(error: &anyhow::Error) -> Option<ByteRange> {
-        error.downcast_ref::<RebuildRange>().map(|range| range.0)
-    }
-    pub fn unavailable_key(error: &anyhow::Error) -> Option<ObjectKey> {
-        error
-            .chain()
-            .find_map(|cause| match cause.downcast_ref::<ContentError>() {
-                Some(ContentError::Missing(key) | ContentError::Corrupt(key)) => Some(*key),
-                None => None,
-            })
-    }
-    pub(crate) fn receipt_directory(&self) -> PathBuf {
-        self.root.join("content-receipts")
-    }
-    pub fn identity(&self) -> Uuid {
-        self.owner.id
-    }
-
-    /// Bounded local byte access for the object engine. Network callers must
-    /// additionally prove reference authorization and disclosure provenance.
-    pub fn read_blob(
-        &self,
-        key: ObjectKey,
-        expected_len: Option<u64>,
-        context: &ReadContext,
-    ) -> Result<Vec<u8>> {
-        self.read_blob_for(
-            key,
-            expected_len,
-            crate::model::workspace::DemandPriority::Background,
-            context,
-        )
-    }
-
-    pub fn read_blob_for(
-        &self,
-        key: ObjectKey,
-        expected_len: Option<u64>,
-        priority: crate::model::workspace::DemandPriority,
-        context: &ReadContext,
-    ) -> Result<Vec<u8>> {
-        let _permit = self.permit(
-            context,
-            1,
-            if priority == crate::model::workspace::DemandPriority::Foreground {
-                BufferClass::Foreground
-            } else if key.kind == ObjectKind::Manifest {
-                BufferClass::Structural
-            } else {
-                BufferClass::Background
-            },
-        )?;
-        self.verified_blob(key, expected_len, context)
-    }
-    pub fn open(root: &Path) -> Result<Self> {
-        ensure!(root.is_dir(), "CONTENT_STORE_NOT_INITIALIZED");
-        let root = root.canonicalize()?;
-        fs::create_dir_all(root.join("objects"))?;
-        fs::create_dir_all(root.join("manifests-v1"))?;
-        let mut owners = lock(&OWNERS);
-        owners.retain(|_, owner| owner.strong_count() != 0);
-        let owner = match owners.get(&root).and_then(Weak::upgrade) {
-            Some(owner) => owner,
-            None => {
-                let owner = Arc::new(ContentOwner {
-                    id: Uuid::new_v4(),
-                    lifetimes: Mutex::new(Lifetimes::default()),
-                    install_locks: Default::default(),
-                    counters: Default::default(),
-                    buffers: Mutex::default(),
-                });
-                owners.insert(root.clone(), Arc::downgrade(&owner));
-                owner
-            }
-        };
-        Ok(Self {
-            root,
-            counters: owner.counters.clone(),
-            owner,
-        })
-    }
-
-    fn permit(
-        &self,
-        context: &ReadContext,
-        buffers: usize,
-        class: BufferClass,
-    ) -> Result<BufferPermit<'_>> {
-        self.permit_checked(context, buffers, class, &|| Ok(()))
-    }
-
-    fn permit_checked(
-        &self,
-        context: &ReadContext,
-        buffers: usize,
-        class: BufferClass,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<BufferPermit<'_>> {
-        loop {
-            context.check()?;
-            check()?;
-            {
-                let mut state = lock(&self.owner.buffers);
-                let total = state.foreground + state.background;
-                let allowed = match class {
-                    BufferClass::Structural => !state.structural,
-                    BufferClass::Foreground => {
-                        total + buffers
-                            <= crate::model::workspace::limits::VERIFY_BUFFERS
-                                - if state.background == 0 { 3 } else { 0 }
-                    }
-                    BufferClass::Background => {
-                        total + buffers
-                            <= crate::model::workspace::limits::VERIFY_BUFFERS
-                                - if state.foreground == 0 { 2 } else { 0 }
-                    }
-                };
-                if allowed {
-                    match class {
-                        BufferClass::Structural => state.structural = true,
-                        BufferClass::Foreground => state.foreground += buffers,
-                        BufferClass::Background => state.background += buffers,
-                    }
-                    state.peak = state
-                        .peak
-                        .max(state.foreground + state.background + usize::from(state.structural));
-                    return Ok(BufferPermit {
-                        owner: &self.owner.buffers,
-                        buffers,
-                        class,
-                    });
+impl Drop for Pin {
+    fn drop(&mut self) {
+        let mut state = guard(&self.store.inner.state);
+        for digest in &self.digests {
+            if let Some(count) = state.pins.get_mut(digest) {
+                *count -= 1;
+                if *count == 0 {
+                    state.pins.remove(digest);
                 }
             }
-            context.cancel.sleep(std::time::Duration::from_millis(5));
         }
     }
-
-    pub fn buffer_usage(&self) -> (usize, bool, usize) {
-        let state = lock(&self.owner.buffers);
-        (
-            state.foreground + state.background,
-            state.structural,
-            state.peak * CHUNK_SIZE as usize,
-        )
+}
+fn segment_path(root: &Path, segment: u64) -> PathBuf {
+    root.join(format!("{segment:016x}.pack"))
+}
+fn append_file(root: &Path, segment: u64) -> Result<File> {
+    Ok(OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(segment_path(root, segment))?)
+}
+fn kind(value: u8) -> Result<Kind> {
+    match value {
+        1 => Ok(Kind::Chunk),
+        2 => Ok(Kind::Manifest),
+        3 => Ok(Kind::Tree),
+        _ => anyhow::bail!("INVALID_OBJECT_KIND"),
     }
+}
 
-    pub(crate) fn foreground_permit_checked(
-        &self,
-        context: &ReadContext,
-        check: &dyn Fn() -> Result<()>,
-    ) -> Result<BufferPermit<'_>> {
-        self.permit_checked(context, 2, BufferClass::Foreground, check)
+impl PackStore {
+    pub fn open(store: &Path) -> Result<Self> {
+        Self::with_limits(store, CACHE_BYTES, SEGMENT_BYTES)
     }
-
-    /// Authenticate an indexed locator against the immutable root. At most one
-    /// page per level is read; derived-index corruption cannot add a private key.
-    pub fn verify_member(
-        &self,
-        pin: &PinnedContent,
-        member: &ContentEdge,
-        context: &ReadContext,
-    ) -> Result<()> {
-        self.verify_member_for(
-            pin,
-            member,
-            crate::model::workspace::DemandPriority::Structural,
-            context,
-        )
-    }
-
-    pub fn verify_member_for(
-        &self,
-        pin: &PinnedContent,
-        member: &ContentEdge,
-        priority: crate::model::workspace::DemandPriority,
-        context: &ReadContext,
-    ) -> Result<()> {
-        ensure!(pin.provider() == self.owner.id, "CONTENT_PROVIDER_MISMATCH");
-        let _permit = self.permit(
-            context,
-            1,
-            if priority == crate::model::workspace::DemandPriority::Foreground {
-                BufferClass::Foreground
-            } else {
-                BufferClass::Structural
-            },
-        )?;
-        let mut current = ContentEdge::root(pin)?;
-        for _ in 0..=MAX_DEPTH {
-            context.check()?;
-            if current.offset == member.offset && current.level == member.level {
-                ensure!(
-                    current.key == member.key && current.len == member.len,
-                    "UNAUTHORIZED_OBJECT"
-                );
-                return Ok(());
+    pub fn with_limits(store: &Path, cache_limit: usize, segment_limit: u64) -> Result<Self> {
+        fs::create_dir_all(store.join("objects/packs"))?;
+        let root = fs::canonicalize(store.join("objects/packs"))?;
+        let mut stores = guard(&STORES);
+        if let Some(inner) = stores.get(&root).and_then(Weak::upgrade) {
+            return Ok(Self { inner });
+        }
+        let db = Connection::open(root.parent().unwrap().join("index.sqlite"))?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+          CREATE TABLE IF NOT EXISTS objects(digest BLOB PRIMARY KEY CHECK(length(digest)=32), segment INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, kind INTEGER NOT NULL);")?;
+        // Never reuse a segment number after GC or a crash with an unindexed tail.
+        let mut segment = 0;
+        for entry in fs::read_dir(&root)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "pack")
+                && let Some(n) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+            {
+                segment = segment.max(n + 1);
             }
-            let level = current.level.context("UNAUTHORIZED_OBJECT")?;
-            ensure!(
-                member.offset >= current.offset && member.offset < current.offset + current.len,
-                "UNAUTHORIZED_OBJECT"
-            );
-            let node = self.node(current.key.digest, current.len, level, context)?;
-            let capacity = ManifestNode::child_capacity(level)?;
-            let index = (member.offset - current.offset) / capacity;
-            let child = node
-                .children
-                .get(index as usize)
-                .context("UNAUTHORIZED_OBJECT")?;
-            current = ContentEdge {
-                key: ObjectKey {
-                    kind: if level == 0 {
-                        ObjectKind::Bytes
-                    } else {
-                        ObjectKind::Manifest
-                    },
-                    digest: child.digest,
-                },
-                offset: current.offset + index * capacity,
-                len: child.len,
-                level: level.checked_sub(1),
-            };
         }
-        anyhow::bail!("MANIFEST_DEPTH")
+        let writer = append_file(&root, segment)?;
+        let inner = Arc::new(Inner {
+            root: root.clone(),
+            cache_limit,
+            segment_limit,
+            state: Mutex::new(State {
+                db,
+                segment,
+                writer,
+                offset: 0,
+                pending: BTreeMap::new(),
+                readers: BTreeMap::new(),
+                cache: BTreeMap::new(),
+                order: BTreeSet::new(),
+                cache_len: 0,
+                stamp: 0,
+                pins: BTreeMap::new(),
+                verified_reads: 0,
+            }),
+        });
+        stores.insert(root, Arc::downgrade(&inner));
+        Ok(Self { inner })
     }
-
-    fn path(&self, key: ObjectKey) -> PathBuf {
-        self.root
-            .join(match key.kind {
-                ObjectKind::Bytes => "objects",
-                ObjectKind::Manifest => "manifests-v1",
+    fn location(state: &State, digest: Digest) -> Result<Option<Location>> {
+        if let Some(location) = state.pending.get(&digest) {
+            return Ok(Some(*location));
+        }
+        let row: Option<(u64, u64, usize, u8)> = state
+            .db
+            .query_row(
+                "SELECT segment,offset,length,kind FROM objects WHERE digest=?1",
+                [&digest.0[..]],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(segment, offset, len, k)| {
+            Ok(Location {
+                segment,
+                offset,
+                len,
+                kind: kind(k)?,
             })
-            .join(key.digest.to_string())
+        })
+        .transpose()
     }
-
-    fn verified_blob(
-        &self,
-        key: ObjectKey,
-        expected: Option<u64>,
-        context: &ReadContext,
-    ) -> Result<Vec<u8>> {
-        context.check()?;
-        let mut file = File::open(self.path(key)).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                anyhow::Error::new(ContentError::Missing(key))
-            } else {
-                error.into()
-            }
-        })?;
-        let len = file.metadata()?.len();
-        let cap = match key.kind {
-            ObjectKind::Bytes => CHUNK_SIZE,
-            ObjectKind::Manifest => MAX_NODE_BYTES as u64,
-        };
+    pub fn put(&self, kind: Kind, bytes: &[u8]) -> Result<Digest> {
         ensure!(
-            len <= cap && expected.is_none_or(|expected| expected == len),
-            ContentError::Corrupt(key)
+            bytes.len() <= MAX_OBJECT_BYTES
+                && (kind != Kind::Chunk || bytes.len() <= CHUNK_SIZE as usize),
+            "OBJECT_TOO_LARGE"
         );
-        let _read = self.counters.begin(
-            if key.kind == ObjectKind::Manifest {
-                Phase::ManifestRead
-            } else {
-                Phase::Read
-            },
-            len,
-        );
-        let mut bytes = vec![0; len as usize];
-        file.read_exact(&mut bytes)?;
-        ensure!(file.read(&mut [0])? == 0, ContentError::Corrupt(key));
-        {
-            let _hash = self.counters.begin(Phase::Hash, len);
-            let digest = match key.kind {
-                ObjectKind::Bytes => Digest::bytes(&bytes),
-                ObjectKind::Manifest => ManifestNode::decode(&bytes)
-                    .and_then(|node| node.digest())
-                    .map_err(|_| ContentError::Corrupt(key))?,
-            };
-            ensure!(digest == key.digest, ContentError::Corrupt(key));
+        let digest = Digest::bytes(bytes);
+        let mut state = guard(&self.inner.state);
+        if let Some(old) = Self::location(&state, digest)? {
+            ensure!(old.kind == kind, "OBJECT_KIND_COLLISION");
+            return Ok(digest);
         }
-        context.check()?;
+        if state.offset > 0 && state.offset + bytes.len() as u64 > self.inner.segment_limit {
+            Self::flush_locked(&mut state)?;
+            state.segment += 1;
+            state.writer = append_file(&self.inner.root, state.segment)?;
+            state.offset = 0;
+        }
+        let location = Location {
+            segment: state.segment,
+            offset: state.offset,
+            len: bytes.len(),
+            kind,
+        };
+        state.writer.write_all(bytes)?;
+        state.offset += bytes.len() as u64;
+        state.pending.insert(digest, location);
+        Ok(digest)
+    }
+    fn flush_locked(state: &mut State) -> Result<()> {
+        if state.pending.is_empty() {
+            return Ok(());
+        }
+        state.writer.sync_all()?;
+        let tx = state.db.transaction()?;
+        for (digest, loc) in &state.pending {
+            tx.execute(
+                "INSERT OR IGNORE INTO objects VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    &digest.0[..],
+                    loc.segment,
+                    loc.offset,
+                    loc.len,
+                    loc.kind as u8
+                ],
+            )?;
+        }
+        tx.commit()?;
+        state.pending.clear();
+        Ok(())
+    }
+    pub fn flush(&self) -> Result<()> {
+        Self::flush_locked(&mut guard(&self.inner.state))
+    }
+    pub fn get(&self, digest: Digest) -> Result<Arc<Vec<u8>>> {
+        let mut state = guard(&self.inner.state);
+        state.stamp += 1;
+        let stamp = state.stamp;
+        if let Some(cached) = state.cache.remove(&digest) {
+            state.order.remove(&(cached.stamp, digest));
+            let bytes = cached.bytes.clone();
+            state.cache.insert(
+                digest,
+                Cached {
+                    bytes: bytes.clone(),
+                    stamp,
+                },
+            );
+            state.order.insert((stamp, digest));
+            return Ok(bytes);
+        }
+        let location = Self::location(&state, digest)?.context("OBJECT_MISSING")?;
+        ensure!(location.len <= MAX_OBJECT_BYTES, "INVALID_PACK_INDEX");
+        let file = if let Some(file) = state.readers.get(&location.segment) {
+            file.clone()
+        } else {
+            let file = Arc::new(File::open(segment_path(
+                &self.inner.root,
+                location.segment,
+            ))?);
+            state.readers.insert(location.segment, file.clone());
+            file
+        };
+        let mut bytes = vec![0; location.len];
+        let read = read_exact_at(&file, &mut bytes, location.offset);
+        if read.is_err() || Digest::bytes(&bytes) != digest {
+            state
+                .db
+                .execute("DELETE FROM objects WHERE digest=?1", [&digest.0[..]])?;
+            state.pending.remove(&digest);
+            anyhow::bail!("OBJECT_CORRUPT: {digest}");
+        }
+        state.verified_reads += 1;
+        let bytes = Arc::new(bytes);
+        if bytes.len() <= self.inner.cache_limit {
+            while state.cache_len + bytes.len() > self.inner.cache_limit {
+                let Some((age, old)) = state.order.pop_first() else {
+                    break;
+                };
+                let cached = state.cache.remove(&old).unwrap();
+                debug_assert_eq!(age, cached.stamp);
+                state.cache_len -= cached.bytes.len();
+            }
+            state.cache_len += bytes.len();
+            state.cache.insert(
+                digest,
+                Cached {
+                    bytes: bytes.clone(),
+                    stamp,
+                },
+            );
+            state.order.insert((stamp, digest));
+        }
         Ok(bytes)
     }
-
-    /// Install only verified bytes, with data and rename durability. Joined
-    /// installations serialize by typed content identity, outside engine locks.
-    pub fn install(&self, key: ObjectKey, bytes: &[u8], context: &ReadContext) -> Result<bool> {
-        let _permit = self.permit(
-            context,
-            1,
-            if key.kind == ObjectKind::Manifest {
-                BufferClass::Structural
-            } else {
-                BufferClass::Background
-            },
-        )?;
-        self.install_inner(key, bytes, context)
-    }
-
-    fn install_inner(&self, key: ObjectKey, bytes: &[u8], context: &ReadContext) -> Result<bool> {
-        context.check()?;
-        let digest = {
-            let _hash = self.counters.begin(Phase::Hash, bytes.len() as u64);
-            match key.kind {
-                ObjectKind::Bytes => {
-                    ensure!(bytes.len() <= CHUNK_SIZE as usize, "CONTENT_BUFFER_LIMIT");
-                    Digest::bytes(bytes)
-                }
-                ObjectKind::Manifest => ManifestNode::decode(bytes)?.digest()?,
-            }
-        };
-        ensure!(digest == key.digest, ContentError::Corrupt(key));
-        let gate = self
-            .owner
-            .install_locks
-            .for_object(&format!("{:?}:{}", key.kind, key.digest));
-        // No network or unrelated content identity is blocked by this gate.
-        let _guard = loop {
-            context.check()?;
-            match gate.try_lock() {
-                Ok(guard) => break guard,
-                Err(std::sync::TryLockError::WouldBlock) => {}
-                Err(std::sync::TryLockError::Poisoned(_)) => anyhow::bail!("CONTENT_LOCK_POISONED"),
-            }
-            context.cancel.sleep(std::time::Duration::from_millis(5));
-        };
-        match self.verified_blob(key, Some(bytes.len() as u64), context) {
-            Ok(_) => return Ok(false),
-            Err(error)
-                if matches!(
-                    error.downcast_ref::<ContentError>(),
-                    Some(ContentError::Missing(_))
-                ) => {}
-            Err(error)
-                if matches!(
-                    error.downcast_ref::<ContentError>(),
-                    Some(ContentError::Corrupt(_))
-                ) =>
-            {
-                let quarantine = self.root.join("quarantine-content");
-                match fs::create_dir(&quarantine) {
-                    Ok(()) => crate::core::objects::sync_dir(&self.root)?,
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => return Err(error.into()),
-                }
-                let retained =
-                    quarantine.join(format!("{:?}-{}-{}", key.kind, key.digest, Uuid::new_v4()));
-                crate::core::objects::install_object(&self.path(key), &retained)?;
-            }
-            Err(error) => return Err(error),
+    pub fn pin(&self, digests: impl IntoIterator<Item = Digest>) -> Pin {
+        let digests: Vec<_> = digests.into_iter().collect();
+        let mut state = guard(&self.inner.state);
+        for digest in &digests {
+            *state.pins.entry(*digest).or_default() += 1;
         }
-        let dest = self.path(key);
-        let temp = dest.with_file_name(format!("{}.part", Uuid::new_v4()));
-        let result = (|| {
-            let _write = self.counters.begin(
-                if key.kind == ObjectKind::Manifest {
-                    Phase::ManifestWrite
-                } else {
-                    Phase::Write
+        Pin {
+            store: self.clone(),
+            digests,
+        }
+    }
+    pub fn contains(&self, digest: Digest) -> Result<bool> {
+        Ok(Self::location(&guard(&self.inner.state), digest)?.is_some())
+    }
+    pub fn verified_reads(&self) -> u64 {
+        guard(&self.inner.state).verified_reads
+    }
+    pub fn keys(&self) -> Result<Vec<(Digest, Kind)>> {
+        let mut state = guard(&self.inner.state);
+        Self::flush_locked(&mut state)?;
+        let mut stmt = state.db.prepare("SELECT digest,kind FROM objects")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, u8>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(d, k)| Ok((Digest(d.as_slice().try_into()?), kind(k)?)))
+            .collect()
+    }
+    /// Caller supplies transitive snapshot reachability; open handles pin their
+    /// entire content closure. Index commit precedes removal of old segments.
+    pub fn collect(&self, live: &BTreeSet<Digest>, threshold: f64) -> Result<usize> {
+        ensure!((0.0..=1.0).contains(&threshold), "INVALID_GC_THRESHOLD");
+        let mut state = guard(&self.inner.state);
+        Self::flush_locked(&mut state)?;
+        let mut live = live.clone();
+        live.extend(state.pins.keys());
+        let rows = {
+            let mut stmt = state.db.prepare(
+                "SELECT digest,segment,offset,length,kind FROM objects ORDER BY segment,offset",
+            )?;
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, u64>(1)?,
+                    r.get::<_, u64>(2)?,
+                    r.get::<_, usize>(3)?,
+                    r.get::<_, u8>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut segments: BTreeMap<u64, Vec<(Digest, Location)>> = BTreeMap::new();
+        for (d, segment, offset, len, k) in rows {
+            segments.entry(segment).or_default().push((
+                Digest(d.as_slice().try_into()?),
+                Location {
+                    segment,
+                    offset,
+                    len,
+                    kind: kind(k)?,
                 },
-                bytes.len() as u64,
-            );
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            file.write_all(bytes)?;
-            context.check()?;
-            {
-                let _sync = self.counters.begin(Phase::FileSync, bytes.len() as u64);
-                file.sync_all()?;
-            }
-            drop(file);
-            crate::util::fault::trigger("content.install.flushed")?;
-            crate::core::objects::install_object(&temp, &dest)?;
-            crate::util::fault::trigger("content.install.installed")?;
-            context.check()?;
-            Ok(true)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp);
+            ));
         }
-        result
+        let mut removed = 0;
+        for (segment, entries) in segments {
+            if segment == state.segment {
+                continue;
+            }
+            let total = entries.iter().map(|(_, l)| l.len.max(1)).sum::<usize>();
+            let kept = entries
+                .iter()
+                .filter(|(d, _)| live.contains(d))
+                .map(|(_, l)| l.len.max(1))
+                .sum::<usize>();
+            if kept as f64 / total as f64 >= threshold {
+                continue;
+            }
+            let old = File::open(segment_path(&self.inner.root, segment))?;
+            let mut updates = Vec::new();
+            for (digest, loc) in &entries {
+                if !live.contains(digest) {
+                    continue;
+                }
+                let mut bytes = vec![0; loc.len];
+                read_exact_at(&old, &mut bytes, loc.offset)?;
+                ensure!(Digest::bytes(&bytes) == *digest, "OBJECT_CORRUPT_DURING_GC");
+                let offset = state.offset;
+                state.writer.write_all(&bytes)?;
+                state.offset += bytes.len() as u64;
+                updates.push((*digest, offset, *loc));
+            }
+            state.writer.sync_all()?;
+            let new_segment = state.segment;
+            let tx = state.db.transaction()?;
+            tx.execute("DELETE FROM objects WHERE segment=?1", [segment])?;
+            for (digest, offset, loc) in updates {
+                tx.execute(
+                    "INSERT INTO objects VALUES(?1,?2,?3,?4,?5)",
+                    params![&digest.0[..], new_segment, offset, loc.len, loc.kind as u8],
+                )?;
+            }
+            tx.commit()?;
+            removed += entries.iter().filter(|(d, _)| !live.contains(d)).count();
+            state.readers.remove(&segment);
+            drop(old);
+            fs::remove_file(segment_path(&self.inner.root, segment))?;
+        }
+        // Cached dead objects must not turn a miss into a successful read.
+        let dead: Vec<_> = state
+            .cache
+            .keys()
+            .filter(|d| !live.contains(d))
+            .copied()
+            .collect();
+        for digest in dead {
+            let old = state.cache.remove(&digest).unwrap();
+            state.cache_len -= old.bytes.len();
+            state.order.remove(&(old.stamp, digest));
+        }
+        Ok(removed)
     }
+}
 
-    fn put_bytes(&self, bytes: &[u8], context: &ReadContext) -> Result<Digest> {
-        let digest = {
-            let _hash = self.counters.begin(Phase::Hash, bytes.len() as u64);
-            Digest::bytes(bytes)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn packs_reopen_deduplicate_and_cache_verified_reads() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let digest;
+        {
+            let store = PackStore::open(root.path())?;
+            digest = store.put(Kind::Chunk, b"immutable bytes")?;
+            assert_eq!(digest, store.put(Kind::Chunk, b"immutable bytes")?);
+            store.flush()?;
+            assert_eq!(&**store.get(digest)?, b"immutable bytes");
+            store.get(digest)?;
+            assert_eq!(store.verified_reads(), 1);
+        }
+        assert_eq!(
+            &**PackStore::open(root.path())?.get(digest)?,
+            b"immutable bytes"
+        );
+        Ok(())
+    }
+    #[test]
+    fn gc_never_removes_a_pinned_object() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 1024, 8)?;
+        let keep = store.put(Kind::Chunk, b"keep me!")?;
+        let dead = store.put(Kind::Chunk, b"dead me!")?;
+        let _roll = store.put(Kind::Chunk, b"roll me!")?;
+        let pin = store.pin([keep]);
+        assert_eq!(store.collect(&BTreeSet::new(), 1.0)?, 1);
+        assert_eq!(&**store.get(keep)?, b"keep me!");
+        assert!(!store.contains(dead)?);
+        drop(pin);
+        store.put(Kind::Chunk, b"roll again")?;
+        store.collect(&BTreeSet::new(), 1.0)?;
+        assert!(!store.contains(keep)?);
+        Ok(())
+    }
+    #[test]
+    fn flat_manifest_ranges_and_corruption() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let content = LocalContent::open(root.path())?;
+        let mut bytes = vec![5; CHUNK_SIZE as usize];
+        bytes.extend_from_slice(b"tail");
+        let reference = content.import(&bytes)?;
+        content.packs.flush()?;
+        let mut range = [0; 7];
+        content.read_range(&reference, CHUNK_SIZE - 3, &mut range)?;
+        assert_eq!(&range, b"\x05\x05\x05tail");
+        let digest = content.packs.put(Kind::Chunk, b"corrupt this")?;
+        content.packs.flush()?;
+        let location = PackStore::location(&guard(&content.packs.inner.state), digest)?.unwrap();
+        let file = OpenOptions::new()
+            .write(true)
+            .open(segment_path(&content.packs.inner.root, location.segment))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            file.seek_write(b"!", location.offset)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.write_at(b"!", location.offset)?;
+        }
+        assert!(content.packs.get(digest).is_err());
+        assert!(!content.packs.contains(digest)?);
+        Ok(())
+    }
+}
+
+pub(crate) fn read_exact_at(
+    file: &File,
+    mut out: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    while !out.is_empty() {
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(out, offset)?
         };
-        self.install_inner(
-            ObjectKey {
-                kind: ObjectKind::Bytes,
-                digest,
-            },
-            bytes,
-            context,
-        )?;
-        Ok(digest)
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(out, offset)?
+        };
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        out = &mut out[n..];
+        offset += n as u64;
     }
+    Ok(())
+}
 
-    fn put_node(&self, node: &ManifestNode, context: &ReadContext) -> Result<Digest> {
-        let digest = node.digest()?;
-        self.install_inner(
-            ObjectKey {
-                kind: ObjectKind::Manifest,
-                digest,
-            },
-            &node.encode()?,
-            context,
-        )?;
-        Ok(digest)
-    }
-
-    /// Streaming construction uses at most one chunk plus one page per depth.
-    /// `len` bytes are consumed exactly; trailing input belongs to the caller.
-    pub fn import(
-        &self,
-        reader: &mut dyn Read,
-        len: u64,
-        context: &ReadContext,
-    ) -> Result<FileContentRef> {
-        context.check()?;
-        ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
-        let _permit = self.permit(context, 3, BufferClass::Background)?;
-        self.import_inner(reader, len, context)
-    }
-    /// Prepare current direct/manifest bytes before taking a metadata writer.
-    pub fn prepare_import(
-        &self,
-        reader: &mut dyn Read,
-        len: u64,
-        context: &ReadContext,
-    ) -> Result<PreparedContent> {
-        let content = self.import(reader, len, context)?;
-        Ok(PreparedContent {
-            pin: self.pin(&content)?,
+/// Immutable range provider used to hydrate scratch files. Missing chunks can
+/// be fetched independently without downloading the rest of the file.
+pub trait ObjectFetcher: Send + Sync {
+    fn fetch(&self, objects: &[(Digest, Kind)]) -> Result<()>;
+}
+#[derive(Clone)]
+pub struct LocalContent {
+    pub packs: PackStore,
+    fetcher: Arc<Mutex<Option<Arc<dyn ObjectFetcher>>>>,
+}
+impl LocalContent {
+    pub fn open(root: &Path) -> Result<Self> {
+        Ok(Self {
+            packs: PackStore::open(root)?,
+            fetcher: Arc::new(Mutex::new(None)),
         })
     }
-    fn import_inner(
-        &self,
-        reader: &mut dyn Read,
-        len: u64,
-        context: &ReadContext,
-    ) -> Result<FileContentRef> {
-        context.check()?;
-        ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
-        if len <= CHUNK_SIZE {
-            let mut bytes = vec![0; len as usize];
-            reader.read_exact(&mut bytes)?;
-            let digest = self.put_bytes(&bytes, context)?;
-            return FileContentRef::new(ContentKind::Direct, digest, len);
-        }
-        let digest = self.import_node(reader, len, ManifestNode::root_level(len)?, context)?;
-        FileContentRef::new(ContentKind::Manifest, digest, len)
+    pub fn set_fetcher(&self, fetcher: Arc<dyn ObjectFetcher>) {
+        *guard(&self.fetcher) = Some(fetcher);
     }
-
-    fn import_node(
-        &self,
-        reader: &mut dyn Read,
-        len: u64,
-        level: u8,
-        context: &ReadContext,
-    ) -> Result<Digest> {
-        context.check()?;
-        let capacity = ManifestNode::child_capacity(level)?;
-        let mut node = ManifestNode {
-            level,
-            total_len: len,
-            children: Vec::new(),
-        };
-        let mut remaining = len;
-        while remaining != 0 {
-            let child_len = remaining.min(capacity);
-            let (kind, digest) = if level == 0 {
-                let mut bytes = vec![0; child_len as usize];
-                reader.read_exact(&mut bytes)?;
-                (ChildKind::Chunk, self.put_bytes(&bytes, context)?)
-            } else {
-                (
-                    ChildKind::Node,
-                    self.import_node(reader, child_len, level - 1, context)?,
-                )
-            };
-            node.children.push(ManifestChild {
-                kind,
-                len: child_len,
-                digest,
-            });
-            remaining -= child_len;
-        }
-        self.put_node(&node, context)
-    }
-
-    fn node(
-        &self,
-        digest: Digest,
-        len: u64,
-        level: u8,
-        context: &ReadContext,
-    ) -> Result<ManifestNode> {
-        let key = ObjectKey {
-            kind: ObjectKind::Manifest,
-            digest,
-        };
-        let bytes = self.verified_blob(key, None, context)?;
-        let node = ManifestNode::decode(&bytes)?;
-        ensure!(
-            node.total_len == len && node.level == level,
-            ContentError::Corrupt(key)
-        );
-        Ok(node)
-    }
-
-    /// Verify exactly one parent before returning any child admission evidence.
-    /// This local API confers no network authorization.
-    pub fn verified_children(
-        &self,
-        edge: &ContentEdge,
-        context: &ReadContext,
-    ) -> Result<Vec<ContentEdge>> {
-        context.check()?;
-        ensure!(edge.key.kind == ObjectKind::Manifest, "EXPECTED_MANIFEST");
-        let level = edge.level.context("EXPECTED_MANIFEST_LEVEL")?;
-        ensure!(
-            edge.offset
-                .checked_add(edge.len)
-                .is_some_and(|end| end <= MAX_FILE_SIZE),
-            "MANIFEST_RANGE"
-        );
-        let _permit = self.permit(context, 1, BufferClass::Structural)?;
-        let node = self.node(edge.key.digest, edge.len, level, context)?;
-        let mut offset = edge.offset;
-        let children = node
-            .children
-            .into_iter()
-            .map(|child| {
-                let result = ContentEdge {
-                    key: ObjectKey {
-                        kind: if level == 0 {
-                            ObjectKind::Bytes
-                        } else {
-                            ObjectKind::Manifest
-                        },
-                        digest: child.digest,
-                    },
-                    offset,
-                    len: child.len,
-                    level: level.checked_sub(1),
-                };
-                offset += child.len; // node and containing range were validated
-                result
+    pub fn ensure(&self, objects: &[(Digest, Kind)]) -> Result<()> {
+        let missing = objects
+            .iter()
+            .filter_map(|(d, k)| match self.packs.get(*d) {
+                Ok(_) => None,
+                Err(_) => Some((*d, *k)),
             })
-            .collect();
-        context.check()?;
-        Ok(children)
-    }
-
-    pub fn walk(&self, pin: &PinnedContent) -> Result<ContentWalk> {
-        ensure!(pin.provider() == self.owner.id, "CONTENT_PROVIDER_MISMATCH");
-        ContentWalk::new(pin)
-    }
-
-    /// A failure retains the same frontier for retry. The walk owns a root pin
-    /// until dropped, including while a missing manifest prevents completion.
-    pub fn walk_step(
-        &self,
-        walk: &mut ContentWalk,
-        context: &ReadContext,
-    ) -> Result<Option<WalkBatch>> {
-        context.check()?;
-        ensure!(
-            walk.pin.provider() == self.owner.id,
-            "CONTENT_PROVIDER_MISMATCH"
-        );
-        let Some(edge) = walk.frontier.last().cloned() else {
-            return Ok(None);
-        };
-        let children = if edge.key.kind == ObjectKind::Manifest {
-            self.verified_children(&edge, context)?
-        } else {
-            vec![]
-        };
-        context.check()?;
-        walk.advance(&children)?;
-        Ok(Some(WalkBatch {
-            visited: edge,
-            children,
-            complete: walk.complete(),
-        }))
-    }
-
-    fn read_node(
-        &self,
-        digest: Digest,
-        len: u64,
-        level: u8,
-        offset: u64,
-        out: &mut [u8],
-        context: &ReadContext,
-    ) -> Result<()> {
-        let node = self.node(digest, len, level, context)?;
-        let end = offset
-            .checked_add(out.len() as u64)
-            .context("RANGE_OVERFLOW")?;
-        ensure!(end <= len, "RANGE_OUT_OF_BOUNDS");
-        let mut start = 0;
-        for child in node.children {
-            let child_end = start + child.len; // validated exact coverage
-            let from = offset.max(start);
-            let until = end.min(child_end);
-            if from < until {
-                let target = &mut out[(from - offset) as usize..(until - offset) as usize];
-                if level == 0 {
-                    let bytes = self.verified_blob(
-                        ObjectKey {
-                            kind: ObjectKind::Bytes,
-                            digest: child.digest,
-                        },
-                        Some(child.len),
-                        context,
-                    )?;
-                    target
-                        .copy_from_slice(&bytes[(from - start) as usize..(until - start) as usize]);
-                } else {
-                    self.read_node(
-                        child.digest,
-                        child.len,
-                        level - 1,
-                        from - start,
-                        target,
-                        context,
-                    )?;
-                }
-            }
-            start = child_end;
-            if start >= end {
-                break;
-            }
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            let fetcher = guard(&self.fetcher).clone().context("OBJECT_MISSING")?;
+            fetcher.fetch(&missing)?;
         }
         Ok(())
     }
-
-    /// Canonical rebuilding walks only changed paths and shape boundaries.
-    /// Unchanged data can remain absent. Structural pages needed for reuse must
-    /// be locally verified; absence never falls back to a whole-file copy.
-    pub(crate) fn rebuild(
-        &self,
-        base: Option<&FileContentRef>,
-        len: u64,
-        source: &mut dyn EditSource,
-        context: &ReadContext,
-    ) -> Result<FileContentRef> {
-        context.check()?;
-        ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
-        let base_pin = base.map(|r| self.pin(r)).transpose()?;
-        let mut cursor = BaseCursor {
-            provider: self,
-            root: base_pin.as_ref().map(ContentEdge::root).transpose()?,
-            pages: (0..MAX_DEPTH).map(|_| None).collect(),
-        };
-        let _permit = self.permit_checked(context, 3, BufferClass::Background, &|| {
-            source.check(context)
-        })?;
-        let mut zeros = BTreeMap::new();
-        let level = if len <= CHUNK_SIZE {
-            None
-        } else {
-            Some(ManifestNode::root_level(len)?)
-        };
-        let digest = self.rebuild_part(0, len, level, source, &mut cursor, &mut zeros, context)?;
-        context.check()?;
-        FileContentRef::new(
-            if level.is_some() {
-                ContentKind::Manifest
-            } else {
-                ContentKind::Direct
-            },
-            digest,
-            len,
-        )
+    fn object(&self, digest: Digest, kind: Kind) -> Result<Arc<Vec<u8>>> {
+        if let Ok(bytes) = self.packs.get(digest) {
+            return Ok(bytes);
+        }
+        self.ensure(&[(digest, kind)])?;
+        self.packs.get(digest)
     }
-    /// Read-only mutation preflight. Existing inputs are verified, but no new
-    /// content hashes, CAS installation or durability boundary are introduced.
-    /// Errors leave this stack (and its permits) before
-    /// the coordinator is allowed to wait for an immutable base object.
-    pub(crate) fn preflight(
-        &self,
-        base: &FileContentRef,
-        len: u64,
-        source: &mut dyn EditSource,
-        context: &ReadContext,
-    ) -> Result<()> {
-        context.check()?;
-        ensure!(len <= MAX_FILE_SIZE, "FILE_TOO_LARGE");
-        if len == 0 {
-            return source.check(context);
+    pub fn chunks(&self, reference: &FileContentRef) -> Result<Vec<Digest>> {
+        reference.validate()?;
+        if reference.kind == ContentKind::Direct {
+            return Ok(vec![reference.digest]);
         }
-        let pin = self.pin(base)?;
-        let mut cursor = BaseCursor {
-            provider: self,
-            root: Some(ContentEdge::root(&pin)?),
-            pages: (0..MAX_DEPTH).map(|_| None).collect(),
-        };
-        let _permit = self.permit_checked(context, 3, BufferClass::Background, &|| {
-            source.check(context)
-        })?;
-        let level = if len <= CHUNK_SIZE {
-            None
-        } else {
-            Some(ManifestNode::root_level(len)?)
-        };
-        Self::preflight_part(0, len, level, source, &mut cursor, context)?;
-        source.check(context)
-    }
-    fn preflight_part(
-        offset: u64,
-        len: u64,
-        level: Option<u8>,
-        source: &mut dyn EditSource,
-        cursor: &mut BaseCursor<'_>,
-        context: &ReadContext,
-    ) -> Result<()> {
-        context.check()?;
-        match source.span(offset, len, context)? {
-            EditSpan::Unchanged => {
-                if let Some(edge) = cursor.find(offset, level, context)?
-                    && edge.len == len
-                {
-                    return Ok(());
-                }
-            }
-            EditSpan::Zero => return Ok(()),
-            EditSpan::Changed => {}
-        }
-        if let Some(level) = level {
-            let capacity = ManifestNode::child_capacity(level)?;
-            let mut position = 0;
-            while position < len {
-                let child = capacity.min(len - position);
-                Self::preflight_part(
-                    offset + position,
-                    child,
-                    level.checked_sub(1),
-                    source,
-                    cursor,
-                    context,
-                )?;
-                position += child;
-            }
-            Ok(())
-        } else {
-            let mut scratch = vec![0; len as usize];
-            source
-                .read(offset, &mut scratch, context)
-                .map_err(|error| error.context(RebuildRange(ByteRange { offset, len })))
-        }
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn rebuild_part(
-        &self,
-        offset: u64,
-        len: u64,
-        level: Option<u8>,
-        source: &mut dyn EditSource,
-        cursor: &mut BaseCursor<'_>,
-        zeros: &mut BTreeMap<(Option<u8>, u64), Digest>,
-        context: &ReadContext,
-    ) -> Result<Digest> {
-        context.check()?;
-        match source.span(offset, len, context)? {
-            EditSpan::Unchanged => {
-                if let Some(edge) = cursor.find(offset, level, context)?
-                    && edge.len == len
-                {
-                    return Ok(edge.key.digest);
-                }
-            }
-            EditSpan::Zero => return self.zero_part(len, level, zeros, context),
-            EditSpan::Changed => {}
-        }
-        if let Some(level) = level {
-            let capacity = ManifestNode::child_capacity(level)?;
-            let mut node = ManifestNode {
-                level,
-                total_len: len,
-                children: Vec::new(),
-            };
-            let mut position = 0;
-            while position < len {
-                context.check()?;
-                let child_len = capacity.min(len - position);
-                let digest = self.rebuild_part(
-                    offset + position,
-                    child_len,
-                    level.checked_sub(1),
-                    source,
-                    cursor,
-                    zeros,
-                    context,
-                )?;
-                node.children.push(ManifestChild {
-                    kind: if level == 0 {
-                        ChildKind::Chunk
-                    } else {
-                        ChildKind::Node
-                    },
-                    len: child_len,
-                    digest,
-                });
-                position += child_len;
-            }
-            self.put_node(&node, context)
-        } else {
-            let mut bytes = vec![0; len as usize];
-            source.read(offset, &mut bytes, context)?;
-            context.check()?;
-            self.put_bytes(&bytes, context)
-        }
-    }
-    fn zero_part(
-        &self,
-        len: u64,
-        level: Option<u8>,
-        cache: &mut BTreeMap<(Option<u8>, u64), Digest>,
-        context: &ReadContext,
-    ) -> Result<Digest> {
-        context.check()?;
-        if let Some(digest) = cache.get(&(level, len)) {
-            return Ok(*digest);
-        }
-        let digest = if let Some(level) = level {
-            let capacity = ManifestNode::child_capacity(level)?;
-            let mut node = ManifestNode {
-                level,
-                total_len: len,
-                children: Vec::new(),
-            };
-            let mut remaining = len;
-            while remaining > 0 {
-                context.check()?;
-                let child_len = remaining.min(capacity);
-                let digest = self.zero_part(child_len, level.checked_sub(1), cache, context)?;
-                node.children.push(ManifestChild {
-                    kind: if level == 0 {
-                        ChildKind::Chunk
-                    } else {
-                        ChildKind::Node
-                    },
-                    len: child_len,
-                    digest,
-                });
-                remaining -= child_len;
-            }
-            self.put_node(&node, context)?
-        } else {
-            self.put_bytes(&vec![0; len as usize], context)?
-        };
+        let manifest = Manifest::decode(&self.object(reference.digest, Kind::Manifest)?)?;
         ensure!(
-            cache.len() < 2 * MAX_DEPTH as usize + 2,
-            "CONTENT_BUFFER_LIMIT"
+            manifest.len == reference.total_len,
+            "INVALID_MANIFEST_LENGTH"
         );
-        cache.insert((level, len), digest);
-        Ok(digest)
+        Ok(manifest.chunks)
     }
-
-    /// Constant-length aligned-chunk COW update. Unchanged subtrees retain their
-    /// identities. A fully covered chunk requires no read of its old bytes.
-    /// Resize is an explicit operation owned by write sessions.
-    pub fn overwrite(
+    pub fn read_range(
         &self,
-        pin: &PinnedContent,
-        offset: u64,
-        bytes: &[u8],
-        context: &ReadContext,
-    ) -> Result<FileContentRef> {
-        ensure!(pin.provider() == self.owner.id, "CONTENT_PROVIDER_MISMATCH");
-        let base = pin.reference();
-        context.validate(base, offset, bytes.len())?;
-        if bytes.is_empty() {
-            return Ok(base.clone());
-        }
-        let _permit = self.permit(context, 3, BufferClass::Background)?;
-        let digest = if base.kind == ContentKind::Direct {
-            let chunk = self.patch_chunk(base.digest, base.total_len, offset, bytes, context)?;
-            chunk.digest
-        } else {
-            self.patch_node(
-                base.digest,
-                base.total_len,
-                ManifestNode::root_level(base.total_len)?,
-                offset,
-                bytes,
-                context,
-            )?
-        };
-        FileContentRef::new(base.kind, digest, base.total_len)
-    }
-
-    fn patch_chunk(
-        &self,
-        digest: Digest,
-        len: u64,
-        offset: u64,
-        bytes: &[u8],
-        context: &ReadContext,
-    ) -> Result<ManifestChild> {
-        let digest = if offset == 0 && bytes.len() as u64 == len {
-            self.put_bytes(bytes, context)?
-        } else {
-            let mut data = self.verified_blob(
-                ObjectKey {
-                    kind: ObjectKind::Bytes,
-                    digest,
-                },
-                Some(len),
-                context,
-            )?;
-            data[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
-            self.put_bytes(&data, context)?
-        };
-        Ok(ManifestChild {
-            kind: ChildKind::Chunk,
-            len,
-            digest,
-        })
-    }
-
-    fn patch_node(
-        &self,
-        digest: Digest,
-        len: u64,
-        level: u8,
-        offset: u64,
-        bytes: &[u8],
-        context: &ReadContext,
-    ) -> Result<Digest> {
-        let mut node = self.node(digest, len, level, context)?;
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .context("RANGE_OVERFLOW")?;
-        ensure!(end <= len, "RANGE_OUT_OF_BOUNDS");
-        let mut start = 0;
-        for child in &mut node.children {
-            let child_end = start + child.len;
-            let from = start.max(offset);
-            let until = child_end.min(end);
-            if from < until {
-                let patch = &bytes[(from - offset) as usize..(until - offset) as usize];
-                if level == 0 {
-                    *child =
-                        self.patch_chunk(child.digest, child.len, from - start, patch, context)?;
-                } else {
-                    child.digest = self.patch_node(
-                        child.digest,
-                        child.len,
-                        level - 1,
-                        from - start,
-                        patch,
-                        context,
-                    )?;
-                }
-            }
-            start = child_end;
-            if start >= end {
-                break;
-            }
-        }
-        self.put_node(&node, context)
-    }
-
-    /// Captures only current explicit pins. This is not a complete reachability
-    /// inventory: metadata histories/recovery records must be added by retention.
-    pub fn pinned_roots(&self) -> (u64, Vec<FileContentRef>) {
-        let state = lock(&self.owner.lifetimes);
-        (
-            state.generation,
-            state.pins.values().map(|(root, _)| root.clone()).collect(),
-        )
-    }
-
-    fn read_range_inner(
-        &self,
-        pin: &PinnedContent,
+        reference: &FileContentRef,
         offset: u64,
         out: &mut [u8],
-        context: &ReadContext,
     ) -> Result<()> {
-        let reference = pin.reference();
-        if out.is_empty() {
-            return context.check();
+        ensure!(
+            offset
+                .checked_add(out.len() as u64)
+                .is_some_and(|n| n <= reference.total_len),
+            "READ_PAST_EOF"
+        );
+        let chunks = self.chunks(reference)?;
+        if !out.is_empty() {
+            let wanted = (offset / CHUNK_SIZE..=(offset + out.len() as u64 - 1) / CHUNK_SIZE)
+                .map(|i| (chunks[i as usize], Kind::Chunk))
+                .collect::<Vec<_>>();
+            self.ensure(&wanted)?;
         }
-        match reference.kind {
-            ContentKind::Direct => {
-                let bytes = self.verified_blob(
-                    ObjectKey::root(reference),
-                    Some(reference.total_len),
-                    context,
-                )?;
-                out.copy_from_slice(&bytes[offset as usize..offset as usize + out.len()]);
-            }
-            ContentKind::Manifest => self.read_node(
-                reference.digest,
-                reference.total_len,
-                ManifestNode::root_level(reference.total_len)?,
-                offset,
-                out,
-                context,
-            )?,
+        let mut done = 0;
+        while done < out.len() {
+            let pos = offset + done as u64;
+            let bytes = self.packs.get(chunks[(pos / CHUNK_SIZE) as usize])?;
+            let expected =
+                (reference.total_len - pos / CHUNK_SIZE * CHUNK_SIZE).min(CHUNK_SIZE) as usize;
+            ensure!(bytes.len() == expected, "INVALID_CHUNK_LENGTH");
+            let start = (pos % CHUNK_SIZE) as usize;
+            let count = (out.len() - done).min(bytes.len() - start);
+            out[done..done + count].copy_from_slice(&bytes[start..start + count]);
+            done += count;
         }
-        context.check()
+        Ok(())
     }
-}
-
-pub(crate) struct BufferPermit<'a> {
-    owner: &'a Mutex<BufferState>,
-    buffers: usize,
-    class: BufferClass,
-}
-impl Drop for BufferPermit<'_> {
-    fn drop(&mut self) {
-        let mut state = lock(self.owner);
-        match self.class {
-            BufferClass::Structural => state.structural = false,
-            BufferClass::Foreground => state.foreground -= self.buffers,
-            BufferClass::Background => state.background -= self.buffers,
-        }
+    pub fn pin(&self, reference: &FileContentRef) -> Result<Pin> {
+        let root_pin = self.packs.pin([reference.digest]);
+        let mut chunks = self.chunks(reference)?;
+        chunks.push(reference.digest);
+        let pin = self.packs.pin(chunks);
+        drop(root_pin);
+        Ok(pin)
     }
-}
-
-impl ContentProvider for LocalContent {
-    fn pin(&self, reference: &FileContentRef) -> Result<PinnedContent> {
-        let key = reference.encode()?;
-        let mut state = lock(&self.owner.lifetimes);
-        state
-            .pins
-            .entry(key)
-            .or_insert_with(|| (reference.clone(), 0))
-            .1 += 1;
-        state.generation = state.generation.wrapping_add(1);
-        drop(state);
-        PinnedContent::new(
-            reference.clone(),
-            self.owner.id,
-            Arc::new(PinLease {
-                owner: self.owner.clone(),
-                key,
-            }),
-        )
-    }
-
-    fn availability(
-        &self,
-        pin: &PinnedContent,
-        range: ByteRange,
-        context: &ReadContext,
-    ) -> Result<Availability> {
-        let len = usize::try_from(range.len).context("CONTENT_BUFFER_LIMIT")?;
-        context.validate(pin.reference(), range.offset, len)?;
-        ensure!(pin.provider() == self.owner.id, "CONTENT_PROVIDER_MISMATCH");
-        let _permit = self.permit(context, 2, BufferClass::Foreground)?;
-        let result = (|| -> Result<()> {
-            if len == 0 {
-                return context.check();
-            }
-            let mut offset = range.offset;
-            let end = range.end()?;
-            while offset < end {
-                self.read_range_inner(pin, offset, &mut [0], context)?;
-                offset = ((offset / CHUNK_SIZE + 1) * CHUNK_SIZE).min(end);
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => Ok(Availability::Available),
-            Err(error) => match error.downcast_ref::<ContentError>() {
-                Some(ContentError::Missing(_)) => Ok(Availability::Missing),
-                Some(ContentError::Corrupt(_)) => Ok(Availability::Corrupt),
-                None => Err(error),
-            },
-        }
-    }
-
-    fn read_range(
-        &self,
-        pin: &PinnedContent,
-        offset: u64,
-        out: &mut [u8],
-        context: &ReadContext,
-    ) -> Result<()> {
-        ensure!(pin.provider() == self.owner.id, "CONTENT_PROVIDER_MISMATCH");
-        let reference = pin.reference();
-        context.validate(reference, offset, out.len())?;
-        if out.is_empty() {
-            return context.check();
-        }
-        let _permit = self.permit(context, 2, BufferClass::Foreground)?;
-        self.read_range_inner(pin, offset, out, context)
+    pub fn import(&self, bytes: &[u8]) -> Result<FileContentRef> {
+        let chunks = if bytes.is_empty() {
+            vec![self.packs.put(Kind::Chunk, &[])?]
+        } else {
+            bytes
+                .chunks(CHUNK_SIZE as usize)
+                .map(|chunk| self.packs.put(Kind::Chunk, chunk))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let (kind, digest) = if bytes.len() as u64 <= CHUNK_SIZE {
+            (ContentKind::Direct, chunks[0])
+        } else {
+            (
+                ContentKind::Manifest,
+                self.packs.put(
+                    Kind::Manifest,
+                    &Manifest {
+                        len: bytes.len() as u64,
+                        chunks,
+                    }
+                    .encode()?,
+                )?,
+            )
+        };
+        FileContentRef::new(kind, digest, bytes.len() as u64)
     }
 }

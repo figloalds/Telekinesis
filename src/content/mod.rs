@@ -1,13 +1,5 @@
-//! Immutable content foundation. No runtime feature activation is performed here.
+//! Immutable pack storage and the host-file working layer.
 pub mod local;
-pub mod overlay_map;
-pub mod provider;
-pub mod receipt;
-pub mod scheduler;
-pub mod walk;
-pub mod work;
-pub mod write;
-
-pub use local::{LocalContent, PreparedContent};
-pub use provider::{Availability, ContentProvider, PinnedContent, ReadContext, SnapshotRootHandle};
-pub use walk::{ContentEdge, ContentWalk, WalkBatch};
+pub mod seal;
+pub mod working;
+pub use local::*;

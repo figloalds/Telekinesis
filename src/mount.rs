@@ -1,50 +1,25 @@
-//! Real WinFsp mount. Only the C shim touches WinFsp structures.
-//!
-//! Re-attachable (REVAMP_PLAN §4.3, WP1.5): [`bind`] sets the engine the
-//! callbacks serve (idempotent for the same `Arc`, independent of any path
-//! check); every [`attach`] starts a fresh `FSP_FILE_SYSTEM`; [`detach`] runs
-//! fence → drain → [force: retain dirty] → stop → release → unfence (see
-//! `worker::mount_ctl`). Mount failures never write `Engine.health`: callback
-//! failures go to the mount-scoped error counter and a rate-limited log, and a
-//! failed checkout remount reports `Lost` to the controller.
-//!
-//! `MOUNT` is the transition lock: [`bind`], [`attach`], [`detach`] and
-//! [`checkout`] hold it across their mount I/O (so they wait for each other);
-//! a callback, [`attached`], [`serves`] and [`inflight`] never take it, and
-//! [`notify`] only tries it, so readers never wait for a transition.
-//!
-//! WP5.2: a callback does the work that needs no engine lock first (waiting
-//! for content that is downloading, the writable copy of a large file, the
-//! hashing and copying of a save; `runtime::engine`, *Saves off the engine
-//! lock*), and takes the engine only for its own short phases. During a
-//! burst of closes a cleanup queues the save of the closed file for a
-//! background saver and returns (`runtime::engine::write_behind`); a lone
-//! cleanup, a flush, a rename and a delete-on-close wait for the save. A read of content
-//! that cannot arrive answers `STATUS_DEVICE_NOT_READY` (programs report "the
-//! device is not ready"); `STATUS_FILE_IS_OFFLINE` read as "invalid argument"
-//! (CCR-WP4.INT-2). At most half of the dispatcher threads wait for content.
+//! WinFsp callbacks route byte I/O directly to version-bound host scratch files.
 use crate::{
-    core::*,
-    model::ipc::timing::DETACH_DRAIN,
-    runtime::{Shared, lock_engine},
-    util::lock::lock,
-    worker::mount_ctl::adapter,
+    content::working::lock,
+    core::{Entry, EntryKind},
+    runtime::Engine,
 };
-use anyhow::{Context, Result, bail, ensure};
-use serde_json::Value;
+use anyhow::{Context, Result, ensure};
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError, RwLock},
+    sync::atomic::Ordering,
+    sync::{Arc, Mutex, RwLock},
 };
-/// The engine callbacks serve. Replaced only while nothing is attached.
-static ENGINE: RwLock<Option<Shared>> = RwLock::new(None);
-struct Mount {
-    native: usize,
-    path: PathBuf,
+
+static ENGINE: RwLock<Option<Arc<Engine>>> = RwLock::new(None);
+static MOUNT: Mutex<Option<(usize, PathBuf)>> = Mutex::new(None);
+static CALLS: [std::sync::atomic::AtomicU64; 16] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+static NANOS: [std::sync::atomic::AtomicU64; 16] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+pub fn stats() -> Vec<serde_json::Value> {
+    (1..16).map(|i|serde_json::json!({"operation":i,"calls":CALLS[i].load(Ordering::Relaxed),"ms":NANOS[i].load(Ordering::Relaxed) as f64/1e6})).collect()
 }
-/// The attached native instance. Lock order: `MOUNT`, then `ENGINE`, then the
-/// engine lock; never taken by a callback.
-static MOUNT: Mutex<Option<Mount>> = Mutex::new(None);
 #[repr(C)]
 #[derive(Default)]
 pub struct Info {
@@ -58,802 +33,271 @@ pub struct Info {
 }
 unsafe extern "C" {
     fn tk_winfsp_load(attempted: *mut u16, count: u32) -> u32;
-    fn tk_mount_start(path: *const u16, out: *mut usize, threads: u32, irp_timeout_ms: u32) -> u32;
+    fn tk_mount_start(path: *const u16, out: *mut usize, threads: u32, timeout: u32) -> u32;
     fn tk_mount_stop(native: usize);
     fn tk_mount_notify(native: usize, path: *const u16, action: u32) -> u32;
 }
-/// Called outside the engine mutex, using paths in their WinFsp-normalized form.
-/// Never waits for a mount transition (a detach can hold the adapter for its
-/// quiet wait and drain): `BUSY_VIEW`, and the caller keeps the notification
-/// for its next delivery.
-pub fn notify(path: &str, action: u32) -> Result<()> {
-    let guard = match MOUNT.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => {
-            bail!("BUSY_VIEW: mount transition in progress")
-        }
-    };
-    let Some(m) = guard.as_ref().filter(|m| m.native != 0) else {
-        return Ok(());
-    };
-    let path = path.to_uppercase();
-    let encoded: Vec<_> = path.encode_utf16().chain(Some(0)).collect();
-    let status = unsafe { tk_mount_notify(m.native, encoded.as_ptr(), action) };
-    ensure!(status == 0, "NOTIFICATION_FAILED: 0x{status:08x}");
-    Ok(())
+fn fill(entry: &Entry, size: u64) -> Info {
+    let size = entry.working_len.unwrap_or(size);
+    let index = uuid::Uuid::parse_str(&entry.id)
+        .map(|u| u.as_u128() as u64)
+        .unwrap_or(0);
+    Info {
+        size,
+        creation_time: entry.times.created,
+        access_time: entry.times.accessed,
+        write_time: entry.times.modified,
+        change_time: entry.times.changed,
+        index,
+        attributes: entry.attributes
+            | if entry.kind == EntryKind::Directory {
+                0x10
+            } else {
+                0
+            },
+    }
 }
-fn wide(path: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    // canonicalize produces extended DOS paths. WinFsp's mount-point parser
-    // expects a DOS folder path; retain canonical paths for reservation checks.
-    let text = path.as_os_str().to_string_lossy();
-    let normalized = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{unc}")
-    } else {
-        text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned()
-    };
-    std::ffi::OsStr::new(&normalized)
-        .encode_wide()
+pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
+    let mut mount = lock(&MOUNT);
+    ensure!(mount.is_none(), "MOUNT_ALREADY_ATTACHED");
+    let mut attempted = vec![0; 1024];
+    let status = unsafe { tk_winfsp_load(attempted.as_mut_ptr(), 1024) };
+    ensure!(status == 0, "WINFSP_LOAD_FAILED: {status:08x}");
+    *ENGINE.write().unwrap() = Some(engine.clone());
+    let wide: Vec<_> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
         .chain(Some(0))
-        .collect()
-}
-fn load_runtime() -> Result<()> {
-    let mut attempted = vec![0u16; 32768];
-    let loaded = unsafe { tk_winfsp_load(attempted.as_mut_ptr(), attempted.len() as u32) };
-    let length = attempted
-        .iter()
-        .position(|c| *c == 0)
-        .unwrap_or(attempted.len());
-    ensure!(
-        loaded == 0,
-        "WINFSP_RUNTIME_UNAVAILABLE: {} at {}; install WinFsp or set WINFSP_DIR to its installation root",
-        std::io::Error::from_raw_os_error(loaded as i32),
-        String::from_utf16_lossy(&attempted[..length])
-    );
-    Ok(())
-}
-/// Starts a native WinFsp instance at `path` (dispatcher threads and the
-/// request timeout of [`dispatcher_threads`] and [`REQUEST_TIMEOUT`]).
-fn start_native(path: &Path) -> Result<usize> {
-    let threads = dispatcher_threads();
-    CONTENT_WAITERS.set_max((threads / 2) as usize);
+        .collect();
     let mut native = 0;
-    let status = unsafe {
-        tk_mount_start(
-            wide(path).as_ptr(),
-            &mut native,
-            threads,
-            REQUEST_TIMEOUT.as_millis() as u32,
-        )
-    };
-    ensure!(status == 0, "WINFSP_MOUNT_FAILED: 0x{status:08x}");
-    Ok(native)
+    let status = unsafe { tk_mount_start(wide.as_ptr(), &mut native, 0, 60_000) };
+    if status != 0 {
+        *ENGINE.write().unwrap() = None;
+        anyhow::bail!("MOUNT_FAILED: {status:08x}");
+    }
+    *mount = Some((native, path.to_owned()));
+    engine.set_invalidator(Arc::new(notify));
+    Ok(())
 }
-fn bound() -> Result<Shared> {
-    ENGINE
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone()
-        .context("ENGINE_NOT_READY: no engine bound to the mount")
+pub fn detach() -> Result<()> {
+    let mut mount = lock(&MOUNT);
+    if let Some((native, _)) = mount.take() {
+        unsafe { tk_mount_stop(native) };
+    }
+    if let Some(engine) = ENGINE.write().unwrap().take() {
+        engine.flush(None)?;
+    }
+    Ok(())
 }
-/// Sets the engine the callbacks serve. Idempotent for the same `Arc`; a
-/// different engine replaces it only while nothing is attached
-/// (`ONE_MOUNT_PER_RUNTIME` otherwise). Performs no path check.
-pub fn bind(engine: &Shared) -> Result<()> {
+pub fn notify(path: &str, action: u32) -> Result<()> {
     let mount = lock(&MOUNT);
-    let mut slot = ENGINE.write().unwrap_or_else(PoisonError::into_inner);
-    if let Some(current) = slot.as_ref() {
-        if Arc::ptr_eq(current, engine) {
-            return Ok(());
-        }
-        ensure!(
-            mount.is_none(),
-            "ONE_MOUNT_PER_RUNTIME: another engine owns the attached mount"
-        );
+    if let Some((native, _)) = mount.as_ref() {
+        let path = path.replace('/', "\\");
+        let wide: Vec<_> = path.encode_utf16().chain(Some(0)).collect();
+        let status = unsafe { tk_mount_notify(*native, wide.as_ptr(), action) };
+        ensure!(status == 0, "NOTIFY_FAILED: {status:08x}");
     }
-    *slot = Some(engine.clone());
-    drop(slot);
-    crate::runtime::Engine::adopt_shared(engine);
     Ok(())
 }
-/// `MOUNT_PATH_MUST_NOT_EXIST` unless nothing is at `path`.
-pub fn vacant(path: &Path) -> Result<()> {
-    adapter::vacant(path)
-}
-/// Whether `engine` is the engine the callbacks serve.
-pub fn serves(engine: &Shared) -> bool {
-    ENGINE
-        .read()
-        .unwrap_or_else(PoisonError::into_inner)
-        .as_ref()
-        .is_some_and(|bound| Arc::ptr_eq(bound, engine))
-}
-/// The path of the attached native instance, if any. Never waits for a
-/// transition in progress.
-pub fn attached() -> Option<PathBuf> {
-    adapter::attached_path()
-}
-/// Whether the attached instance was unmounted outside this process. Always
-/// `false` for WinFsp: the mount point lives as long as the native instance,
-/// which only `tk_mount_stop` ends (FUSE has a real probe).
-pub fn vanished() -> bool {
-    false
-}
-/// Callbacks currently running.
-pub fn inflight() -> usize {
-    adapter::inflight()
-}
-/// Mount-scoped callback failures since the process started.
-pub fn mount_errors() -> u64 {
-    adapter::mount_errors()
-}
-/// Starts a fresh WinFsp instance at `path` for the bound engine. The path
-/// must not exist (WinFsp creates and removes the mount point).
-pub fn attach(path: &Path) -> Result<()> {
-    let mut guard = lock(&MOUNT);
-    if let Some(mount) = guard.as_ref() {
-        bail!(
-            "ONE_MOUNT_PER_RUNTIME: already attached at {}",
-            mount.path.display()
-        );
+unsafe fn text(path: *const u16) -> Result<String> {
+    if path.is_null() {
+        return Ok(String::new());
     }
-    let engine = bound()?;
-    load_runtime()?;
-    adapter::vacant(path)?;
-    crate::runtime::content_writes::NativeWrites::install(
-        &engine,
-        &crate::runtime::content_writes::default_context(&engine)?,
-    )?;
-    let native = start_native(path)?;
-    *guard = Some(Mount {
-        native,
-        path: path.to_owned(),
-    });
-    adapter::set_attached_path(Some(path.to_owned()));
-    adapter::attached(&engine);
-    Ok(())
-}
-/// Stops the attached instance (no-op when nothing is attached): fence →
-/// drain (≤ `DETACH_DRAIN`) → [force: `retain_all_dirty`] → `tk_mount_stop`
-/// → release handles → unfence. A graceful detach is refused with
-/// `BUSY_VIEW` (and stays attached, unfenced) while handles are open, a
-/// session is dirty, or callbacks do not drain.
-pub fn detach(force: bool) -> Result<()> {
-    let mut guard = lock(&MOUNT);
-    let Some(mount) = guard.as_ref() else {
-        return Ok(());
-    };
-    let engine = bound()?;
-    adapter::fence(&engine, force)?;
-    if !adapter::drain(DETACH_DRAIN) && !force {
-        adapter::unfence(&engine);
-        bail!(
-            "BUSY_VIEW: {} filesystem callbacks still running",
-            adapter::inflight()
-        );
+    let mut len = 0;
+    while len < 32768 && unsafe { *path.add(len) } != 0 {
+        len += 1;
     }
-    if force {
-        adapter::persist_dirty(&engine);
-    }
-    // Never hold the engine mutex while stopping callbacks.
-    if mount.native != 0 {
-        unsafe { tk_mount_stop(mount.native) };
-    }
-    *guard = None;
-    adapter::set_attached_path(None);
-    adapter::release(&engine);
-    Ok(())
+    ensure!(len < 32768, "INVALID_NAME");
+    Ok(String::from_utf16(unsafe {
+        std::slice::from_raw_parts(path, len)
+    })?)
 }
-/// Legacy entry (`daemon --mount`): bind, then attach.
-pub fn start(engine: Shared, path: &Path) -> Result<()> {
-    bind(&engine)?;
-    attach(path)
-}
-/// Legacy `stop` op: refuses unless the engine is quiet, then detaches
-/// gracefully. The fence is lifted afterwards.
-pub fn stop(engine: &Shared) -> Result<()> {
-    lock_engine(engine).quiet()?;
-    detach(false)
-}
-pub fn checkout(engine: &Shared, request: &str, payload: &Value) -> Result<Value> {
-    let mut mount_guard = lock(&MOUNT);
-    let mount = mount_guard.as_mut().context("MOUNT_NOT_RUNNING")?;
-    {
-        let mut e = lock_engine(engine);
-        if let Some(result) = e.store.receipt(request, payload)? {
-            return Ok(result);
-        }
-        if let Some(g) = payload["generation"].as_u64() {
-            ensure!(g == e.store.generation, "STALE_VIEW");
-        }
-        e.quiet()?;
-        // Refused before the mount stops, not after (`Engine::control` checks
-        // it again).
-        e.checkout_allowed()?;
-        let branch = e
-            .store
-            .branch(payload["name"].as_str().context("MISSING_ARGUMENT")?)?;
-        let p = e.store.projection(&branch.id)?;
-        ensure!(p.pending.is_empty(), "INCOMPLETE_CAUSAL_HISTORY");
-        e.switching = true;
-        // Content waits end now (they would hold the drain below).
-        adapter::set_fenced(true);
-    }
-    // New opens fenced before stopping. No engine mutex during dispatcher stop.
-    adapter::drain(DETACH_DRAIN);
-    unsafe { tk_mount_stop(mount.native) };
-    mount.native = 0;
-    let result = {
-        let mut e = lock_engine(engine);
-        e.mounted = false;
-        e.quiet().and_then(|()| e.control(request, payload))
-    };
-    let remount = crate::util::fault::fail("fs.remount").and_then(|()| start_native(&mount.path));
-    match remount {
-        Ok(native) => {
-            mount.native = native;
-            adapter::attached(engine);
-            result
-        }
-        Err(error) => {
-            // The mount is gone: Lost (never `Engine.health`).
-            *mount_guard = None;
-            adapter::set_attached_path(None);
-            adapter::release(engine);
-            let error = anyhow::anyhow!("REMOUNT_FAILED: {error:#}");
-            adapter::report_lost(&error);
-            Err(error)
+fn status(error: &anyhow::Error) -> u32 {
+    let text = format!("{error:#}");
+    for (code, value) in [
+        ("NOT_FOUND", 0xc0000034),
+        ("ALREADY_EXISTS", 0xc0000035),
+        ("NOT_A_DIRECTORY", 0xc0000103),
+        ("IS_A_DIRECTORY", 0xc00000ba),
+        ("DIRECTORY_NOT_EMPTY", 0xc0000101),
+        ("ACCESS_DENIED", 0xc0000022),
+        ("INVALID_HANDLE", 0xc0000008),
+        ("INVALID_NAME", 0xc0000033),
+        ("OBJECT_MISSING", 0xc00000a3),
+        ("STOPPING", 0xc00000a3),
+    ] {
+        if text.contains(code) {
+            return value;
         }
     }
-}
-fn fill(info: &mut Info, entry: &Entry, size: usize) {
-    info.size = size as u64;
-    let basic = entry.basic_info();
-    info.attributes = basic.attributes;
-    info.creation_time = basic.creation_time;
-    info.access_time = basic.access_time;
-    info.write_time = basic.write_time;
-    info.change_time = basic.change_time;
-    let h = hash(entry.id.as_bytes());
-    info.index = u64::from_str_radix(&h[..16], 16).unwrap();
-}
-unsafe fn string(ptr: *const u16) -> String {
-    if ptr.is_null() {
-        return String::new();
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        match io.kind() {
+            std::io::ErrorKind::NotFound => return 0xc0000034,
+            std::io::ErrorKind::PermissionDenied => return 0xc0000022,
+            _ => {}
+        }
     }
-    let mut n = 0;
-    while n < 32768 && unsafe { *ptr.add(n) } != 0 {
-        n += 1;
-    }
-    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, n) })
+    eprintln!("mount callback: {error:#}");
+    0xc0000001
 }
-/// C shim entry point.
-///
 /// # Safety
-/// The caller must provide a valid token pointer and writable output pointers.
-/// Names must be NUL-terminated UTF-16. I/O buffers must cover `length` bytes;
-/// directory enumeration buffers must cover `length` UTF-16 code units.
+/// Called by the WinFsp shim with buffers valid for the supplied operation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tk_call(
     op: u32,
     name: *const u16,
     token: *mut u64,
     offset: u64,
-    buffer: *mut u8,
+    buffer: *mut std::ffi::c_void,
     length: u32,
     flags: u32,
     info: *mut Info,
-    transferred: *mut u32,
+    count: *mut u32,
 ) -> u32 {
-    // Counted until return, so a detach can drain callbacks before stopping.
-    let _callback = adapter::callback();
-    let run = std::panic::catch_unwind(|| -> Result<u32> {
-        let engine = bound()?;
-        let engine = &engine;
-        ensure!(
-            lock_engine(engine).native_writes.is_some(),
-            "CONTENT_STORE_NOT_INITIALIZED"
-        );
-        let h = unsafe { *token };
-        let path = unsafe { string(name) };
-        if op == 2 {
-            let attributes = if length == 4 {
-                Some(unsafe { std::ptr::read_unaligned(buffer.cast::<u32>()) })
-            } else {
-                None
-            };
-            ensure!(
-                flags & 1 != 0 || flags & 4 == 0 || attributes.is_none_or(|value| value & 1 == 0),
-                "ACCESS_DENIED: readonly delete-on-close file"
-            );
-            let create = if flags & 1 != 0 {
-                crate::runtime::content_writes::create_directory
-            } else {
-                crate::runtime::content_writes::create
-            };
-            let (handle, entry) = create(
-                engine,
-                &path,
-                crate::runtime::content_writes::CreateOptions {
-                    writable: flags & 2 != 0,
-                    attributes,
-                    ..Default::default()
-                },
-                content_wait(),
-            )?
-            .context("CONTENT_STORE_NOT_INITIALIZED")?;
-            {
-                unsafe { *token = handle };
-                if flags & 4 != 0
-                    && let Err(error) = crate::runtime::content_writes::set_delete_disposition(
-                        engine,
-                        handle,
-                        true,
-                        content_wait(),
-                    )
-                {
-                    let _ = lock_engine(engine).release_handle(handle);
-                    unsafe { *token = 0 };
-                    return Err(error);
-                }
-                if !info.is_null() {
-                    let mut out = Info::default();
-                    fill(&mut out, &entry, 0);
-                    unsafe { *info = out };
-                }
-                return Ok(0);
-            }
+    let started = std::time::Instant::now();
+    if op < 16 {
+        CALLS[op as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    let result = std::panic::catch_unwind(|| -> Result<u32> {
+        let engine = ENGINE.read().unwrap().clone().context("STOPPING")?;
+        let h = if token.is_null() {
+            0
+        } else {
+            unsafe { *token }
+        };
+        if !count.is_null() {
+            unsafe { *count = 0 };
         }
-        if op == 12 {
-            let (entity, target) = {
-                let e = lock_engine(engine);
-                let entity = e.handle_entry(h)?.id;
-                let parent = e.store.lookup(&crate::core::split_path(&path)?.0)?;
-                (
-                    entity,
-                    crate::core::content_saves::NamespaceTarget {
-                        path: path.clone(),
-                        parent: parent.id,
-                    },
-                )
-            };
-            if crate::runtime::content_writes::rename_directory(
-                engine,
-                &entity,
-                Some(h),
-                None,
-                &target,
-                flags & 1 != 0,
-                content_wait(),
-            )? {
-                return Ok(0);
-            }
-            if crate::runtime::content_writes::rename(
-                engine,
-                &entity,
-                &path,
-                flags & 1 != 0,
-                content_wait(),
-            )? {
-                return Ok(0);
-            }
-            bail!("PERMISSION_DENIED: root/control rename");
-        }
-        if op == 3 && flags & 4 != 0 {
-            let e = lock_engine(engine);
-            let entry = e.lookup_visible(&path)?;
-            ensure!(
-                entry.kind != "file" || entry.basic_info().attributes & 1 == 0,
-                "ACCESS_DENIED: readonly delete-on-close file"
-            );
-        }
-        if op == 9 && flags & 1 != 0 {
-            crate::runtime::content_writes::unlink_on_cleanup(engine, h, &path, content_wait())?;
-        }
-        if op == 15 {
-            crate::runtime::content_writes::set_delete_disposition(
-                engine,
-                h,
-                flags & 1 != 0,
-                content_wait(),
-            )?;
-            return Ok(0);
-        }
-        if op == 5 {
-            let bytes = if length == 0 {
-                &[]
-            } else {
-                unsafe { std::slice::from_raw_parts(buffer, length as usize) }
-            };
-            let count = crate::runtime::content_writes::write(
-                engine,
-                h,
-                offset,
-                bytes,
-                flags & 1 != 0,
-                flags & 2 != 0,
-                content_wait(),
-            )?
-            .context("CONTENT_WRITE_REQUIRES_PRIVATE_SESSION")?;
-            {
-                let e = lock_engine(engine);
-                if !info.is_null() {
-                    let s = e.session(h)?;
-                    let mut out = Info::default();
-                    fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
-                    unsafe { *info = out };
-                }
-                if !transferred.is_null() {
-                    unsafe { *transferred = count as u32 };
-                }
-                return Ok(0);
-            }
-        }
-        if op == 6 {
-            ensure!(
-                crate::runtime::content_writes::truncate(
-                    engine,
-                    h,
-                    offset,
-                    flags & 1 != 0,
-                    content_wait(),
-                )?,
-                "CONTENT_WRITE_REQUIRES_PRIVATE_SESSION"
-            );
-            let e = lock_engine(engine);
-            if !info.is_null() {
-                let s = e.session(h)?;
-                let mut out = Info::default();
-                fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
-                unsafe { *info = out };
-            }
-            return Ok(0);
-        }
-        if op == 14 && h != 0 {
-            #[repr(C)]
-            #[derive(Clone, Copy)]
-            struct BasicUpdate {
-                times: [u64; 4],
-                attributes: u32,
-            }
-            ensure!(
-                length as usize == std::mem::size_of::<BasicUpdate>() && !buffer.is_null(),
-                "INVALID_PARAMETER"
-            );
-            let update = unsafe { std::ptr::read_unaligned(buffer.cast::<BasicUpdate>()) };
-            {
-                let e = lock_engine(engine);
-                let entry = e.handle_entry(h)?;
-                ensure!(entry.id != ROOT, "UNSUPPORTED_FS_OPERATION: root metadata");
-                ensure!(entry.id != "control", "PERMISSION_DENIED");
-            }
-            ensure!(
-                crate::runtime::content_writes::set_basic(
-                    engine,
-                    h,
-                    update.attributes,
-                    update.times,
-                    content_wait(),
-                )?,
-                "CONTENT_STORE_NOT_INITIALIZED"
-            );
-            {
-                let e = lock_engine(engine);
-                if !info.is_null() {
-                    let s = e.session(h)?;
-                    let mut out = Info::default();
-                    fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
-                    unsafe { *info = out };
-                }
-                return Ok(0);
-            }
-        }
-        if [7, 9].contains(&op) && h != 0 {
-            {
-                let mut e = lock_engine(engine);
-                let entry = e.handle_entry(h)?;
-                if entry.kind == "directory" || entry.id == "control" {
-                    if op == 9 {
-                        e.cleanup_unsaved(h)?;
-                    }
-                    if !info.is_null() {
-                        let mut out = Info::default();
-                        fill(&mut out, &entry, 0);
-                        unsafe { *info = out };
-                    }
-                    return Ok(0);
-                }
-            }
-            let context = crate::runtime::content_reads::request_context(engine, content_wait())?;
-            if crate::runtime::content_writes::file(engine, h, &context)?.is_some() {
-                ensure!(
-                    op != 9
-                        || flags & 1 == 0
-                        || crate::runtime::content_writes::retired_cleanup(engine, h, &context)?,
-                    "CONTENT_METADATA_CONTINUATION_LOST: native cleanup did not retire its entity"
-                );
-                if op == 9 {
-                    crate::runtime::engine::save_handle_on_cleanup(engine, h)?;
-                } else {
-                    crate::runtime::engine::save_handle(engine, h)?;
-                }
-                let mut e = lock_engine(engine);
-                if op == 9 {
-                    e.cleanup_unsaved(h)?;
-                }
-                if !info.is_null() {
-                    let s = e.session(h)?;
-                    let mut out = Info::default();
-                    fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
-                    unsafe { *info = out };
-                }
-                return Ok(0);
-            }
-            // A read-only immutable selection has no byte save to publish.
-            let mut e = lock_engine(engine);
-            ensure!(
-                !e.session(h)?.dirty,
-                "CONTENT_WRITE_REQUIRES_PRIVATE_SESSION"
-            );
-            if op == 9 {
-                e.cleanup_unsaved(h)?;
-            }
-            if !info.is_null() {
-                let mut out = Info::default();
-                fill(&mut out, &e.handle_entry(h)?, e.session(h)?.bytes.len());
-                unsafe { *info = out };
-            }
-            return Ok(0);
-        }
-        if op == 4 {
-            if !transferred.is_null() {
-                unsafe { *transferred = 0 };
-            }
-            if let Some(result) = crate::runtime::content_reads::read_mount_range(
-                engine,
-                h,
-                offset,
-                if length == 0 {
-                    &mut []
-                } else {
-                    unsafe { std::slice::from_raw_parts_mut(buffer, length as usize) }
-                },
-                content_wait(),
-            )? {
-                if !transferred.is_null() {
-                    unsafe { *transferred = result.count as u32 };
-                }
-                return Ok(if result.count == 0 && offset >= result.length {
-                    0xc0000011
-                } else {
-                    0
-                });
-            }
-            if length == 0 {
-                let e = lock_engine(engine);
-                return Ok(if offset >= e.session(h)?.bytes.len() as u64 {
-                    0xc0000011
-                } else {
-                    0
-                });
-            }
-        }
-        if op == 7 && h == 0 {
-            crate::runtime::engine::save_handle(engine, 0)?;
-            return Ok(0);
-        }
-        if op == 10 {
-            crate::runtime::engine::close_handle(engine, h)?;
-            crate::util::fault::fail("fs.close")?;
-            return Ok(0);
-        }
-        let _foreground = crate::runtime::engine::foreground();
-        let mut e = lock_engine(engine);
-        let mut out = Info::default();
-        let mut count = 0;
         match op {
             1 => {
-                let special = path
-                    .trim_matches('\\')
-                    .eq_ignore_ascii_case(".tkfs-runtime.json");
-                let entry = if special {
-                    Entry {
-                        id: "control".into(),
-                        kind: "file".into(),
-                        ..Default::default()
-                    }
-                } else {
-                    e.lookup_visible(&path)?
-                };
-                let size = if special {
-                    e.discovery.len()
-                } else {
-                    e.visible_size(&entry)?
-                };
-                fill(&mut out, &entry, size);
+                let entry = engine.lookup(&unsafe { text(name) }?)?;
+                if !info.is_null() {
+                    unsafe {
+                        *info = fill(
+                            &entry,
+                            entry.content.as_ref().map(|c| c.total_len).unwrap_or(0),
+                        )
+                    };
+                }
             }
-            3 => {
-                let (handle, entry) = e.open_with_attributes(&path, None, flags & 2 != 0, None)?;
-                unsafe { *token = handle };
-                fill(&mut out, &entry, e.session(handle)?.bytes.len());
+            2 | 3 => {
+                let attrs = if op == 2 && !buffer.is_null() {
+                    Some(unsafe { *(buffer as *const u32) })
+                } else {
+                    None
+                };
+                let h = engine.open_file_with_attributes(
+                    &unsafe { text(name) }?,
+                    op == 2,
+                    flags & 1 != 0,
+                    flags & 2 != 0,
+                    attrs,
+                )?;
+                unsafe { *token = h };
+                if flags & 4 != 0 {
+                    engine.handle(h)?.delete.store(true, Ordering::Release);
+                }
+                let (e, len) = engine.info(h)?;
+                unsafe { *info = fill(&e, len) };
             }
             4 => {
-                ensure!(
-                    e.handle_entry(h)?.id == "control",
-                    "MISSING_CONTENT_DESCRIPTOR"
-                );
-                let s = e.session(h)?;
-                let start = usize::try_from(offset)?;
-                if start >= s.bytes.len() {
+                let out = if length == 0 {
+                    &mut []
+                } else {
+                    unsafe { std::slice::from_raw_parts_mut(buffer as *mut u8, length as usize) }
+                };
+                let n = engine.read(h, offset, out)?;
+                if !count.is_null() {
+                    unsafe { *count = n as u32 };
+                }
+                if n == 0 && length != 0 {
                     return Ok(0xc0000011);
                 }
-                count = s.bytes.read_at(start, unsafe {
-                    std::slice::from_raw_parts_mut(buffer, length as usize)
-                })? as u32;
             }
-            8 => {}
+            5 => {
+                let bytes = if length == 0 {
+                    &[]
+                } else {
+                    unsafe { std::slice::from_raw_parts(buffer as *const u8, length as usize) }
+                };
+                let n = engine.write(h, offset, bytes, flags & 1 != 0, flags & 2 != 0)?;
+                if !count.is_null() {
+                    unsafe { *count = n as u32 };
+                }
+                let (e, len) = engine.info(h)?;
+                unsafe { *info = fill(&e, len) };
+            }
+            6 => {
+                engine.truncate(h, offset, flags & 1 != 0)?;
+                let (e, len) = engine.info(h)?;
+                unsafe { *info = fill(&e, len) };
+            }
+            7 => {
+                engine.flush((h != 0).then_some(h))?;
+                if h != 0 {
+                    let (e, len) = engine.info(h)?;
+                    unsafe { *info = fill(&e, len) };
+                }
+            }
+            8 => {
+                let (e, len) = engine.info(h)?;
+                unsafe { *info = fill(&e, len) };
+            }
+            9 => engine.cleanup(h, flags & 1 != 0)?,
+            10 => engine.close(h)?,
             11 => {
-                let s = e.session(h)?;
-                ensure!(
-                    s.entry.id != ROOT && s.entry.id != "control",
-                    "PERMISSION_DENIED"
-                );
-                ensure!(
-                    s.entry.kind == "directory" || s.entry.basic_info().attributes & 1 == 0,
-                    "ACCESS_DENIED: readonly file"
-                );
-                let entity = s.entry.id.clone();
-                ensure!(
-                    e.children_visible(&entity)?.is_empty(),
-                    "DIRECTORY_NOT_EMPTY"
-                );
+                let handle = engine.handle(h)?;
+                let entry = lock(&handle.entry);
+                ensure!(entry.id != crate::core::ROOT, "ACCESS_DENIED");
+                if entry.kind == EntryKind::Directory {
+                    ensure!(
+                        lock(&engine.store)
+                            .projection()
+                            .children(&entry.id)
+                            .is_empty(),
+                        "DIRECTORY_NOT_EMPTY"
+                    );
+                }
             }
+            12 => engine.rename(h, &unsafe { text(name) }?, flags & 1 != 0)?,
             13 => {
-                // Runtime discovery is direct-lookup-only, never a directory entry.
-                // FindFirstFile on a completely empty directory must still open a
-                // search handle. Git's Windows opendir rejects ERROR_FILE_NOT_FOUND;
-                // ordinary directory consumers discard these standard dot entries.
-                let Some((entry, size)) =
-                    e.directory_entry(h, usize::try_from(offset)?, flags & 1 != 0)?
-                else {
+                let entries = engine.children(h, flags & 1 != 0)?;
+                let Some(entry) = entries.get(offset as usize) else {
                     return Ok(0x80000006);
                 };
-                let encoded: Vec<_> = entry.name.encode_utf16().chain(Some(0)).collect();
-                ensure!(encoded.len() <= length as usize, "BUFFER_TOO_SMALL");
+                let wide: Vec<_> = entry.name.encode_utf16().chain(Some(0)).collect();
+                ensure!(wide.len() <= length as usize, "INVALID_NAME");
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        encoded.as_ptr(),
-                        buffer.cast::<u16>(),
-                        encoded.len(),
-                    )
-                };
-                fill(&mut out, &entry, size);
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), buffer as *mut u16, wide.len());
+                    *info = fill(
+                        entry,
+                        entry.content.as_ref().map(|c| c.total_len).unwrap_or(0),
+                    );
+                }
             }
-            _ => bail!("UNSUPPORTED_FS_OPERATION"),
-        }
-        if op == 8 && h != 0 {
-            let s = e.session(h)?;
-            fill(&mut out, &e.handle_entry(h)?, s.bytes.len());
-        }
-        if !info.is_null() {
-            unsafe { *info = out };
-        }
-        if !transferred.is_null() {
-            unsafe { *transferred = count };
-        }
-        e.publish_observation();
-        if op == 3 {
-            let opened = unsafe { *token };
-            let descriptor = e.session(opened)?.bytes.content_selection().is_some();
-            drop(e);
-            if descriptor
-                && let Err(error) =
-                    crate::runtime::content_reads::prepare_open(engine, opened, content_wait())
-            {
-                let _ = lock_engine(engine).release_handle(opened);
-                unsafe { *token = 0 };
-                return Err(error);
+            14 => {
+                ensure!(length >= 36, "INVALID_BASIC_INFO");
+                let times = unsafe { std::slice::from_raw_parts(buffer as *const u64, 4) };
+                let attrs = unsafe { *((buffer as *const u8).add(32) as *const u32) };
+                engine.basic(h, attrs, times.try_into()?)?;
+                let (e, len) = engine.info(h)?;
+                unsafe { *info = fill(&e, len) };
             }
-            if flags & 4 != 0
-                && let Err(error) = crate::runtime::content_writes::set_delete_disposition(
-                    engine,
-                    opened,
-                    true,
-                    content_wait(),
-                )
-            {
-                let _ = lock_engine(engine).release_handle(opened);
-                unsafe { *token = 0 };
-                return Err(error);
-            }
+            15 => engine
+                .handle(h)?
+                .delete
+                .store(flags & 1 != 0, Ordering::Release),
+            _ => anyhow::bail!("UNSUPPORTED_OPERATION"),
         }
         Ok(0)
     });
-    match run {
+    if op < 16 {
+        NANOS[op as usize].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    match result {
         Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            let status = nt_status(&error);
-            // Mount-scoped: counted and logged at a bounded rate, never
-            // written to `Engine.health` (which would block stop, RC11).
-            adapter::fs_error(
-                op,
-                &error,
-                [9, 10].contains(&op) || status == STATUS_IO_DEVICE_ERROR,
-            );
-            status
-        }
-        Err(_) => {
-            adapter::fs_error(
-                op,
-                &anyhow::anyhow!("UNKNOWN_ERROR: filesystem callback panicked"),
-                true,
-            );
-            STATUS_IO_DEVICE_ERROR
-        }
-    }
-}
-const STATUS_IO_DEVICE_ERROR: u32 = 0xc0000185;
-/// What a read of content that cannot arrive in time answers.
-pub const STATUS_DEVICE_NOT_READY: u32 = 0xc00000a3;
-/// The WinFsp request timeout this adapter sets (`IrpTimeout`, the SDK's
-/// default, made explicit): a callback must answer within it.
-pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-/// How long a read waits for content that is downloading (crate docs of
-/// `runtime::content`): until no byte arrived for a minute, at most four
-/// minutes in all, a minute below [`REQUEST_TIMEOUT`].
-pub const CONTENT_STALL: std::time::Duration = std::time::Duration::from_secs(60);
-pub const CONTENT_BOUND: std::time::Duration = std::time::Duration::from_secs(240);
-/// Reads waiting for downloads at once: half the dispatcher threads, so the
-/// mount's other operations always find a thread.
-static CONTENT_WAITERS: crate::runtime::content::WaitSlots =
-    crate::runtime::content::WaitSlots::new(4);
-/// The dispatcher threads of a WinFsp instance: the processor count (the
-/// WinFsp default), at least 8 and at most 64.
-pub fn dispatcher_threads() -> u32 {
-    std::thread::available_parallelism()
-        .map_or(8, |n| n.get())
-        .clamp(8, 64) as u32
-}
-fn content_wait() -> crate::runtime::content::ContentWait {
-    let (stall, bound) = crate::runtime::content::wait_bounds(CONTENT_STALL, CONTENT_BOUND);
-    crate::runtime::content::ContentWait {
-        stall,
-        bound,
-        slots: Some(&CONTENT_WAITERS),
-        cancelled: adapter::fenced,
-    }
-}
-fn nt_status(error: &anyhow::Error) -> u32 {
-    let message = format!("{error:#}");
-    if message.contains("CONTENT_UNAVAILABLE") {
-        // Not STATUS_FILE_IS_OFFLINE: the C runtime maps its Win32 error to
-        // EINVAL, so programs reported "invalid argument" (CCR-WP4.INT-2).
-        // ERROR_NOT_READY reads "The device is not ready." in Win32 programs
-        // and maps to EACCES in the C runtime.
-        STATUS_DEVICE_NOT_READY
-    } else if message.contains("FILE_NOT_FOUND") {
-        0xc0000034
-    } else if message.contains("NAME_COLLISION") {
-        0xc0000035
-    } else if message.contains("NOT_EMPTY") {
-        0xc0000101
-    } else if message.contains("NOT_DIRECTORY") {
-        0xc0000103
-    } else if message.contains("BUSY") {
-        0xc0000043
-    } else if message.contains("INVALID_NAME") {
-        0xc0000033
-    } else if message.contains("PERMISSION") || message.contains("ACCESS_DENIED") {
-        0xc0000022
-    } else if message.contains("UNSUPPORTED") {
-        0xc00000bb
-    } else if message.contains("INVALID_TIMESTAMP")
-        || message.contains("INVALID_ATTRIBUTES")
-        || message.contains("INVALID_PARAMETER")
-    {
-        0xc000000d
-    } else {
-        STATUS_IO_DEVICE_ERROR
+        Ok(Err(error)) => status(&error),
+        Err(_) => 0xc0000001,
     }
 }

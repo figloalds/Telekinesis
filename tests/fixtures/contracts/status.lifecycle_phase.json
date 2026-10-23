@@ -1,9 +1,0 @@
-[
-  "stopped",
-  "starting",
-  "running",
-  "stop_blocked",
-  "stopping",
-  "backoff",
-  "failed"
-]

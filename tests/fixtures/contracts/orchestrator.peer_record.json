@@ -1,6 +1,0 @@
-{
-  "endpoint": "wss://peer.example:43180",
-  "installation": "inst-bbbb-2222",
-  "connections": 4,
-  "revision": "rev-7"
-}

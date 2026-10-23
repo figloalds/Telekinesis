@@ -1518,7 +1518,7 @@ impl Conn {
 
     /// The predicate must be nonblocking; cancellation abandons only this call
     /// and preserves unrelated exchanges on the same connection.
-    pub(crate) fn call_cancellable(
+    pub fn call_cancellable(
         &self,
         op: &str,
         header: Value,
@@ -1574,7 +1574,7 @@ impl Conn {
     /// Cancels only this stream, including while no chunks arrive. Used to
     /// yield legacy bulk capacity without tearing down a shared connection.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn call_streaming_cancellable(
+    pub fn call_streaming_cancellable(
         &self,
         op: &str,
         header: Value,
@@ -1939,13 +1939,6 @@ pub struct Responder {
 }
 
 impl Responder {
-    /// Internal bounded protocols retain a connection fence until the peer
-    /// ACKs queued bytes. Closing it purges queues before returning credit.
-    pub(crate) fn connection(&self) -> Conn {
-        Conn {
-            inner: self.shared.clone(),
-        }
-    }
     pub(crate) fn new(shared: Arc<Shared>, id: u64, cancel: Arc<AtomicBool>, limit: usize) -> Self {
         Self {
             id,

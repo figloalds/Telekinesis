@@ -38,9 +38,7 @@ static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs
     TK_INFO info={0};UINT32 flags=((options&FILE_DIRECTORY_FILE)?1:0)|((access&(FILE_WRITE_DATA|FILE_APPEND_DATA))?2:0)|((options&FILE_DELETE_ON_CLOSE)?4:0);
     NTSTATUS result=tk_call(op,name,&handle->token,0,op==2?&attrs:0,op==2?sizeof attrs:0,flags,&info,0);
     if(!NT_SUCCESS(result)){free(handle);return result;}*context=handle;fill(fi,&info);
-    /* Force ordinary reads/writes through Rust; kernel data caching would hide
-       remotely updated bytes behind an existing file node. Public SDK wire flag. */
-    FspFileSystemGetOperationContext()->Response->Rsp.Create.Opened.DisableCache=1;
+    /* Kernel caching is coherent through remote event notifications. */
     return result;
 }
 static NTSTATUS create(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,PSECURITY_DESCRIPTOR sd,UINT64 allocation,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,attrs,2,context,fi);}
@@ -107,8 +105,8 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
     Interface.Flush=flush;Interface.GetFileInfo=get_info;Interface.SetBasicInfo=basic;Interface.SetFileSize=size_file;
     Interface.CanDelete=can_delete;Interface.SetDelete=set_delete;Interface.Rename=rename_file;Interface.GetSecurity=get_security;Interface.ReadDirectory=read_dir;
     FSP_FSCTL_VOLUME_PARAMS p={0};p.Version=sizeof p;p.SectorSize=4096;p.SectorsPerAllocationUnit=1;
-    p.MaxComponentLength=255;p.FileInfoTimeout=0;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
-    p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=1;p.UmFileContextIsUserContext2=1;
+    p.MaxComponentLength=255;p.FileInfoTimeout=1000;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
+    p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=0;p.UmFileContextIsUserContext2=1;
     /* Every mount uses native retirement for open destination handles. */
     p.SupportsPosixUnlinkRename=1;
     if(irp_timeout_ms)p.IrpTimeout=irp_timeout_ms;

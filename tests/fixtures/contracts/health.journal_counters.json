@@ -1,9 +1,0 @@
-{
-  "events": 4096,
-  "shared_events": 4090,
-  "branches": 2,
-  "tip": 4096,
-  "epoch": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
-  "outgoing_unacknowledged": 12,
-  "unresolved_conflicts": 1
-}

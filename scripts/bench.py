@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import wave6_build  # noqa: E402  (the .NET harness generator and build runner)
+import bench_build  # noqa: E402  (the .NET harness generator and build runner)
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = ("copy_small", "build", "seq_1g", "random_4k", "git_status_50k", "remote_visibility")
@@ -122,14 +122,14 @@ def git_setup(root, args):
         (folder / f"file{index:05d}.txt").write_bytes(rng.randbytes(64 + rng.randrange(192)))
     git = ["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
            "-c", "user.name=bench", "-c", "user.email=bench@example.invalid"]
-    wave6_build.command(git + ["init", "-q"], cwd=repo)
-    wave6_build.command(git + ["add", "-A"], cwd=repo)
-    wave6_build.command(git + ["commit", "-q", "-m", "bench"], cwd=repo)
+    bench_build.command(git + ["init", "-q"], cwd=repo)
+    bench_build.command(git + ["add", "-A"], cwd=repo)
+    bench_build.command(git + ["commit", "-q", "-m", "bench"], cwd=repo)
     return repo
 
 
 def git_status_50k(repo, args, run):
-    elapsed, output = wave6_build.command(
+    elapsed, output = bench_build.command(
         ["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
          "status", "--porcelain"], cwd=repo)
     assert output == "", f"dirty tree: {output[:200]}"
@@ -140,10 +140,10 @@ def build(root, args, log_dir):
     """Clean and no-op builds of the generated .NET harness, via the Wave 6 runner."""
     harness = root / "dotnet"
     tree_rm(harness)
-    wave6_build.generate(harness, args.projects, args.files, args.framework)
+    bench_build.generate(harness, args.projects, args.files, args.framework)
     build_args = argparse.Namespace(runs=args.runs, projects=args.projects, files=args.files,
                                     jobs=args.jobs, framework=args.framework)
-    result = wave6_build.measure(harness, build_args, log_dir, {})
+    result = bench_build.measure(harness, build_args, log_dir, {})
     samples = {"build_clean": [], "build_noop": [], "build_incremental": []}
     for sample in result["samples"]:
         if not sample["warmup"]:
@@ -152,22 +152,126 @@ def build(root, args, log_dir):
 
 
 def remote_visibility(root, peer_root, args, run):
-    """Write on the peer side; time until the same bytes are readable under root."""
-    name = f"remote-{run}-{time.time_ns()}.bin"
+    """Prime caches, update on peer, measure visibility from local event apply."""
+    name = "remote-visibility.bin"
+    original = random.Random(run + 100).randbytes(4096)
     payload = random.Random(run).randbytes(4096)
-    started = time.perf_counter()
-    (peer_root / name).write_bytes(payload)
-    deadline = started + 60
-    while time.perf_counter() < deadline:
+    with (peer_root / name).open("wb") as stream:
+        stream.write(original)
+        stream.flush()
+        os.fsync(stream.fileno())
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            if (root / name).read_bytes() == original:
+                break
+        except OSError:
+            pass
+        time.sleep(.005)
+    else:
+        raise TimeoutError("cache priming did not replicate")
+    (root / name).stat()
+    with (peer_root / name).open("wb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    started_ns = time.time_ns()
+    if args.local_state and args.tkfs:
+        expected = hashlib.sha256(payload).hexdigest()
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            result = json.loads(bench_build.command([args.tkfs, "--state", args.local_state,
+                "rpc", "lookup", json.dumps({"path": args.mount_prefix + "/" + name})])[1])
+            if result["entry"]["content"]["digest"] == expected:
+                started_ns = int(result["applied_ns"])
+                break
+            time.sleep(.005)
+        else:
+            raise TimeoutError("peer event not applied")
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
         try:
             if (root / name).read_bytes() == payload:
-                elapsed = ms(started)
+                elapsed = (time.time_ns() - started_ns) / 1_000_000
                 (peer_root / name).unlink()
                 return {"remote_visibility": elapsed}
         except OSError:
             pass
         time.sleep(0.005)
     raise TimeoutError(f"{name} not visible under {root} within 60 s")
+
+
+def matrix(args):
+    """Run the same gate natively, mounted, and with a paired idle peer."""
+    import tempfile
+    exe = args.matrix_tkfs.resolve()
+    common = ["--runs", str(args.runs), "--copy-files", str(args.copy_files),
+              "--large-mib", str(args.large_mib), "--random-ops", str(args.random_ops),
+              "--git-files", str(args.git_files), "--projects", str(args.projects),
+              "--files", str(args.files), "--jobs", str(args.jobs), "--framework", args.framework]
+    if args.only:
+        common += ["--only", args.only]
+    base = ROOT / "test-evidence/bench" / f"{args.label}-native.json"
+    failures = []
+    native = subprocess.run([sys.executable, __file__, "--label", args.label + "-native",
+                             "--output", str(base), *common])
+    if native.returncode:
+        return native.returncode
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with tempfile.TemporaryDirectory(prefix="tkfs-bench-states-") as temp:
+        home = Path(temp)
+        processes = []
+        def cli(state, *command):
+            return json.loads(bench_build.command([exe, "--state", state, *command])[1])
+        def start(name, mount):
+            state = home / name
+            cli(state, "init", "--repo", "benchmark")
+            log = (home / f"{name}.log").open("w")
+            command = [str(exe), "--state", str(state), "daemon", "--listen", "127.0.0.1:0"]
+            if mount:
+                command += ["--mount", mount]
+            proc = subprocess.Popen(command, stdout=log, stderr=log, creationflags=flags)
+            processes.append((state, proc, log))
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    raise RuntimeError((home / f"{name}.log").read_text())
+                if (state / "control.json").exists():
+                    return state
+                time.sleep(.05)
+            raise TimeoutError("mount startup")
+        try:
+            if os.name != "nt":
+                raise RuntimeError("matrix mount letters currently require Windows; use --root on Linux")
+            state = start("mounted", args.matrix_mount)
+            root = Path(args.matrix_mount + "/bench")
+            mounted = subprocess.run([sys.executable, __file__, "--label", args.label + "-mounted",
+                "--root", str(root), "--compare", str(base), *common])
+            if mounted.returncode:
+                failures.append("mounted")
+            peer = start("peer", args.matrix_peer_mount)
+            endpoint = json.loads((home / "mounted.log").read_text().splitlines()[0])["peer"]
+            cli(peer, "pair", endpoint, cli(state, "pairing-code")["code"])
+            peer_root = Path(args.matrix_peer_mount + "/bench")
+            deadline = time.monotonic() + 60
+            while not peer_root.exists() and time.monotonic() < deadline:
+                time.sleep(.05)
+            idle = subprocess.run([sys.executable, __file__, "--label", args.label + "-idle-peer",
+                "--root", str(root), "--peer-root", str(peer_root), "--local-state", str(state),
+                "--tkfs", str(exe), "--mount-prefix", "bench", "--compare", str(base), *common])
+            if idle.returncode:
+                failures.append("idle-peer")
+        finally:
+            for state, proc, log in reversed(processes):
+                try:
+                    cli(state, "stop")
+                    proc.wait(timeout=30)
+                except Exception:
+                    proc.kill()
+                    proc.wait()
+                log.close()
+    print("Matrix failures:", failures)
+    return int(bool(failures))
 
 
 # --- driver ----------------------------------------------------------------
@@ -197,7 +301,7 @@ def host_info():
             "python": sys.version.split()[0]}
     for tool in (["git", "--version"], ["dotnet", "--version"]):
         try:
-            info[tool[0]] = wave6_build.command(tool)[1]
+            info[tool[0]] = bench_build.command(tool)[1]
         except Exception as error:  # noqa: BLE001
             info[tool[0]] = f"unavailable: {error}"
     return info
@@ -250,6 +354,12 @@ def main():
     parser.add_argument("--stage", type=Path, help="staging dir for copy sources, on the same drive "
                         "but outside --root (default C:/tkfs-bench/stage)")
     parser.add_argument("--peer-root", type=Path, help="peer-side directory for remote_visibility")
+    parser.add_argument("--matrix-tkfs", type=Path, help="run the native/mounted/idle-peer matrix with this binary")
+    parser.add_argument("--matrix-mount", default="X:")
+    parser.add_argument("--matrix-peer-mount", default="Y:")
+    parser.add_argument("--local-state", type=Path)
+    parser.add_argument("--tkfs", type=Path)
+    parser.add_argument("--mount-prefix", default="bench")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--only", help="comma-separated subset of " + ",".join(WORKLOADS))
     parser.add_argument("--compare", type=Path, help="earlier report to print ratios against")
@@ -264,12 +374,15 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--framework", default="net10.0")
     args = parser.parse_args()
+    if args.matrix_tkfs:
+        return matrix(args)
     if args.runs < 1 or min(args.copy_files, args.large_mib, args.random_ops,
                            args.git_files, args.projects, args.files, args.jobs) < 1:
         parser.error("runs and workload sizes must be positive")
 
     bench_home = Path("C:/tkfs-bench") if os.name == "nt" else Path.home() / "tkfs-bench"
-    root = (args.root or bench_home / args.label).resolve()
+    # GetFinalPathNameByHandle is not implemented by every mounted filesystem.
+    root = Path(os.path.abspath(args.root or bench_home / args.label))
     stage = (args.stage or bench_home / "stage").resolve()
     if root == stage or root in stage.parents or stage in root.parents:
         parser.error("--root and --stage must be separate, non-nested directories")

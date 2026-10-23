@@ -1,78 +1,200 @@
-//! Folder lifecycle and networking belong to one daemon. Workers never dial peers.
-mod api;
-// The legacy `Supervisor` (`supervisor.rs`) and its catalog SQL
-// (`catalog_db.rs`) were deleted by WP2.INT (REVAMP_PLAN §14 WP2.INT task 1);
-// the daemon runs the Wave 1 actors since WP2.1.
-// WP3.1 deleted the legacy (v2) network: `legacy_bridge.rs`, `lanes.rs`,
-// `peering.rs` and `status.rs` (REVAMP_PLAN §14 WP3.1); the v3 peer stack
-// (`peer`, `scheduler`, `meta_exchange`, `objects`, `inbound`) is the only
-// network path.
-mod config;
-mod run;
-
-// Seam modules landed by WP0.INT (REVAMP_PLAN §14 WP0.INT); each file names
-// its owner in its first line.
+//! A folder daemon owns its metadata, mount and paired session connections.
 pub mod catalog;
-pub mod compat;
-pub mod content_dispatch;
-pub mod content_transport;
-pub mod ctx;
-pub mod diagnostics;
-pub mod folder;
-pub mod hub;
-pub mod hub_rules;
-pub mod inbound;
-pub mod inbound_objects;
-pub mod lease_clock;
-pub mod legacy_demand;
-pub mod manage;
-pub mod manage_v2;
-pub mod meta_exchange;
-pub mod objects;
-pub mod peer;
-pub mod process;
-pub mod published;
-pub mod registry;
-pub mod scheduler;
-pub mod shutdown;
-pub mod worker_client;
-
-pub use api::{Action, Project, client};
-// CCR-WP2.2-1 (applied by WP2.INT): the client side of the management API
-// where §14 names it (`orchestrator::ControlClient`, `api::format_status`).
-pub use api::{ControlClient, default_deadline, format_folder, format_status, is_read_only};
-pub use config::{Config, Network};
-pub use run::{run, serve, serve_with};
-
-#[cfg(unix)]
-use anyhow::ensure;
-use anyhow::{Context, Result};
+pub mod control;
+pub mod sync;
+use crate::{
+    content::working::lock,
+    model::protocol::LaneRole,
+    orchestrator::sync::{DigestFetch, FeedCursor, SessionSource},
+    runtime::Engine,
+    session::{self, Conn, ConnOptions},
+};
+use anyhow::Result;
 use std::{
-    fs::{File, OpenOptions},
-    path::Path,
+    collections::BTreeMap,
+    net::TcpListener,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
 };
 
-pub fn lock(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(false).read(true).write(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.share_mode(0);
+pub fn run(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<()> {
+    let listener = TcpListener::bind(listen)?;
+    listener.set_nonblocking(true)?;
+    let endpoint = advertise
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("ws://{}", listener.local_addr().unwrap()));
+    let catalog = catalog::Catalog::open(engine.clone())?;
+    catalog.set("advertise", &endpoint)?;
+    let control = control::start(engine.clone(), catalog.clone())?;
+    let fetch = DigestFetch::new(engine.working.content().packs.clone());
+    engine.working.content().set_fetcher(fetch.clone());
+    let (device, repo) = {
+        let s = lock(&engine.store);
+        (s.device.clone(), s.repo.clone())
+    };
+    println!(
+        "{}",
+        serde_json::json!({"ready":true,"peer":endpoint,"control":control,"device":device,"repo":repo})
+    );
+    let mut started = BTreeMap::<String, std::thread::JoinHandle<()>>::new();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut sessions: Vec<Conn> = Vec::new();
+    let handshakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    while !engine.stopping.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if sessions.len() < 64 && handshakes.load(Ordering::Acquire) < 16 {
+                    let catalog = catalog.clone();
+                    let engine = engine.clone();
+                    let tx = tx.clone();
+                    let count = handshakes.clone();
+                    count.fetch_add(1, Ordering::AcqRel);
+                    std::thread::spawn(move || {
+                        if let Ok((conn, peer)) =
+                            session::accept(stream, catalog.clone(), ConnOptions::default())
+                        {
+                            conn.serve(Arc::new(catalog::PeerService {
+                                catalog,
+                                engine,
+                                peer: peer.installation,
+                            }));
+                            let _ = tx.send(conn);
+                        }
+                        count.fetch_sub(1, Ordering::AcqRel);
+                    });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+        sessions.extend(rx.try_iter());
+        sessions.retain(|conn| conn.closed().is_none());
+        started.retain(|_, thread| !thread.is_finished());
+        for peer in catalog.peers()? {
+            if !started.contains_key(&peer.endpoint) {
+                let endpoint = peer.endpoint.clone();
+                let weak = Arc::downgrade(&engine);
+                let catalog = catalog.clone();
+                let fetch = fetch.clone();
+                let thread =
+                    std::thread::Builder::new()
+                        .name("tkfs-peer".into())
+                        .spawn(move || {
+                            let mut delay = 1;
+                            let mut cursor = FeedCursor::default();
+                            loop {
+                                let Some(engine) = weak.upgrade() else {
+                                    break;
+                                };
+                                if engine.stopping.load(Ordering::Acquire)
+                                    || !catalog.contains(&peer.endpoint)
+                                {
+                                    break;
+                                }
+                                let device = lock(&engine.store).device.clone();
+                                let hello =
+                                    session::client_hello(&device, LaneRole::Control, None, 1);
+                                let key = match peer.key() {
+                                    Ok(key) => key,
+                                    Err(_) => break,
+                                };
+                                match session::dial_expecting(
+                                    &peer.endpoint,
+                                    hello,
+                                    &session::auth::PeerAuth { key },
+                                    Some(&peer.installation),
+                                    None,
+                                    ConnOptions::default(),
+                                ) {
+                                    Ok((conn, _)) => {
+                                        fetch.add(
+                                            peer.endpoint.clone(),
+                                            Arc::new(SessionSource {
+                                                conn: conn.clone(),
+                                                repo: lock(&engine.store).repo.clone(),
+                                            }),
+                                        );
+                                        delay = 1;
+                                        while !engine.stopping.load(Ordering::Acquire)
+                                            && catalog.contains(&peer.endpoint)
+                                            && conn.closed().is_none()
+                                        {
+                                            match sync::exchange(&engine, &conn, &mut cursor) {
+                                                Ok(more) => {
+                                                    if more {
+                                                        continue;
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    eprintln!("peer {}: {error:#}", peer.endpoint);
+                                                    break;
+                                                }
+                                            }
+                                            let references = lock(&engine.store)
+                                                .projection()
+                                                .entries
+                                                .values()
+                                                .filter(|e| !e.deleted)
+                                                .filter_map(|e| e.content.clone())
+                                                .collect::<Vec<_>>();
+                                            for reference in references {
+                                                if engine.stopping.load(Ordering::Acquire) {
+                                                    break;
+                                                }
+                                                let root = (
+                                                reference.digest,
+                                                if reference.kind
+                                                    == crate::model::content::ContentKind::Direct
+                                                {
+                                                    crate::content::Kind::Chunk
+                                                } else {
+                                                    crate::content::Kind::Manifest
+                                                },
+                                            );
+                                                if fetch.prefetch(&[root]).is_ok()
+                                                    && let Ok(chunks) =
+                                                        engine.working.content().chunks(&reference)
+                                                {
+                                                    let wanted = chunks
+                                                        .into_iter()
+                                                        .map(|d| (d, crate::content::Kind::Chunk))
+                                                        .collect::<Vec<_>>();
+                                                    let _ = fetch.prefetch(&wanted);
+                                                }
+                                            }
+                                            std::thread::sleep(Duration::from_millis(100));
+                                        }
+                                        conn.close();
+                                        fetch.remove(&peer.endpoint);
+                                    }
+                                    Err(error) => eprintln!("peer {}: {error}", peer.endpoint),
+                                }
+                                drop(engine);
+                                for _ in 0..delay * 10 {
+                                    let Some(engine) = weak.upgrade() else {
+                                        return;
+                                    };
+                                    if engine.stopping.load(Ordering::Acquire) {
+                                        return;
+                                    }
+                                    drop(engine);
+                                    std::thread::sleep(Duration::from_millis(100));
+                                }
+                                delay = (delay * 2).min(60);
+                            }
+                        })?;
+                started.insert(endpoint, thread);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    let file = options
-        .open(path)
-        .context("ALREADY_RUNNING_OR_PATH_UNAVAILABLE")?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        ensure!(
-            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-            "ALREADY_RUNNING"
-        );
+    for session in sessions {
+        session.close();
     }
-    Ok(file)
-}
-pub fn lock_state(path: &Path) -> Result<File> {
-    lock(&path.join("owner.lock"))
+    engine.shutdown()?;
+    #[cfg(any(windows, target_os = "linux"))]
+    crate::mount::detach()?;
+    let root = lock(&engine.store).root.clone();
+    let _ = std::fs::remove_file(root.join("control.json"));
+    Ok(())
 }
