@@ -11,6 +11,11 @@ static PSECURITY_DESCRIPTOR Security;
 static ULONG SecuritySize;
 static volatile LONG SelfOpenRefusals;
 UINT32 tk_self_open_refusals(void) {return (UINT32)SelfOpenRefusals;}
+static BOOLEAN refuse_self_open(PWSTR name) {
+    if(FspFileSystemOperationProcessId()!=GetCurrentProcessId())return FALSE;
+    if(InterlockedIncrement(&SelfOpenRefusals)==1)fwprintf(stderr,L"mount: refused self-open of %s (W6-P0-MOUNT-LIFECYCLE)\n",name);
+    return TRUE;
+}
 static void fill(FSP_FSCTL_FILE_INFO *out, TK_INFO *in) {
     if (!out) return;
     memset(out,0,sizeof *out);out->FileAttributes=in->attributes;out->FileSize=in->size;
@@ -20,6 +25,10 @@ static void fill(FSP_FSCTL_FILE_INFO *out, TK_INFO *in) {
     out->IndexNumber=in->index;
 }
 static NTSTATUS call(UINT32 op,PWSTR name,PVOID context,UINT64 offset,PVOID buffer,ULONG length,UINT32 flags,FSP_FSCTL_FILE_INFO *fi,PULONG count) {
+#ifdef TKFS_NATIVE_CACHE_PROBE
+    if(op==2||op==5||op==6||op==11||op==12||op==14||op==15)return STATUS_MEDIA_WRITE_PROTECTED;
+    if(op==9)flags=0; /* retire read contexts without namespace/timestamp edits */
+#endif
     TK_INFO info={0};UINT64 token=context?((TK_HANDLE*)context)->token:0;
     NTSTATUS result=tk_call(op,name,&token,offset,buffer,length,flags,&info,count);
     if(NT_SUCCESS(result))fill(fi,&info);return result;
@@ -33,6 +42,9 @@ static NTSTATUS volume(FSP_FILE_SYSTEM *fs,FSP_FSCTL_VOLUME_INFO *out) {
     wcscpy_s(out->VolumeLabel,32,L"TKFS PoC");out->VolumeLabelLength=16;return STATUS_SUCCESS;
 }
 static NTSTATUS security_name(FSP_FILE_SYSTEM *fs,PWSTR name,PUINT32 attrs,PSECURITY_DESCRIPTOR sd,SIZE_T *size) {
+    /* WinFsp can call this before Create/Open. Reject before entering Rust:
+       the self-opening thread might already hold its metadata/store lock. */
+    if(refuse_self_open(name))return STATUS_ACCESS_DENIED;
     TK_INFO info={0};UINT64 token=0;NTSTATUS result=tk_call(1,name,&token,0,0,0,0,&info,0);
     if(!NT_SUCCESS(result))return result;if(attrs)*attrs=info.attributes;return sec(sd,size);
 }
@@ -40,12 +52,16 @@ static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs
     /* W6-P0-MOUNT-LIFECYCLE: this server must never hold a handle into its
        own namespace. Windows sweeps a dying process's handles one at a time;
        a cleanup that needs this (dead) dispatcher never completes. */
-    if(FspFileSystemOperationProcessId()==GetCurrentProcessId()){
-        if(InterlockedIncrement(&SelfOpenRefusals)==1)fwprintf(stderr,L"mount: refused self-open of %s (W6-P0-MOUNT-LIFECYCLE)\n",name);
-        return STATUS_ACCESS_DENIED;
-    }
+    if(refuse_self_open(name))return STATUS_ACCESS_DENIED;
+#ifdef TKFS_NATIVE_CACHE_PROBE
+    if(op==2||(options&FILE_DELETE_ON_CLOSE)||(access&(FILE_WRITE_DATA|FILE_APPEND_DATA|FILE_WRITE_EA|FILE_WRITE_ATTRIBUTES|DELETE|WRITE_DAC|WRITE_OWNER|GENERIC_WRITE|GENERIC_ALL)))return STATUS_MEDIA_WRITE_PROTECTED;
+#endif
     TK_HANDLE *handle=calloc(1,sizeof *handle);if(!handle)return STATUS_INSUFFICIENT_RESOURCES;
     TK_INFO info={0};UINT32 flags=((options&FILE_DIRECTORY_FILE)?1:0)|((access&(FILE_WRITE_DATA|FILE_APPEND_DATA))?2:0)|((options&FILE_DELETE_ON_CLOSE)?4:0);
+    /* An attribute/security/delete-only handle cannot initialize data caching.
+       Keep it out of scratch materialization; real read/write/execute handles
+       still own the full byte context, including read-only paging writeback. */
+    if(!(access&(FILE_READ_DATA|FILE_WRITE_DATA|FILE_APPEND_DATA|FILE_EXECUTE)))flags|=8;
     NTSTATUS result=tk_call(op,name,&handle->token,0,op==2?&attrs:0,op==2?sizeof attrs:0,flags,&info,0);
     if(!NT_SUCCESS(result)){free(handle);return result;}handle->root=wcscmp(name,L"\\")==0;*context=handle;fill(fi,&info);
     /* Kernel caching is coherent through remote event notifications. */
@@ -54,7 +70,7 @@ static NTSTATUS create_open(PWSTR name,UINT32 options,UINT32 access,UINT32 attrs
 static NTSTATUS create(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,UINT32 attrs,PSECURITY_DESCRIPTOR sd,UINT64 allocation,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,attrs,2,context,fi);}
 static NTSTATUS open_file(FSP_FILE_SYSTEM *fs,PWSTR name,UINT32 options,UINT32 access,PVOID *context,FSP_FSCTL_FILE_INFO *fi) {return create_open(name,options,access,0,3,context,fi);}
 static NTSTATUS overwrite(FSP_FILE_SYSTEM *fs,PVOID context,UINT32 attrs,BOOLEAN replace,UINT64 allocation,FSP_FSCTL_FILE_INFO *fi) {return call(6,0,context,0,0,0,0,fi,0);}
-static void cleanup(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name,ULONG flags) {call(9,name,context,0,0,0,((flags&FspCleanupDelete)?1:0)|((flags&(FspCleanupSetAllocationSize|FspCleanupSetArchiveBit|FspCleanupSetLastWriteTime))?2:0),0,0);}
+static void cleanup(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR name,ULONG flags) {call(9,name,context,0,0,0,((flags&FspCleanupDelete)?1:0)|((flags&FspCleanupSetLastWriteTime)?2:0),0,0);}
 static void close_file(FSP_FILE_SYSTEM *fs,PVOID context) {call(10,0,context,0,0,0,0,0,0);free(context);}
 static NTSTATUS read_file(FSP_FILE_SYSTEM *fs,PVOID context,PVOID buffer,UINT64 offset,ULONG length,PULONG count) {return call(4,0,context,offset,buffer,length,0,0,count);}
 static NTSTATUS write_file(FSP_FILE_SYSTEM *fs,PVOID context,PVOID buffer,UINT64 offset,ULONG length,BOOLEAN append,BOOLEAN constrained,PULONG count,FSP_FSCTL_FILE_INFO *fi) {return call(5,0,context,offset,buffer,length,(append?1:0)|(constrained?2:0),fi,count);}
@@ -103,10 +119,39 @@ static NTSTATUS read_dir(FSP_FILE_SYSTEM *fs,PVOID context,PWSTR pattern,PWSTR m
     FspFileSystemAddDirInfo(0,buffer,length,count);return STATUS_SUCCESS;
 }
 static FSP_FILE_SYSTEM_INTERFACE Interface;
+static NTSTATUS injected_mount_failure(const char *stage) {
+    fprintf(stderr,"injected mount failure: %s\n",stage);return STATUS_UNSUCCESSFUL;
+}
+#ifdef TKFS_NATIVE_CACHE_PROBE
+/* Runtime sweep of one binary, available only in the mutation-rejecting
+   read-only diagnostic. Reject bad settings before any volume is created. */
+static NTSTATUS cache_probe_threads(UINT32 *threads) {
+    char value[16];SetLastError(ERROR_SUCCESS);
+    DWORD length=GetEnvironmentVariableA("TKFS_TEST_READONLY_DISPATCH_THREADS",value,sizeof value);
+    if(!length&&GetLastError()==ERROR_ENVVAR_NOT_FOUND)return STATUS_SUCCESS;
+    if(length&&length<sizeof value) {
+        if(!strcmp(value,"2"))*threads=2;
+        else if(!strcmp(value,"4"))*threads=4;
+        else if(!strcmp(value,"8"))*threads=8;
+        else if(!strcmp(value,"16"))*threads=16;
+        else goto invalid;
+        fprintf(stderr,"TKFS_CACHE_PROBE read-only dispatcher override=%u\n",*threads);
+        return STATUS_SUCCESS;
+    }
+invalid:
+    fprintf(stderr,"TKFS_CACHE_PROBE invalid read-only dispatcher count\n");
+    return STATUS_INVALID_PARAMETER;
+}
+#endif
 /* threads: dispatcher threads (0: the WinFsp default); irp_timeout_ms: how
    long the FSD waits for a callback before it cancels the request (0: the
    default). Rust bounds its content waits below it. */
-UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp_timeout_ms) {
+UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp_timeout_ms,UINT32 fault) {
+    *out=0;
+#ifdef TKFS_NATIVE_CACHE_PROBE
+    NTSTATUS probe_status=cache_probe_threads(&threads);
+    if(!NT_SUCCESS(probe_status))return probe_status;
+#endif
     if(!Security) {
         /* Report the host owner so tools such as Git can identify this user's
            files. Access remains the ordinary personal-use mount policy. */
@@ -130,10 +175,23 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
     /* WinFsp enables the Windows data cache only for the infinity sentinel.
        Directories retain a finite metadata lifetime; remote changes notify.
        FlushAndPurgeOnCleanup makes the FSD deliver a file's dirty cached
-       pages as Write callbacks before Cleanup, so seal-on-close needs no
+       pages as Write callbacks before the last Cleanup, so seal-on-close needs no
        volume flush from this process (W6-P0-MOUNT-LIFECYCLE). */
     p.MaxComponentLength=255;p.FileInfoTimeout=INFINITE;p.DirInfoTimeoutValid=1;p.DirInfoTimeout=1000;p.CaseSensitiveSearch=0;p.CasePreservedNames=1;
     p.UnicodeOnDisk=1;p.PersistentAcls=0;p.FlushAndPurgeOnCleanup=1;p.UmFileContextIsUserContext2=1;
+    /* Unmodified opens need no user-mode Cleanup roundtrip. Close still retires
+       every Rust handle (including its fallback cleanup); modified/deleting
+       Cleanup and the driver's last-handle cached-byte flush remain enabled. */
+    p.PostCleanupWhenModifiedOnly=1;
+#ifdef TKFS_NATIVE_CACHE_PROBE
+    /* Isolate standby/purge cost on an already sealed corpus. Reject client
+       writes in both variants; these binaries cannot qualify writer/seal policy. */
+    p.ReadOnlyVolume=1;p.FlushAndPurgeOnCleanup=TKFS_NATIVE_CACHE_PROBE;p.PostCleanupWhenModifiedOnly=0;
+#ifdef TKFS_NATIVE_CACHE_PROBE_POST_MODIFIED
+    p.PostCleanupWhenModifiedOnly=1;
+#endif
+    fprintf(stderr,"TKFS_CACHE_PROBE read-only volume, purge=%d, modified-only=%d; writer policy unqualified\n",TKFS_NATIVE_CACHE_PROBE,p.PostCleanupWhenModifiedOnly);
+#endif
     /* Every mount uses native retirement for open destination handles. */
     p.SupportsPosixUnlinkRename=1;
     if(irp_timeout_ms)p.IrpTimeout=irp_timeout_ms;
@@ -146,9 +204,15 @@ UINT32 tk_mount_start(PWSTR path,FSP_FILE_SYSTEM **out,UINT32 threads,UINT32 irp
        The kernel's per-file serialization remains in effect. */
     FspFileSystemSetOperationGuardStrategy(*out,FSP_FILE_SYSTEM_OPERATION_GUARD_STRATEGY_FINE);
     FspFileSystemSetOperationGuard(*out,0,0);
-    status=FspFileSystemSetMountPoint(*out,path);
+    status=fault==1?injected_mount_failure("after-create"):FspFileSystemSetMountPoint(*out,path);
+    if(NT_SUCCESS(status)&&fault==2)status=injected_mount_failure("after-mount");
     if(NT_SUCCESS(status))status=FspFileSystemStartDispatcher(*out,threads);
-    if(!NT_SUCCESS(status)){FspFileSystemDelete(*out);*out=0;}return status;
+    if(NT_SUCCESS(status)&&fault==3)status=injected_mount_failure("after-dispatcher");
+    if(!NT_SUCCESS(status)){
+        /* Delete does not join dispatchers. Also unwind the case where the
+           dispatcher is already running (injected in VM acceptance). */
+        FspFileSystemStopDispatcher(*out);FspFileSystemDelete(*out);*out=0;
+    }return status;
 }
 void tk_mount_stop(FSP_FILE_SYSTEM *fs) {FspFileSystemStopDispatcher(fs);FspFileSystemDelete(fs);}
 UINT32 tk_mount_notify(FSP_FILE_SYSTEM *fs,PWSTR path,UINT32 action) {

@@ -9,26 +9,31 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mount_lifecycle import stop_all  # noqa: E402
+from mount_lifecycle import kill_daemon, run_bounded, stop_all  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = ROOT / "target/debug/tkfs.exe"
 HOME = ROOT / "test-runs/replacement" / str(time.time_ns())
 
 
-def cli(state, *args):
-    result = subprocess.run([str(EXE), "--state", str(state), *args],
-                            capture_output=True, text=True, timeout=60, check=True)
+def cli(state, *args, timeout=60):
+    result = run_bounded([str(EXE), "--state", str(state), *args],
+                         text=True, timeout=timeout)
+    result.check_returncode()
     return json.loads(result.stdout) if result.stdout.strip() else None
 
 
-def daemon(state, letter, repo):
+def daemon(state, letter, repo, processes):
     state.mkdir(parents=True)
     cli(state, "init", "--repo", repo)
     log = (state / "daemon.log").open("w")
     proc = subprocess.Popen([str(EXE), "--state", str(state), "daemon", "--mount", letter,
                              "--listen", "127.0.0.1:0"], stdout=log, stderr=log,
                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    # Register before waiting: failed startup still needs bounded cleanup.
+    processes.append((state, proc, log, letter))
+    (state / "daemon-process.json").write_text(json.dumps({
+        "pid": proc.pid, "mount": letter, "log": str(state / "daemon.log")}), encoding="utf-8")
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -56,20 +61,29 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument("--binary",type=Path,default=EXE)
     parser.add_argument("--home",type=Path,default=HOME)
+    parser.add_argument("--mount-a", default="X:" if os.name == "nt" else None,
+                        help="free drive letter or nonexistent directory (VM only on Windows)")
+    parser.add_argument("--mount-b", default="Y:" if os.name == "nt" else None)
+    parser.add_argument("--hold-cached", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--ready-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--forced-kill",action="store_true",
         help="W6-P0-MOUNT-LIFECYCLE: after the body passes, kill peer A while a cached "
              "write and a retained reader are open; the daemon must exit within 10 s and "
              "the host must stay responsive. Run only in an isolated Windows VM.")
     args=parser.parse_args()
+    if args.hold_cached:
+        hold_cached(args.hold_cached, args.ready_file)
+        return
     EXE=args.binary.resolve();HOME=args.home
     HOME.mkdir(parents=True)
     processes = []  # (state, proc, log, mount)
     try:
         a = HOME / "a"
-        mount=Path("X:/") if os.name=="nt" else HOME/"mount-a"
-        other=Path("Y:/") if os.name=="nt" else HOME/"mount-b"
-        mount_a = "X:" if os.name=="nt" else str(mount)
-        processes.append((a, *daemon(a, mount_a, "replacement-smoke"), mount_a))
+        mount_a = args.mount_a or str(HOME / "mount-a")
+        mount_b = args.mount_b or str(HOME / "mount-b")
+        mount = Path(mount_a + "/")
+        other = Path(mount_b + "/")
+        daemon(a, mount_a, "replacement-smoke", processes)
         (mount / "folder").mkdir()
         empty=mount / "folder/empty"
         empty.mkdir()
@@ -91,8 +105,7 @@ def main():
         assert sealed == b"oriXYnal", f"sealed bytes differ from the kernel cache: {sealed!r}"
         print("single-mount create/read/write/fsync/rename passed", flush=True)
         b = HOME / "b"
-        mount_b = "Y:" if os.name=="nt" else str(other)
-        processes.append((b, *daemon(b, mount_b, "replacement-smoke"), mount_b))
+        daemon(b, mount_b, "replacement-smoke", processes)
         peer = json.loads((a / "daemon.log").read_text().splitlines()[0])["peer"]
         code = cli(a, "pairing-code")["code"]
         cli(b, "pair", peer, code)
@@ -105,6 +118,9 @@ def main():
         with (mount / "folder/open-writer.txt").open("wb") as writer:
             writer.write(b"open writer data")
             writer.flush()
+            # RPC flush cannot drain another process's Windows cache. File
+            # fsync is the durability point (plan section 3a).
+            os.fsync(writer.fileno())
             cli(a, "flush")
             sealed = bytes(cli(a, "rpc", "cat", json.dumps({"path":"folder/open-writer.txt"}))["bytes"])
             assert sealed == b"open writer data", sealed
@@ -157,7 +173,7 @@ def main():
         # Bounded graceful stop, bounded kill, stranded daemons fail the run
         # (W6-P0-MOUNT-LIFECYCLE). Never wait forever on a deleting process.
         try:
-            stop_all([(lambda s=state: cli(s, "stop"), proc, state / "daemon.log", mnt)
+            stop_all([(lambda timeout, s=state: cli(s, "stop", timeout=timeout), proc, state / "daemon.log", mnt)
                       for state, proc, log, mnt in processes])
         finally:
             for _, _, log, _ in processes:
@@ -170,38 +186,54 @@ def main():
             raise RuntimeError("mount I/O errors logged: " + "; ".join(refused))
 
 
-def forced_kill_check(processes, mount):
-    """Kill peer A mid-write with a retained reader. With no self-handle the
-    process must finish exiting within 10 s, the mount must disappear and a
-    fresh PowerShell must still enumerate drives (W6-P0-MOUNT-LIFECYCLE)."""
-    state, proc, log, letter = processes[0]
-    target = mount / "folder/forced-kill.txt"
+def hold_cached(target, ready):
+    """All risky namespace handles stay in a disposable, bounded child."""
     target.write_bytes(b"before kill")
-    reader = target.open("rb", buffering=0)
-    writer = target.open("r+b", buffering=0)
-    writer.write(b"dirty cached bytes " * 4096)  # stays in the Windows cache
-    started = time.monotonic()
-    proc.kill()
+    with target.open("rb", buffering=0) as reader, target.open("r+b", buffering=0) as writer:
+        assert reader.read() == b"before kill"
+        writer.write(b"dirty cached bytes " * 4096)
+        ready.write_text("ready")
+        time.sleep(600)
+
+
+def forced_kill_check(processes, mount):
+    state, proc, log, letter = processes[0]
+    ready = state / "cached-worker-ready"
+    worker_log = (state / "cached-worker.log").open("w")
+    worker = subprocess.Popen([sys.executable, __file__, "--hold-cached",
+                               str(mount / "folder/forced-kill.txt"), "--ready-file", str(ready)],
+                              stdout=worker_log, stderr=worker_log)
     try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"forced kill: daemon pid {proc.pid} still deleting after 10 s")
-    exited = time.monotonic() - started
-    for handle in (writer, reader):
-        try:
-            handle.close()
-        except OSError:
-            pass
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline and mount.exists():
-        time.sleep(.1)
-    assert not mount.exists(), f"stale usable mount {mount} after forced kill"
-    if os.name == "nt":
-        shell = subprocess.run(["powershell", "-NoProfile", "-Command", "(Get-PSDrive -PSProvider FileSystem).Count"],
-                               capture_output=True, text=True, timeout=10)
-        assert shell.returncode == 0, shell.stderr
-    processes.pop(0)
-    print(json.dumps({"forced_kill_exit_s": round(exited, 3), "mount_gone": True}), flush=True)
+        wait_for(ready.exists, timeout=20)  # native disk only
+        processes.pop(0)  # do not retry a stranded daemon in final cleanup
+        record = kill_daemon(proc, state / "daemon.log", letter)
+        if record["stranded"] or not record["killed"]:
+            raise RuntimeError("forced kill failed: " + json.dumps(record))
+        errors = [line for line in (state / "daemon.log").read_text(errors="replace").splitlines()
+                  if "mount I/O operation" in line or "refused self-open" in line]
+        if errors:
+            raise RuntimeError("forced peer logged I/O errors: " + "; ".join(errors))
+        # Even stat/exists can block on a hung mount; probe in a bounded child.
+        probe = run_bounded([sys.executable, "-c",
+            "import os,sys; sys.exit(int(os.path.exists(sys.argv[1])))", str(mount)],
+            timeout=10, text=True)
+        assert probe.returncode == 0, f"stale usable mount {mount}"
+        if os.name == "nt":
+            shell = run_bounded(["powershell", "-NoProfile", "-Command",
+                "(Get-PSDrive -PSProvider FileSystem).Count; "
+                "$p=Join-Path $env:TEMP 'tkfs-native-probe'; "
+                "[IO.File]::WriteAllText($p,'ok'); [IO.File]::ReadAllText($p); "
+                "Remove-Item -LiteralPath $p"], timeout=10, text=True)
+            shell.check_returncode()
+        print(json.dumps({"forced_kill_exit_s": record["kill_seconds"], "mount_gone": True}), flush=True)
+    finally:
+        worker_record = kill_daemon(worker, state / "cached-worker.log", letter)
+        worker_log.close()
+        # Peer A is no longer in the normal teardown list.
+        if not any(p is proc for _, p, _, _ in processes):
+            log.close()
+        if worker_record["stranded"]:
+            raise RuntimeError("cached worker stranded: " + json.dumps(worker_record))
 
 
 if __name__ == "__main__":

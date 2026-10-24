@@ -23,8 +23,9 @@ FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 
 def command(argv, *, cwd=None, timeout=600):
+    from mount_lifecycle import run_bounded
     started = time.perf_counter()
-    result = subprocess.run(list(map(str, argv)), cwd=cwd, capture_output=True,
+    result = run_bounded(list(map(str, argv)), cwd=cwd,
                             text=True, timeout=timeout, creationflags=FLAGS)
     elapsed = (time.perf_counter() - started) * 1000
     if result.returncode:
@@ -112,22 +113,30 @@ def measure(root, args, log_dir, report):
             elapsed, output = command(base, cwd=root)
             after = outputs(root)
             _, answer = command(["dotnet", f"App/bin/Release/{args.framework}/App.dll"], cwd=root)
+            # Preserve the command and both observations before a correctness
+            # assertion can abort the benchmark. A changed mtime alone does not
+            # establish that the compiler ran, but still fails no-op stability.
+            (log_dir / f"{scenario}-{repetition}.txt").write_text(output, encoding="utf-8")
+            changed = sorted(path for path in after if after[path] != before.get(path))
+            item = {"scenario": scenario, "repetition": repetition, "warmup": repetition == 0,
+                    "elapsed_ms": elapsed, "changed_targets": changed, "before": before,
+                    "outputs": after, "answer": answer, "validated": False}
+            samples.append(item)
+            observation = log_dir / f"{scenario}-{repetition}.json"
+            observation.write_text(json.dumps(item, indent=1), encoding="utf-8")
             if int(answer) != expected + delta:
                 raise AssertionError(f"stale/wrong build: {answer} != {expected + delta}")
-            changed = sorted(path for path in after if after[path] != before.get(path))
             if scenario == "noop" and changed:
-                raise AssertionError(f"no-op recompiled targets: {changed}")
+                raise AssertionError(f"no-op changed targets: {changed}")
             if scenario == "incremental":
                 if not any(path.startswith("Lib0/") for path in changed):
                     raise AssertionError("incremental build missed edited target")
                 if any(path.startswith(f"Lib{i}/") for i in range(1, args.projects)
                        for path in changed):
                     raise AssertionError(f"incremental recompiled unrelated libraries: {changed}")
-            (log_dir / f"{scenario}-{repetition}.txt").write_text(output, encoding="utf-8")
-            item = {"scenario": scenario, "repetition": repetition, "warmup": repetition == 0,
-                    "elapsed_ms": elapsed, "changed_targets": changed, "outputs": after}
-            samples.append(item)
-            print(json.dumps({key: value for key, value in item.items() if key != "outputs"}),
+            item["validated"] = True
+            observation.write_text(json.dumps(item, indent=1), encoding="utf-8")
+            print(json.dumps({key: value for key, value in item.items() if key not in ("before", "outputs")}),
                   flush=True)
     medians = {}
     for scenario in ("clean", "noop", "incremental"):

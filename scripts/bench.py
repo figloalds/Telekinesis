@@ -13,27 +13,57 @@ other machine's directory); it is skipped otherwise.
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import random
 import shutil
+import sqlite3
 import statistics
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from contextlib import closing
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_build  # noqa: E402  (the .NET harness generator and build runner)
-from mount_lifecycle import stop_all  # noqa: E402  (bounded daemon shutdown)
+from mount_lifecycle import run_bounded, stop_all  # noqa: E402  (bounded daemon shutdown)
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = ("copy_small", "build", "seq_1g", "random_4k", "git_status_50k", "remote_visibility")
 MIB = 1024 * 1024
+GIT_FIXTURE_MODE = "packed-native-copy-v1"
 # Target ratios against native from docs/revamp/WAVE_6_REPLACEMENT.md section 8.
 TARGETS = {"copy_small": 1.3, "build_clean": 1.3, "build_noop": 1.2,
            "seq_write_1g": 1.2, "seq_read_1g": 1.2, "random_4k": 1.5, "git_status_50k": 1.3}
+
+
+def wait_peer_metadata(source, peer, timeout=120):
+    """Native backend reads only; never probe the served namespace here.
+
+    Feed order is the source journal sequence. Seeing its committed last event
+    on the receiver proves the initial metadata feed reached that cut before
+    measuring an idle connected peer. Initial catch-up is not an idle workload.
+    """
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("peer catch-up timeout must be finite and positive")
+
+    def query(state, sql, params=()):
+        uri = (state / "metadata.sqlite").as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True, timeout=.2)) as db:
+            return db.execute(sql, params).fetchone()
+    head = query(source, "SELECT seq,id FROM events ORDER BY seq DESC LIMIT 1")
+    started = time.monotonic()
+    if head:
+        while not query(peer, "SELECT 1 FROM events WHERE id=?", (head[1],)):
+            if time.monotonic() - started >= timeout:
+                raise TimeoutError(f"peer initial metadata catch-up did not reach {head} within {timeout}s")
+            time.sleep(.05)
+    return {"source_sequence": head[0] if head else 0,
+            "source_event": head[1] if head else None,
+            "seconds": time.monotonic() - started, "timeout_seconds": timeout}
 
 
 def ms(started):
@@ -111,21 +141,53 @@ def random_4k(root, args, run):
 
 
 def git_setup(root, args):
-    """50,000 small tracked files in 500 directories, committed once."""
+    """Copy a fixed tracked tree; Git object creation is outside the workload.
+
+    The gate measures status, not add. Build and pack its immutable fixture on
+    native storage once, then copy the same bytes into native and mounted trees.
+    This avoids thousands of unrelated object fsyncs during mount preparation.
+    """
     repo = root / "repo"
-    tree_rm(repo)
-    repo.mkdir()
-    rng = random.Random(7)
-    for index in range(args.git_files):
-        folder = repo / f"dir{index // 100:03d}"
-        if index % 100 == 0:
-            folder.mkdir()
-        (folder / f"file{index:05d}.txt").write_bytes(rng.randbytes(64 + rng.randrange(192)))
+    home = Path("C:/tkfs-bench") if os.name == "nt" else Path.home() / "tkfs-bench"
+    fixtures = (home / "git-fixtures").resolve()
+    if root == fixtures or root in fixtures.parents or fixtures in root.parents:
+        raise ValueError("--root must be separate from the native Git fixture cache")
+    fixtures.mkdir(parents=True, exist_ok=True)
+    fixture = fixtures / f"{GIT_FIXTURE_MODE}-{args.git_files}"
+    marker = fixture / ".git/tkfs-bench-fixture.json"
+    expected = {"mode": GIT_FIXTURE_MODE, "files": args.git_files}
     git = ["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
            "-c", "user.name=bench", "-c", "user.email=bench@example.invalid"]
-    bench_build.command(git + ["init", "-q"], cwd=repo)
-    bench_build.command(git + ["add", "-A"], cwd=repo)
-    bench_build.command(git + ["commit", "-q", "-m", "bench"], cwd=repo)
+    if not marker.exists():
+        if fixture.exists():
+            raise RuntimeError(f"incomplete native Git fixture: {fixture}")
+        builder = fixtures / f"building-{args.git_files}-{time.time_ns()}"
+        builder.mkdir()
+        rng = random.Random(7)
+        for index in range(args.git_files):
+            folder = builder / f"dir{index // 100:03d}"
+            if index % 100 == 0:
+                folder.mkdir()
+            (folder / f"file{index:05d}.txt").write_bytes(rng.randbytes(64 + rng.randrange(192)))
+        bench_build.command(git + ["init", "-q"], cwd=builder)
+        bench_build.command(git + ["add", "-A"], cwd=builder)
+        bench_build.command(git + ["commit", "-q", "-m", "bench"], cwd=builder)
+        bench_build.command(git + ["gc", "--quiet", "--prune=now"], cwd=builder)
+        (builder / ".git/tkfs-bench-fixture.json").write_text(json.dumps(expected))
+        # Both resolved move targets must stay in the generated native cache.
+        if builder.resolve().parent != fixtures or fixture.resolve().parent != fixtures:
+            raise RuntimeError("Git fixture move escaped its cache directory")
+        builder.rename(fixture)
+    if json.loads(marker.read_text()) != expected:
+        raise RuntimeError(f"incompatible native Git fixture: {fixture}")
+    tree_rm(repo)
+    shutil.copytree(fixture, repo, copy_function=shutil.copyfile)
+    if args.local_state and args.tkfs:
+        # Close already delivered the cached bytes through WinFsp Cleanup.
+        # Finish their delayed seals before warming the steady-state tree.
+        bench_build.command([args.tkfs, "--state", args.local_state, "flush"])
+    tracked = bench_build.command(git + ["ls-files", "-z"], cwd=repo)[1]
+    assert tracked.count("\0") == args.git_files, "incomplete tracked Git fixture"
     return repo
 
 
@@ -137,17 +199,25 @@ def git_status_50k(repo, args, run):
     return {"git_status_50k": elapsed}
 
 
-def build(root, args, log_dir):
+def build(root, args, log_dir, report):
     """Clean and no-op builds of the generated .NET harness, via the Wave 6 runner."""
     harness = root / "dotnet"
     tree_rm(harness)
     bench_build.generate(harness, args.projects, args.files, args.framework)
     build_args = argparse.Namespace(runs=args.runs, projects=args.projects, files=args.files,
                                     jobs=args.jobs, framework=args.framework)
-    result = bench_build.measure(harness, build_args, log_dir, {})
+    detail = report.setdefault("build_details", {})
+    try:
+        bench_build.measure(harness, build_args, log_dir, detail)
+    finally:
+        # A failed no-op/incremental validation must retain earlier validated
+        # clean samples without treating the failed observation as a pass.
+        for sample in detail.get("samples", []):
+            if sample["validated"] and not sample["warmup"]:
+                report["samples"].setdefault(f"build_{sample['scenario']}", []).append(sample["elapsed_ms"])
     samples = {"build_clean": [], "build_noop": [], "build_incremental": []}
-    for sample in result["samples"]:
-        if not sample["warmup"]:
+    for sample in detail["samples"]:
+        if sample["validated"] and not sample["warmup"]:
             samples[f"build_{sample['scenario']}"].append(sample["elapsed_ms"])
     return samples
 
@@ -204,7 +274,6 @@ def remote_visibility(root, peer_root, args, run):
 
 def matrix(args):
     """Run the same gate natively, mounted, and with a paired idle peer."""
-    import tempfile
     exe = args.matrix_tkfs.resolve()
     common = ["--runs", str(args.runs), "--copy-files", str(args.copy_files),
               "--large-mib", str(args.large_mib), "--random-ops", str(args.random_ops),
@@ -212,73 +281,99 @@ def matrix(args):
               "--files", str(args.files), "--jobs", str(args.jobs), "--framework", args.framework]
     if args.only:
         common += ["--only", args.only]
+    if args.keep:
+        common += ["--keep"]
     base = ROOT / "test-evidence/bench" / f"{args.label}-native.json"
     failures = []
-    native = subprocess.run([sys.executable, __file__, "--label", args.label + "-native",
-                             "--output", str(base), *common])
+    native = run_bounded([sys.executable, __file__, "--label", args.label + "-native",
+                             "--output", str(base), *common], timeout=args.matrix_timeout, text=True)
+    print(native.stdout, end="", flush=True)
     if native.returncode:
         return native.returncode
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    with tempfile.TemporaryDirectory(prefix="tkfs-bench-states-") as temp:
-        home = Path(temp)
-        processes = []
-        def cli(state, *command):
-            return json.loads(bench_build.command([exe, "--state", state, *command])[1])
-        def start(name, mount):
-            state = home / name
-            cli(state, "init", "--repo", "benchmark")
-            log = (home / f"{name}.log").open("w")
-            command = [str(exe), "--state", str(state), "daemon", "--listen", "127.0.0.1:0"]
-            if mount:
-                command += ["--mount", mount]
-            proc = subprocess.Popen(command, stdout=log, stderr=log, creationflags=flags)
-            processes.append((state, proc, log, mount))
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    raise RuntimeError((home / f"{name}.log").read_text())
-                if (state / "control.json").exists():
-                    return state
-                time.sleep(.05)
-            raise TimeoutError("mount startup")
+    home = ROOT / "test-runs/bench" / f"{args.label}-lifecycle-{time.time_ns()}"
+    home.mkdir(parents=True)
+    (home / "matrix-context.json").write_text(json.dumps({
+        "binary": str(exe), "binary_sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
+        "command": sys.argv, "baseline": str(base)}, indent=2), encoding="utf-8")
+    processes = []
+    def cli(state, *command, timeout=20):
+        result = run_bounded(list(map(str, [exe, "--state", state, *command])), timeout=timeout, text=True)
+        result.check_returncode()
+        return json.loads(result.stdout)
+    def start(name, mount):
+        state = home / name
+        cli(state, "init", "--repo", "benchmark")
+        log = (home / f"{name}.log").open("w")
+        command = [str(exe), "--state", str(state), "daemon", "--listen", "127.0.0.1:0"]
+        if mount:
+            command += ["--mount", mount]
+        proc = subprocess.Popen(command, stdout=log, stderr=log, creationflags=flags)
+        processes.append((state, proc, log, mount))
+        (home / f"{name}-process.json").write_text(json.dumps({
+            "pid": proc.pid, "mount": mount, "state": str(state),
+            "log": str(home / f"{name}.log")}), encoding="utf-8")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                raise RuntimeError((home / f"{name}.log").read_text())
+            if (state / "control.json").exists():
+                return state
+            time.sleep(.05)
+        raise TimeoutError("mount startup")
+    try:
+        if os.name != "nt":
+            raise RuntimeError("matrix mount letters currently require Windows; use --root on Linux")
+        state = start("mounted", args.matrix_mount)
+        root = Path(args.matrix_mount + "/bench")
+        mounted = run_bounded([sys.executable, __file__, "--label", args.label + "-mounted",
+            "--root", str(root), "--local-state", str(state), "--tkfs", str(exe),
+            "--compare", str(base), *common], timeout=args.matrix_timeout, text=True)
+        print(mounted.stdout, end="", flush=True)
+        # Retain callback costs even when completed measurements miss a target.
+        # They distinguish adapter/metadata work from driver cache purge cost.
+        (home / "mounted-stats.json").write_text(json.dumps(cli(state, "rpc", "mount-stats", "{}")))
+        mounted_report = json.loads((ROOT / "test-evidence/bench" / f"{args.label}-mounted.json").read_text())
+        if mounted.returncode:
+            if not performance_only_failure(mounted_report):
+                raise RuntimeError("mounted workload failed: " + mounted.stderr[-2000:])
+            # Complete correctness with slow measurements is still useful for
+            # the peer comparison. Keep the gate failed; any missing sample,
+            # I/O/build error or cleanup timeout still stops further mounts.
+            failures.append("mounted-performance: " + "; ".join(mounted_report["failures"]))
+        peer = start("peer", args.matrix_peer_mount)
+        endpoint = json.loads((home / "mounted.log").read_text().splitlines()[0])["peer"]
+        cli(peer, "pair", endpoint, cli(state, "pairing-code")["code"])
+        cli(state, "flush")
+        catchup = wait_peer_metadata(state, peer, args.peer_catchup_timeout)
+        cli(peer, "flush")
+        (home / "peer-catchup.json").write_text(json.dumps(catchup, indent=2))
+        peer_root = Path(args.matrix_peer_mount + "/bench")
+        idle = run_bounded([sys.executable, __file__, "--label", args.label + "-idle-peer",
+            "--root", str(root), "--peer-root", str(peer_root), "--local-state", str(state),
+            "--tkfs", str(exe), "--mount-prefix", "bench", "--compare", str(base), *common], timeout=args.matrix_timeout, text=True)
+        print(idle.stdout, end="", flush=True)
+        if idle.returncode:
+            failures.append("idle-peer")
+        idle_report = json.loads((ROOT / "test-evidence/bench" / f"{args.label}-idle-peer.json").read_text())
+        overhead = peer_overhead(mounted_report, idle_report)
+        (home / "peer-overhead.json").write_text(json.dumps(overhead, indent=2))
+        failures.extend(overhead["failures"])
+        (home / "idle-stats.json").write_text(json.dumps(cli(state, "rpc", "mount-stats", "{}")))
+    except Exception as error:
+        failures.append(f"{type(error).__name__}: {error}")
+    finally:
+        # Bounded graceful stop, bounded kill, stranded daemons fail the
+        # run (W6-P0-MOUNT-LIFECYCLE). Never wait forever on a deleting process.
         try:
-            if os.name != "nt":
-                raise RuntimeError("matrix mount letters currently require Windows; use --root on Linux")
-            state = start("mounted", args.matrix_mount)
-            root = Path(args.matrix_mount + "/bench")
-            mounted = subprocess.run([sys.executable, __file__, "--label", args.label + "-mounted",
-                "--root", str(root), "--compare", str(base), *common])
-            if mounted.returncode:
-                failures.append("mounted")
-            (home / "mounted-stats.json").write_text(json.dumps(cli(state, "rpc", "mount-stats", "{}")))
-            peer = start("peer", args.matrix_peer_mount)
-            endpoint = json.loads((home / "mounted.log").read_text().splitlines()[0])["peer"]
-            cli(peer, "pair", endpoint, cli(state, "pairing-code")["code"])
-            peer_root = Path(args.matrix_peer_mount + "/bench")
-            deadline = time.monotonic() + 60
-            while not peer_root.exists() and time.monotonic() < deadline:
-                time.sleep(.05)
-            idle = subprocess.run([sys.executable, __file__, "--label", args.label + "-idle-peer",
-                "--root", str(root), "--peer-root", str(peer_root), "--local-state", str(state),
-                "--tkfs", str(exe), "--mount-prefix", "bench", "--compare", str(base), *common])
-            if idle.returncode:
-                failures.append("idle-peer")
-            (home / "idle-stats.json").write_text(json.dumps(cli(state, "rpc", "mount-stats", "{}")))
+            stop_all([(lambda timeout, s=state: cli(s, "stop", timeout=timeout), proc, home / f"{state.name}.log", mnt)
+                      for state, proc, log, mnt in processes], )
+        except RuntimeError as error:
+            failures.append(f"unclean-daemon: {error}")
         finally:
-            # Bounded graceful stop, bounded kill, stranded daemons fail the
-            # run (W6-P0-MOUNT-LIFECYCLE). Never wait forever on a deleting process.
-            try:
-                stop_all([(lambda s=state: cli(s, "stop"), proc, home / f"{state.name}.log", mnt)
-                          for state, proc, log, mnt in processes], )
-            except RuntimeError as error:
-                failures.append(f"stranded-daemon: {error}")
-            finally:
-                for _, _, log, _ in processes:
-                    log.close()
-            saved = ROOT / "test-runs/bench" / f"{args.label}-daemon-logs"
-            saved.mkdir(parents=True, exist_ok=True)
-            for log_path in [*home.glob("*.log"), *home.glob("*-stats.json"), *home.glob("*-exit-state.json")]:
-                shutil.copyfile(log_path, saved / log_path.name)
+            for _, _, log, _ in processes:
+                log.close()
+        (home / "matrix-result.json").write_text(json.dumps({"failures": failures}, indent=2), encoding="utf-8")
     print("Matrix failures:", failures)
     return int(bool(failures))
 
@@ -297,6 +392,34 @@ def run_workload(name, samples, runs, body):
             collect(samples, outcome)
         print(json.dumps({"workload": name, "run": run, "warmup": run == 0,
                           **{k: round(v, 2) for k, v in outcome.items()}}), flush=True)
+
+
+def observe_workload(report, args, name, run, body):
+    """Bracket each mounted repetition; keep RPC cost outside its timed body."""
+    if not (args.local_state and args.tkfs):
+        return body()
+
+    def snapshot():
+        return json.loads(bench_build.command(
+            [args.tkfs, "--state", args.local_state, "rpc", "mount-stats", "{}"],
+            timeout=20)[1])
+
+    record = {"run": run, "warmup": run == 0, "before": snapshot()}
+    report.setdefault("callback_observations", {}).setdefault(name, []).append(record)
+    started = time.perf_counter()
+    try:
+        return body()
+    except BaseException as error:
+        record["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        record["wall_ms"] = ms(started)
+        try:
+            record["after"] = snapshot()
+        except Exception as error:
+            record["snapshot_error"] = f"{type(error).__name__}: {error}"
+            if "error" not in record:
+                raise
 
 
 def summarize(samples):
@@ -333,11 +456,39 @@ def print_table(summary, compare):
         print(line)
 
 
+def performance_only_failure(report):
+    if report.get("errors"):
+        return False
+    if any(name != "remote_visibility" or reason != "no --peer-root"
+           for name, reason in report.get("skipped", {}).items()):
+        return False
+    allowed = {f"{metric}: exceeds {target}x native" for metric, target in TARGETS.items()}
+    failures = report.get("failures")
+    return isinstance(failures, list) and bool(failures) and all(f in allowed for f in failures)
+
+
+def peer_overhead(mounted, idle):
+    result = {"limit": 1.2, "ratios": {}, "failures": []}
+    for metric in TARGETS:
+        if metric not in mounted["summary"]:
+            continue
+        base = mounted["summary"][metric]["median_ms"]
+        row = idle["summary"].get(metric)
+        if base <= 0 or not row:
+            result["failures"].append(f"idle-peer overhead: {metric} missing measurement")
+            continue
+        ratio = row["median_ms"] / base
+        result["ratios"][metric] = ratio
+        if ratio > result["limit"]:
+            result["failures"].append(f"idle-peer overhead: {metric} exceeds 1.2x mounted")
+    return result
+
+
 def gate(report, compare):
     """A missing measurement or incompatible baseline cannot pass the gate."""
     failures = []
     failures.extend(report.get("errors", []))
-    expected = {"copy_small": ["copy_small"], "build": ["build_clean", "build_noop"],
+    expected = {"copy_small": ["copy_small"], "build": ["build_clean", "build_noop", "build_incremental"],
                 "seq_1g": ["seq_write_1g", "seq_read_1g"], "random_4k": ["random_4k"],
                 "git_status_50k": ["git_status_50k"], "remote_visibility": ["remote_visibility"]}
     for workload in (report["args"].get("only") or ",".join(WORKLOADS)).split(","):
@@ -347,6 +498,9 @@ def gate(report, compare):
             if report["summary"].get(metric, {}).get("samples", 0) != report["args"]["runs"]:
                 failures.append(f"{metric}: missing measurements")
     if compare:
+        if "git_status_50k" in report["summary"] and (
+                report.get("git_fixture_mode") != compare.get("git_fixture_mode")):
+            failures.append("incompatible baseline: git_fixture_mode")
         dimensions = ("runs", "copy_files", "large_mib", "random_ops", "git_files",
                       "projects", "files", "jobs", "framework")
         for key in dimensions:
@@ -374,6 +528,10 @@ def main():
                         "but outside --root (default C:/tkfs-bench/stage)")
     parser.add_argument("--peer-root", type=Path, help="peer-side directory for remote_visibility")
     parser.add_argument("--matrix-tkfs", type=Path, help="run the native/mounted/idle-peer matrix with this binary")
+    parser.add_argument("--matrix-timeout", type=float, default=3600,
+                        help="deadline in seconds for each workload child")
+    parser.add_argument("--peer-catchup-timeout", type=float, default=120,
+                        help="bounded initial metadata import deadline, excluded from idle-peer timing")
     parser.add_argument("--matrix-mount", default="X:")
     parser.add_argument("--matrix-peer-mount", default="Y:")
     parser.add_argument("--local-state", type=Path)
@@ -393,6 +551,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--framework", default="net10.0")
     args = parser.parse_args()
+    if not math.isfinite(args.peer_catchup_timeout) or args.peer_catchup_timeout <= 0:
+        parser.error("peer catch-up timeout must be finite and positive")
     if args.matrix_tkfs:
         return matrix(args)
     if args.runs < 1 or min(args.copy_files, args.large_mib, args.random_ops,
@@ -426,27 +586,33 @@ def main():
               "host": host_info(), "script_sha256": hashlib.file_digest(open(__file__, "rb"), "sha256").hexdigest(),
               "samples": {}, "skipped": {}}
     samples = report["samples"]
+    def measure(name, body):
+        run_workload(name, samples, args.runs,
+                     lambda run: observe_workload(report, args, name, run, lambda: body(run)))
+    if "git_status_50k" in selected:
+        report["git_fixture_mode"] = GIT_FIXTURE_MODE
     try:
         if "copy_small" in selected:
-            run_workload("copy_small", samples, args.runs, lambda run: copy_small(root, stage, args, run))
+            measure("copy_small", lambda run: copy_small(root, stage, args, run))
         if "seq_1g" in selected or "random_4k" in selected:
             buffer = random.Random(3).randbytes(MIB)
             if "seq_1g" in selected:
-                run_workload("seq_1g", samples, args.runs, lambda run: seq_1g(root, buffer, args, run))
+                measure("seq_1g", lambda run: seq_1g(root, buffer, args, run))
             elif not (root / "large.bin").exists():
                 seq_1g(root, buffer, args, 0)
             if "random_4k" in selected:
-                run_workload("random_4k", samples, args.runs, lambda run: random_4k(root, args, run))
+                measure("random_4k", lambda run: random_4k(root, args, run))
             if not args.keep:
                 (root / "large.bin").unlink()
         if "git_status_50k" in selected:
             repo = git_setup(root, args)
-            run_workload("git_status_50k", samples, args.runs, lambda run: git_status_50k(repo, args, run))
+            measure("git_status_50k", lambda run: git_status_50k(repo, args, run))
             if not args.keep:
                 tree_rm(repo)
         if "build" in selected:
             try:
-                for key, values in build(root, args, log_dir).items():
+                for key, values in observe_workload(report, args, "build", None,
+                        lambda: build(root, args, log_dir, report)).items():
                     samples[key] = values
                     print(json.dumps({"workload": key, "samples_ms": [round(v, 1) for v in values]}), flush=True)
             except Exception as error:  # noqa: BLE001  the other workloads still count
@@ -456,8 +622,7 @@ def main():
                 tree_rm(root / "dotnet")
         if "remote_visibility" in selected:
             if args.peer_root:
-                run_workload("remote_visibility", samples, args.runs,
-                             lambda run: remote_visibility(root, args.peer_root, args, run))
+                measure("remote_visibility", lambda run: remote_visibility(root, args.peer_root, args, run))
             else:
                 report["skipped"]["remote_visibility"] = "no --peer-root"
     except Exception as error:

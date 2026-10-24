@@ -225,12 +225,7 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
         "shutdown" => {
             // A failed final seal is a reported durability failure; it never
             // keeps the daemon (and its mount) alive.
-            let flushed = engine.flush(None);
-            engine.stopping.store(true, Ordering::Release);
-            if let Err(error) = &flushed {
-                *lock(&engine.error) = Some(format!("{error:#}"));
-            }
-            flushed?;
+            engine.request_shutdown()?;
             Ok(json!({"stopping":true}))
         }
         "inject-fault" => {

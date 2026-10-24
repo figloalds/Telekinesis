@@ -598,9 +598,18 @@ impl Fs {
                     None
                 };
                 {
-                    let mut store = lock(&self.engine.store);
-                    store.set_times(&e.id, times, mode, None)?;
-                    *lock(&self.engine.handle(h)?.entry) = store.entry(&e.id)?;
+                    let entry = self.engine.set_metadata(
+                        &e.id,
+                        [
+                            None,
+                            (valid & ((1 << 4) | (1 << 7)) != 0).then_some(times.accessed),
+                            (valid & ((1 << 5) | (1 << 8)) != 0).then_some(times.modified),
+                            None,
+                        ],
+                        mode,
+                        None,
+                    )?;
+                    *lock(&self.engine.handle(h)?.entry) = entry;
                 }
                 let (e, len) = self.engine.info(h)?;
                 if temporary {

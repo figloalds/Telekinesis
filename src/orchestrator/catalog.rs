@@ -1,4 +1,5 @@
 //! Pairing catalog shares the folder's metadata database.
+use crate::util::sqlite::CachedConnection;
 use crate::{
     content::working::lock,
     model::{errors::ErrorWire, protocol::frame::ClientHello},
@@ -41,11 +42,11 @@ impl Catalog {
     pub fn get(&self, key: &str) -> Result<Option<String>> {
         Ok(lock(&self.engine.store)
             .db
-            .query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
+            .query_cached("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
             .optional()?)
     }
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
-        lock(&self.engine.store).db.execute(
+        lock(&self.engine.store).db.execute_cached(
             "INSERT OR REPLACE INTO config VALUES(?1,?2)",
             params![key, value],
         )?;
@@ -61,7 +62,7 @@ impl Catalog {
         let store = lock(&self.engine.store);
         let mut q = store
             .db
-            .prepare("SELECT endpoint,installation,credential FROM peers")?;
+            .prepare_cached("SELECT endpoint,installation,credential FROM peers")?;
         Ok(q.query_map([], |r| {
             Ok(Peer {
                 endpoint: r.get(0)?,
@@ -78,7 +79,7 @@ impl Catalog {
     pub fn paired_key(&self, installation: &str) -> Result<[u8; 32]> {
         let key: String = lock(&self.engine.store)
             .db
-            .query_row(
+            .query_cached(
                 "SELECT credential FROM paired WHERE installation=?1",
                 [installation],
                 |r| r.get(0),
@@ -94,11 +95,11 @@ impl Catalog {
         let mut store = lock(&self.engine.store);
         store.flush_metadata()?;
         let tx = store.db.unchecked_transaction()?;
-        tx.execute(
+        tx.execute_cached(
             "INSERT OR REPLACE INTO paired VALUES(?1,?2)",
             params![installation, key],
         )?;
-        tx.execute(
+        tx.execute_cached(
             "INSERT OR REPLACE INTO peers VALUES(?1,?2,?3)",
             params![endpoint, installation, key],
         )?;
@@ -147,8 +148,8 @@ impl Catalog {
         let mut store = lock(&self.engine.store);
         store.flush_metadata()?;
         let tx = store.db.unchecked_transaction()?;
-        tx.execute("DELETE FROM paired WHERE installation=?1", [installation])?;
-        tx.execute("DELETE FROM peers WHERE installation=?1", [installation])?;
+        tx.execute_cached("DELETE FROM paired WHERE installation=?1", [installation])?;
+        tx.execute_cached("DELETE FROM peers WHERE installation=?1", [installation])?;
         tx.commit()?;
         Ok(())
     }

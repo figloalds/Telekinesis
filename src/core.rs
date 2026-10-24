@@ -1,20 +1,68 @@
 //! Authoritative version journal and cached current namespace. No cone replay.
-use crate::content::local::{Kind as ObjectKind, LocalContent};
+use crate::content::local::{Kind as ObjectKind, LocalContent, Pin};
 use crate::content::working::Basis;
 use crate::model::content::{Digest, FileContentRef};
+use crate::util::cost::Counter;
+use crate::util::sqlite::CachedConnection;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 pub const ROOT: &str = "root";
 pub const MAIN: &str = "main";
+static VERSION_COST: Counter = Counter::new();
+static VERSION_DECODE_COST: Counter = Counter::new();
+static ENCODE_COST: Counter = Counter::new();
+static INDEX_COST: Counter = Counter::new();
+static DELTA_COST: Counter = Counter::new();
+static MAP_COPY_COST: [Counter; 6] = [const { Counter::new() }; 6];
+static MAP_COPY_ITEMS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const MAP_NAMES: [&str; 6] = [
+    "entries", "children", "slots", "visible", "anchors", "heads",
+];
+fn map_mut<K: Clone, V: Clone>(map: &mut Arc<BTreeMap<K, V>>, kind: usize) -> &mut BTreeMap<K, V> {
+    if Arc::strong_count(map) > 1 {
+        let _cost = MAP_COPY_COST[kind].time();
+        MAP_COPY_ITEMS[kind].fetch_add(map.len() as u64, Ordering::Relaxed);
+        Arc::make_mut(map)
+    } else {
+        Arc::make_mut(map)
+    }
+}
+fn encode_metadata(value: &impl Serialize) -> Result<Vec<u8>> {
+    let _cost = ENCODE_COST.time();
+    Ok(serde_json::to_vec(value)?)
+}
+pub fn metadata_stats() -> serde_json::Value {
+    let mut stages = crate::util::sqlite::metadata_stats();
+    stages.extend([
+        VERSION_COST.json("version_total"),
+        VERSION_DECODE_COST.json("version_decode"),
+        ENCODE_COST.json("json_encode"),
+        INDEX_COST.json("projection_index"),
+        DELTA_COST.json("projection_delta_total"),
+    ]);
+    let copies: Vec<_> = MAP_NAMES
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let mut row = MAP_COPY_COST[index].json(name);
+            row["items"] = MAP_COPY_ITEMS[index].load(Ordering::Relaxed).into();
+            row
+        })
+        .collect();
+    serde_json::json!({"inclusive_scopes":true, "stages":stages, "map_copies":copies})
+}
 pub fn id() -> String {
     Uuid::new_v4().to_string()
 }
@@ -179,23 +227,24 @@ pub struct Projection {
 impl Projection {
     fn empty() -> Self {
         let mut p = Self::default();
-        Arc::make_mut(&mut p.entries).insert(ROOT.into(), Entry::root());
+        map_mut(&mut p.entries, 0).insert(ROOT.into(), Entry::root());
         p.dirty.insert(ROOT.into());
         p
     }
     fn index(&mut self, entry: Entry) -> Result<()> {
+        let _cost = INDEX_COST.time();
         if let Some(old) = self.entries.get(&entry.id) {
             if !old.deleted {
                 let key = name_key(&old.name)?;
                 let slot = (old.parent.clone(), key.clone());
-                let slots = Arc::make_mut(&mut self.slots);
+                let slots = map_mut(&mut self.slots, 2);
                 if let Some(members) = slots.get_mut(&slot) {
                     members.remove(&old.id);
                     if members.is_empty() {
                         slots.remove(&slot);
                     }
                 }
-                if let Some(children) = Arc::make_mut(&mut self.children).get_mut(&old.parent) {
+                if let Some(children) = map_mut(&mut self.children, 1).get_mut(&old.parent) {
                     if let Some(winner) = slots.get(&slot).and_then(|s| s.first()) {
                         children.insert(key, winner.clone());
                     } else {
@@ -206,18 +255,18 @@ impl Projection {
             self.dirty.insert(old.parent.clone());
         }
         if !entry.deleted && entry.id != ROOT {
-            let children = Arc::make_mut(&mut self.children)
+            let children = map_mut(&mut self.children, 1)
                 .entry(entry.parent.clone())
                 .or_default();
             let key = name_key(&entry.name)?;
-            let members = Arc::make_mut(&mut self.slots)
+            let members = map_mut(&mut self.slots, 2)
                 .entry((entry.parent.clone(), key.clone()))
                 .or_default();
             members.insert(entry.id.clone());
             children.insert(key, members.first().unwrap().clone());
             self.dirty.insert(entry.parent.clone());
         }
-        Arc::make_mut(&mut self.entries).insert(entry.id.clone(), entry);
+        map_mut(&mut self.entries, 0).insert(entry.id.clone(), entry);
         Ok(())
     }
     pub fn lookup(&self, path: &str) -> Result<Entry> {
@@ -286,10 +335,16 @@ pub struct Store {
     pub repo: String,
     pub active: String,
     pub content: LocalContent,
+    empty_content: FileContentRef,
+    _empty_pin: Pin,
     pub(crate) db: Connection,
+    // Declared after db so the writer closes before its maintenance worker.
+    pub(crate) checkpoint: crate::util::checkpoint::CheckpointWorker,
+    pub(crate) namespace_epoch: Arc<AtomicU64>,
     views: BTreeMap<String, Projection>,
     clock: u64,
     pending_since: Option<std::time::Instant>,
+    durable_metadata: Option<(u64, u32)>,
 }
 const SCHEMA:&str="
 CREATE TABLE config(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -309,36 +364,38 @@ impl Store {
         std::fs::create_dir_all(root)?;
         let content = LocalContent::open(root)?;
         let db = Connection::open(root.join("metadata.sqlite"))?;
+        db.set_prepared_statement_cache_capacity(128);
         db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.execute_batch(
+        db.batch_profiled(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
-        let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+        crate::util::sqlite::profile_default_auto_checkpoint(&db)?;
+        let app: i64 = db.query_profiled("PRAGMA application_id", [], |r| r.get(0))?;
         if app == 0 {
             let count: i64 =
-                db.query_row("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
+                db.query_profiled("SELECT count(*) FROM sqlite_schema", [], |r| r.get(0))?;
             ensure!(count == 0, "UNSUPPORTED_METADATA_FORMAT");
             let tx = db.unchecked_transaction()?;
-            tx.execute_batch(SCHEMA)?;
+            tx.batch_profiled(SCHEMA)?;
             for (key, value) in [
                 ("device", id()),
                 ("repo", repo.map(str::to_owned).unwrap_or_else(id)),
                 ("active", MAIN.into()),
                 ("clock", "0".into()),
             ] {
-                tx.execute("INSERT INTO config VALUES(?1,?2)", params![key, value])?;
+                tx.execute_profiled("INSERT INTO config VALUES(?1,?2)", params![key, value])?;
             }
-            tx.execute("INSERT INTO branches VALUES(?1,?1,NULL)", [MAIN])?;
+            tx.execute_profiled("INSERT INTO branches VALUES(?1,?1,NULL)", [MAIN])?;
             tx.commit()?;
         } else {
             ensure!(
                 app == 1414223440
-                    && db.query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))? == 1,
+                    && db.query_profiled("PRAGMA user_version", [], |r| r.get::<_, u32>(0))? == 1,
                 "UNSUPPORTED_METADATA_FORMAT"
             );
         }
         let config = |key: &str| -> Result<String> {
-            Ok(db.query_row("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))?)
+            Ok(db.query_profiled("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))?)
         };
         let device = config("device")?;
         let repository = config("repo")?;
@@ -346,21 +403,35 @@ impl Store {
         if let Some(repo) = repo {
             ensure!(repo == repository, "REPOSITORY_MISMATCH");
         }
+        // Install the canonical empty object once, before any namespace event
+        // can reference it. Keep it pinned so later creates need no object I/O
+        // and cannot flush another entity's in-progress seal batch.
+        let empty_content = content.import(&[])?;
+        content.packs.flush()?;
+        let empty_pin = content.pin(&empty_content)?;
+        let checkpoint =
+            crate::util::checkpoint::CheckpointWorker::start(&root.join("metadata.sqlite"))?;
+        checkpoint.replace_inline(&db)?;
         let mut store = Self {
             root: root.to_owned(),
             device,
             repo: repository,
             active,
             content,
+            empty_content,
+            _empty_pin: empty_pin,
             db,
+            checkpoint,
+            namespace_epoch: Arc::new(AtomicU64::new(1)),
             views: BTreeMap::new(),
             clock: 0,
             pending_since: None,
+            durable_metadata: None,
         };
         store.load_view(&store.active.clone())?;
         store.clock = store
             .db
-            .query_row("SELECT value FROM config WHERE key='clock'", [], |r| {
+            .query_profiled("SELECT value FROM config WHERE key='clock'", [], |r| {
                 r.get::<_, String>(0)
             })?
             .parse()?;
@@ -406,7 +477,7 @@ impl Store {
         }
         let snapshot: Option<String> = self
             .db
-            .query_row("SELECT snapshot FROM branches WHERE id=?1", [branch], |r| {
+            .query_profiled("SELECT snapshot FROM branches WHERE id=?1", [branch], |r| {
                 r.get(0)
             })
             .context("BRANCH_NOT_FOUND")?;
@@ -432,7 +503,7 @@ impl Store {
         let rows = {
             let mut q = self
                 .db
-                .prepare("SELECT entity,state,visible FROM current WHERE branch=?1")?;
+                .prepare_cached("SELECT entity,state,visible FROM current WHERE branch=?1")?;
             q.query_map([branch], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -444,12 +515,12 @@ impl Store {
         };
         for (entity, state, visible) in rows {
             projection.index(serde_json::from_slice(&state)?)?;
-            Arc::make_mut(&mut projection.visible).insert(entity, visible);
+            map_mut(&mut projection.visible, 3).insert(entity, visible);
         }
         let rows = {
             let mut q = self
                 .db
-                .prepare("SELECT entity,version FROM heads WHERE branch=?1")?;
+                .prepare_cached("SELECT entity,version FROM heads WHERE branch=?1")?;
             q.query_map([branch], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })?
@@ -457,16 +528,17 @@ impl Store {
         };
         let mut overlaid = BTreeSet::new();
         for (entity, version) in rows {
-            let heads = Arc::make_mut(&mut projection.heads);
+            let heads = map_mut(&mut projection.heads, 5);
             if overlaid.insert(entity.clone()) {
                 heads.insert(entity.clone(), BTreeSet::new());
             }
             heads.entry(entity).or_default().insert(version);
         }
         for (entity, visible) in &*projection.visible {
-            Arc::make_mut(&mut projection.anchors)
+            map_mut(&mut projection.anchors, 4)
                 .insert(entity.clone(), self.content_anchor(visible)?);
         }
+        self.namespace_epoch.fetch_add(1, Ordering::Release);
         self.views.insert(branch.into(), projection);
         Ok(())
     }
@@ -592,11 +664,17 @@ impl Store {
         Ok(true)
     }
     pub fn version(&self, id: &str) -> Result<Option<Event>> {
+        let _cost = VERSION_COST.time();
         let value: Option<Vec<u8>> = self
             .db
-            .query_row("SELECT event FROM events WHERE id=?1", [id], |r| r.get(0))
+            .query_profiled("SELECT event FROM events WHERE id=?1", [id], |r| r.get(0))
             .optional()?;
-        value.map(|v| Ok(serde_json::from_slice(&v)?)).transpose()
+        value
+            .map(|v| {
+                let _decode = VERSION_DECODE_COST.time();
+                Ok(serde_json::from_slice(&v)?)
+            })
+            .transpose()
     }
     /// One metadata transaction per batch. Projection changes become visible
     /// only after commit, and missing parents remain in the bounded inbox.
@@ -610,11 +688,14 @@ impl Store {
     ) -> Result<Vec<String>> {
         let mut applied = Vec::new();
         let mut pending: Vec<Event> = events.to_vec();
-        {
-            let mut q = self.db.prepare("SELECT event FROM waiting LIMIT 4096")?;
-            for row in q.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
-                pending.push(serde_json::from_slice(&row?)?);
-            }
+        let waiting = crate::util::sqlite::metadata_rows(|| -> rusqlite::Result<Vec<Vec<u8>>> {
+            let mut q = self
+                .db
+                .prepare_cached("SELECT event FROM waiting LIMIT 4096")?;
+            q.query_map([], |r| r.get::<_, Vec<u8>>(0))?.collect()
+        })?;
+        for row in waiting {
+            pending.push(serde_json::from_slice(&row)?);
         }
         if pending.is_empty() && receipts.is_empty() {
             return Ok(applied);
@@ -622,7 +703,7 @@ impl Store {
         // Validate against earlier events in the same batch through a temporary
         // transaction. All projections are rebuilt from per-entity deltas below.
         for event in events {
-            let exists: bool = self.db.query_row(
+            let exists: bool = self.db.query_profiled(
                 "SELECT EXISTS(SELECT 1 FROM branches WHERE id=?1)",
                 [&event.branch],
                 |r| r.get(0),
@@ -634,13 +715,13 @@ impl Store {
         let mut affected = BTreeSet::new();
         if !receipts.is_empty() {
             self.flush_metadata()?;
-            self.db.execute_batch("PRAGMA synchronous=FULL;")?;
+            self.db.batch_profiled("PRAGMA synchronous=FULL;")?;
         }
         if self.db.is_autocommit() {
-            self.db.execute_batch("BEGIN IMMEDIATE;")?;
+            self.db.batch_profiled("BEGIN IMMEDIATE;")?;
             self.pending_since = Some(std::time::Instant::now());
         }
-        self.db.execute_batch("SAVEPOINT apply_events;")?;
+        self.db.batch_profiled("SAVEPOINT apply_events;")?;
         let tx = &self.db;
         let result = (|| -> Result<()> {
             let mut progress = true;
@@ -650,65 +731,68 @@ impl Store {
                 for event in pending.drain(..) {
                     if let Some(existing) = self.version(&event.id)? {
                         ensure!(existing == event, "EVENT_ID_COLLISION");
-                        tx.execute("DELETE FROM waiting WHERE id=?1", [&event.id])?;
+                        tx.execute_profiled("DELETE FROM waiting WHERE id=?1", [&event.id])?;
                         continue;
                     }
                     if !self.validate_event(&event)? {
                         remain.push(event);
                         continue;
                     }
-                    let exists: bool = tx.query_row(
+                    let exists: bool = tx.query_profiled(
                         "SELECT EXISTS(SELECT 1 FROM branches WHERE id=?1)",
                         [&event.branch],
                         |r| r.get(0),
                     )?;
                     if !exists {
-                        tx.execute("INSERT INTO branches VALUES(?1,?1,NULL)", [&event.branch])?;
+                        tx.execute_profiled(
+                            "INSERT INTO branches VALUES(?1,?1,NULL)",
+                            [&event.branch],
+                        )?;
                     }
                     // Seed inherited heads when a branch receives its first edit.
                     let inherited = self
                         .views
                         .get(&event.branch)
                         .and_then(|p| p.heads.get(&event.entity));
-                    let explicit: bool = tx.query_row(
+                    let explicit: bool = tx.query_profiled(
                         "SELECT EXISTS(SELECT 1 FROM heads WHERE branch=?1 AND entity=?2)",
                         params![event.branch, event.entity],
                         |r| r.get(0),
                     )?;
                     if !explicit && let Some(heads) = inherited {
                         for head in heads {
-                            tx.execute(
+                            tx.execute_profiled(
                                 "INSERT OR IGNORE INTO heads VALUES(?1,?2,?3)",
                                 params![event.branch, event.entity, head],
                             )?;
                         }
                     }
                     for parent in &event.parents {
-                        tx.execute(
+                        tx.execute_profiled(
                             "DELETE FROM heads WHERE branch=?1 AND entity=?2 AND version=?3",
                             params![event.branch, event.entity, parent],
                         )?;
                     }
-                    tx.execute(
+                    tx.execute_profiled(
                         "INSERT INTO events(id,branch,entity,event) VALUES(?1,?2,?3,?4)",
                         params![
                             event.id,
                             event.branch,
                             event.entity,
-                            serde_json::to_vec(&event)?
+                            encode_metadata(&event)?
                         ],
                     )?;
-                    tx.execute(
+                    tx.execute_profiled(
                         "INSERT INTO heads VALUES(?1,?2,?3)",
                         params![event.branch, event.entity, event.id],
                     )?;
-                    let heads: usize = tx.query_row(
+                    let heads: usize = tx.query_profiled(
                         "SELECT count(*) FROM heads WHERE branch=?1 AND entity=?2",
                         params![event.branch, event.entity],
                         |r| r.get(0),
                     )?;
                     let old: Option<String> = tx
-                        .query_row(
+                        .query_profiled(
                             "SELECT visible FROM current WHERE branch=?1 AND entity=?2",
                             params![event.branch, event.entity],
                             |r| r.get(0),
@@ -733,19 +817,23 @@ impl Store {
                             .context("VISIBLE_VERSION_MISSING")?
                             .state
                     };
-                    tx.execute(
-                        "INSERT OR REPLACE INTO current VALUES(?1,?2,?3,?4)",
+                    // Keep the existing row/index entry when advancing a known
+                    // entity; REPLACE needlessly deletes and reinserts it.
+                    tx.execute_profiled(
+                        "INSERT INTO current VALUES(?1,?2,?3,?4) \
+                         ON CONFLICT(branch,entity) DO UPDATE SET \
+                         state=excluded.state,visible=excluded.visible",
                         params![
                             event.branch,
                             event.entity,
-                            serde_json::to_vec(&state)?,
+                            encode_metadata(&state)?,
                             visible
                         ],
                     )?;
                     if heads > 1 {
-                        tx.execute("INSERT OR IGNORE INTO conflict_history SELECT branch,entity,version FROM heads WHERE branch=?1 AND entity=?2",params![event.branch,event.entity])?;
+                        tx.execute_profiled("INSERT OR IGNORE INTO conflict_history SELECT branch,entity,version FROM heads WHERE branch=?1 AND entity=?2",params![event.branch,event.entity])?;
                     }
-                    tx.execute("DELETE FROM waiting WHERE id=?1", [&event.id])?;
+                    tx.execute_profiled("DELETE FROM waiting WHERE id=?1", [&event.id])?;
                     affected.insert((event.branch.clone(), event.entity.clone()));
                     applied.push(event.id.clone());
                     progress = true;
@@ -754,7 +842,7 @@ impl Store {
             }
             ensure!(pending.len() <= 4096, "INBOX_FULL");
             for event in &pending {
-                tx.execute(
+                tx.execute_profiled(
                     "INSERT OR IGNORE INTO waiting VALUES(?1,?2)",
                     params![event.id, serde_json::to_vec(event)?],
                 )?;
@@ -762,9 +850,9 @@ impl Store {
             Ok(())
         })();
         if let Err(error) = result {
-            tx.execute_batch("ROLLBACK TO apply_events; RELEASE apply_events;")?;
+            tx.batch_profiled("ROLLBACK TO apply_events; RELEASE apply_events;")?;
             if !receipts.is_empty() {
-                tx.execute_batch("ROLLBACK;PRAGMA synchronous=NORMAL;")?;
+                tx.batch_profiled("ROLLBACK;PRAGMA synchronous=NORMAL;")?;
                 self.pending_since = None;
             }
             return Err(error);
@@ -775,49 +863,60 @@ impl Store {
             .max()
             .unwrap_or(0)
             .max(self.clock);
-        tx.execute(
+        tx.execute_profiled(
             "UPDATE config SET value=?1 WHERE key='clock'",
             [clock.to_string()],
         )?;
         for (operation, event, stamp) in receipts {
-            tx.execute(
+            tx.execute_profiled(
                 "INSERT OR IGNORE INTO seal_receipts VALUES(?1,?2,?3)",
                 params![operation, event, stamp.to_string()],
             )?;
         }
-        tx.execute_batch("RELEASE apply_events;")?;
+        tx.batch_profiled("RELEASE apply_events;")?;
         if !receipts.is_empty() {
             self.flush_metadata()?;
-            self.db.execute_batch("PRAGMA synchronous=NORMAL;")?;
+            self.db.batch_profiled("PRAGMA synchronous=NORMAL;")?;
+            // A FULL WAL commit syncs this transaction and every preceding
+            // namespace/catalog commit. Moving its pages into the main DB is
+            // not another durability requirement for the same file fsync.
+            self.durable_metadata = Some(self.metadata_stamp()?);
         } else if self
             .pending_since
             .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(5))
         {
             self.flush_metadata()?;
         }
+        if !affected.is_empty() {
+            // Invalidate before touching projections, including on a later
+            // projection error. Readers missing this epoch wait for Store.
+            self.namespace_epoch.fetch_add(1, Ordering::Release);
+        }
         for (branch, entity) in affected {
+            let _cost = DELTA_COST.time();
             if !self.views.contains_key(&branch) {
                 self.load_view(&branch)?;
                 continue;
             }
-            let (state, visible): (Vec<u8>, String) = self.db.query_row(
+            let (state, visible): (Vec<u8>, String) = self.db.query_profiled(
                 "SELECT state,visible FROM current WHERE branch=?1 AND entity=?2",
                 params![branch, entity],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            let heads = {
-                let mut q = self
-                    .db
-                    .prepare("SELECT version FROM heads WHERE branch=?1 AND entity=?2")?;
-                q.query_map(params![branch, entity], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<BTreeSet<_>>>()?
-            };
+            let heads =
+                crate::util::sqlite::metadata_rows(|| -> rusqlite::Result<BTreeSet<String>> {
+                    let mut q = self.db.prepare_cached(
+                        "SELECT version FROM heads WHERE branch=?1 AND entity=?2",
+                    )?;
+                    q.query_map(params![branch, entity], |r| r.get::<_, String>(0))?
+                        .collect()
+                })?;
             let anchor = self.content_anchor(&visible)?;
             let p = self.views.get_mut(&branch).unwrap();
             p.index(serde_json::from_slice(&state)?)?;
-            Arc::make_mut(&mut p.visible).insert(entity.clone(), visible);
-            Arc::make_mut(&mut p.anchors).insert(entity.clone(), anchor);
-            Arc::make_mut(&mut p.heads).insert(entity, heads);
+            map_mut(&mut p.visible, 3).insert(entity.clone(), visible);
+            map_mut(&mut p.anchors, 4).insert(entity.clone(), anchor);
+            map_mut(&mut p.heads, 5).insert(entity, heads);
         }
         if let Some(clock) = events.iter().map(|e| e.clock).max() {
             self.clock = self.clock.max(clock);
@@ -826,12 +925,42 @@ impl Store {
     }
     pub fn flush_metadata(&mut self) -> Result<()> {
         if !self.db.is_autocommit() {
-            self.db.execute_batch("COMMIT;")?;
+            self.db.batch_profiled("COMMIT;")?;
+            self.checkpoint.request();
         }
         self.pending_since = None;
+        self.checkpoint.check_error()
+    }
+    fn metadata_stamp(&self) -> Result<(u64, u32)> {
+        Ok((
+            self.db.total_changes(),
+            self.db
+                .query_profiled("PRAGMA schema_version", [], |r| r.get(0))?,
+        ))
+    }
+    /// Make metadata durable, without checkpointing a seal that already used
+    /// a FULL-synchronous WAL commit. The connection's change count also covers
+    /// direct catalog writes; the schema cookie covers DDL. A reopened store
+    /// always starts with an unknown stamp and takes the conservative barrier.
+    pub fn sync_metadata(&mut self) -> Result<()> {
+        self.flush_metadata()?;
+        let _checkpoint = self.checkpoint.barrier()?;
+        self.checkpoint.check_error()?;
+        let stamp = self.metadata_stamp()?;
+        if self.durable_metadata == Some(stamp) {
+            return Ok(());
+        }
+        let (busy, frames, synced): (i64, i64, i64) =
+            self.db
+                .query_profiled("PRAGMA wal_checkpoint(FULL)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+        ensure!(busy == 0 && frames == synced, "METADATA_SYNC_INCOMPLETE");
+        self.durable_metadata = Some(stamp);
         Ok(())
     }
     pub fn commit_due(&mut self) -> Result<()> {
+        self.checkpoint.check_error()?;
         if self
             .pending_since
             .is_some_and(|t| t.elapsed() >= std::time::Duration::from_millis(5))
@@ -867,9 +996,7 @@ impl Store {
         let parent = self.lookup(&names[..names.len() - 1].join("/"))?;
         ensure!(parent.kind == EntryKind::Directory, "NOT_A_DIRECTORY");
         let content = if kind == EntryKind::File {
-            let content = self.content.import(&[])?;
-            self.content.packs.flush()?;
-            Some(content)
+            Some(self.empty_content.clone())
         } else {
             None
         };
@@ -993,7 +1120,7 @@ impl Store {
     pub fn receipt(&self, operation: &str) -> Result<Option<(String, u128)>> {
         let row: Option<(String, String)> = self
             .db
-            .query_row(
+            .query_profiled(
                 "SELECT event,modified_ns FROM seal_receipts WHERE operation=?1",
                 [operation],
                 |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1075,18 +1202,18 @@ impl Store {
                 })
                 .collect(),
         };
-        self.db.execute(
+        self.db.execute_profiled(
             "INSERT INTO snapshots VALUES(?1,?2,?3)",
             params![
                 snapshot.id,
                 &root.0[..],
-                serde_json::to_vec(&snapshot.frontier)?
+                encode_metadata(&snapshot.frontier)?
             ],
         )?;
         Ok(snapshot)
     }
     pub fn snapshot(&self, id: &str) -> Result<Snapshot> {
-        let (root, frontier): (Vec<u8>, Vec<u8>) = self.db.query_row(
+        let (root, frontier): (Vec<u8>, Vec<u8>) = self.db.query_profiled(
             "SELECT root,frontier FROM snapshots WHERE id=?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -1100,29 +1227,30 @@ impl Store {
     pub fn fork(&mut self, snapshot: &Snapshot, name: &str) -> Result<String> {
         ensure!(!name.is_empty(), "INVALID_BRANCH");
         let branch = id();
-        self.db.execute(
+        self.db.execute_profiled(
             "INSERT INTO branches VALUES(?1,?2,?3)",
             params![branch, name, snapshot.id],
         )?;
         Ok(branch)
     }
     pub fn checkout(&mut self, branch: &str) -> Result<()> {
-        let branch: String = self.db.query_row(
+        let branch: String = self.db.query_profiled(
             "SELECT id FROM branches WHERE id=?1 OR name=?1",
             [branch],
             |r| r.get(0),
         )?;
         self.load_view(&branch)?;
         self.db
-            .execute("UPDATE config SET value=?1 WHERE key='active'", [&branch])?;
+            .execute_profiled("UPDATE config SET value=?1 WHERE key='active'", [&branch])?;
         self.active = branch;
+        self.namespace_epoch.fetch_add(1, Ordering::Release);
         Ok(())
     }
     pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Event)>> {
         ensure!(limit <= 4096, "FEED_BATCH_TOO_LARGE");
         let mut q = self
             .db
-            .prepare("SELECT seq,event FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2")?;
+            .prepare_cached("SELECT seq,event FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2")?;
         let rows = q
             .query_map(params![after, limit], |r| {
                 Ok((r.get::<_, u64>(0)?, r.get::<_, Vec<u8>>(1)?))
@@ -1143,7 +1271,7 @@ impl Store {
         if include_resolved {
             let mut q = self
                 .db
-                .prepare("SELECT entity,version FROM conflict_history WHERE branch=?1")?;
+                .prepare_cached("SELECT entity,version FROM conflict_history WHERE branch=?1")?;
             for row in q.query_map([&self.active], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
             })? {
@@ -1224,7 +1352,7 @@ impl Store {
         }
         let mut q = self
             .db
-            .prepare("SELECT root FROM snapshots ORDER BY rowid DESC LIMIT ?1")?;
+            .prepare_cached("SELECT root FROM snapshots ORDER BY rowid DESC LIMIT ?1")?;
         for row in q.query_map([history_depth], |r| r.get::<_, Vec<u8>>(0))? {
             let digest = row?;
             pending.push((Digest(digest.as_slice().try_into()?), ObjectKind::Tree));
@@ -1232,12 +1360,12 @@ impl Store {
         // Branch bases cannot age out merely because another branch checkpoints.
         let mut q = self
             .db
-            .prepare("SELECT s.root FROM snapshots s JOIN branches b ON b.snapshot=s.id")?;
+            .prepare_cached("SELECT s.root FROM snapshots s JOIN branches b ON b.snapshot=s.id")?;
         for row in q.query_map([], |r| r.get::<_, Vec<u8>>(0))? {
             let digest = row?;
             pending.push((Digest(digest.as_slice().try_into()?), ObjectKind::Tree));
         }
-        let mut q = self.db.prepare(
+        let mut q = self.db.prepare_cached(
             "SELECT DISTINCT version FROM conflict_history UNION SELECT version FROM heads",
         )?;
         for row in q.query_map([], |r| r.get::<_, String>(0))? {

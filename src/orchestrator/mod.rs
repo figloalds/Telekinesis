@@ -18,6 +18,30 @@ use std::{
 };
 
 pub fn run(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<()> {
+    // Startup and loop failures take the same cleanup path as a control stop.
+    // In particular, bind/catalog errors after attach must not skip detach.
+    let served = serve(engine.clone(), listen, advertise);
+    let shutdown = engine.shutdown();
+    #[cfg(any(windows, target_os = "linux"))]
+    let detach = crate::mount::detach();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let detach: Result<()> = Ok(());
+    let root = lock(&engine.store).root.clone();
+    let _ = std::fs::remove_file(root.join("control.json"));
+    let errors: Vec<String> = [served.err(), shutdown.err(), detach.err()]
+        .into_iter()
+        .flatten()
+        .map(|error| format!("{error:#}"))
+        .collect();
+    ensure!(
+        errors.is_empty(),
+        "SHUTDOWN_INCOMPLETE: {}",
+        errors.join("; ")
+    );
+    Ok(())
+}
+
+fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<()> {
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
     let endpoint = advertise
@@ -191,25 +215,5 @@ pub fn run(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result
     for session in sessions {
         session.close();
     }
-    // Both run whatever the other reports: a failed final seal is a durability
-    // failure to report, never a reason to leave the mount attached
-    // (W6-P0-MOUNT-LIFECYCLE).
-    let shutdown = engine.shutdown();
-    #[cfg(any(windows, target_os = "linux"))]
-    let detach = crate::mount::detach();
-    #[cfg(not(any(windows, target_os = "linux")))]
-    let detach: Result<()> = Ok(());
-    let errors: Vec<String> = [shutdown.err(), detach.err()]
-        .into_iter()
-        .flatten()
-        .map(|error| format!("{error:#}"))
-        .collect();
-    ensure!(
-        errors.is_empty(),
-        "SHUTDOWN_INCOMPLETE: {}",
-        errors.join("; ")
-    );
-    let root = lock(&engine.store).root.clone();
-    let _ = std::fs::remove_file(root.join("control.json"));
     Ok(())
 }

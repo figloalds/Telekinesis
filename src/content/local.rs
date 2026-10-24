@@ -1,5 +1,6 @@
 //! Append-only packs. No per-object flush, rename, or separate loose files.
 use crate::model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef};
+use crate::util::sqlite::CachedConnection;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,16 @@ impl Manifest {
         Ok(bytes)
     }
     pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let (len, chunks) = Self::encoded_chunks(bytes)?;
+        Ok(Self {
+            len,
+            chunks: chunks
+                .chunks_exact(32)
+                .map(|b| Digest(b.try_into().unwrap()))
+                .collect(),
+        })
+    }
+    fn encoded_chunks(bytes: &[u8]) -> Result<(u64, &[u8])> {
         ensure!(
             bytes.len() >= 13
                 && &bytes[..5] == b"TKFM\x02"
@@ -54,13 +65,7 @@ impl Manifest {
             len > CHUNK_SIZE && (bytes.len() - 13) as u64 / 32 == len.div_ceil(CHUNK_SIZE),
             "INVALID_MANIFEST"
         );
-        Ok(Self {
-            len,
-            chunks: bytes[13..]
-                .chunks_exact(32)
-                .map(|b| Digest(b.try_into().unwrap()))
-                .collect(),
-        })
+        Ok((len, &bytes[13..]))
     }
 }
 
@@ -153,6 +158,7 @@ impl PackStore {
             return Ok(Self { inner });
         }
         let db = Connection::open(root.parent().unwrap().join("index.sqlite"))?;
+        db.set_prepared_statement_cache_capacity(32);
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS objects(digest BLOB PRIMARY KEY CHECK(length(digest)=32), segment INTEGER NOT NULL, offset INTEGER NOT NULL, length INTEGER NOT NULL, kind INTEGER NOT NULL);")?;
         // Never reuse a segment number after GC or a crash with an unindexed tail.
@@ -197,7 +203,7 @@ impl PackStore {
         }
         let row: Option<(u64, u64, usize, u8)> = state
             .db
-            .query_row(
+            .query_cached(
                 "SELECT segment,offset,length,kind FROM objects WHERE digest=?1",
                 [&digest.0[..]],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -214,6 +220,11 @@ impl PackStore {
         .transpose()
     }
     pub fn put(&self, kind: Kind, bytes: &[u8]) -> Result<Digest> {
+        self.put_with_status(kind, bytes).map(|(digest, _)| digest)
+    }
+    /// Hash and validate the supplied bytes once; report insertion under the
+    /// same pack lock as deduplication. Callers never supply an unchecked hash.
+    pub(crate) fn put_with_status(&self, kind: Kind, bytes: &[u8]) -> Result<(Digest, bool)> {
         ensure!(
             bytes.len() <= MAX_OBJECT_BYTES
                 && (kind != Kind::Chunk || bytes.len() <= CHUNK_SIZE as usize),
@@ -223,7 +234,7 @@ impl PackStore {
         let mut state = guard(&self.inner.state);
         if let Some(old) = Self::location(&state, digest)? {
             ensure!(old.kind == kind, "OBJECT_KIND_COLLISION");
-            return Ok(digest);
+            return Ok((digest, false));
         }
         if state.offset > 0 && state.offset + bytes.len() as u64 > self.inner.segment_limit {
             Self::flush_locked(&mut state)?;
@@ -240,7 +251,7 @@ impl PackStore {
         state.writer.write_all(bytes)?;
         state.offset += bytes.len() as u64;
         state.pending.insert(digest, location);
-        Ok(digest)
+        Ok((digest, true))
     }
     fn flush_locked(state: &mut State) -> Result<()> {
         if state.pending.is_empty() {
@@ -249,7 +260,7 @@ impl PackStore {
         state.writer.sync_all()?;
         let tx = state.db.transaction()?;
         for (digest, loc) in &state.pending {
-            tx.execute(
+            tx.execute_cached(
                 "INSERT OR IGNORE INTO objects VALUES(?1,?2,?3,?4,?5)",
                 params![
                     &digest.0[..],
@@ -301,7 +312,7 @@ impl PackStore {
         if read.is_err() || Digest::bytes(&bytes) != digest {
             state
                 .db
-                .execute("DELETE FROM objects WHERE digest=?1", [&digest.0[..]])?;
+                .execute_cached("DELETE FROM objects WHERE digest=?1", [&digest.0[..]])?;
             state.pending.remove(&digest);
             anyhow::bail!("OBJECT_CORRUPT: {digest}");
         }
@@ -348,7 +359,7 @@ impl PackStore {
     pub fn keys(&self) -> Result<Vec<(Digest, Kind)>> {
         let mut state = guard(&self.inner.state);
         Self::flush_locked(&mut state)?;
-        let mut stmt = state.db.prepare("SELECT digest,kind FROM objects")?;
+        let mut stmt = state.db.prepare_cached("SELECT digest,kind FROM objects")?;
         let rows = stmt
             .query_map([], |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, u8>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -365,7 +376,7 @@ impl PackStore {
         let mut live = live.clone();
         live.extend(state.pins.keys());
         let rows = {
-            let mut stmt = state.db.prepare(
+            let mut stmt = state.db.prepare_cached(
                 "SELECT digest,segment,offset,length,kind FROM objects ORDER BY segment,offset",
             )?;
             stmt.query_map([], |r| {
@@ -422,9 +433,9 @@ impl PackStore {
             state.writer.sync_all()?;
             let new_segment = state.segment;
             let tx = state.db.transaction()?;
-            tx.execute("DELETE FROM objects WHERE segment=?1", [segment])?;
+            tx.execute_cached("DELETE FROM objects WHERE segment=?1", [segment])?;
             for (digest, offset, loc) in updates {
-                tx.execute(
+                tx.execute_cached(
                     "INSERT INTO objects VALUES(?1,?2,?3,?4,?5)",
                     params![&digest.0[..], new_segment, offset, loc.len, loc.kind as u8],
                 )?;
@@ -471,6 +482,128 @@ mod tests {
             &**PackStore::open(root.path())?.get(digest)?,
             b"immutable bytes"
         );
+        Ok(())
+    }
+    #[test]
+    fn counted_puts_report_one_insert_and_keep_kind_and_size_validation() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::open(root.path())?;
+        let bytes = Arc::new(vec![19; CHUNK_SIZE as usize]);
+        let expected = Digest::bytes(&bytes);
+        let start = Arc::new(std::sync::Barrier::new(9));
+        let workers = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let bytes = bytes.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    store.put_with_status(Kind::Chunk, &bytes)
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let mut inserted = 0;
+        for worker in workers {
+            let (digest, new) = worker.join().unwrap()?;
+            assert_eq!(digest, expected);
+            inserted += usize::from(new);
+        }
+        assert_eq!(inserted, 1);
+        assert!(
+            store
+                .put_with_status(Kind::Tree, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("OBJECT_KIND_COLLISION")
+        );
+        store.flush()?;
+        drop(store);
+        let store = PackStore::open(root.path())?;
+        assert_eq!(
+            store.put_with_status(Kind::Chunk, &bytes)?,
+            (expected, false)
+        );
+        assert!(
+            store
+                .put_with_status(Kind::Tree, &bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("OBJECT_KIND_COLLISION")
+        );
+        assert!(
+            store
+                .put_with_status(Kind::Chunk, &vec![0; CHUNK_SIZE as usize + 1])
+                .unwrap_err()
+                .to_string()
+                .contains("OBJECT_TOO_LARGE")
+        );
+        assert_eq!(store.keys()?, vec![(expected, Kind::Chunk)]);
+        assert_eq!(store.get(expected)?.as_slice(), bytes.as_slice());
+        Ok(())
+    }
+    #[test]
+    fn range_reads_preserve_cross_chunk_partial_eof_and_empty_boundaries() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let content = LocalContent::open(home.path())?;
+        for len in [17, CHUNK_SIZE as usize, 3 * CHUNK_SIZE as usize + 17] {
+            let bytes = (0..len)
+                .map(|i| (i.wrapping_mul(17) % 251) as u8)
+                .collect::<Vec<_>>();
+            let reference = content.import(&bytes)?;
+            for start in [0, 3, len / 2, len - 1, len] {
+                for count in [0, 1, 31, CHUNK_SIZE as usize + 7] {
+                    let mut got = vec![0; count.min(len - start)];
+                    content.read_range(&reference, start as u64, &mut got)?;
+                    assert_eq!(got, bytes[start..start + got.len()]);
+                }
+            }
+            assert!(
+                content
+                    .read_range(&reference, len as u64, &mut [0])
+                    .is_err()
+            );
+            assert!(
+                content
+                    .read_range(&reference, len as u64 + 1, &mut [])
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn small_range_read_still_validates_complete_manifest_framing() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let content = LocalContent::open(home.path())?;
+        let digest = content
+            .packs
+            .put(Kind::Chunk, &vec![7; CHUNK_SIZE as usize])?;
+        let valid = Manifest {
+            len: CHUNK_SIZE * 2,
+            chunks: vec![digest; 2],
+        }
+        .encode()?;
+        for kind in 0..3 {
+            let mut malformed = valid.clone();
+            match kind {
+                0 => malformed.push(0),
+                1 => {
+                    malformed.truncate(malformed.len() - 32);
+                }
+                _ => malformed[5..13].copy_from_slice(&(CHUNK_SIZE * 2 - 1).to_le_bytes()),
+            }
+            let reference = FileContentRef::new(
+                ContentKind::Manifest,
+                content.packs.put(Kind::Manifest, &malformed)?,
+                CHUNK_SIZE * 2,
+            )?;
+            assert!(content.read_range(&reference, 0, &mut [0]).is_err());
+            assert!(
+                content
+                    .read_range(&reference, reference.total_len, &mut [])
+                    .is_err()
+            );
+        }
         Ok(())
     }
     #[test]
@@ -601,6 +734,31 @@ impl LocalContent {
         );
         Ok(manifest.chunks)
     }
+    fn range_chunks(
+        &self,
+        reference: &FileContentRef,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<Digest>> {
+        reference.validate()?;
+        if reference.kind == ContentKind::Direct {
+            return Ok(if range.is_empty() {
+                Vec::new()
+            } else {
+                vec![reference.digest]
+            });
+        }
+        // The pack verifies/caches the complete immutable object. Validate its
+        // complete framing and descriptor length, but decode only the requested
+        // digests: a small read of a large file must not allocate/copy its whole
+        // flat manifest on every paging callback.
+        let bytes = self.object(reference.digest, Kind::Manifest)?;
+        let (len, encoded) = Manifest::encoded_chunks(&bytes)?;
+        ensure!(len == reference.total_len, "INVALID_MANIFEST_LENGTH");
+        Ok(encoded[range.start * 32..range.end * 32]
+            .chunks_exact(32)
+            .map(|b| Digest(b.try_into().unwrap()))
+            .collect())
+    }
     pub fn read_range(
         &self,
         reference: &FileContentRef,
@@ -613,17 +771,26 @@ impl LocalContent {
                 .is_some_and(|n| n <= reference.total_len),
             "READ_PAST_EOF"
         );
-        let chunks = self.chunks(reference)?;
+        let first = (offset / CHUNK_SIZE) as usize;
+        let end = if out.is_empty() {
+            first
+        } else {
+            ((offset + out.len() as u64 - 1) / CHUNK_SIZE + 1) as usize
+        };
+        let chunks = self.range_chunks(reference, first..end)?;
         if !out.is_empty() {
-            let wanted = (offset / CHUNK_SIZE..=(offset + out.len() as u64 - 1) / CHUNK_SIZE)
-                .map(|i| (chunks[i as usize], Kind::Chunk))
+            let wanted = chunks
+                .iter()
+                .map(|digest| (*digest, Kind::Chunk))
                 .collect::<Vec<_>>();
             self.ensure(&wanted)?;
         }
         let mut done = 0;
         while done < out.len() {
             let pos = offset + done as u64;
-            let bytes = self.packs.get(chunks[(pos / CHUNK_SIZE) as usize])?;
+            let bytes = self
+                .packs
+                .get(chunks[(pos / CHUNK_SIZE) as usize - first])?;
             let expected =
                 (reference.total_len - pos / CHUNK_SIZE * CHUNK_SIZE).min(CHUNK_SIZE) as usize;
             ensure!(bytes.len() == expected, "INVALID_CHUNK_LENGTH");

@@ -1,10 +1,13 @@
 pub mod backoff;
 pub mod cancel;
+pub(crate) mod checkpoint;
+pub(crate) mod cost;
 pub mod fault;
 pub mod lock;
 pub mod log;
 pub mod notify;
 pub mod secret;
 pub mod snapshot;
+pub(crate) mod sqlite;
 pub mod time;
 pub use cancel::Cancel;

@@ -1,6 +1,6 @@
 # Wave 6 replacement: objects, snapshots and a passthrough working layer
 
-Status: implementation in progress, 2026-10-23. Supersedes the scope of [WAVE_6_PLAN.md](WAVE_6_PLAN.md)
+Status: implementation in progress, 2026-10-24. Supersedes the scope of [WAVE_6_PLAN.md](WAVE_6_PLAN.md)
 and the WP6.G interlude. Steps 1–6 have implementation commits; runtime cutover
 and benchmark qualification are blocked by W6-P0-MOUNT-LIFECYCLE. See the
 replacement step notes. The
@@ -17,8 +17,21 @@ The demand contains the dump evidence, unsafe shutdown/test sequence and the
 small mandatory exit/responsiveness checks. Reproduction belongs in an isolated
 Windows VM until those checks pass; folder mounts do not bypass this gate.
 The no-self-handle fix is implemented ([note](notes/mount-lifecycle-fix.md),
-invariants in section 3a); VM acceptance and the purge-cost measurement are
-still open.
+invariants in section 3a). The final binary passes 32 isolated VM lifecycle
+checks, including early self-open refusal under the store lock. The full-gate
+attempt failed during Git fixture preparation and exceeded measured I/O targets;
+Git status/build purge-cost acceptance remains open. The blocker is not closed.
+The [file-fsync cost follow-up](notes/fsync-cost.md) retains a passing 32-case
+lifecycle matrix for its WAL release, but its full performance gate also failed.
+The metadata-cost candidate exposed a timestamp recovery hole; its corrected
+release passes the expanded 34-case VM matrix, while copy still fails at 11.59x
+native ([recovery note](notes/recovery-timestamps.md)). Git/build cost and the
+subsequent create-path candidate remain under isolated VM qualification.
+Before the next VM lap, read the blocker's
+[performance triage](WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md#performance-triage-read-the-counters-before-the-next-vm-lap):
+retained callback counters show that opening an existing file copies it into a
+scratch, which dominates Git/build cost, and that metadata work is secondary.
+Section 3's hydrate-on-first-open is the design point to revisit first.
 
 ## 1. Why
 
@@ -66,17 +79,18 @@ boundaries and to present a snapshot as a directory. It is not a block device.
 
 ## 3. Working layer: scratch files and passthrough I/O
 
-- Each open regular file is backed by one **scratch file** on the host
-  filesystem under the store directory. On first open the scratch file is
-  hydrated from the entity's current manifest: local chunks are copied in,
-  remote chunks are fetched on demand by range and written in. A handle is
+- Regular-file handles share an **in-memory draft** and pin its immutable base.
+  Open and read create no host scratch or sidecar. Reads come from packs/LRU
+  until a range is materialized; the first write or size change creates the
+  scratch and recovery record under the store directory. Partial writes hydrate
+  only touched chunks, with recovery markers before accepting edits. A handle is
   bound to the version it opened on Linux. On Windows, data caching takes
   priority: existing handles may see remote updates because WinFsp shares
   cached pages by pathname (user decision, 2026-10-23). A local edit retains
   its parent version so concurrent changes still produce a conflict at seal.
-- **Read, write, truncate and append** are passthrough calls on the scratch
-  file's host handle. No hashing, no SQLite, no journal. The only bookkeeping on
-  write is an in-memory dirty flag and dirty-range bitmap (4 KiB granularity)
+- **Read, write, truncate and append** use the shared draft's immutable ranges
+  and host scratch handle. No hashing or SQLite on the byte path. After demand
+  hydration, write bookkeeping is an in-memory dirty flag and dirty-range bitmap (4 KiB granularity)
   per open entity, used to skip unchanged chunks at seal.
 - **Kernel caching is on.** `FileInfoTimeout` becomes a positive value with
   explicit invalidation: when a remote event changes an entity, the adapter
@@ -145,8 +159,9 @@ They hold for drive-letter and directory mounts alike.
 - **Durability contract** matches the host filesystem: fsync/flush is the
   durability point. A crash loses at most the write-back window of closed but
   unsealed files, exactly as it would on NTFS without fsync. Scratch files that
-  survive a crash are re-sealed on startup if their entity's recorded version
-  is older than the scratch file's modification time; otherwise discarded.
+  survive a crash are compared with their immutable base or committed receipt
+  before discard. Equal or backwards timestamps cannot prove unchanged bytes;
+  different materialized bytes are re-sealed on startup.
 - Editors that save by write-temp-then-rename produce one version per save: the
   temp file's seal plus the rename event, folded into one content event on the
   target entity when both land in the same seal batch.

@@ -18,6 +18,13 @@ failures, not passing qualification. See `test-evidence/bench/wave6-*.json` and
 the benchmark command in `docs/VALIDATION.md`.
 # Windows cache follow-up
 
+**Historical design, superseded by
+[W6-P0-MOUNT-LIFECYCLE](../WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md).** The persistent
+root handle and volume-drain thread described below caused a termination-time
+kernel cleanup dependency and have been removed. The current adapter relies on
+driver flush-before-Cleanup and per-file fsync; see
+[the lifecycle fix note](mount-lifecycle-fix.md). Do not restore the old drain.
+
 WinFsp now uses `FileInfoTimeout=INFINITE`, the setting required to enable
 Windows data caching. Closed writable files queue a volume cache drain at the
 one-second/64 MiB seal boundary. A persistent root handle permits a synchronous
