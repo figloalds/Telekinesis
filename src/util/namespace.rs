@@ -181,4 +181,20 @@ mod tests {
         let history = changes.history.read().unwrap();
         assert!(history.bytes <= BYTE_LIMIT && history.changes.len() <= RECORD_LIMIT);
     }
+
+    #[test]
+    fn byte_budget_evicts_history_before_record_limit() {
+        let changes = NamespaceChanges::default();
+        let old = changes.epoch();
+        for _ in 0..32 {
+            let epoch = changes.begin_global();
+            let mut scope = Scope::default();
+            assert!(scope.add(&"x".repeat(BYTE_LIMIT / 16)));
+            changes.refine(epoch, scope);
+        }
+        assert!(!changes.unchanged(old, changes.epoch(), "file", Some(&[])));
+        assert!(changes.unchanged(changes.epoch() - 1, changes.epoch(), "file", Some(&[])));
+        let history = changes.history.read().unwrap();
+        assert!(history.bytes <= BYTE_LIMIT && history.changes.len() < 32);
+    }
 }

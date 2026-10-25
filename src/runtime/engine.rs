@@ -1088,6 +1088,58 @@ mod tests {
     }
 
     #[test]
+    fn metadata_cache_invalidates_descendants_after_ancestor_move() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        {
+            let mut store = lock(&engine.store);
+            store.create("left", EntryKind::Directory)?;
+            store.create("right", EntryKind::Directory)?;
+            store.create("left/nested", EntryKind::Directory)?;
+        }
+        seed_cached_file(&engine, "left/nested/file", b"nested")?;
+        let original = engine.lookup("\\LEFT\\NESTED\\FILE")?.id;
+        let directory = engine.lookup("left/nested")?.id;
+        lock(&engine.store).rename(&directory, "right/moved", false)?;
+        assert!(engine.lookup("\\LEFT\\NESTED\\FILE").is_err());
+        assert_eq!(engine.lookup("/RIGHT/MOVED/FILE")?.id, original);
+        let top = engine.lookup("right")?.id;
+        lock(&engine.store).rename(&top, "renamed", false)?;
+        assert!(engine.lookup("/RIGHT/MOVED/FILE").is_err());
+        assert_eq!(engine.lookup("renamed/moved/file")?.id, original);
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_cache_follows_remote_name_collision_winner_and_delete() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        lock(&engine.store).create("directory", EntryKind::Directory)?;
+        seed_cached_file(&engine, "directory/file", b"original")?;
+        let original = engine.lookup("/DIRECTORY/FILE")?;
+        let remote = {
+            let mut store = lock(&engine.store);
+            let mut state = store.entry(&original.id)?;
+            state.id = "00000000-0000-0000-0000-000000000000".into();
+            state.name = "FILE".into();
+            store.event(MAIN, state, vec![], Operation::Create)
+        };
+        engine.apply_remote(std::slice::from_ref(&remote))?;
+        assert_eq!(engine.lookup("/DIRECTORY/FILE")?.id, remote.entity);
+        let deletion = {
+            let mut store = lock(&engine.store);
+            let mut state = remote.state.clone();
+            state.deleted = true;
+            store.event(MAIN, state, vec![remote.id], Operation::Delete)
+        };
+        engine.apply_remote(&[deletion])?;
+        assert_eq!(engine.lookup("/DIRECTORY/FILE")?.id, original.id);
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
     fn metadata_cache_invalidates_aliases_on_rename_delete_and_recreate() -> Result<()> {
         let home = tempfile::tempdir()?;
         let engine = Engine::open(home.path(), None)?;

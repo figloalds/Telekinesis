@@ -77,3 +77,48 @@ build passes 185 host tests, Clippy, formatting/release and the five inert
 import-binding fixtures. No result from the failed setup is accepted.
 The [cleanup/cache isolation note](cleanup-cache-cost.md) records both the
 purge/standby comparison and the subsequent modified-only Cleanup experiment.
+
+## Canonical Git reference and scoped invalidation
+
+A fresh isolated guest compares five measured canonical Git status runs on
+NTFS, the pinned upstream WinFsp memory filesystem, and Telekinesis `23b4e6aa...`,
+followed by another NTFS control. All three fixtures have the same Git tree;
+all 50,000 files are byte-verified. Optional locks remain enabled, fsmonitor
+and untracked cache are disabled, and `core.fscache` is unset/false.
+
+| Backend | Median Git status |
+|---|---:|
+| NTFS before | 270.8 ms |
+| Upstream memory filesystem | 3,127.3 ms |
+| Telekinesis | 3,246.7 ms |
+| NTFS after | 275.9 ms |
+
+Both mounted backends issue 51,096 Open callbacks per measured run. Their
+normal stops take 0.112/0.334 s, with no kill or stranded process. The 174.3 MB
+export passes CRC, SHA-256 and timestamp-size checks; the runner's final process
+handle is missing. See the
+[retained reference](../../../test-evidence/wave-6/memfs-reference-sandbox-20261025.json).
+The memory backend lacks durable receipts, synchronization and conflict logic;
+it retains upstream operation guards and ACL support. Its result is neither a
+theoretical lower bound nor a replacement for this project's acceptance.
+
+The stopped Telekinesis database independently confirms 12 `index.lock`
+creation/deletion events across warmup and measurement. Each measured run
+records 51,062 namespace misses and 51,166 hits. The global namespace epoch
+turns a change confined to `.git` into a cache miss for every tracked file.
+
+The scoped candidate records changed entity IDs and, for membership changes,
+old/new parent IDs. Cached entries retain ancestor IDs, so invalidation covers
+case/path aliases, moved descendants and name-collision winners without relying
+on pathname prefixes. Each publication starts as global; only successful
+projection updates narrow it. Checkout, failed updates, unknown ancestry,
+oversized scopes and history gaps require authoritative lookup. History is
+bounded to 1,024 records and a 1 MiB accounting budget; the entry cache keeps
+its existing 65,536-entry/64 MiB limits, including ancestry storage.
+
+The new regression fails before the change and passes afterward: a cached
+`sources/file` lookup completes while Store is held after creating/deleting
+`.git/index.lock`. Ancestor moves, remote collision/deletion, aliases, unsealed
+metadata and checkout are covered. All 193 host tests, formatting, strict
+Clippy, release build and five inert binding fixtures pass. Mounted lifecycle
+and paired performance qualification are in progress; P0 remains open.
