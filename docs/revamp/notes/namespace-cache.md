@@ -148,3 +148,42 @@ verification; see the
 [retained qualification](../../../test-evidence/wave-6/namespace-scoped-sandbox-20261025.json).
 This qualifies scoped cache coherence and lifecycle behavior, not the full
 workload/build/idle-peer gate or the failed Git target. P0 remains open.
+
+## Complete five-sample gate on the scoped candidate
+
+The same `de1c25b7...` binary subsequently completes the native, mounted and
+idle-peer workloads in the isolated guest. All **54 build observations** are
+correct, with no workload I/O errors. These are new matched measurements;
+absolute differences from older guests do not establish a code speedup.
+
+| Metric | Native | Mounted | With idle peer | Mounted/native |
+|---|---:|---:|---:|---:|
+| Copy small files | 568.3 ms | 3,490.7 ms | 4,991.2 ms | 6.14x |
+| Sequential write | 501.6 ms | 1,409.7 ms | 2,258.8 ms | 2.81x |
+| File fsync | 402.5 ms | 669.6 ms | 1,492.1 ms | 1.66x |
+| Sequential read | 512.3 ms | 758.6 ms | 771.1 ms | 1.48x |
+| Random overwrite | 42.3 ms | 1,341.2 ms | 1,731.6 ms | 31.70x |
+| Git status | 297.1 ms | 3,358.2 ms | 3,558.6 ms | 11.30x |
+| Clean build | 4,506.4 ms | 4,886.5 ms | 5,015.9 ms | 1.08x |
+| No-op build | 1,051.7 ms | 1,194.9 ms | 1,196.4 ms | 1.14x |
+| Incremental build | 1,966.9 ms | 2,332.0 ms | 2,163.4 ms | 1.19x |
+
+The five copy/write/read/random/Git targets still fail, both with and without
+the peer. Clean/no-op targets pass. Fsync and incremental times are retained
+without inventing separate numeric targets. Initial peer catch-up completes
+in 70.900 s within its 300-second bound. Remote visibility passes at a 34.831 ms
+median. Idle-peer overhead fails for copy (+43.0%), sequential write (+60.2%)
+and random overwrite (+29.1%); read (+1.6%), Git (+6.0%) and clean/no-op builds
+(+2.6%/+0.1%) pass that overhead limit.
+
+Both daemons stop normally in 0.380/0.086 s, with no kill or stranded process.
+After shutdown an independent verifier reconstructs every byte of the final
+1 GiB, including six seeded 10,000-overwrite laps and 53,560 changed pages.
+All 16,385 objects verify; actual/expected SHA-256 agree:
+`16e78db98a9732f51955188d6b69de7749375dbfc9d79d7b934bc09f1afee0ba`.
+Metadata catch-up does not imply complete peer payload hydration. Cache,
+durability and access policy, the canonical Git command and all original
+acceptance targets remain unchanged. The
+[full-gate record](../../../test-evidence/wave-6/namespace-full-sandbox-20261025.json)
+retains reports, callback observations, traces, exits and the verified export.
+P0 remains open on performance and the purge-cost decision.
