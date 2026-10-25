@@ -120,5 +120,31 @@ The new regression fails before the change and passes afterward: a cached
 `sources/file` lookup completes while Store is held after creating/deleting
 `.git/index.lock`. Ancestor moves, remote collision/deletion, aliases, unsealed
 metadata and checkout are covered. All 193 host tests, formatting, strict
-Clippy, release build and five inert binding fixtures pass. Mounted lifecycle
-and paired performance qualification are in progress; P0 remains open.
+Clippy, release build and five inert binding fixtures pass; see the
+[host record](../../../test-evidence/wave-6/namespace-scoped-host-20261025.json).
+
+Candidate `de1c25b7...` passes all 44 isolated lifecycle cases (forced exit
+maximum 0.004 s; ordinary graceful maximum 0.100 s) and six timestamp laps.
+The subsequent five-sample Git A–B–B–A comparison uses independent copies of
+the same stopped corpus and verifies every fixture byte before each phase:
+
+| Phase | Code | Median Git | Namespace misses per measured run |
+|---|---|---:|---:|
+| A1 | UPSERT reference | 3,293.3 ms | 51,062 |
+| B1 | Scoped invalidation | 3,369.6 ms | 54 |
+| B2 | Scoped invalidation | 3,261.7 ms | 54 |
+| A2 | UPSERT reference | 3,309.8 ms | 51,062 |
+
+The candidate has 102,174 cache hits per measured run. The miss reduction does
+not produce a consistent wall-time improvement. Open/security callback counts
+remain 51,096/51,132, and every Git trace still records 50,000 index checks.
+Matched native before/after medians are 320.1/289.6 ms, so Git still fails.
+All four mounted daemons exit normally in 0.308–0.359 s; the runner's final
+handle is missing. All four stopped databases pass integrity and show only
+the expected 12 lock events. The controller retained native read-only backing
+connections, so raw WAL/SHM are preserved and included when verifying private
+database copies. The 563.1 MB export passes CRC, SHA-256 and timestamp-size
+verification; see the
+[retained qualification](../../../test-evidence/wave-6/namespace-scoped-sandbox-20261025.json).
+This qualifies scoped cache coherence and lifecycle behavior, not the full
+workload/build/idle-peer gate or the failed Git target. P0 remains open.

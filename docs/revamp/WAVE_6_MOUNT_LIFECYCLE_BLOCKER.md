@@ -1,7 +1,7 @@
 # W6-P0-MOUNT-LIFECYCLE: kernel cleanup hang
 
 Status: **OPEN, P0 — fixed-driver lifecycle/build checks pass; performance acceptance fails**
-(2026-10-24). Resolve this before
+(2026-10-25). Resolve this before
 other Wave 6 feature work, runtime cutover or mounted performance qualification.
 Documentation and diagnosis do not close this demand. The fix below is
 implemented in this checkout ([note](notes/mount-lifecycle-fix.md)); the demand
@@ -313,6 +313,22 @@ and [cached-query isolation](notes/cleanup-cache-cost.md#cached-attribute-query-
 All test clients/servers exit cleanly and exports verify. The experimental
 build/bridge changes are removed; no production helper, access bypass or cache
 policy change is adopted. This does not close any failed performance target.
+
+The next five-sample canonical Git comparison uses a fresh guest and a pinned
+upstream memory-filesystem reference. NTFS before/after measures 270.8/275.9 ms,
+the memory backend 3,127.3 ms, and Telekinesis 3,246.7 ms. The memory reference
+does not implement this project's persistence/sync semantics or establish a
+theoretical lower bound. Stopped metadata confirms that `index.lock` changes
+invalidate the entire Telekinesis namespace cache. Candidate `de1c25b7...`
+scopes invalidation by entity/ancestor IDs, with bounded history and global
+fallback on failure, checkout or incomplete history. It passes 193 host tests,
+the inert binding fixtures, 44 isolated lifecycle cases and six timestamp laps
+(forced exit max 0.004 s; ordinary graceful max 0.100 s). A five-sample A–B–B–A
+comparison reduces cache misses from 51,062 to 54 per Git, but wall time stays
+around 3.3 s and the same Open/security callbacks remain. All four servers stop
+normally and both complete exports verify. See the
+[scoped-cache evidence](notes/namespace-cache.md#canonical-git-reference-and-scoped-invalidation).
+Git performance and the full workload/idle-peer gate remain open.
 
 The no-self-handle implementation was qualified for lifecycle correctness in **Windows Sandbox**
 (a separate Windows kernel under the Microsoft hypervisor). All stores and
