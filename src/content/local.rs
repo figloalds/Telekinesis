@@ -5,7 +5,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -15,6 +15,8 @@ use std::{
 pub const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 pub const CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
+// Fixed-size records only, separate from the verified object-byte cache.
+const LOCATION_CACHE_ENTRIES: usize = 131_072;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -86,6 +88,8 @@ struct State {
     writer: File,
     offset: u64,
     pending: BTreeMap<Digest, Location>,
+    locations: BTreeMap<Digest, Location>,
+    location_order: VecDeque<Digest>,
     readers: BTreeMap<u64, Arc<File>>,
     cache: BTreeMap<Digest, Cached>,
     order: BTreeSet<(u64, Digest)>,
@@ -185,6 +189,8 @@ impl PackStore {
                 writer,
                 offset: 0,
                 pending: BTreeMap::new(),
+                locations: BTreeMap::new(),
+                location_order: VecDeque::new(),
                 readers: BTreeMap::new(),
                 cache: BTreeMap::new(),
                 order: BTreeSet::new(),
@@ -197,8 +203,11 @@ impl PackStore {
         stores.insert(root, Arc::downgrade(&inner));
         Ok(Self { inner })
     }
-    fn location(state: &State, digest: Digest) -> Result<Option<Location>> {
+    fn location(state: &mut State, digest: Digest) -> Result<Option<Location>> {
         if let Some(location) = state.pending.get(&digest) {
+            return Ok(Some(*location));
+        }
+        if let Some(location) = state.locations.get(&digest) {
             return Ok(Some(*location));
         }
         let row: Option<(u64, u64, usize, u8)> = state
@@ -209,15 +218,24 @@ impl PackStore {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        row.map(|(segment, offset, len, k)| {
-            Ok(Location {
-                segment,
-                offset,
-                len,
-                kind: kind(k)?,
-            })
-        })
-        .transpose()
+        let Some((segment, offset, len, k)) = row else {
+            return Ok(None);
+        };
+        let location = Location {
+            segment,
+            offset,
+            len,
+            kind: kind(k)?,
+        };
+        // Positive entries only: a missing digest can arrive at any time.
+        // FIFO bounds memory without mutating the order on every presence check.
+        if state.locations.len() == LOCATION_CACHE_ENTRIES {
+            let oldest = state.location_order.pop_front().unwrap();
+            state.locations.remove(&oldest);
+        }
+        state.locations.insert(digest, location);
+        state.location_order.push_back(digest);
+        Ok(Some(location))
     }
     pub fn put(&self, kind: Kind, bytes: &[u8]) -> Result<Digest> {
         self.put_with_status(kind, bytes).map(|(digest, _)| digest)
@@ -232,7 +250,7 @@ impl PackStore {
         );
         let digest = Digest::bytes(bytes);
         let mut state = guard(&self.inner.state);
-        if let Some(old) = Self::location(&state, digest)? {
+        if let Some(old) = Self::location(&mut state, digest)? {
             ensure!(old.kind == kind, "OBJECT_KIND_COLLISION");
             return Ok((digest, false));
         }
@@ -278,6 +296,19 @@ impl PackStore {
     pub fn flush(&self) -> Result<()> {
         Self::flush_locked(&mut guard(&self.inner.state))
     }
+    /// Background presence checks must not commit an unrelated foreground
+    /// batch. Still persist requested objects left pending by any earlier call.
+    pub(crate) fn flush_if_pending(&self, digests: impl IntoIterator<Item = Digest>) -> Result<()> {
+        let mut state = guard(&self.inner.state);
+        if !state.pending.is_empty()
+            && digests
+                .into_iter()
+                .any(|digest| state.pending.contains_key(&digest))
+        {
+            Self::flush_locked(&mut state)?;
+        }
+        Ok(())
+    }
     pub fn get(&self, digest: Digest) -> Result<Arc<Vec<u8>>> {
         let mut state = guard(&self.inner.state);
         state.stamp += 1;
@@ -295,7 +326,7 @@ impl PackStore {
             state.order.insert((stamp, digest));
             return Ok(bytes);
         }
-        let location = Self::location(&state, digest)?.context("OBJECT_MISSING")?;
+        let location = Self::location(&mut state, digest)?.context("OBJECT_MISSING")?;
         ensure!(location.len <= MAX_OBJECT_BYTES, "INVALID_PACK_INDEX");
         let file = if let Some(file) = state.readers.get(&location.segment) {
             file.clone()
@@ -310,6 +341,8 @@ impl PackStore {
         let mut bytes = vec![0; location.len];
         let read = read_exact_at(&file, &mut bytes, location.offset);
         if read.is_err() || Digest::bytes(&bytes) != digest {
+            state.locations.clear();
+            state.location_order.clear();
             state
                 .db
                 .execute_cached("DELETE FROM objects WHERE digest=?1", [&digest.0[..]])?;
@@ -351,7 +384,7 @@ impl PackStore {
         }
     }
     pub fn contains(&self, digest: Digest) -> Result<bool> {
-        Ok(Self::location(&guard(&self.inner.state), digest)?.is_some())
+        Ok(Self::location(&mut guard(&self.inner.state), digest)?.is_some())
     }
     pub fn verified_reads(&self) -> u64 {
         guard(&self.inner.state).verified_reads
@@ -373,6 +406,10 @@ impl PackStore {
         ensure!((0.0..=1.0).contains(&threshold), "INVALID_GC_THRESHOLD");
         let mut state = guard(&self.inner.state);
         Self::flush_locked(&mut state)?;
+        // GC can relocate live entries or delete dead ones. Invalidate before
+        // any index mutation so error/partial-completion paths are safe too.
+        state.locations.clear();
+        state.location_order.clear();
         let mut live = live.clone();
         live.extend(state.pins.keys());
         let rows = {
@@ -624,6 +661,99 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn cached_locations_follow_gc_relocation_and_allow_missing_objects_to_arrive() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 16)?;
+        let keep = store.put(Kind::Chunk, b"keep me!")?;
+        let dead = store.put(Kind::Chunk, b"dead me!")?;
+        store.put(Kind::Chunk, b"roll me!")?;
+        assert!(store.contains(keep)? && store.contains(dead)?);
+        let original = guard(&store.inner.state).locations[&keep].segment;
+        assert_eq!(store.collect(&BTreeSet::from([keep]), 1.0)?, 1);
+        assert!(!store.contains(dead)?);
+        assert_eq!(store.get(keep)?.as_slice(), b"keep me!");
+        assert_ne!(guard(&store.inner.state).locations[&keep].segment, original);
+        assert!(store.put(Kind::Tree, b"keep me!").is_err());
+        let arriving = Digest::bytes(b"arriving");
+        assert!(!store.contains(arriving)?);
+        assert_eq!(
+            store.put_with_status(Kind::Chunk, b"arriving")?,
+            (arriving, true)
+        );
+        assert!(store.contains(arriving)?);
+        store.flush()?;
+        drop(store);
+        let reopened = PackStore::open(root.path())?;
+        assert!(!reopened.contains(dead)?);
+        assert_eq!(reopened.get(keep)?.as_slice(), b"keep me!");
+        assert_eq!(reopened.get(arriving)?.as_slice(), b"arriving");
+        Ok(())
+    }
+    #[test]
+    fn location_cache_evicts_without_losing_indexed_objects() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::open(root.path())?;
+        let digests = (0..LOCATION_CACHE_ENTRIES + 3)
+            .map(|n| Digest::bytes(&(n as u64).to_le_bytes()))
+            .collect::<Vec<_>>();
+        // Index-only fixture: contains checks index presence, not file bytes.
+        {
+            let mut state = guard(&store.inner.state);
+            let tx = state.db.transaction()?;
+            for digest in &digests {
+                tx.execute_cached("INSERT INTO objects VALUES(?1,0,0,8,1)", [&digest.0[..]])?;
+            }
+            tx.commit()?;
+        }
+        for digest in &digests {
+            assert!(store.contains(*digest)?);
+        }
+        {
+            let state = guard(&store.inner.state);
+            assert_eq!(state.locations.len(), LOCATION_CACHE_ENTRIES);
+            assert_eq!(state.location_order.len(), LOCATION_CACHE_ENTRIES);
+            assert!(!state.locations.contains_key(&digests[0]));
+        }
+        assert!(store.contains(digests[0])?);
+        assert_eq!(
+            guard(&store.inner.state).locations.len(),
+            LOCATION_CACHE_ENTRIES
+        );
+        Ok(())
+    }
+    #[cfg(windows)]
+    #[test]
+    fn location_cache_follows_committed_gc_even_when_old_segment_deletion_fails() -> Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 16)?;
+        let keep = store.put(Kind::Chunk, b"keep me!")?;
+        let dead = store.put(Kind::Chunk, b"dead me!")?;
+        store.put(Kind::Chunk, b"roll me!")?;
+        assert!(store.contains(keep)? && store.contains(dead)?);
+        let original = guard(&store.inner.state).locations[&keep].segment;
+        // Permit reads/writes but prevent deletion after the index commits.
+        let held = OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(segment_path(&store.inner.root, original))?;
+        assert!(store.collect(&BTreeSet::from([keep]), 1.0).is_err());
+        assert!(!store.contains(dead)?);
+        assert_eq!(store.get(keep)?.as_slice(), b"keep me!");
+        assert_ne!(guard(&store.inner.state).locations[&keep].segment, original);
+        assert_eq!(
+            store.put_with_status(Kind::Chunk, b"dead me!")?,
+            (dead, true)
+        );
+        store.flush()?;
+        drop(held);
+        drop(store);
+        let reopened = PackStore::open(root.path())?;
+        assert_eq!(reopened.get(keep)?.as_slice(), b"keep me!");
+        assert_eq!(reopened.get(dead)?.as_slice(), b"dead me!");
+        Ok(())
+    }
+    #[test]
     fn flat_manifest_ranges_and_corruption() -> Result<()> {
         let root = tempfile::tempdir()?;
         let content = LocalContent::open(root.path())?;
@@ -636,7 +766,9 @@ mod tests {
         assert_eq!(&range, b"\x05\x05\x05tail");
         let digest = content.packs.put(Kind::Chunk, b"corrupt this")?;
         content.packs.flush()?;
-        let location = PackStore::location(&guard(&content.packs.inner.state), digest)?.unwrap();
+        assert!(content.packs.contains(digest)?);
+        let location =
+            PackStore::location(&mut guard(&content.packs.inner.state), digest)?.unwrap();
         let file = OpenOptions::new()
             .write(true)
             .open(segment_path(&content.packs.inner.root, location.segment))?;
@@ -652,6 +784,14 @@ mod tests {
         }
         assert!(content.packs.get(digest).is_err());
         assert!(!content.packs.contains(digest)?);
+        assert_eq!(
+            content
+                .packs
+                .put_with_status(Kind::Chunk, b"corrupt this")?,
+            (digest, true)
+        );
+        content.packs.flush()?;
+        assert_eq!(content.packs.get(digest)?.as_slice(), b"corrupt this");
         Ok(())
     }
 }

@@ -138,6 +138,10 @@ the same stopped corpus and verifies every fixture byte before each phase:
 The candidate has 102,174 cache hits per measured run. The miss reduction does
 not produce a consistent wall-time improvement. Open/security callback counts
 remain 51,096/51,132, and every Git trace still records 50,000 index checks.
+Median cumulative security-callback time falls from 1,850.5/1,874.5 ms in the
+reference phases to 399.0/375.8 ms in the candidate phases. Open callback time
+remains around 676–699 ms. These concurrent callback durations overlap and
+cannot be subtracted from elapsed Git time as disjoint components.
 Matched native before/after medians are 320.1/289.6 ms, so Git still fails.
 All four mounted daemons exit normally in 0.308–0.359 s; the runner's final
 handle is missing. All four stopped databases pass integrity and show only
@@ -186,4 +190,9 @@ durability and access policy, the canonical Git command and all original
 acceptance targets remain unchanged. The
 [full-gate record](../../../test-evidence/wave-6/namespace-full-sandbox-20261025.json)
 retains reports, callback observations, traces, exits and the verified export.
+Its 7.905 GB/26,996-member archive passes CRC, SHA-256 and exact timestamp-size
+manifest verification. The final controller process handle is missing. No host
+compilation or heavy host I/O overlaps timing; one bounded control snapshot
+during Git preparation and lightweight process/native-file observations are
+retained separately.
 P0 remains open on performance and the purge-cost decision.

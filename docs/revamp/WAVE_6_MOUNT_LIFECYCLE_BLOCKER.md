@@ -7,6 +7,13 @@ Documentation and diagnosis do not close this demand. The fix below is
 implemented in this checkout ([note](notes/mount-lifecycle-fix.md)); the demand
 closes only when all acceptance checks, including the purge-cost decision, pass.
 
+Read the [performance gate reassessment](notes/perf-gate-reassessment.md)
+before the next candidate lap. It separates the three failures caused by
+`FlushAndPurgeOnCleanup` inside the timed windows from the two metadata
+workloads sitting at the measured WinFsp memory-filesystem floor, gives the
+predicted counters for the sanctioned purge-off lap, and proposes a section 8
+target rewrite for the user to decide. It changes no policy or ratio itself.
+
 ## Current work and executable acceptance
 
 The earlier full gate (`e8ee0871...`, 2026-10-24) **stranded the daemon and .NET**
@@ -329,6 +336,100 @@ around 3.3 s and the same Open/security callbacks remain. All four servers stop
 normally and both complete exports verify. See the
 [scoped-cache evidence](notes/namespace-cache.md#canonical-git-reference-and-scoped-invalidation).
 Git performance and the full workload/idle-peer gate remain open.
+
+The same candidate's subsequent complete five-sample gate finishes with all
+54 build observations correct and no I/O errors. Copy, sequential write/read,
+random overwrite and Git still fail at **6.14x, 2.81x/1.48x, 31.70x and 11.30x**
+matched native. Clean/no-op builds pass at 1.08x/1.14x. Initial peer catch-up
+takes 70.900 s within the 300-second bound and remote visibility passes at
+34.831 ms median. Idle-peer overhead passes for read, Git and builds, but
+fails for copy (+43.0%), write (+60.2%) and random overwrite (+29.1%). Both
+daemons stop normally in 0.380/0.086 s, without kills or stranded processes.
+Independent stopped-backing verification confirms every byte of the final
+1 GiB after six overwrite laps. The 7.905 GB export passes CRC, SHA-256 and
+timestamp-size checks; the runner's final handle is missing. See the
+[current full-gate result](../../test-evidence/wave-6/namespace-full-sandbox-20261025.json)
+and [complete comparison](notes/namespace-cache.md#complete-five-sample-gate-on-the-scoped-candidate).
+This completed gate does not establish performance acceptance or a qualified
+writable purge-off/Close policy. P0 remains open.
+
+A subsequent public batch-transport diagnostic preserves 16 active callbacks,
+SDK guards and cache/access policy on the pinned memory reference. Nine inert
+host protocol/lifecycle fixtures pass without WinFsp imports. Eight isolated
+small lifecycle cases and all four large-corpus normal stops pass; self-origin
+requests are refused, forced exit is at most 0.003 s and no process is stranded.
+However, Git A–B–B–A medians of 3,375.6/3,198.2/3,206.1/3,139.9 ms show no
+consistent batch improvement against both controls. Callback counts remain
+unchanged and the target still fails. The dispatcher is not promoted and
+production source hashes remained unchanged during that experiment. The
+[transport note](notes/dispatcher-workers.md#public-batch-transport-isolation)
+retains verified exports, two cleanly terminated setup failures and the
+required `Transact0` readiness correction. P0 remains open on the full failed
+performance/peer gates above.
+
+Separating two transport receivers and two senders from 16 callback workers
+also fails to improve the memory reference: dynamic/reusable-buffer Git
+medians are 4.05/4.42/4.02/3.95 s between 3.22/3.16-second stock controls.
+All 14 stops and refused self-origin probes pass, with no stranded process.
+The [split-transport comparison](notes/dispatcher-workers.md#split-receive-operation-and-completion-queues)
+retains the bounded-queue/ASAN fixtures and verified guest exports. Neither
+transport variant is promoted.
+
+The next production candidate `60a747c1...` instead caches bounded positive
+immutable-pack locations. A native 50,000-object prefetch scan falls from
+474.4 ms to 17.4 ms; the original binary's return control is 484.9 ms. It has
+196 passing host tests, strict Clippy/format/release and five inert binding
+fixtures, including GC relocation/error and corruption-repair coverage.
+This isolates a repeated peer-prefetch lookup cost, not actual idle-peer
+overhead. The [cache contract and evidence](notes/pack-location-cache.md)
+retain the limits and unchanged durability policy. The exact candidate passes
+all 44 isolated lifecycle cases and six timestamp laps (maximum forced exit
+0.004 s; matrix graceful exit 0.094 s). Its complete five-sample gate validates
+54 build observations and every byte of the final 1 GiB after six overwrite
+laps. Both servers exit normally in 0.569/0.433 s without a kill or stranded
+process. Copy, sequential write/read, random overwrite and Git still fail at
+6.63x, 3.09x/1.43x, 33.22x and 11.04x native. Peer overhead fails for copy,
+write and read (+36.1%, +43.0%, +30.7%); catch-up and remote visibility pass.
+The [complete gate](../../test-evidence/wave-6/pack-location-cache-sandbox-20261025.json)
+retains a verified 6.957 GB export and terminal runner-handle observation.
+The native lookup improvement is not full performance acceptance. P0 is open.
+
+The next candidate `db2a81cd...` removes an unrelated foreground pack barrier
+from presence-only background prefetch. A native regression proves that the
+old path commits an unrelated pending write; requested pending objects, partial
+download retries and foreground fetch still retain their full barriers. All
+202 host tests, strict Clippy/format/release and five inert binding cases pass.
+In a controlled 2,000-object batching model, prefetch phases fall from
+3,854/3,888 ms to 147/148 ms, near 142/164 ms no-prefetch controls. This is
+not an actual mounted peer result. The [barrier contract and evidence](notes/prefetch-pack-barrier.md)
+retain the exact change and its limits. The candidate then passes all 44
+isolated lifecycle cases and six timestamp laps (forced exit max 0.004 s;
+matrix graceful max 0.101 s). The complete five-sample gate validates 54 build
+observations and every byte of the final 1 GiB after six overwrite laps.
+Both servers exit normally in 1.852/0.084 s without kills or stranded processes.
+Peer overhead now passes for write/read (+5.1%/+7.0%), random overwrite, Git
+and builds in this run; copy still fails at +48.6%. The five original native
+performance targets also fail at 6.80x, 3.27x/1.60x, 31.71x and 10.71x.
+Catch-up and remote visibility pass. The
+[latest complete gate](../../test-evidence/wave-6/prefetch-barrier-sandbox-20261025.json)
+retains a verified 4.408 GB export and terminal runner-handle observation.
+The unrelated background barrier is removed, but P0 remains open on the
+original performance gate and peer copy overhead. The
+[reassessment note](notes/perf-gate-reassessment.md) reads this gate's
+medians: random overwrite, sequential write and sequential read are timed
+through a close that flushes and purges inside the window while native
+defers that work, and Git is within 4% of the upstream memory filesystem.
+
+The next candidate `272a1194...` groups at most 32 direct content roots per
+prefetch request, with validation and deduplication. A native same-library
+model reduces 2,000 source calls to 63 and takes 225–230 ms versus repeated
+3,914/3,944 ms single-root controls. A separate authenticated production-protocol
+test transfers maximum-size roots in requests of 32 and 1 within the unchanged
+default body limit. All 207 host tests, strict Clippy/format/release and five
+inert binding cases pass. The [batching contract and evidence](notes/prefetch-root-batching.md)
+retain the bounds, partial-reply progress, foreground/stop behavior and native
+model limitations. Isolated lifecycle/timestamp/full-gate qualification is
+pending; the preceding failed complete gate remains authoritative.
 
 The no-self-handle implementation was qualified for lifecycle correctness in **Windows Sandbox**
 (a separate Windows kernel under the Microsoft hypervisor). All stores and

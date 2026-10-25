@@ -4,7 +4,10 @@ pub mod control;
 pub mod sync;
 use crate::{
     content::working::lock,
-    model::protocol::LaneRole,
+    model::{
+        content::{ContentKind, FileContentRef},
+        protocol::LaneRole,
+    },
     orchestrator::sync::{DigestFetch, FeedCursor, SessionSource},
     runtime::Engine,
     session::{self, Conn, ConnOptions},
@@ -16,6 +19,31 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Duration,
 };
+
+fn prefetch_pass(engine: &Engine, fetch: &DigestFetch, references: &[FileContentRef]) {
+    for batch in references.chunks(sync::DIRECT_PREFETCH_BATCH) {
+        if engine.stopping.load(Ordering::Acquire) {
+            break;
+        }
+        fetch.prefetch_direct_roots(batch, &engine.stopping);
+        for reference in batch.iter().filter(|r| r.kind == ContentKind::Manifest) {
+            if engine.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            if fetch
+                .prefetch(&[(reference.digest, crate::content::Kind::Manifest)])
+                .is_ok()
+                && let Ok(chunks) = engine.working.content().chunks(reference)
+            {
+                let wanted = chunks
+                    .into_iter()
+                    .map(|d| (d, crate::content::Kind::Chunk))
+                    .collect::<Vec<_>>();
+                let _ = fetch.prefetch(&wanted);
+            }
+        }
+    }
+}
 
 pub fn run(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<()> {
     // Startup and loop failures take the same cleanup path as a control stop.
@@ -161,31 +189,7 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                                 .filter(|e| !e.deleted)
                                                 .filter_map(|e| e.content.clone())
                                                 .collect::<Vec<_>>();
-                                            for reference in references {
-                                                if engine.stopping.load(Ordering::Acquire) {
-                                                    break;
-                                                }
-                                                let root = (
-                                                reference.digest,
-                                                if reference.kind
-                                                    == crate::model::content::ContentKind::Direct
-                                                {
-                                                    crate::content::Kind::Chunk
-                                                } else {
-                                                    crate::content::Kind::Manifest
-                                                },
-                                            );
-                                                if fetch.prefetch(&[root]).is_ok()
-                                                    && let Ok(chunks) =
-                                                        engine.working.content().chunks(&reference)
-                                                {
-                                                    let wanted = chunks
-                                                        .into_iter()
-                                                        .map(|d| (d, crate::content::Kind::Chunk))
-                                                        .collect::<Vec<_>>();
-                                                    let _ = fetch.prefetch(&wanted);
-                                                }
-                                            }
+                                            prefetch_pass(&engine, &fetch, &references);
                                             std::thread::sleep(Duration::from_millis(100));
                                         }
                                         conn.close();
