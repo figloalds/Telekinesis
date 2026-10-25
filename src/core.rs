@@ -3,6 +3,7 @@ use crate::content::local::{Kind as ObjectKind, LocalContent, Pin};
 use crate::content::working::Basis;
 use crate::model::content::{Digest, FileContentRef};
 use crate::util::cost::Counter;
+use crate::util::namespace::{NamespaceChanges, Scope};
 use crate::util::sqlite::CachedConnection;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -340,7 +341,7 @@ pub struct Store {
     pub(crate) db: Connection,
     // Declared after db so the writer closes before its maintenance worker.
     pub(crate) checkpoint: crate::util::checkpoint::CheckpointWorker,
-    pub(crate) namespace_epoch: Arc<AtomicU64>,
+    pub(crate) namespace_changes: Arc<NamespaceChanges>,
     views: BTreeMap<String, Projection>,
     clock: u64,
     pending_since: Option<std::time::Instant>,
@@ -422,7 +423,7 @@ impl Store {
             _empty_pin: empty_pin,
             db,
             checkpoint,
-            namespace_epoch: Arc::new(AtomicU64::new(1)),
+            namespace_changes: Arc::new(NamespaceChanges::default()),
             views: BTreeMap::new(),
             clock: 0,
             pending_since: None,
@@ -538,7 +539,7 @@ impl Store {
             map_mut(&mut projection.anchors, 4)
                 .insert(entity.clone(), self.content_anchor(visible)?);
         }
-        self.namespace_epoch.fetch_add(1, Ordering::Release);
+        self.namespace_changes.begin_global();
         self.views.insert(branch.into(), projection);
         Ok(())
     }
@@ -887,11 +888,14 @@ impl Store {
         {
             self.flush_metadata()?;
         }
-        if !affected.is_empty() {
+        let epoch = if !affected.is_empty() {
             // Invalidate before touching projections, including on a later
             // projection error. Readers missing this epoch wait for Store.
-            self.namespace_epoch.fetch_add(1, Ordering::Release);
-        }
+            Some(self.namespace_changes.begin_global())
+        } else {
+            None
+        };
+        let mut scope = Some(Scope::default());
         for (branch, entity) in affected {
             let _cost = DELTA_COST.time();
             if !self.views.contains_key(&branch) {
@@ -913,10 +917,30 @@ impl Store {
                 })?;
             let anchor = self.content_anchor(&visible)?;
             let p = self.views.get_mut(&branch).unwrap();
-            p.index(serde_json::from_slice(&state)?)?;
+            let state: Entry = serde_json::from_slice(&state)?;
+            if let Some(changes) = &mut scope {
+                let old = p.entries.get(&entity);
+                let membership_changed = old.is_none_or(|old| {
+                    old.parent != state.parent
+                        || old.name != state.name
+                        || old.kind != state.kind
+                        || old.deleted != state.deleted
+                });
+                let bounded = changes.add(&entity)
+                    && (!membership_changed
+                        || (changes.add(&state.parent)
+                            && old.is_none_or(|old| changes.add(&old.parent))));
+                if !bounded {
+                    scope = None;
+                }
+            }
+            p.index(state)?;
             map_mut(&mut p.visible, 3).insert(entity.clone(), visible);
             map_mut(&mut p.anchors, 4).insert(entity.clone(), anchor);
             map_mut(&mut p.heads, 5).insert(entity, heads);
+        }
+        if let (Some(epoch), Some(scope)) = (epoch, scope) {
+            self.namespace_changes.refine(epoch, scope);
         }
         if let Some(clock) = events.iter().map(|e| e.clock).max() {
             self.clock = self.clock.max(clock);
@@ -1243,7 +1267,7 @@ impl Store {
         self.db
             .execute_profiled("UPDATE config SET value=?1 WHERE key='active'", [&branch])?;
         self.active = branch;
-        self.namespace_epoch.fetch_add(1, Ordering::Release);
+        self.namespace_changes.begin_global();
         Ok(())
     }
     pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Event)>> {

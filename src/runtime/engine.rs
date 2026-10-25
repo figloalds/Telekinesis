@@ -1,4 +1,5 @@
 //! Filesystem operations share metadata only at namespace/save boundaries.
+use crate::util::namespace::NamespaceChanges;
 use crate::{
     content::{seal, working::*},
     core::*,
@@ -30,6 +31,7 @@ struct NamespaceEntry {
     branch: String,
     version: Option<String>,
     anchor: Option<String>,
+    ancestors: Option<Arc<[String]>>,
 }
 impl NamespaceEntry {
     fn cache_bytes(&self, path: &str) -> usize {
@@ -44,6 +46,12 @@ impl NamespaceEntry {
             + self.branch.len()
             + self.version.as_ref().map_or(0, String::len)
             + self.anchor.as_ref().map_or(0, String::len)
+            + self.ancestors.as_ref().map_or(0, |ancestors| {
+                32 + ancestors
+                    .iter()
+                    .map(|id| std::mem::size_of::<String>() + id.len())
+                    .sum::<usize>()
+            })
     }
     fn basis(&self) -> Result<Option<Basis>> {
         if self.entry.kind == EntryKind::Directory {
@@ -119,7 +127,7 @@ pub struct Handle {
 pub struct Engine {
     pub store: Mutex<Store>,
     pub working: WorkingLayer,
-    namespace_epoch: Arc<AtomicU64>,
+    namespace_changes: Arc<NamespaceChanges>,
     namespace_cache: Mutex<NamespaceCache>,
     handles: RwLock<BTreeMap<u64, Arc<Handle>>>,
     next: AtomicU64,
@@ -157,11 +165,11 @@ impl Engine {
         let working = WorkingLayer::new(root, store.content.clone())?;
         let store = Mutex::new(store);
         seal::recover(&store, &working)?;
-        let namespace_epoch = lock(&store).namespace_epoch.clone();
+        let namespace_changes = lock(&store).namespace_changes.clone();
         let engine = Arc::new(Self {
             store,
             working,
-            namespace_epoch,
+            namespace_changes,
             namespace_cache: Mutex::new(NamespaceCache::default()),
             handles: RwLock::new(BTreeMap::new()),
             next: AtomicU64::new(1),
@@ -243,14 +251,25 @@ impl Engine {
         path: &str,
         timing: Option<std::time::Instant>,
     ) -> Result<NamespaceEntry> {
-        let epoch = self.namespace_epoch.load(Ordering::Acquire);
+        let epoch = self.namespace_changes.epoch();
         let cached = lock(&self.namespace_cache)
             .entries
-            .get(path)
-            .filter(|value| value.epoch == epoch)
-            .cloned();
+            .get_mut(path)
+            .and_then(|value| {
+                if self.namespace_changes.unchanged(
+                    value.epoch,
+                    epoch,
+                    &value.entry.id,
+                    value.ancestors.as_deref(),
+                ) {
+                    value.epoch = epoch;
+                    Some(value.clone())
+                } else {
+                    None
+                }
+            });
         if let Some(cached) = cached
-            && self.namespace_epoch.load(Ordering::Acquire) == epoch
+            && self.namespace_changes.epoch() == epoch
         {
             NAMESPACE_HITS.fetch_add(1, Ordering::Relaxed);
             if let Some(started) = timing {
@@ -266,19 +285,34 @@ impl Engine {
             }
             let entry = store.lookup(path)?;
             NamespaceEntry {
-                epoch: store.namespace_epoch.load(Ordering::Acquire),
+                epoch: store.namespace_changes.epoch(),
                 branch: store.active.clone(),
                 version: store.projection().visible.get(&entry.id).cloned(),
                 anchor: store.projection().anchors.get(&entry.id).cloned(),
+                ancestors: Self::namespace_ancestors(store.projection(), &entry),
                 entry,
             }
         };
         // Cache only successful lookups and owned entry values, never a clone
         // of the projection maps or a handle into the served namespace. Raw
         // pathname keys can miss on aliases; authoritative lookup validates
-        // them before insertion. Epoch tags invalidate every alias on change.
+        // them before insertion. Entity/ancestor IDs invalidate all aliases;
+        // global records and history gaps force an authoritative lookup.
         lock(&self.namespace_cache).insert(path, value.clone());
         Ok(value)
+    }
+    fn namespace_ancestors(projection: &Projection, entry: &Entry) -> Option<Arc<[String]>> {
+        let mut ids = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut current = entry;
+        while current.id != ROOT {
+            if !seen.insert(current.id.as_str()) {
+                return None;
+            }
+            ids.push(current.parent.clone());
+            current = projection.entries.get(&current.parent)?;
+        }
+        Some(ids.into())
     }
     pub fn lookup(&self, path: &str) -> Result<Entry> {
         let NamespaceEntry {
@@ -1018,6 +1052,38 @@ mod tests {
         let (_, len) = result.context("cached stat waited for the metadata Store lock")??;
         assert_eq!(len, 6);
         engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn git_lock_changes_preserve_unrelated_cached_lookups() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        for path in ["sources", ".git"] {
+            let directory = engine.open_file(path, true, true, false)?;
+            engine.close(directory)?;
+        }
+        seed_cached_file(&engine, "sources/file", b"cached")?;
+        let original = engine.lookup("/SOURCES/FILE")?.id;
+        seed_cached_file(&engine, ".git/index.lock", b"")?;
+        let lock_id = engine.lookup(".git/index.lock")?.id;
+        lock(&engine.store).delete(&lock_id)?;
+        let held = lock(&engine.store);
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = engine.clone();
+        let thread = std::thread::spawn(move || {
+            send.send(reader.lookup("/SOURCES/FILE")).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        thread.join().unwrap();
+        engine.shutdown()?;
+        assert_eq!(
+            result
+                .context("index.lock invalidated an unrelated cached path")??
+                .id,
+            original
+        );
         Ok(())
     }
 

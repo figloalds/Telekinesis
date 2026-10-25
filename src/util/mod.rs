@@ -5,6 +5,7 @@ pub(crate) mod cost;
 pub mod fault;
 pub mod lock;
 pub mod log;
+pub(crate) mod namespace;
 pub mod notify;
 pub mod secret;
 pub mod snapshot;
