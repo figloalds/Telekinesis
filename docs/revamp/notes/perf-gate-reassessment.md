@@ -204,6 +204,11 @@ pending-callback cancellation on provider exit. This is a wave-sized
 decision, not a P0 candidate; it is recorded here so the P0 record states
 why the WinFsp floor exists and what would remove it.
 
+A source review of the pinned Beta5 driver
+([winfsp-source-review.md](winfsp-source-review.md)) maps each failing ratio
+to the driver's request model, weighs keeping, forking or bypassing WinFsp,
+and adds the Cloud Files API beside ProjFS as the second in-box option.
+
 ## 7. Order
 
 The follow-up review changes the order:
