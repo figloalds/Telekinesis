@@ -5,12 +5,14 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 python scripts/mount_lifecycle.py
+python -m unittest discover -s scripts -p test_peer_readiness.py
 ```
 
 Mounted runs belong in an isolated Windows VM until
 [W6-P0-MOUNT-LIFECYCLE](revamp/WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md) closes.
 Windows Sandbox provides a separate kernel and is suitable for the lifecycle
-matrix. Install WinFsp inside the guest and copy the executable and scripts to
+matrix. Install the exact WinFsp DLL/SYS build allowed by the native preflight
+described in the blocker, and copy the executable and scripts to
 its local disk; the host installation is not inherited. Keep state, scratch,
 mount points and benchmark trees off mapped host folders. Export reports/logs
 before closing Sandbox, which deletes its local state. A persistent VM is
@@ -32,7 +34,7 @@ native I/O in bounded children. It stops at the first failure and retains
 the report's binary SHA-256 matches the release under qualification. No report
 from a failed driver setup or a partial matrix establishes acceptance.
 
-The matrix now has 34 cases: each mount kind also recovers dirty scratch with
+The matrix now has 44 cases: each mount kind also recovers dirty scratch with
 its timestamp set exactly to the saved marker. Fault cases preserve the full
 pre-recovery store before the offline reopen can consume scratch, and report
 the recovered byte length/hash. Equal or backwards clocks cannot prove that
@@ -96,6 +98,17 @@ and mounted with one paired peer, using identical workload dimensions.
 Reports are under `test-evidence/bench/`. An exceeded target, failed workload or
 incompatible baseline fails the command. Partial `--only` runs are diagnostic;
 they do not establish completion of the full gate.
+
+Before the idle-peer phase, the matrix waits for the source's captured metadata
+head and all current active file roots/chunks in the receiver's committed
+native object index. `--peer-catchup-timeout` bounds the whole initial import;
+it is not restarted after metadata arrival. The report retains metadata time,
+the inventory at metadata arrival and final readiness time. This checks object
+membership/kind, not independent verification of every peer payload byte. All
+native read handles close before workload timing. The
+[readiness diagnostic](revamp/notes/peer-payload-readiness.md) explains why a
+metadata-only wait did not establish an idle peer. The native regression suite
+above checks this boundary without mounting or loading a driver.
 
 Git status uses a packed native fixture copied identically into each target,
 with the tracked count checked before timing. Object creation/fsync during

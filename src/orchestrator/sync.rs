@@ -25,9 +25,11 @@ use std::{
 
 pub const BATCH: usize = 64;
 pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
-// At most 2 MiB of direct payload, or about 8 MiB as JSON byte arrays plus
-// metadata, below the default connection's 16 MiB reassembled-body bound.
-pub(crate) const DIRECT_PREFETCH_BATCH: usize = BATCH / 2;
+// Bound chunk requests as well as direct-root scans: 32 maximum-size chunks
+// hold 2 MiB raw, or about 8 MiB as JSON byte arrays plus metadata. A 64-chunk
+// reply can exceed the unchanged default 16 MiB reassembled-body bound.
+const FETCH_BATCH: usize = BATCH / 2;
+pub(crate) const DIRECT_PREFETCH_BATCH: usize = FETCH_BATCH;
 pub const FETCH_OP: &str = "objects.fetch";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Object {
@@ -70,7 +72,7 @@ impl DigestFetch {
         lock(&self.peers).remove(peer);
     }
     fn run(&self, wanted: &[(Digest, Kind)], background: bool) -> Result<()> {
-        for batch in wanted.chunks(BATCH) {
+        for batch in wanted.chunks(FETCH_BATCH) {
             if background && self.foreground.load(Ordering::Acquire) > 0 {
                 return Ok(());
             }
@@ -208,6 +210,8 @@ pub struct FeedRequest {
 #[derive(Serialize, Deserialize)]
 pub struct FeedReply {
     pub cursor: u64,
+    // An identical event carried in this request need not be echoed. Cursor
+    // and more still describe the complete scanned page, including omissions.
     pub events: Vec<Event>,
     pub more: bool,
 }
@@ -215,6 +219,34 @@ pub struct Service {
     pub engine: Arc<Engine>,
 }
 impl Service {
+    fn feed_reply(&self, request: FeedRequest) -> Result<FeedReply> {
+        ensure!(request.events.len() <= 256, "FEED_BATCH_TOO_LARGE");
+        self.engine.apply_remote(&request.events)?;
+        let rows = lock(&self.engine.store).events_after(request.after, 256)?;
+        let cursor = rows.last().map(|(n, _)| *n).unwrap_or(request.after);
+        let more = rows.len() == 256;
+        // Validate/apply first, including collisions and unresolved parents.
+        // Knowledge is limited to this request's exact bodies: author-based
+        // filtering would lose unknown self-authored history after recovery.
+        let received: BTreeMap<_, _> = request
+            .events
+            .iter()
+            .map(|event| (event.id.as_str(), event))
+            .collect();
+        Ok(FeedReply {
+            cursor,
+            events: rows
+                .into_iter()
+                .map(|(_, event)| event)
+                .filter(|event| {
+                    received
+                        .get(event.id.as_str())
+                        .is_none_or(|known| *known != event)
+                })
+                .collect(),
+            more,
+        })
+    }
     fn handle_request(&self, req: &Incoming) -> Result<Vec<u8>> {
         let repo = lock(&self.engine.store).repo.clone();
         ensure!(
@@ -224,16 +256,7 @@ impl Service {
         match req.op.as_str() {
             "meta.exchange" => {
                 let request: FeedRequest = serde_json::from_slice(&req.body)?;
-                ensure!(request.events.len() <= 256, "FEED_BATCH_TOO_LARGE");
-                self.engine.apply_remote(&request.events)?;
-                let rows = lock(&self.engine.store).events_after(request.after, 256)?;
-                let cursor = rows.last().map(|(n, _)| *n).unwrap_or(request.after);
-                let more = rows.len() == 256;
-                Ok(serde_json::to_vec(&FeedReply {
-                    cursor,
-                    events: rows.into_iter().map(|(_, e)| e).collect(),
-                    more,
-                })?)
+                Ok(serde_json::to_vec(&self.feed_reply(request)?)?)
             }
             FETCH_OP => {
                 let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body)?;
@@ -310,6 +333,308 @@ pub fn exchange(engine: &Engine, conn: &Conn, cursor: &mut FeedCursor) -> Result
 mod tests {
     use super::*;
     use std::path::Path;
+
+    fn journal(engine: &Engine) -> Result<Vec<Event>> {
+        Ok(lock(&engine.store)
+            .events_after(0, 4096)?
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
+    }
+
+    #[test]
+    fn feed_reply_omits_only_exact_current_request_echo_and_keeps_page_cursor() -> Result<()> {
+        let source_home = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let source = Engine::open(source_home.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        {
+            let mut store = lock(&source.store);
+            for n in 0..257 {
+                store.create(&format!("file-{n}"), crate::core::EntryKind::File)?;
+            }
+            store.sync_metadata()?;
+        }
+        let events = journal(&source)?;
+        let service = Service {
+            engine: target.clone(),
+        };
+        let first = service.feed_reply(FeedRequest {
+            after: 0,
+            events: events[..256].to_vec(),
+        })?;
+        assert!(
+            first.events.is_empty(),
+            "the request already carries these exact events"
+        );
+        assert_eq!(first.cursor, 256);
+        assert!(
+            first.more,
+            "pagination is based on scanned rows, not filtered replies"
+        );
+        let last = service.feed_reply(FeedRequest {
+            after: first.cursor,
+            events: events[256..].to_vec(),
+        })?;
+        assert!(last.events.is_empty());
+        assert_eq!(last.cursor, 257);
+        assert!(!last.more);
+        assert_eq!(journal(&target)?, events);
+        let replay = service.feed_reply(FeedRequest {
+            after: 0,
+            events: Vec::new(),
+        })?;
+        assert_eq!(replay.events, events[..256]);
+        assert_eq!(replay.cursor, 256);
+        assert!(replay.more);
+        let tail = service.feed_reply(FeedRequest {
+            after: replay.cursor,
+            events: Vec::new(),
+        })?;
+        assert_eq!(tail.events, events[256..]);
+        assert_eq!(tail.cursor, 257);
+        assert!(!tail.more);
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn feed_reply_preserves_independent_history_and_rejects_id_collisions() -> Result<()> {
+        let source_home = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let source = Engine::open(source_home.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        lock(&source.store).create("source", crate::core::EntryKind::File)?;
+        lock(&target.store).create("independent", crate::core::EntryKind::File)?;
+        let source_events = journal(&source)?;
+        let independent = journal(&target)?;
+        let service = Service {
+            engine: target.clone(),
+        };
+        let reply = service.feed_reply(FeedRequest {
+            after: 0,
+            events: source_events.clone(),
+        })?;
+        assert_eq!(reply.events, independent);
+        assert_eq!(reply.cursor, 2);
+        assert!(!reply.more);
+        let mut forged = source_events[0].clone();
+        forged.state.name = "forged".into();
+        let error = service
+            .feed_reply(FeedRequest {
+                after: 0,
+                events: vec![forged],
+            })
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("EVENT_ID_COLLISION"));
+        assert!(lock(&target.store).lookup("source").is_ok());
+        assert!(lock(&target.store).lookup("forged").is_err());
+        assert_eq!(journal(&target)?.len(), 2);
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn feed_reply_keeps_waiting_children_and_recovers_unknown_self_authored_history() -> Result<()>
+    {
+        let source_home = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let restored_home = tempfile::tempdir()?;
+        let source = Engine::open(source_home.path(), Some("repo"))?;
+        {
+            let mut store = lock(&source.store);
+            store.sync_metadata()?;
+            store.db.execute(
+                "VACUUM INTO ?1",
+                [restored_home
+                    .path()
+                    .join("metadata.sqlite")
+                    .to_str()
+                    .unwrap()],
+            )?;
+            let entry = store.create("file", crate::core::EntryKind::File)?;
+            store.delete(&entry.id)?;
+            store.sync_metadata()?;
+        }
+        let events = journal(&source)?;
+        assert_eq!(events.len(), 2);
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        let service = Service {
+            engine: target.clone(),
+        };
+        let waiting = service.feed_reply(FeedRequest {
+            after: 0,
+            events: vec![events[1].clone()],
+        })?;
+        assert!(waiting.events.is_empty());
+        assert_eq!(waiting.cursor, 0);
+        assert!(journal(&target)?.is_empty());
+        let resolved = service.feed_reply(FeedRequest {
+            after: 0,
+            events: vec![events[0].clone()],
+        })?;
+        assert_eq!(resolved.events, vec![events[1].clone()]);
+        assert_eq!(resolved.cursor, 2);
+        let restored = Engine::open(restored_home.path(), None)?;
+        assert_eq!(lock(&restored.store).device, lock(&source.store).device);
+        assert!(journal(&restored)?.is_empty());
+        let recovery = service.feed_reply(FeedRequest {
+            after: 0,
+            events: journal(&restored)?,
+        })?;
+        assert!(
+            recovery
+                .events
+                .iter()
+                .all(|event| event.author == lock(&restored.store).device)
+        );
+        assert_eq!(recovery.events, events);
+        assert_eq!(restored.apply_remote(&recovery.events)?.len(), 2);
+        assert_eq!(journal(&restored)?, events);
+        assert!(lock(&restored.store).lookup("file").is_err());
+        source.shutdown()?;
+        target.shutdown()?;
+        restored.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn feed_reply_rejects_oversized_requests_before_any_apply() -> Result<()> {
+        let source_home = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let source = Engine::open(source_home.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        lock(&source.store).create("file", crate::core::EntryKind::File)?;
+        let service = Service {
+            engine: target.clone(),
+        };
+        let error = service
+            .feed_reply(FeedRequest {
+                after: 0,
+                events: vec![journal(&source)?[0].clone(); 257],
+            })
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("FEED_BATCH_TOO_LARGE"));
+        assert!(journal(&target)?.is_empty());
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_feed_keeps_existing_client_cursor_progress_with_empty_echo_pages() -> Result<()>
+    {
+        use crate::pairing_code::Verifier;
+        struct Policy(Verifier);
+        impl crate::session::AcceptPolicy for Policy {
+            fn installation(&self) -> String {
+                "feed-test-server".into()
+            }
+            fn verifier(&self) -> Option<(Verifier, u64)> {
+                Some((self.0.clone(), 1))
+            }
+            fn admit(
+                &self,
+                _: &crate::model::protocol::frame::ClientHello,
+            ) -> std::result::Result<(), ErrorWire> {
+                Ok(())
+            }
+            fn legacy_attempt(&self, _: std::net::SocketAddr, _: &serde_json::Value) {}
+        }
+        let source_home = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let source = Engine::open(source_home.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        {
+            let mut store = lock(&source.store);
+            for n in 0..257 {
+                store.create(&format!("file-{n}"), crate::core::EntryKind::File)?;
+            }
+            store.sync_metadata()?;
+        }
+        let events = journal(&source)?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let (code, verifier) = Verifier::generate();
+        let serving = target.clone();
+        let (ready, received) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> Result<Conn> {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::WouldBlock
+                                && Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                let (conn, _) = crate::session::accept(
+                    stream,
+                    Arc::new(Policy(verifier)),
+                    crate::session::ConnOptions::default(),
+                )
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+                conn.serve(Arc::new(Service { engine: serving }));
+                Ok(conn)
+            })();
+            let _ = ready.send(result);
+        });
+        let (client, _) = crate::session::dial(
+            &endpoint,
+            crate::session::client_hello(
+                "feed-test-client",
+                crate::model::protocol::LaneRole::Control,
+                None,
+                1,
+            ),
+            &crate::session::CodeAuth { code },
+            None,
+            crate::session::ConnOptions::default(),
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let server = received.recv_timeout(Duration::from_secs(10))??;
+        worker.join().unwrap();
+        let reply = client
+            .call(
+                "meta.exchange",
+                json!({"repo":"repo"}),
+                serde_json::to_vec(&FeedRequest {
+                    after: 0,
+                    events: events[..256].to_vec(),
+                })?,
+                Priority::Control,
+                Duration::from_secs(10),
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let reply: FeedReply = serde_json::from_slice(&reply.body)?;
+        assert!(reply.events.is_empty());
+        assert_eq!(reply.cursor, 256);
+        assert!(reply.more);
+        // Use the unchanged client exchange implementation, including a retry
+        // of the first page that was already accepted by the manual request.
+        let mut cursor = FeedCursor::default();
+        assert!(exchange(&source, &client, &mut cursor)?);
+        assert_eq!((cursor.sent, cursor.received), (256, 256));
+        assert!(!exchange(&source, &client, &mut cursor)?);
+        assert_eq!((cursor.sent, cursor.received), (257, 257));
+        assert_eq!(journal(&source)?, events);
+        assert_eq!(journal(&target)?, events);
+        client.close();
+        server.close();
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
 
     fn indexed(home: &Path, digest: Digest) -> Result<bool> {
         let db = rusqlite::Connection::open_with_flags(
@@ -531,8 +856,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn maximum_direct_batches_fit_authenticated_session_defaults() -> Result<()> {
+    #[derive(Clone, Copy)]
+    enum MaximumFetchPath {
+        DirectRoots,
+        ForegroundChunks,
+        ManifestPrefetch,
+    }
+
+    fn maximum_fetch_batches_fit_defaults(path: MaximumFetchPath) -> Result<()> {
         use crate::{
             model::protocol::{LaneRole, frame::ClientHello},
             pairing_code::Verifier,
@@ -570,7 +901,11 @@ mod tests {
         let target = Engine::open(target_home.path(), Some("repo"))?;
         let mut references = Vec::new();
         let mut objects = Vec::new();
-        for n in 0..33u64 {
+        let count: u64 = match path {
+            MaximumFetchPath::DirectRoots => 33,
+            MaximumFetchPath::ForegroundChunks | MaximumFetchPath::ManifestPrefetch => 64,
+        };
+        for n in 0..count {
             let mut bytes = vec![255; crate::model::content::CHUNK_SIZE as usize];
             bytes[..8].copy_from_slice(&n.to_le_bytes());
             let digest = source.working.content().packs.put(Kind::Chunk, &bytes)?;
@@ -585,11 +920,32 @@ mod tests {
                 bytes,
             });
         }
+        let manifest = if matches!(path, MaximumFetchPath::ManifestPrefetch) {
+            let encoded = crate::content::local::Manifest {
+                len: count * crate::model::content::CHUNK_SIZE,
+                chunks: objects.iter().map(|object| object.digest).collect(),
+            }
+            .encode()?;
+            Some(FileContentRef::new(
+                ContentKind::Manifest,
+                source
+                    .working
+                    .content()
+                    .packs
+                    .put(Kind::Manifest, &encoded)?,
+                count * crate::model::content::CHUNK_SIZE,
+            )?)
+        } else {
+            None
+        };
         source.working.content().packs.flush()?;
         let wire = serde_json::to_vec(&objects[..DIRECT_PREFETCH_BATCH])?;
         let options = session::ConnOptions::default();
         assert_eq!(options.max_body, 16 * 1024 * 1024);
         assert!(wire.len() > 8 * 1024 * 1024 && wire.len() < options.max_body);
+        if objects.len() >= BATCH {
+            assert!(serde_json::to_vec(&objects[..BATCH])?.len() > options.max_body);
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -645,8 +1001,42 @@ mod tests {
                 repo: "repo".into(),
             }),
         );
-        fetch.prefetch_direct_roots(&references, &target.stopping);
-        assert_eq!(*lock(&requests), vec![32, 1]);
+        let expected = match path {
+            MaximumFetchPath::DirectRoots => {
+                fetch.prefetch_direct_roots(&references, &target.stopping);
+                vec![32, 1]
+            }
+            MaximumFetchPath::ForegroundChunks => {
+                let wanted = objects
+                    .iter()
+                    .map(|object| (object.digest, object.kind))
+                    .collect::<Vec<_>>();
+                crate::content::ObjectFetcher::fetch(fetch.as_ref(), &wanted)?;
+                vec![32, 32]
+            }
+            MaximumFetchPath::ManifestPrefetch => {
+                super::super::prefetch_pass(
+                    &target,
+                    &fetch,
+                    std::slice::from_ref(manifest.as_ref().unwrap()),
+                );
+                vec![1, 32, 32]
+            }
+        };
+        assert_eq!(*lock(&requests), expected);
+        if let Some(manifest) = manifest {
+            let mut got = vec![0; manifest.total_len as usize];
+            target
+                .working
+                .content()
+                .read_range(&manifest, 0, &mut got)?;
+            for (chunk, object) in got
+                .chunks(crate::model::content::CHUNK_SIZE as usize)
+                .zip(&objects)
+            {
+                assert_eq!(chunk, object.bytes);
+            }
+        }
         for object in objects {
             assert_eq!(
                 target
@@ -665,6 +1055,21 @@ mod tests {
         source.shutdown()?;
         target.shutdown()?;
         Ok(())
+    }
+
+    #[test]
+    fn maximum_direct_batches_fit_authenticated_session_defaults() -> Result<()> {
+        maximum_fetch_batches_fit_defaults(MaximumFetchPath::DirectRoots)
+    }
+
+    #[test]
+    fn maximum_foreground_chunk_batches_fit_authenticated_session_defaults() -> Result<()> {
+        maximum_fetch_batches_fit_defaults(MaximumFetchPath::ForegroundChunks)
+    }
+
+    #[test]
+    fn maximum_manifest_prefetch_batches_fit_authenticated_session_defaults() -> Result<()> {
+        maximum_fetch_batches_fit_defaults(MaximumFetchPath::ManifestPrefetch)
     }
 
     #[test]

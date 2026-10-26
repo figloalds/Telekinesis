@@ -1,18 +1,21 @@
 # W6-P0-MOUNT-LIFECYCLE: kernel cleanup hang
 
 Status: **OPEN, P0 — fixed-driver lifecycle/build checks pass; performance acceptance fails**
-(2026-10-25). Resolve this before
+(2026-10-26). Resolve this before
 other Wave 6 feature work, runtime cutover or mounted performance qualification.
 Documentation and diagnosis do not close this demand. The fix below is
 implemented in this checkout ([note](notes/mount-lifecycle-fix.md)); the demand
 closes only when all acceptance checks, including the purge-cost decision, pass.
 
 Read the [performance gate reassessment](notes/perf-gate-reassessment.md)
-before the next candidate lap. It separates the three failures caused by
-`FlushAndPurgeOnCleanup` inside the timed windows from the two metadata
-workloads sitting at the measured WinFsp memory-filesystem floor, gives the
-predicted counters for the sanctioned purge-off lap, and proposes a section 8
-target rewrite for the user to decide. It changes no policy or ratio itself.
+before the next candidate lap. It records cache-policy and metadata-reference
+cost hypotheses, predicts counters for a proposed purge-off experiment, and
+proposes a section 8 target rewrite for the user to decide. The
+[follow-up review](notes/perf-gate-reassessment.md#8-follow-up-review-2026-10-26)
+identifies why notification plus a quiet interval does not prove complete or
+successful cache delivery. The writable policy stays unchanged; a
+[complete paired-policy memory reference](notes/perf-gate-reassessment.md#9-complete-paired-policy-reference-measurement-2026-10-26)
+is now retained. The note changes no acceptance ratio.
 
 ## Current work and executable acceptance
 
@@ -411,7 +414,7 @@ Peer overhead now passes for write/read (+5.1%/+7.0%), random overwrite, Git
 and builds in this run; copy still fails at +48.6%. The five original native
 performance targets also fail at 6.80x, 3.27x/1.60x, 31.71x and 10.71x.
 Catch-up and remote visibility pass. The
-[latest complete gate](../../test-evidence/wave-6/prefetch-barrier-sandbox-20261025.json)
+[preceding complete gate](../../test-evidence/wave-6/prefetch-barrier-sandbox-20261025.json)
 retains a verified 4.408 GB export and terminal runner-handle observation.
 The unrelated background barrier is removed, but P0 remains open on the
 original performance gate and peer copy overhead. The
@@ -428,8 +431,107 @@ test transfers maximum-size roots in requests of 32 and 1 within the unchanged
 default body limit. All 207 host tests, strict Clippy/format/release and five
 inert binding cases pass. The [batching contract and evidence](notes/prefetch-root-batching.md)
 retain the bounds, partial-reply progress, foreground/stop behavior and native
-model limitations. Isolated lifecycle/timestamp/full-gate qualification is
-pending; the preceding failed complete gate remains authoritative.
+model limitations. The exact candidate subsequently passes all 44 isolated
+lifecycle cases and six timestamp laps (forced exit max 0.005 s; matrix graceful
+max 0.076 s). Its complete five-sample gate validates all 54 build observations
+and every byte of the final 1 GiB after six overwrite laps. Both servers exit
+normally in 0.477/0.527 s, without kills or stranded processes. Copy, write,
+random overwrite and Git still fail at 6.44x, 3.03x, 22.21x and 10.99x native.
+Read passes at 1.13x with a slower native baseline; this does not establish a
+batching effect outside the peer path. Idle-peer overhead passes except copy
+(+23.3%); catch-up is 71.283 s and remote visibility 40.414 ms. The
+[preceding complete gate](../../test-evidence/wave-6/prefetch-roots-sandbox-20261025.json)
+retains a verified 7.413 GB export and terminal runner-handle observation.
+P0 remains open under the original targets.
+
+The subsequent reference measurement compares NTFS before/after with purge-on
+and standby in one test-only memory-backend executable. An initial unadapted
+allocator attempt is retained as intentionally incomplete, with a normal
+0.058-second server exit. The capacity-adapted reference completes all workloads,
+72 validated build observations, four 1 GiB client byte checks and 24 canonical
+Git runs. Ten normal/forced lifecycle/large-corpus stops pass (forced max
+0.003 s; normal max 0.577 s), without stranding. Random overwrite improves
+592.5 to 49.3 ms and Git 3,390.5 to 1,692.8 ms with standby, but sequential
+write stays near 2 seconds, read does not improve, and copy gains about 4%.
+The [paired-policy results and counters](notes/perf-gate-reassessment.md#9-complete-paired-policy-reference-measurement-2026-10-26)
+retain the verified 2.183 GB export and terminal runner-handle observation.
+This tests a memory reference, not Telekinesis delivery, receipts or durability.
+Notification plus a quiet interval still lacks completion/error accounting;
+production cache policy and original acceptance targets remain unchanged.
+
+A native [metadata-echo experiment](notes/metadata-echo-cost.md) rejects another
+hypothesis for peer copy overhead: a repeated clock UPDATE advances SQLite's
+change counter, but both reference/candidate write zero bytes in the stable-
+echo stress, with no meaningful repeated wall-time gain. The conditional-clock
+candidate is not promoted; qualified production source and artifact are
+restored. The peer-copy failure remains open.
+
+The next candidate `49af917f...` fixes a reproduced access failure in general
+chunk fetching: 64 maximum-size near-255 chunks serialize to 16,782,839 bytes,
+exceeding the unchanged default 16 MiB session body limit. General requests now
+group 32 objects, matching the direct-root bound. A real authenticated test
+fails before the fix and passes afterwards; foreground and manifest-prefetch
+paths verify every byte and keep both connections open. It has 209 passing
+host tests, strict Clippy/format/release and five inert binding fixtures.
+The [wire-bound contract](notes/fetch-wire-bound.md) retains exact evidence and
+unchanged integrity/durability/driver policy. All 44 original isolated cases,
+six timestamp laps and four additional large-payload paired cases pass (forced
+exit max 0.004 s; ordinary matrix graceful max 0.099 s). The complete five-sample
+gate validates 54 build observations and every byte of the final 1 GiB after
+six overwrite laps, with no workload I/O errors. Both servers exit normally in
+0.481/0.071 s without kills or stranded processes. Copy, sequential write/read,
+random overwrite and Git still fail at 6.32x, 4.63x/1.42x, 32.49x and 11.25x
+native. Clean/no-op builds pass at 1.03x/1.05x. Peer overhead fails copy (+40.6%);
+catch-up and remote visibility pass at 77.831 s/36.991 ms. The
+[wire-bound complete gate](../../test-evidence/wave-6/fetch-wire-bound-sandbox-20261026.json)
+retains a CRC/SHA/timestamp-size-verified 8.403 GB export and a terminal runner
+handle observation. The reproduced chunk-fetch failure is fixed; P0 remains open on the
+original performance/peer targets. Metadata catch-up alone still does not prove
+complete initial payload hydration.
+
+The [payload-readiness diagnostic](notes/peer-payload-readiness.md) confirms the
+measurement gap: at metadata arrival, only one of 66,663 required current
+objects is committed on the fresh peer. Complete import finishes within the
+same 300-second bound. Fully imported copy series are +17.6%/+11.5% against
+the first control and +20.9%/+14.6% against the return control, so this is not
+an unqualified 20% pass. Both servers stop normally. The harness now requires
+metadata **and** committed current-object inventory before the idle phase,
+without changing targets, cache/durability policy or inserting a quiet delay.
+Ten native checks pass on host and guest. The
+[complete corrected-boundary matrix](../../test-evidence/wave-6/peer-readiness-gate-sandbox-20261026.json)
+validates all 54 builds and every byte of the final 1 GiB, without I/O errors.
+Metadata arrives in 68.606 s with 66,534 objects missing; full inventory is
+ready at 105.736 s. Both servers exit normally (0.458/0.119 s), with no kills
+or stranded processes. The five native ratios still fail: copy 6.70x,
+sequential write/read 5.11x/1.41x, random overwrite 33.52x and Git 10.42x.
+Peer copy overhead still fails at +21.2%; its other six gated metrics pass.
+Clean/no-op builds pass at 1.04x/1.04x and visibility is 23.420 ms median.
+The 8.091 GB, 38,006-member native export passes CRC/SHA/timestamp-size checks;
+the controller's final actual handle is missing. This harness correction does
+not close the remaining copy overhead or native performance gaps. Earlier
+full-gate failures remain retained, and P0 stays open.
+
+Two [cached-prefetch presence experiments](notes/cached-prefetch-presence-cost.md)
+are subsequently rejected before any candidate mount. Grouping presence checks
+under one lock reduces isolated scan cost but worsens native writer contention,
+including with the existing 100 ms cadence. A source-only fast path has no
+repeatable scan gain in the reversed comparison. Qualified Rust sources,
+library identity and executable are restored; 209 host tests, format, strict
+Clippy and release-library checks pass. These experiments do not change the
+remaining performance failures or justify changing cache/access/durability
+policy.
+
+The next [request-local metadata echo candidate](notes/feed-request-echo.md),
+`60eb4c78...`, omits only exact decoded events already carried in the current
+request from its reply, after normal apply/collision validation. Cursor and
+pagination still cover the full journal page; unknown self-authored recovery
+history is retained. Five new regressions and all 214 host tests pass, with
+strict Clippy/release and five inert binding fixtures. A real authenticated
+native replay reduces 6,000 reply events (3.786 MB) to zero (934 bytes), with
+both journals/projections verified; this is not a mounted copy result. All
+44 isolated lifecycle cases, six timestamp laps and four large paired cases
+pass. The complete original-target matrix is running; cache/durability/access
+policies stay unchanged and P0 remains open.
 
 The no-self-handle implementation was qualified for lifecycle correctness in **Windows Sandbox**
 (a separate Windows kernel under the Microsoft hypervisor). All stores and

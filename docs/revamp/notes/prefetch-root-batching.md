@@ -46,6 +46,26 @@ manifests and empty content. The
 retains exact sources, models, protocol coverage and checks. No real WinFsp DLL,
 driver or mount is used on the host.
 
-Isolated lifecycle/timestamp and full performance/build/peer qualification are
-pending for this exact candidate. The preceding complete gate remains failed;
-P0 stays open and all original acceptance targets remain unchanged.
+The exact candidate subsequently passes all 44 isolated lifecycle cases and
+six timestamp laps. Forced exit takes at most 0.005 s and ordinary matrix
+graceful exit 0.076 s. The complete five-sample native/mounted/idle-peer gate
+validates all 54 build observations, with no workload I/O errors. Both servers
+stop normally in 0.477/0.527 s, without kills or stranded processes. The
+controller's terminal process handle is missing.
+
+Mounted/native ratios still fail for copy (6.44x), sequential write (3.03x),
+random overwrite (22.21x) and canonical Git (10.99x). Read passes at 1.13x in
+this run, with a slower native baseline than the preceding gate; batching only
+changes the peer caller and does not establish the cause of that change.
+Clean/no-op builds pass at 0.88x/1.07x. Idle-peer overhead passes for every
+gated metric except copy (+23.3%, above the unchanged 20% limit). Initial
+metadata catch-up takes 71.283 s and remote visibility is 40.414 ms median.
+Metadata catch-up does not establish complete payload hydration.
+
+Independent stopped-backing verification checks every byte of the final 1 GiB
+after six 10,000-overwrite laps. The 7,413,009,763-byte, 37,795-member export
+passes CRC, SHA-256 and timestamp-size checks. The
+[complete qualification record](../../../test-evidence/wave-6/prefetch-roots-sandbox-20261025.json)
+retains reports, lifecycle logs, identities and the export hash. P0 stays open;
+all original acceptance targets and cache/durability/access policy remain
+unchanged.

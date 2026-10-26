@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_build  # noqa: E402  (the .NET harness generator and build runner)
 from mount_lifecycle import run_bounded, stop_all  # noqa: E402  (bounded daemon shutdown)
+from peer_readiness import wait_peer_ready  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = ("copy_small", "build", "seq_1g", "random_4k", "git_status_50k", "remote_visibility")
@@ -43,9 +44,9 @@ TARGETS = {"copy_small": 1.3, "build_clean": 1.3, "build_noop": 1.2,
 def wait_peer_metadata(source, peer, timeout=120):
     """Native backend reads only; never probe the served namespace here.
 
-    Feed order is the source journal sequence. Seeing its committed last event
-    on the receiver proves the initial metadata feed reached that cut before
-    measuring an idle connected peer. Initial catch-up is not an idle workload.
+    Seeing the committed last event proves metadata arrival at that cut only.
+    It does not establish payload readiness; matrix uses wait_peer_ready before
+    measuring an idle connected peer. Keep this metadata-only diagnostic separate.
     """
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("peer catch-up timeout must be finite and positive")
@@ -345,7 +346,9 @@ def matrix(args):
         endpoint = json.loads((home / "mounted.log").read_text().splitlines()[0])["peer"]
         cli(peer, "pair", endpoint, cli(state, "pairing-code")["code"])
         cli(state, "flush")
-        catchup = wait_peer_metadata(state, peer, args.peer_catchup_timeout)
+        catchup = wait_peer_ready(state, peer, args.peer_catchup_timeout,
+            observation=lambda value: (home / "peer-catchup-progress.json").write_text(
+                json.dumps(value, indent=2)))
         cli(peer, "flush")
         (home / "peer-catchup.json").write_text(json.dumps(catchup, indent=2))
         peer_root = Path(args.matrix_peer_mount + "/bench")
@@ -531,7 +534,7 @@ def main():
     parser.add_argument("--matrix-timeout", type=float, default=3600,
                         help="deadline in seconds for each workload child")
     parser.add_argument("--peer-catchup-timeout", type=float, default=120,
-                        help="bounded initial metadata import deadline, excluded from idle-peer timing")
+                        help="cumulative metadata/payload import deadline, excluded from idle-peer timing")
     parser.add_argument("--matrix-mount", default="X:")
     parser.add_argument("--matrix-peer-mount", default="Y:")
     parser.add_argument("--local-state", type=Path)
