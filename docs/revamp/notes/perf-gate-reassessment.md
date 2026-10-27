@@ -152,6 +152,9 @@ both modes rather than assuming its prior configuration was purge-off.
 
 ## 5. Proposed rewrite of the section 8 targets
 
+Adopted by the user on 2026-10-26 for copy, sequential write and Git; see
+[section 11](#11-decision-2026-10-26). The table below is kept as proposed.
+
 Keep one script and one table. Add a second reference column and split the
 targets by what bounds them.
 
@@ -222,6 +225,8 @@ The follow-up review changes the order:
    six timestamp laps and the complete original performance/build/peer gate.
 4. With the measurements retained, the user decides any section 8 target
    rewrite (section 5) and whether to open the ProjFS question (section 6).
+   The target rewrite was decided on 2026-10-26 (section 11); the ProjFS
+   question remains unopened.
 
 ## 8. Follow-up review (2026-10-26)
 
@@ -378,3 +383,40 @@ established. `Client-ProjFS` is `DisabledWithPayloadRemoved`, with no
 `ProjectedFSLib.dll` present. No boot setting, feature, driver, certificate or
 registry value was changed. These facts identify prerequisites; they neither
 qualify a new driver/provider nor prove other isolated VM routes impossible.
+
+## 11. Decision (2026-10-26)
+
+The user decided three things after the
+[WinFsp source review](winfsp-source-review.md):
+
+- **Keep the official WinFsp 2026 Beta5 build as shipped.** No fork and no
+  private driver build. The exact-hash loader preflight stays as it is.
+- **Adopt the section 5 targets for copy, sequential write and Git.** Their
+  bound is the memory-filesystem reference measured in the same guest and
+  session with the candidate's cache policy, and Git runs with
+  `core.fscache=true`. Native ratios stay in every report. Section 8 of
+  [the replacement plan](../WAVE_6_REPLACEMENT.md#8-the-benchmark-gate) and
+  `scripts/bench.py` now carry these targets. Every other target is
+  unchanged.
+- **Propose the flush-by-name control code upstream** instead of carrying a
+  driver change. The draft is in
+  [winfsp-flush-by-name-proposal.md](winfsp-flush-by-name-proposal.md).
+
+No measurement has been taken under the adopted targets. The Git row needs a
+new reference lap because no earlier reference ran with `core.fscache=true`.
+For orientation only, the latest complete gate and the section 9 purge
+reference ran in different guests:
+
+| Workload | Latest gate, mounted | Section 9 reference, purge | Indicative ratio | Target |
+|---|---:|---:|---:|---:|
+| Copy 2,000 files | 4,000.1 ms | 1,816.6 ms | 2.20x | 1.3x |
+| Sequential 1 GiB write | 2,263.6 ms | 2,015.0 ms | 1.12x | 1.2x |
+| Git status, `core.fscache` unset | 3,460.3 ms | 3,390.5 ms | 1.02x | not the adopted configuration |
+
+These are not gate results. On the native-bound rows, the same latest gate
+measured sequential read at 1.13x native, within target, and random
+overwrite at 22.2x native, still failing. P0 stays open: copy and random
+overwrite still fail, the idle-peer copy overhead still fails, and the
+writable purge-off policy still lacks the delivery proof that section 8
+requires.
+

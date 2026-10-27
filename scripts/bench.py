@@ -1,7 +1,9 @@
 """The one performance gate: six workloads against a directory, native or mounted.
 
     python scripts/bench.py --label native
-    python scripts/bench.py --label mounted --root T:\\bench --compare test-evidence/bench/native.json
+    python scripts/bench.py --label memfs-purge --root M:\\bench --cache-policy purge
+    python scripts/bench.py --label mounted --root T:\\bench --cache-policy purge \\
+        --compare test-evidence/bench/native.json --reference test-evidence/bench/memfs-purge.json
 
 Every workload runs against ``--root`` exactly the same way, so a native run and
 a mounted run differ only in the filesystem under that path. One warm-up and
@@ -36,9 +38,16 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = ("copy_small", "build", "seq_1g", "random_4k", "git_status_50k", "remote_visibility")
 MIB = 1024 * 1024
 GIT_FIXTURE_MODE = "packed-native-copy-v1"
-# Target ratios against native from docs/revamp/WAVE_6_REPLACEMENT.md section 8.
+# Target ratios from docs/revamp/WAVE_6_REPLACEMENT.md section 8 (user decision 2026-10-26).
 TARGETS = {"copy_small": 1.3, "build_clean": 1.3, "build_noop": 1.2,
            "seq_write_1g": 1.2, "seq_read_1g": 1.2, "random_4k": 1.5, "git_status_50k": 1.3}
+# Bound by WinFsp's request model, so their target is measured against the
+# memory-filesystem reference run in the same guest and session with the same
+# cleanup cache policy. Their native ratio is still printed and recorded.
+REFERENCE_BOUND = frozenset({"copy_small", "seq_write_1g", "git_status_50k"})
+CACHE_POLICIES = ("native", "purge", "standby")
+# native/mount.c sets FlushAndPurgeOnCleanup=1 on every production mount.
+PRODUCTION_CACHE_POLICY = "purge"
 
 
 def wait_peer_metadata(source, peer, timeout=120):
@@ -193,9 +202,11 @@ def git_setup(root, args):
 
 
 def git_status_50k(repo, args, run):
+    # core.fscache=true is what the Git for Windows installer configures; the
+    # Portable Git in the isolated guest leaves it unset (section 8).
     elapsed, output = bench_build.command(
         ["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
-         "status", "--porcelain"], cwd=repo)
+         "-c", f"core.fscache={args.git_fscache}", "status", "--porcelain"], cwd=repo)
     assert output == "", f"dirty tree: {output[:200]}"
     return {"git_status_50k": elapsed}
 
@@ -279,7 +290,11 @@ def matrix(args):
     common = ["--runs", str(args.runs), "--copy-files", str(args.copy_files),
               "--large-mib", str(args.large_mib), "--random-ops", str(args.random_ops),
               "--git-files", str(args.git_files), "--projects", str(args.projects),
-              "--files", str(args.files), "--jobs", str(args.jobs), "--framework", args.framework]
+              "--files", str(args.files), "--jobs", str(args.jobs), "--framework", args.framework,
+              "--git-fscache", args.git_fscache]
+    mounted_policy = ["--cache-policy", args.matrix_cache_policy]
+    if args.matrix_reference:
+        mounted_policy += ["--reference", str(args.matrix_reference.resolve())]
     if args.only:
         common += ["--only", args.only]
     if args.keep:
@@ -296,7 +311,11 @@ def matrix(args):
     home.mkdir(parents=True)
     (home / "matrix-context.json").write_text(json.dumps({
         "binary": str(exe), "binary_sha256": hashlib.sha256(exe.read_bytes()).hexdigest(),
-        "command": sys.argv, "baseline": str(base)}, indent=2), encoding="utf-8")
+        "command": sys.argv, "baseline": str(base),
+        "reference": str(args.matrix_reference) if args.matrix_reference else None,
+        "reference_sha256": hashlib.sha256(args.matrix_reference.read_bytes()).hexdigest()
+            if args.matrix_reference else None,
+        "cache_policy": args.matrix_cache_policy}, indent=2), encoding="utf-8")
     processes = []
     def cli(state, *command, timeout=20):
         result = run_bounded(list(map(str, [exe, "--state", state, *command])), timeout=timeout, text=True)
@@ -329,7 +348,7 @@ def matrix(args):
         root = Path(args.matrix_mount + "/bench")
         mounted = run_bounded([sys.executable, __file__, "--label", args.label + "-mounted",
             "--root", str(root), "--local-state", str(state), "--tkfs", str(exe),
-            "--compare", str(base), *common], timeout=args.matrix_timeout, text=True)
+            "--compare", str(base), *mounted_policy, *common], timeout=args.matrix_timeout, text=True)
         print(mounted.stdout, end="", flush=True)
         # Retain callback costs even when completed measurements miss a target.
         # They distinguish adapter/metadata work from driver cache purge cost.
@@ -354,7 +373,8 @@ def matrix(args):
         peer_root = Path(args.matrix_peer_mount + "/bench")
         idle = run_bounded([sys.executable, __file__, "--label", args.label + "-idle-peer",
             "--root", str(root), "--peer-root", str(peer_root), "--local-state", str(state),
-            "--tkfs", str(exe), "--mount-prefix", "bench", "--compare", str(base), *common], timeout=args.matrix_timeout, text=True)
+            "--tkfs", str(exe), "--mount-prefix", "bench", "--compare", str(base), *mounted_policy, *common],
+            timeout=args.matrix_timeout, text=True)
         print(idle.stdout, end="", flush=True)
         if idle.returncode:
             failures.append("idle-peer")
@@ -442,20 +462,40 @@ def host_info():
     return info
 
 
-def print_table(summary, compare):
+def target_basis(metric):
+    return "reference" if metric in REFERENCE_BOUND else "native"
+
+
+def target_failure(metric):
+    return f"{metric}: exceeds {TARGETS[metric]}x {target_basis(metric)}"
+
+
+def print_table(summary, compare, reference=None):
     base = compare["summary"] if compare else {}
+    floor = reference["summary"] if reference else {}
     width = max((len(k) for k in summary), default=6)
     header = f"{'metric':{width}s} {'median ms':>11s} {'min':>9s} {'max':>9s}"
     if base:
-        header += f" {'vs ' + compare['label']:>12s} {'target':>7s}"
+        header += f" {'vs ' + compare['label']:>16s}"
+        if floor:
+            header += f" {'vs ' + reference['label']:>16s}"
+        header += f" {'target':>16s}"
     print(header)
     for key, row in summary.items():
         line = f"{key:{width}s} {row['median_ms']:11.1f} {row['min_ms']:9.1f} {row['max_ms']:9.1f}"
         if base and key in base:
-            ratio = row["median_ms"] / base[key]["median_ms"]
+            ratios = {"native": row["median_ms"] / base[key]["median_ms"]}
+            line += f" {ratios['native']:15.2f}x"
+            if floor.get(key, {}).get("median_ms", 0) > 0:
+                ratios["reference"] = row["median_ms"] / floor[key]["median_ms"]
+            if floor:
+                line += f" {ratios['reference']:15.2f}x" if "reference" in ratios else f" {'':>16s}"
             target = TARGETS.get(key)
-            mark = "" if target is None else (" ok" if ratio <= target else " FAIL")
-            line += f" {ratio:11.2f}x {('<=' + str(target)) if target else '':>7s}{mark}"
+            if target is not None:
+                basis = target_basis(key)
+                ratio = ratios.get(basis)
+                mark = " no reference" if ratio is None else (" ok" if ratio <= target else " FAIL")
+                line += f" {'<=' + str(target) + 'x ' + basis:>16s}{mark}"
         print(line)
 
 
@@ -465,7 +505,7 @@ def performance_only_failure(report):
     if any(name != "remote_visibility" or reason != "no --peer-root"
            for name, reason in report.get("skipped", {}).items()):
         return False
-    allowed = {f"{metric}: exceeds {target}x native" for metric, target in TARGETS.items()}
+    allowed = {target_failure(metric) for metric in TARGETS}
     failures = report.get("failures")
     return isinstance(failures, list) and bool(failures) and all(f in allowed for f in failures)
 
@@ -487,8 +527,24 @@ def peer_overhead(mounted, idle):
     return result
 
 
-def gate(report, compare):
-    """A missing measurement or incompatible baseline cannot pass the gate."""
+def compatibility(report, other, name):
+    """Workload sizes and the Git client must match whatever the run is judged against."""
+    failures = []
+    dimensions = ("runs", "copy_files", "large_mib", "random_ops", "git_files",
+                  "projects", "files", "jobs", "framework")
+    for key in dimensions:
+        if report["args"].get(key) != other.get("args", {}).get(key):
+            failures.append(f"incompatible {name}: {key}")
+    if "git_status_50k" in report["summary"]:
+        if report.get("git_fixture_mode") != other.get("git_fixture_mode"):
+            failures.append(f"incompatible {name}: git_fixture_mode")
+        if report["args"].get("git_fscache") != other.get("args", {}).get("git_fscache"):
+            failures.append(f"incompatible {name}: git_fscache")
+    return failures
+
+
+def gate(report, compare, reference=None):
+    """A missing measurement or incompatible baseline/reference cannot pass the gate."""
     failures = []
     failures.extend(report.get("errors", []))
     expected = {"copy_small": ["copy_small"], "build": ["build_clean", "build_noop", "build_incremental"],
@@ -501,19 +557,31 @@ def gate(report, compare):
             if report["summary"].get(metric, {}).get("samples", 0) != report["args"]["runs"]:
                 failures.append(f"{metric}: missing measurements")
     if compare:
-        if "git_status_50k" in report["summary"] and (
-                report.get("git_fixture_mode") != compare.get("git_fixture_mode")):
-            failures.append("incompatible baseline: git_fixture_mode")
-        dimensions = ("runs", "copy_files", "large_mib", "random_ops", "git_files",
-                      "projects", "files", "jobs", "framework")
-        for key in dimensions:
-            if report["args"][key] != compare["args"][key]:
-                failures.append(f"incompatible baseline: {key}")
+        failures.extend(compatibility(report, compare, "baseline"))
+        bound = [key for key in report["summary"] if key in REFERENCE_BOUND]
+        if reference is not None and bound:
+            failures.extend(compatibility(report, reference, "reference"))
+            # The reference must share the candidate's cleanup cache policy and
+            # the guest and client it ran in; a cross-session floor proves nothing.
+            policy = reference.get("args", {}).get("cache_policy")
+            if policy not in ("purge", "standby") or policy != report["args"].get("cache_policy"):
+                failures.append("incompatible reference: cache_policy")
+            for key in ("hostname", "git"):
+                if reference.get("host", {}).get(key) != report["host"].get(key):
+                    failures.append(f"incompatible reference: host {key}")
         for key, row in report["summary"].items():
-            if key in TARGETS:
-                base = compare["summary"].get(key, {}).get("median_ms", 0)
-                if base <= 0 or row["median_ms"] > base * TARGETS[key]:
-                    failures.append(f"{key}: exceeds {TARGETS[key]}x native")
+            if key not in TARGETS:
+                continue
+            basis = target_basis(key)
+            if basis == "reference" and reference is None:
+                failures.append(f"{key}: no memory-filesystem reference")
+                continue
+            source = reference if basis == "reference" else compare
+            base = source["summary"].get(key, {}).get("median_ms", 0)
+            if base <= 0:
+                failures.append(f"{key}: missing {basis} measurement")
+            elif row["median_ms"] > base * TARGETS[key]:
+                failures.append(target_failure(key))
     if "remote_visibility" in report["summary"]:
         if report["summary"]["remote_visibility"]["median_ms"] > 250:
             failures.append("remote_visibility: exceeds 250 ms")
@@ -542,7 +610,17 @@ def main():
     parser.add_argument("--mount-prefix", default="bench")
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--only", help="comma-separated subset of " + ",".join(WORKLOADS))
-    parser.add_argument("--compare", type=Path, help="earlier report to print ratios against")
+    parser.add_argument("--compare", type=Path, help="native report to judge native-bound targets against")
+    parser.add_argument("--reference", type=Path, help="same-session memory-filesystem report for the "
+                        "reference-bound targets (copy, sequential write, Git)")
+    parser.add_argument("--cache-policy", choices=CACHE_POLICIES, default="native",
+                        help="cleanup cache policy of the filesystem under --root")
+    parser.add_argument("--git-fscache", choices=("true", "false"), default="true",
+                        help="Git client core.fscache for git_status_50k (section 8: true)")
+    parser.add_argument("--matrix-reference", type=Path,
+                        help="memory-filesystem reference report for the matrix's mounted runs")
+    parser.add_argument("--matrix-cache-policy", choices=CACHE_POLICIES[1:], default=PRODUCTION_CACHE_POLICY,
+                        help="cleanup cache policy of the matrix binary's mount")
     parser.add_argument("--output", type=Path, help="report path (default test-evidence/bench/<label>.json)")
     parser.add_argument("--keep", action="store_true", help="leave generated trees under --root")
     parser.add_argument("--copy-files", type=int, default=2000)
@@ -557,6 +635,12 @@ def main():
     if not math.isfinite(args.peer_catchup_timeout) or args.peer_catchup_timeout <= 0:
         parser.error("peer catch-up timeout must be finite and positive")
     if args.matrix_tkfs:
+        selected = set(args.only.split(",")) if args.only else set(WORKLOADS)
+        if selected & {"copy_small", "seq_1g", "git_status_50k"} and not args.matrix_reference:
+            parser.error("copy, sequential write and Git are judged against a same-session "
+                         "memory-filesystem reference; pass --matrix-reference")
+        if args.matrix_reference and not args.matrix_reference.is_file():
+            parser.error(f"reference report not found: {args.matrix_reference}")
         return matrix(args)
     if args.runs < 1 or min(args.copy_files, args.large_mib, args.random_ops,
                            args.git_files, args.projects, args.files, args.jobs) < 1:
@@ -635,12 +719,18 @@ def main():
         report["summary"] = summarize(samples)
         report["finished"] = datetime.now(timezone.utc).isoformat()
         compare = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
-        report["failures"] = gate(report, compare)
+        reference = json.loads(args.reference.read_text(encoding="utf-8")) if args.reference else None
+        if reference is not None:
+            report["reference"] = {
+                "path": str(args.reference), "label": reference.get("label"),
+                "sha256": hashlib.sha256(args.reference.read_bytes()).hexdigest(),
+                "cache_policy": reference.get("args", {}).get("cache_policy"),
+                "started": reference.get("started")}
+        report["failures"] = gate(report, compare, reference)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=1), encoding="utf-8")
-    compare = json.loads(args.compare.read_text(encoding="utf-8")) if args.compare else None
     print()
-    print_table(report["summary"], compare)
+    print_table(report["summary"], compare, reference)
     for name, reason in report["skipped"].items():
         print(f"skipped {name}: {reason[:200]}")
     print(f"\nreport: {output}")

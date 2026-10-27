@@ -248,6 +248,10 @@ development host (`Windows Kits\10\Include\10.0.26100.0\um`).
 
 ## 6. Recommendation
 
+Decided by the user on 2026-10-26: items 1 and 2 are adopted; see
+[the decision](perf-gate-reassessment.md#11-decision-2026-10-26) and the
+[upstream proposal draft](winfsp-flush-by-name-proposal.md).
+
 1. **Keep WinFsp as shipped for the P0 closure.** Do not fork. The floor is
    measured, it is the request model, and no fork within reach changes copy
    or sequential write. Accept the section 5 floor-relative targets for

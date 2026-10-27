@@ -1,0 +1,556 @@
+diff --git a/inc/winfsp/fsctl.h b/inc/winfsp/fsctl.h
+index 7528a8e5..915d24dc 100644
+--- a/inc/winfsp/fsctl.h
++++ b/inc/winfsp/fsctl.h
+@@ -111,6 +111,8 @@ extern const __declspec(selectany) GUID FspFsvrtDeviceClassGuid =
+     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 's', METHOD_BUFFERED, FILE_ANY_ACCESS)
+ #define FSP_FSCTL_NOTIFY                \
+     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'n', METHOD_NEITHER, FILE_ANY_ACCESS)
++#define FSP_FSCTL_FLUSH_BY_NAME         \
++    CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'F', METHOD_BUFFERED, FILE_ANY_ACCESS)
+ #define FSP_FSCTL_UNLOAD                \
+     CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x800 + 'U', METHOD_NEITHER, FILE_ANY_ACCESS)
+ 
+@@ -331,6 +333,14 @@ typedef struct
+ FSP_FSCTL_STATIC_ASSERT(12 == sizeof(FSP_FSCTL_NOTIFY_INFO),
+     "sizeof(FSP_FSCTL_NOTIFY_INFO) must be exactly 12.");
+ typedef struct
++{
++    UINT32 Timeout;                     /* millis; INFINITE to wait until the flush completes */
++    UINT32 Flags;                       /* reserved; must be 0 */
++    WCHAR FileNameBuf[];                /* absolute file name; not NUL-terminated */
++} FSP_FSCTL_FLUSH_BY_NAME_INFO;
++FSP_FSCTL_STATIC_ASSERT(8 == sizeof(FSP_FSCTL_FLUSH_BY_NAME_INFO),
++    "sizeof(FSP_FSCTL_FLUSH_BY_NAME_INFO) must be exactly 8.");
++typedef struct
+ {
+     UINT64 UserContext;
+     UINT64 UserContext2;
+@@ -695,6 +705,8 @@ FSP_API NTSTATUS FspFsctlStop(HANDLE VolumeHandle);
+ FSP_API NTSTATUS FspFsctlStop0(HANDLE VolumeHandle);
+ FSP_API NTSTATUS FspFsctlNotify(HANDLE VolumeHandle,
+     FSP_FSCTL_NOTIFY_INFO *NotifyInfo, SIZE_T Size);
++FSP_API NTSTATUS FspFsctlFlushByName(HANDLE VolumeHandle,
++    PWSTR FileName, ULONG Timeout);
+ FSP_API NTSTATUS FspFsctlGetVolumeList(PWSTR DevicePath,
+     PWCHAR VolumeListBuf, PSIZE_T PVolumeListSize);
+ FSP_API NTSTATUS FspFsctlPreflight(PWSTR DevicePath);
+diff --git a/inc/winfsp/winfsp.h b/inc/winfsp/winfsp.h
+index 0bfa8a25..dbf06fc8 100644
+--- a/inc/winfsp/winfsp.h
++++ b/inc/winfsp/winfsp.h
+@@ -1305,6 +1305,42 @@ FSP_API NTSTATUS FspFileSystemNotifyEnd(FSP_FILE_SYSTEM *FileSystem);
+  */
+ FSP_API NTSTATUS FspFileSystemNotify(FSP_FILE_SYSTEM *FileSystem,
+     FSP_FSCTL_NOTIFY_INFO *NotifyInfo, SIZE_T Size);
++/**
++ * Flush the cached data of a file and wait for the flush to complete.
++ *
++ * Unless a file system sets FlushAndPurgeOnCleanup, Windows may keep data written
++ * to a file in its cache after the file has been closed; the data reaches the file
++ * system later as Write requests. FspFileSystemFlushByName asks the FSD to write the
++ * cached data of the named file now. It returns after the FSD has received the
++ * responses to the resulting Write requests, with the status of the flush. It does
++ * not purge the cache and does not send a Flush request to the file system.
++ *
++ * When this function returns STATUS_SUCCESS, all data of the file that was dirty in
++ * the cache when the flush started has been delivered to the file system by Write
++ * requests that completed successfully. A file that has no cached data, including a
++ * file that is not open, and a directory flush successfully without Write requests.
++ * On case-insensitive file systems the name is matched without regard to case.
++ *
++ * The Write requests that the flush produces are serviced by the dispatcher threads.
++ * This function must therefore not be called from a dispatcher thread (it returns
++ * STATUS_POSSIBLE_DEADLOCK), and the caller must not hold locks that the file system
++ * needs to service Write requests.
++ *
++ * @param FileSystem
++ *     The file system object.
++ * @param FileName
++ *     The absolute name of the file within the file system (e.g. \\dir\\file).
++ * @param Timeout
++ *     Maximum time to wait in milliseconds, or INFINITE. If the time expires, this
++ *     function returns STATUS_IO_TIMEOUT while the flush continues in the FSD; its
++ *     outcome is then unknown.
++ * @return
++ *     STATUS_SUCCESS or error code. The error code STATUS_IO_TIMEOUT means that the
++ *     flush did not complete in time. The error code STATUS_NOT_IMPLEMENTED means
++ *     that the FSD does not support this operation.
++ */
++FSP_API NTSTATUS FspFileSystemFlushByName(FSP_FILE_SYSTEM *FileSystem,
++    PWSTR FileName, ULONG Timeout);
+ /**
+  * Get the current operation context.
+  *
+diff --git a/src/dll/fs.c b/src/dll/fs.c
+index 8dfd46f8..b448c610 100644
+--- a/src/dll/fs.c
++++ b/src/dll/fs.c
+@@ -519,6 +519,20 @@ FSP_API NTSTATUS FspFileSystemNotify(FSP_FILE_SYSTEM *FileSystem,
+     return FspFsctlNotify(FileSystem->VolumeHandle, NotifyInfo, Size);
+ }
+ 
++FSP_API NTSTATUS FspFileSystemFlushByName(FSP_FILE_SYSTEM *FileSystem,
++    PWSTR FileName, ULONG Timeout)
++{
++    /*
++     * The flush produces Write requests that the dispatcher threads service, and it
++     * waits for the FileNode resources that a request being serviced owns. A call from
++     * a dispatcher thread can therefore deadlock; refuse it.
++     */
++    if (0 != FspFileSystemGetOperationContext())
++        return STATUS_POSSIBLE_DEADLOCK;
++
++    return FspFsctlFlushByName(FileSystem->VolumeHandle, FileName, Timeout);
++}
++
+ /*
+  * Out-of-Line
+  */
+diff --git a/src/dll/fsctl.c b/src/dll/fsctl.c
+index 7621e69c..5fa1e45d 100644
+--- a/src/dll/fsctl.c
++++ b/src/dll/fsctl.c
+@@ -226,6 +226,43 @@ exit:
+     return Result;
+ }
+ 
++FSP_API NTSTATUS FspFsctlFlushByName(HANDLE VolumeHandle,
++    PWSTR FileName, ULONG Timeout)
++{
++    NTSTATUS Result = STATUS_SUCCESS;
++    FSP_FSCTL_FLUSH_BY_NAME_INFO *FlushInfo = 0;
++    SIZE_T FileNameSize, Size;
++    DWORD Bytes = 0;
++
++    FileNameSize = lstrlenW(FileName) * sizeof(WCHAR);
++    if (FSP_FSCTL_TRANSACT_PATH_SIZEMAX < FileNameSize)
++        return STATUS_OBJECT_NAME_INVALID;
++
++    Size = sizeof *FlushInfo + FileNameSize;
++    FlushInfo = MemAlloc(Size);
++    if (0 == FlushInfo)
++        return STATUS_INSUFFICIENT_RESOURCES;
++
++    FlushInfo->Timeout = Timeout;
++    FlushInfo->Flags = 0;
++    memcpy(FlushInfo->FileNameBuf, FileName, FileNameSize);
++
++    /* the FSD completes this request before it returns; it never pends it */
++    if (!DeviceIoControl(VolumeHandle,
++        FSP_FSCTL_FLUSH_BY_NAME,
++        FlushInfo, (DWORD)Size, 0, 0,
++        &Bytes, 0))
++    {
++        Result = FspNtStatusFromWin32(GetLastError());
++        goto exit;
++    }
++
++exit:
++    MemFree(FlushInfo);
++
++    return Result;
++}
++
+ FSP_API NTSTATUS FspFsctlGetVolumeList(PWSTR DevicePath,
+     PWCHAR VolumeListBuf, PSIZE_T PVolumeListSize)
+ {
+diff --git a/src/sys/driver.h b/src/sys/driver.h
+index cbec7272..f5630aad 100644
+--- a/src/sys/driver.h
++++ b/src/sys/driver.h
+@@ -1630,6 +1630,8 @@ NTSTATUS FspVolumeStop(
+     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+ NTSTATUS FspVolumeNotify(
+     PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
++NTSTATUS FspVolumeFlushByName(
++    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+ NTSTATUS FspVolumeWork(
+     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+ 
+diff --git a/src/sys/fsctl.c b/src/sys/fsctl.c
+index febddbb0..b8e891b3 100644
+--- a/src/sys/fsctl.c
++++ b/src/sys/fsctl.c
+@@ -128,6 +128,10 @@ static NTSTATUS FspFsctlFileSystemControl(
+             if (0 != IrpSp->FileObject->FsContext2)
+                 Result = FspVolumeNotify(FsctlDeviceObject, Irp, IrpSp);
+             break;
++        case FSP_FSCTL_FLUSH_BY_NAME:
++            if (0 != IrpSp->FileObject->FsContext2)
++                Result = FspVolumeFlushByName(FsctlDeviceObject, Irp, IrpSp);
++            break;
+         case FSP_FSCTL_UNLOAD:
+             Result = FspDriverUnload(FsctlDeviceObject, Irp, IrpSp);
+             break;
+diff --git a/src/sys/volume.c b/src/sys/volume.c
+index bf70c66a..da7cca53 100644
+--- a/src/sys/volume.c
++++ b/src/sys/volume.c
+@@ -66,6 +66,10 @@ NTSTATUS FspVolumeNotify(
+ static NTSTATUS FspVolumeNotifyLock(
+     PDEVICE_OBJECT FsvolDeviceObject);
+ static WORKER_THREAD_ROUTINE FspVolumeNotifyWork;
++NTSTATUS FspVolumeFlushByName(
++    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
++static NTSTATUS FspVolumeFlushByNameWait(PKEVENT Event, PLARGE_INTEGER PTimeout, PIRP Irp);
++static WORKER_THREAD_ROUTINE FspVolumeFlushByNameWork;
+ NTSTATUS FspVolumeWork(
+     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp);
+ 
+@@ -89,6 +93,9 @@ NTSTATUS FspVolumeWork(
+ #pragma alloc_text(PAGE, FspVolumeNotify)
+ #pragma alloc_text(PAGE, FspVolumeNotifyLock)
+ #pragma alloc_text(PAGE, FspVolumeNotifyWork)
++#pragma alloc_text(PAGE, FspVolumeFlushByName)
++#pragma alloc_text(PAGE, FspVolumeFlushByNameWait)
++#pragma alloc_text(PAGE, FspVolumeFlushByNameWork)
+ #pragma alloc_text(PAGE, FspVolumeWork)
+ #endif
+ 
+@@ -1606,6 +1613,224 @@ static VOID FspVolumeNotifyWork(PVOID NotifyWorkItem0)
+     FsRtlExitFileSystem();
+ }
+ 
++typedef struct
++{
++    WORK_QUEUE_ITEM WorkItem;
++    PDEVICE_OBJECT FsvolDeviceObject;
++    KEVENT Event;
++    NTSTATUS Result;
++    LONG RefCount;
++    UNICODE_STRING FileName;
++    WCHAR FileNameBuf[];
++} FSP_VOLUME_FLUSH_WORK_ITEM;
++
++NTSTATUS FspVolumeFlushByName(
++    PDEVICE_OBJECT FsctlDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
++{
++    PAGED_CODE();
++
++    /*
++     * FspVolumeFlushByName flushes the cached data of one file, waits for the flush
++     * and returns its status. A file system that does not use FlushAndPurgeOnCleanup
++     * can use it to learn whether the data that Windows still caches for a closed file
++     * has been delivered to it as Write requests.
++     *
++     * The flush runs on a system worker thread, like FspVolumeNotify, and the calling
++     * thread waits for it with the same alertable wait that FspVolumeFastTransact uses
++     * (see FspQeventCancellableWait). The wait ends early if the timeout expires or the
++     * calling thread is terminating; the flush then continues on the worker thread. A
++     * file system process that is killed while it waits therefore does not wait for its
++     * own paging I/O during termination. The worker holds the volume delete resource
++     * shared, as the notify worker does; FspVolumeDelete stops the IOQ before it acquires
++     * that resource, which fails any paging I/O the worker still waits for and lets it
++     * finish.
++     *
++     * The worker acquires the FileNode Full exclusive, as the lazy writer and the per-file
++     * FlushBuffers path do. It therefore waits for any request that owns those resources.
++     * The caller must not be servicing a request for the same file; the DLL refuses calls
++     * from dispatcher threads.
++     */
++
++    ASSERT(IRP_MJ_FILE_SYSTEM_CONTROL == IrpSp->MajorFunction);
++    ASSERT(IRP_MN_USER_FS_REQUEST == IrpSp->MinorFunction);
++    ASSERT(FSP_FSCTL_FLUSH_BY_NAME == IrpSp->Parameters.FileSystemControl.FsControlCode);
++    ASSERT(METHOD_BUFFERED == (IrpSp->Parameters.FileSystemControl.FsControlCode & 3));
++    ASSERT(0 != IrpSp->FileObject->FsContext2);
++
++    PDEVICE_OBJECT FsvolDeviceObject = IrpSp->FileObject->FsContext2;
++    FSP_FSVOL_DEVICE_EXTENSION *FsvolDeviceExtension = FspFsvolDeviceExtension(FsvolDeviceObject);
++    FSP_FSCTL_FLUSH_BY_NAME_INFO *FlushInfo = Irp->AssociatedIrp.SystemBuffer;
++    ULONG InputBufferLength = IrpSp->Parameters.FileSystemControl.InputBufferLength;
++    FSP_VOLUME_FLUSH_WORK_ITEM *FlushWorkItem = 0;
++    UNICODE_STRING FileName, StreamPart = { 0 };
++    ULONG StreamType = FspFileNameStreamTypeNone;
++    ULONG TimeoutMillis;
++    LARGE_INTEGER Timeout;
++    NTSTATUS Result;
++
++    Irp->IoStatus.Information = 0;
++
++    if (sizeof(FSP_FSCTL_FLUSH_BY_NAME_INFO) > InputBufferLength ||
++        sizeof(FSP_FSCTL_FLUSH_BY_NAME_INFO) + FSP_FSCTL_TRANSACT_PATH_SIZEMAX < InputBufferLength ||
++        0 != (InputBufferLength - sizeof(FSP_FSCTL_FLUSH_BY_NAME_INFO)) % sizeof(WCHAR))
++        return STATUS_INVALID_PARAMETER;
++    if (0 != FlushInfo->Flags)
++        return STATUS_INVALID_PARAMETER;
++    TimeoutMillis = FlushInfo->Timeout;
++
++    FileName.Length = FileName.MaximumLength =
++        (USHORT)(InputBufferLength - sizeof(FSP_FSCTL_FLUSH_BY_NAME_INFO));
++    FileName.Buffer = FlushInfo->FileNameBuf;
++    if (sizeof(WCHAR) * 2/* not empty or root */ <= FileName.Length &&
++        L'\\' == FileName.Buffer[FileName.Length / sizeof(WCHAR) - 1])
++        FileName.Length -= sizeof(WCHAR);
++    if (sizeof(WCHAR) > FileName.Length || L'\\' != FileName.Buffer[0] ||
++        !FspFileNameIsValid(&FileName, FsvolDeviceExtension->VolumeParams.MaxComponentLength,
++            FsvolDeviceExtension->VolumeParams.NamedStreams ? &StreamPart : 0,
++            &StreamType))
++        return STATUS_OBJECT_NAME_INVALID;
++
++    if (!FspDeviceReference(FsvolDeviceObject))
++        return STATUS_CANCELLED;
++
++    FspFsvolDeviceVolumeDeleteAcquireShared(FsvolDeviceObject);
++    if (FsvolDeviceExtension->VolumeDeleted ||
++        FspIoqStopped(FsvolDeviceExtension->Ioq))
++    {
++        Result = STATUS_CANCELLED;
++        goto fail;
++    }
++
++    FlushWorkItem = FspAllocNonPaged(
++        FIELD_OFFSET(FSP_VOLUME_FLUSH_WORK_ITEM, FileNameBuf) + FileName.Length);
++    if (0 == FlushWorkItem)
++    {
++        Result = STATUS_INSUFFICIENT_RESOURCES;
++        goto fail;
++    }
++
++    RtlCopyMemory(FlushWorkItem->FileNameBuf, FileName.Buffer, FileName.Length);
++    FlushWorkItem->FileName.Length = FlushWorkItem->FileName.MaximumLength = FileName.Length;
++    FlushWorkItem->FileName.Buffer = FlushWorkItem->FileNameBuf;
++    FlushWorkItem->FsvolDeviceObject = FsvolDeviceObject;
++    KeInitializeEvent(&FlushWorkItem->Event, NotificationEvent, FALSE);
++    FlushWorkItem->Result = STATUS_UNSUCCESSFUL;
++    FlushWorkItem->RefCount = 2; /* this thread and the worker */
++
++    FspFsvolDeviceVolumeDeleteSetOwner(FsvolDeviceObject, FlushWorkItem);
++
++    ExInitializeWorkItem(&FlushWorkItem->WorkItem, FspVolumeFlushByNameWork, FlushWorkItem);
++    ExQueueWorkItem(&FlushWorkItem->WorkItem, DelayedWorkQueue);
++
++    Timeout.QuadPart = (LONGLONG)TimeoutMillis * -10000LL;
++        /* convert millis to relative 100ns units */
++    Result = FspVolumeFlushByNameWait(&FlushWorkItem->Event,
++        INFINITE != TimeoutMillis ? &Timeout : 0, Irp);
++    if (STATUS_SUCCESS == Result)
++        Result = FlushWorkItem->Result;
++    else if (STATUS_TIMEOUT == Result)
++        Result = STATUS_IO_TIMEOUT; /* STATUS_TIMEOUT is a success code */
++    else
++        Result = STATUS_CANCELLED;
++
++    if (0 == InterlockedDecrement(&FlushWorkItem->RefCount))
++        FspFree(FlushWorkItem);
++
++    return Result;
++
++fail:
++    FspFsvolDeviceVolumeDeleteRelease(FsvolDeviceObject);
++
++    FspDeviceDereference(FsvolDeviceObject);
++
++    return Result;
++}
++
++static NTSTATUS FspVolumeFlushByNameWait(PKEVENT Event, PLARGE_INTEGER PTimeout, PIRP Irp)
++{
++    PAGED_CODE();
++
++    /*
++     * Same logic as FspQeventCancellableWait, on a KEVENT. The caller is inside
++     * FsRtlEnterFileSystem, so thread termination is noticed through an alerted
++     * kernel-mode wait rather than through an APC.
++     */
++
++    NTSTATUS Result;
++    UINT64 ExpirationTime = 0, InterruptTime;
++    if (0 != PTimeout && 0 > PTimeout->QuadPart)
++        ExpirationTime = KeQueryInterruptTime() - PTimeout->QuadPart;
++retry:
++    Result = KeWaitForSingleObject(Event, Executive, KernelMode, TRUE, PTimeout);
++    if (STATUS_ALERTED == Result)
++    {
++        if (PsIsThreadTerminating(PsGetCurrentThread()))
++            return STATUS_THREAD_IS_TERMINATING;
++        if (Irp->Cancel)
++            return STATUS_CANCELLED;
++        if (0 != ExpirationTime)
++        {
++            InterruptTime = KeQueryInterruptTime();
++            if (ExpirationTime <= InterruptTime)
++                return STATUS_TIMEOUT;
++            PTimeout->QuadPart = (INT64)InterruptTime - (INT64)ExpirationTime;
++        }
++        goto retry;
++    }
++    return Result;
++}
++
++static VOID FspVolumeFlushByNameWork(PVOID FlushWorkItem0)
++{
++    PAGED_CODE();
++
++    FsRtlEnterFileSystem();
++    IoSetTopLevelIrp(0);
++
++    FSP_VOLUME_FLUSH_WORK_ITEM *FlushWorkItem = FlushWorkItem0;
++    PDEVICE_OBJECT FsvolDeviceObject = FlushWorkItem->FsvolDeviceObject;
++    FSP_FILE_NODE *FileNode;
++    IO_STATUS_BLOCK IoStatus;
++    NTSTATUS Result = STATUS_SUCCESS;
++
++    FspFsvolDeviceLockContextTable(FsvolDeviceObject);
++    FileNode = FspFsvolDeviceLookupContextByName(FsvolDeviceObject, &FlushWorkItem->FileName);
++    if (0 != FileNode)
++        FspFileNodeReference(FileNode);
++    FspFsvolDeviceUnlockContextTable(FsvolDeviceObject);
++
++    /*
++     * A FileNode leaves the context table when its last FILE_OBJECT is closed, which
++     * happens only after any data section that refers to it is gone, or when its file
++     * is deleted. A name that is not in the table therefore has no cached data to flush.
++     * Directories have no cached data either.
++     */
++    if (0 != FileNode)
++    {
++        if (!FileNode->IsDirectory)
++        {
++            FspFileNodeAcquireExclusive(FileNode, Full);
++            if (0 != FileNode->NonPaged->SectionObjectPointers.DataSectionObject)
++                Result = FspCcFlushCache(&FileNode->NonPaged->SectionObjectPointers, 0, 0, &IoStatus);
++            FspFileNodeRelease(FileNode, Full);
++        }
++
++        FspFileNodeDereference(FileNode);
++    }
++
++    FlushWorkItem->Result = Result;
++    KeSetEvent(&FlushWorkItem->Event, 1, FALSE);
++
++    FspFsvolDeviceVolumeDeleteReleaseOwner(FsvolDeviceObject, FlushWorkItem);
++
++    FspDeviceDereference(FsvolDeviceObject);
++
++    if (0 == InterlockedDecrement(&FlushWorkItem->RefCount))
++        FspFree(FlushWorkItem);
++
++    FsRtlExitFileSystem();
++}
++
+ NTSTATUS FspVolumeWork(
+     PDEVICE_OBJECT FsvolDeviceObject, PIRP Irp, PIO_STACK_LOCATION IrpSp)
+ {
+diff --git a/tst/winfsp-tests/flush-test.c b/tst/winfsp-tests/flush-test.c
+index 7163344a..b252cc8d 100644
+--- a/tst/winfsp-tests/flush-test.c
++++ b/tst/winfsp-tests/flush-test.c
+@@ -274,8 +274,116 @@ void flush_volume_test(void)
+     }
+ }
+ 
++static FSP_FILE_SYSTEM_OPERATION *flush_by_name_WriteOp;
++static volatile LONG flush_by_name_Writes;
++
++static NTSTATUS flush_by_name_Write(FSP_FILE_SYSTEM *FileSystem,
++    FSP_FSCTL_TRANSACT_REQ *Request, FSP_FSCTL_TRANSACT_RSP *Response)
++{
++    InterlockedIncrement(&flush_by_name_Writes);
++    return flush_by_name_WriteOp(FileSystem, Request, Response);
++}
++
++static void flush_by_name_dotest(ULONG Flags, PWSTR Prefix)
++{
++    void *memfs = memfs_start_ex(Flags, INFINITE);
++    FSP_FILE_SYSTEM *FileSystem = MemfsFileSystem(memfs);
++
++    HANDLE Handle;
++    BOOL Success;
++    WCHAR FilePath[MAX_PATH];
++    SYSTEM_INFO SystemInfo;
++    PUINT8 Buffer[2];
++    DWORD BufferSize, BytesTransferred;
++    LONG Writes;
++    NTSTATUS Result;
++
++    GetSystemInfo(&SystemInfo);
++    BufferSize = 16 * SystemInfo.dwPageSize;
++    Buffer[0] = malloc(BufferSize);
++    Buffer[1] = malloc(BufferSize);
++    ASSERT(0 != Buffer[0] && 0 != Buffer[1]);
++
++    srand((unsigned)time(0));
++    for (DWORD I = 0; BufferSize > I; I++)
++        Buffer[0][I] = (UINT8)rand();
++
++    flush_by_name_Writes = 0;
++    flush_by_name_WriteOp = FileSystem->Operations[FspFsctlTransactWriteKind];
++    FileSystem->Operations[FspFsctlTransactWriteKind] = flush_by_name_Write;
++
++    /* names without cached data flush successfully and produce no Write requests */
++    Result = FspFileSystemFlushByName(FileSystem, L"\\", INFINITE);
++    ASSERT(STATUS_SUCCESS == Result);
++    Result = FspFileSystemFlushByName(FileSystem, L"\\file0", INFINITE);
++    ASSERT(STATUS_SUCCESS == Result);
++    Result = FspFileSystemFlushByName(FileSystem, L"file0", INFINITE);
++    ASSERT(STATUS_OBJECT_NAME_INVALID == Result);
++    Result = FspFileSystemFlushByName(FileSystem, L"", INFINITE);
++    ASSERT(STATUS_OBJECT_NAME_INVALID == Result);
++    ASSERT(0 == flush_by_name_Writes);
++
++    StringCbPrintfW(FilePath, sizeof FilePath, L"%s%s\\file0",
++        Prefix ? L"" : L"\\\\?\\GLOBALROOT", Prefix ? Prefix : memfs_volumename(memfs));
++
++    Handle = CreateFileW(FilePath,
++        GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
++        CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
++    ASSERT(INVALID_HANDLE_VALUE != Handle);
++    Success = WriteFile(Handle, Buffer[0], BufferSize, &BytesTransferred, 0);
++    ASSERT(Success);
++    ASSERT(BufferSize == BytesTransferred);
++    Success = CloseHandle(Handle);
++    ASSERT(Success);
++
++    /*
++     * The data of the closed file may still be dirty in the cache. A successful flush
++     * returns only after its Write requests completed, so nothing is dirty afterwards
++     * and an immediate second flush produces no Write requests.
++     */
++    Result = FspFileSystemFlushByName(FileSystem, L"\\file0", INFINITE);
++    ASSERT(STATUS_SUCCESS == Result);
++    Writes = flush_by_name_Writes;
++    ASSERT(0 < Writes);
++    Result = FspFileSystemFlushByName(FileSystem, L"\\file0", 10000);
++    ASSERT(STATUS_SUCCESS == Result);
++    ASSERT(Writes == flush_by_name_Writes);
++
++    Handle = CreateFileW(FilePath,
++        GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
++        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, 0);
++    ASSERT(INVALID_HANDLE_VALUE != Handle);
++    memset(Buffer[1], 0, BufferSize);
++    Success = ReadFile(Handle, Buffer[1], BufferSize, &BytesTransferred, 0);
++    ASSERT(Success);
++    ASSERT(BufferSize == BytesTransferred);
++    ASSERT(0 == memcmp(Buffer[0], Buffer[1], BufferSize));
++    Success = CloseHandle(Handle);
++    ASSERT(Success);
++
++    FileSystem->Operations[FspFsctlTransactWriteKind] = flush_by_name_WriteOp;
++
++    free(Buffer[0]);
++    free(Buffer[1]);
++
++    memfs_stop(memfs);
++}
++
++void flush_by_name_test(void)
++{
++    if (NtfsTests)
++        return;
++
++    if (WinFspDiskTests)
++        flush_by_name_dotest(MemfsDisk, 0);
++    if (WinFspNetTests)
++        flush_by_name_dotest(MemfsNet, L"\\\\memfs\\share");
++}
++
+ void flush_tests(void)
+ {
+     TEST(flush_test);
+     TEST(flush_volume_test);
++    if (!NtfsTests && !OptFuseExternal)
++        TEST(flush_by_name_test);
+ }

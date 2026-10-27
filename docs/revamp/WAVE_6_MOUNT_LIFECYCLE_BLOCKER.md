@@ -15,7 +15,16 @@ proposes a section 8 target rewrite for the user to decide. The
 identifies why notification plus a quiet interval does not prove complete or
 successful cache delivery. The writable policy stays unchanged; a
 [complete paired-policy memory reference](notes/perf-gate-reassessment.md#9-complete-paired-policy-reference-measurement-2026-10-26)
-is now retained. The note changes no acceptance ratio.
+is now retained.
+
+On 2026-10-26 the user decided to keep the official WinFsp Beta5 build and to
+adopt the reassessment's section 5 targets for copy, sequential write and Git
+([decision](notes/perf-gate-reassessment.md#11-decision-2026-10-26)). Those
+three are now bound by a same-session memory-filesystem reference with the
+candidate's cache policy, and Git runs with `core.fscache=true`. Native ratios
+stay in every report and all other targets are unchanged. No gate has run
+under the new targets yet. Random overwrite and idle-peer copy overhead still
+fail, and the purge-off delivery proof is still open, so P0 stays open.
 
 ## Current work and executable acceptance
 

@@ -238,14 +238,37 @@ One script, `scripts/bench.py`, runs each workload native and mounted (no
 peers, then with one peer connected and idle) and prints one table of medians
 over five runs after one warm-up. It is the only performance gate.
 
-| Workload | Target vs native |
-|---|---|
-| Copy 2,000 files, 1–64 KiB, into the mount | ≤ 1.3× |
-| Clean build and no-op build of the .NET harness inside the mount | ≤ 1.3× clean, ≤ 1.2× no-op |
-| 1 GiB sequential write, then read | ≤ 1.2× |
-| 4 KiB random overwrites of a 1 GiB file, 10,000 ops | ≤ 1.5×, and ≤ one new chunk per op at seal |
-| `git status` on a 50,000-file tree | ≤ 1.3× |
-| Remote change visible locally after apply | ≤ 250 ms with the file cached |
+Targets as decided by the user on 2026-10-26 (WinFsp Beta5 kept as shipped;
+[reassessment section 5](notes/perf-gate-reassessment.md#5-proposed-rewrite-of-the-section-8-targets)
+adopted for copy, sequential write and Git). Those three workloads are bounded
+by WinFsp's request model rather than by the server
+([source review](notes/winfsp-source-review.md)). Their pass/fail bound is the
+pinned memory-filesystem reference, run by the same script in the same guest
+and session, with the same cleanup cache policy as the candidate
+(`--reference`, `--cache-policy`). Their native ratio is still printed and
+recorded on every run. Every other bound is unchanged.
+
+| Workload | Target | Measured against |
+|---|---|---|
+| Copy 2,000 files, 1–64 KiB, into the mount | ≤ 1.3× | memory-filesystem reference |
+| Clean build and no-op build of the .NET harness inside the mount | ≤ 1.3× clean, ≤ 1.2× no-op | native |
+| 1 GiB sequential write | ≤ 1.2× | memory-filesystem reference |
+| 1 GiB sequential read | ≤ 1.2× | native |
+| 4 KiB random overwrites of a 1 GiB file, 10,000 ops | ≤ 1.5×, and ≤ one new chunk per op at seal | native |
+| `git status` on a 50,000-file tree, client `core.fscache=true` | ≤ 1.3× | memory-filesystem reference |
+| Remote change visible locally after apply | ≤ 250 ms with the file cached | absolute |
+| Idle-peer overhead | ≤ 20% per metric | the same mount without a peer |
+
+The superseded targets were copy ≤ 1.3×, sequential write ≤ 1.2× and Git
+≤ 1.3× native, with Git run with `core.fscache` unset. Git now runs with
+`core.fscache=true`, the setting Git for Windows installs by default, in the
+native, reference and mounted runs alike. A report whose Git client setting,
+cache policy, host, Git version or workload sizes differ from its reference
+cannot pass. A run without a reference cannot pass the three reference-bound
+workloads. The reference is the upstream memory filesystem at the pinned
+Beta5 source with the recorded capacity adapter
+([section 9 of the reassessment](notes/perf-gate-reassessment.md#9-complete-paired-policy-reference-measurement-2026-10-26));
+it is a measured reference, not a theoretical lower bound.
 
 Native baseline, captured 2026-10-23 on the development NVMe with the warm
 OS cache (`test-evidence/bench/native.json`, medians of five runs): copy 2,000
