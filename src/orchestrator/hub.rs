@@ -25,9 +25,13 @@
 //! 2. at [`FORCE_AT`] at the latest (as soon as every graceful stop
 //!    returned), a folder left running gets `stop(true)`, and one whose
 //!    graceful stop is still waiting is sent `shutdown {force}` on its link;
-//! 3. at [`KILL_AT`] a worker still not confirmed gone is killed
-//!    (`kill_verified`, from `STATE/worker.json`);
-//! 4. every folder that needed step 2 or 3 logs `FORCED_STOP`.
+//! 3. at [`KILL_AT`] a worker not shown gone is killed: one still Starting
+//!    through its controller (`Controller::abort_start`: the child's handle,
+//!    no `worker.json` needed), any other by `kill_verified` from
+//!    `STATE/worker.json`; a worker neither shown gone nor killed is reported
+//!    `stranded` with the reason, never `not_running`;
+//! 4. every folder that needed step 2 or 3 logs `FORCED_STOP`; then requests
+//!    in flight get what is left of [`SHUTDOWN_BOUND`] (at most 2 s).
 use super::{
     catalog::{Catalog, FolderRecord},
     config::Config,
@@ -69,15 +73,16 @@ pub const SHUTDOWN_BOUND: Duration = Duration::from_secs(30);
 /// forced stop still has [`FORCE_STOP_WAIT`] before the bound.
 pub const FORCE_AT: Duration = SHUTDOWN_BOUND.saturating_sub(FORCE_STOP_WAIT);
 /// A worker not confirmed gone at this point of the sequence is killed.
-pub const KILL_AT: Duration = SHUTDOWN_BOUND.saturating_sub(Duration::from_secs(3));
+pub const KILL_AT: Duration = SHUTDOWN_BOUND.saturating_sub(Duration::from_secs(5));
 /// After the kill, how long stop threads get to report.
 const KILL_SETTLE: Duration = Duration::from_secs(2);
 /// How often the main loop ticks every controller.
 pub const TICK: Duration = Duration::from_millis(50);
 /// A `stop` of a still-starting folder waits this long for it to run.
 pub const START_WAIT: Duration = Duration::from_secs(READY_TIMEOUT.as_secs() + 5);
-/// After the sequence, how long the daemon waits for requests in flight
-/// (the `shutdown` reply among them) before exiting.
+/// After the sequence, the longest the daemon waits for requests in flight
+/// (the `shutdown` reply among them) before exiting; never past
+/// [`SHUTDOWN_BOUND`] from the sequence's start.
 const REQUEST_DRAIN: Duration = Duration::from_secs(2);
 /// How long `inspect`, `folder` and the shutdown sequence wait for a
 /// controller before falling back to its cached view.
@@ -305,6 +310,8 @@ pub struct Daemon {
     admission: Mutex<()>,
     requests: AtomicUsize,
     latch: Latch,
+    /// When the shutdown sequence began.
+    shutdown_started: OnceLock<Instant>,
     _lock: File,
 }
 
@@ -369,7 +376,13 @@ pub fn run(config_path: &Path) -> Result<()> {
         daemon.stopping.sleep(TICK);
     }
     let reply = daemon.shutdown();
-    daemon.drain_requests(REQUEST_DRAIN);
+    let left = daemon
+        .shutdown_started
+        .get()
+        .map_or(REQUEST_DRAIN, |started| {
+            SHUTDOWN_BOUND.saturating_sub(started.elapsed())
+        });
+    daemon.drain_requests(left.min(REQUEST_DRAIN));
     drop(discovery);
     event!(info, ORCHESTRATOR_STOPPED, { "folders": reply["folders"].clone() });
     signals::completed();
@@ -434,6 +447,7 @@ impl Daemon {
             admission: Mutex::new(()),
             requests: AtomicUsize::new(0),
             latch: Latch::default(),
+            shutdown_started: OnceLock::new(),
             _lock: lock,
             config,
         });
@@ -693,6 +707,13 @@ impl Daemon {
         }
         let slot = self.register(record.clone());
         let mut controller = slot.lock();
+        // A shutdown that began meanwhile may already have listed the
+        // folders: a worker started now would escape it.
+        ensure!(
+            !self.stopping.is_cancelled(),
+            "ORCHESTRATOR_STOPPING: the orchestrator is shutting down; {} was created but not started",
+            record.label
+        );
         controller.start();
         slot.refresh(&controller);
         Ok(serde_json::to_value(record)?)
@@ -705,8 +726,18 @@ impl Daemon {
         if !slot.active() {
             self.admit(Some(&record.id))?;
         }
+        ensure!(
+            !self.stopping.is_cancelled(),
+            "ORCHESTRATOR_STOPPING: the orchestrator is shutting down"
+        );
         self.set_desired(&slot, &record.id, true)?;
         let mut controller = slot.lock();
+        // Checked again under the lock the shutdown's stop takes: a start
+        // after the sequence listed this folder would escape it.
+        ensure!(
+            !self.stopping.is_cancelled(),
+            "ORCHESTRATOR_STOPPING: the orchestrator is shutting down"
+        );
         if retry {
             controller.retry();
         } else {
@@ -818,12 +849,38 @@ impl Daemon {
                 .wait(SHUTDOWN_BOUND + Duration::from_secs(10))
                 .unwrap_or_else(|| json!({"stopped": true, "folders": []}));
         }
+        let _ = self.shutdown_started.set(Instant::now());
         self.stopping.cancel();
         event!(info, ORCHESTRATOR_STOPPING, { "folders": self.slots().len() });
-        let reply = json!({"stopped": true, "folders": shutdown_folders(self.slots())});
+        let folders = shutdown_folders(self.slots(), TIMINGS);
+        let reply = json!({"stopped": true, "folders": folders});
         self.latch.finish(reply.clone());
         reply
     }
+}
+
+/// When the steps of the shutdown sequence happen (from its start).
+#[derive(Clone, Copy, Debug)]
+struct Timings {
+    force_at: Duration,
+    kill_at: Duration,
+    settle: Duration,
+}
+
+const TIMINGS: Timings = Timings {
+    force_at: FORCE_AT,
+    kill_at: KILL_AT,
+    settle: KILL_SETTLE,
+};
+
+/// How a kill of the sequence's step 3 went.
+#[derive(Debug)]
+enum Kill {
+    Killed,
+    /// The worker was already gone.
+    Gone,
+    /// Not killed, and not known to be gone.
+    Failed(String),
 }
 
 /// One folder of the shutdown sequence.
@@ -838,7 +895,7 @@ struct Job {
     results: Receiver<Result<StopOutcome, String>>,
     outcome: Option<Result<StopOutcome, String>>,
     forced: bool,
-    killed: Option<Result<bool, String>>,
+    kill: Option<Kill>,
 }
 
 impl Job {
@@ -855,9 +912,80 @@ impl Job {
         }
     }
 
-    fn left_running(&self) -> bool {
-        matches!(self.outcome, Some(Ok(StopOutcome::LeftRunning(_))))
+    /// The stop has not shown the worker gone: no result yet, a refusal or
+    /// an error, or a folder still starting (its stop found nothing to stop).
+    fn unresolved(&self) -> bool {
+        match &self.outcome {
+            None | Some(Ok(StopOutcome::LeftRunning(_))) | Some(Err(_)) => true,
+            Some(Ok(_)) => self.slot.phase_name() == "Starting",
+        }
     }
+
+    /// The stop thread confirmed the worker's exit.
+    fn confirmed(&self) -> Option<&'static str> {
+        match &self.outcome {
+            Some(Ok(outcome @ (StopOutcome::Stopped | StopOutcome::Killed))) => {
+                Some(outcome_name(outcome))
+            }
+            _ => None,
+        }
+    }
+
+    /// `(outcome, error)` for the reply. A worker neither confirmed gone nor
+    /// killed is `stranded`, never `not_running`.
+    fn result(&self) -> (&'static str, Option<String>) {
+        match &self.kill {
+            Some(Kill::Killed) => ("killed", None),
+            Some(Kill::Gone) => (self.confirmed().unwrap_or("stopped"), None),
+            Some(Kill::Failed(error)) => match self.confirmed() {
+                Some(outcome) => (outcome, None),
+                None => ("stranded", Some(error.clone())),
+            },
+            None => match &self.outcome {
+                Some(Ok(StopOutcome::LeftRunning(reason))) => ("stranded", Some(reason.clone())),
+                Some(Ok(outcome)) => (outcome_name(outcome), None),
+                Some(Err(error)) => ("stranded", Some(error.clone())),
+                None => ("stranded", Some("STOP_UNCONFIRMED".into())),
+            },
+        }
+    }
+
+    /// Step 3: a starting worker is aborted through its controller, any
+    /// other killed by its verified record.
+    fn kill(&self) -> Kill {
+        if self.slot.phase_name() == "Starting" {
+            let Some(mut controller) = self.slot.lock_briefly() else {
+                return Kill::Failed("FOLDER_BUSY: the controller is held by a stop".into());
+            };
+            if matches!(controller.phase(), Phase::Starting { .. }) {
+                let aborted = controller.abort_start();
+                self.slot.refresh(&controller);
+                return match aborted {
+                    Ok(true) => Kill::Killed,
+                    Ok(false) => Kill::Gone,
+                    Err(error) => Kill::Failed(format!("{error:#}")),
+                };
+            }
+        }
+        let Some(record) = read_record(&self.state).or_else(|| self.record.clone()) else {
+            return Kill::Failed("WORKER_RECORD_MISSING: no worker.json to kill by".into());
+        };
+        match process::kill_verified(&record) {
+            Ok(true) => Kill::Killed,
+            Ok(false) if process_alive(record.pid) => Kill::Failed(format!(
+                "WORKER_KILL_REFUSED: pid {} is alive but does not match its record",
+                record.pid
+            )),
+            Ok(false) => Kill::Gone,
+            Err(error) => Kill::Failed(format!("{error:#}")),
+        }
+    }
+}
+
+/// Whether `pid` names a live process (conservative: a recycled pid counts).
+fn process_alive(pid: u32) -> bool {
+    process::ObservedProcess::open(pid)
+        .is_ok_and(|process| process.exited().is_ok_and(|exited| !exited))
 }
 
 /// Runs `slot.stop(force, start_wait)` on a thread; its result arrives on
@@ -881,7 +1009,7 @@ fn stop_thread(
     results
 }
 
-/// Polls `jobs` until each has an outcome (`done`) or `until`.
+/// Polls `jobs` until `done` holds for each, or `until`.
 fn collect(jobs: &mut [Job], until: Instant, done: impl Fn(&Job) -> bool) {
     loop {
         jobs.iter_mut().for_each(Job::poll);
@@ -892,7 +1020,7 @@ fn collect(jobs: &mut [Job], until: Instant, done: impl Fn(&Job) -> bool) {
     }
 }
 
-fn shutdown_folders(slots: Vec<Arc<Slot>>) -> Vec<Value> {
+fn shutdown_folders(slots: Vec<Arc<Slot>>, timings: Timings) -> Vec<Value> {
     let started = Instant::now();
     // 1. Every folder stops gracefully, in parallel.
     let mut jobs: Vec<Job> = slots
@@ -912,7 +1040,7 @@ fn shutdown_folders(slots: Vec<Arc<Slot>>) -> Vec<Value> {
                 )
             };
             let record = read_record(&state);
-            let results = stop_thread(slot.clone(), false, FORCE_AT);
+            let results = stop_thread(slot.clone(), false, timings.force_at);
             Job {
                 slot,
                 id,
@@ -923,73 +1051,54 @@ fn shutdown_folders(slots: Vec<Arc<Slot>>) -> Vec<Value> {
                 results,
                 outcome: None,
                 forced: false,
-                killed: None,
+                kill: None,
             }
         })
         .collect();
-    collect(&mut jobs, started + FORCE_AT, |job| job.outcome.is_some());
-    // 2. Force what is left: `stop(true)` where the graceful stop gave up,
-    // `shutdown {force}` on the link where it is still waiting.
-    let kill_at = started + KILL_AT;
-    for job in &mut jobs {
-        if job.left_running() {
-            job.forced = true;
-            job.outcome = None;
-            let wait = kill_at.saturating_duration_since(Instant::now());
-            job.results = stop_thread(job.slot.clone(), true, wait);
-        } else if job.outcome.is_none() {
-            job.forced = true;
-            if let Some(link) = job.link.clone() {
-                let deadline = kill_at.saturating_duration_since(Instant::now());
-                let _ = thread::Builder::new()
-                    .name("tkfs-shutdown-force".into())
-                    .spawn(move || {
-                        let _ = link.call("shutdown", json!({"force": true}), Vec::new(), deadline);
-                    });
-            }
-        }
-    }
-    collect(&mut jobs, kill_at, |job| {
-        job.outcome.is_some() && !job.left_running()
+    collect(&mut jobs, started + timings.force_at, |job| {
+        job.outcome.is_some()
     });
-    // 3. Kill any worker not confirmed gone, and any still starting (its
-    // stop found nothing to stop).
-    let mut killing = false;
+    // 2. Force what is left: `stop(true)` where the graceful stop ended
+    // without the worker gone (it waits for a starting one to run), and
+    // `shutdown {force}` on the link where it is still waiting.
+    let kill_at = started + timings.kill_at;
     for job in &mut jobs {
-        let starting = job.slot.phase_name() == "Starting";
-        if job.outcome.is_some() && !job.left_running() && !starting {
+        if !job.unresolved() {
             continue;
         }
         job.forced = true;
-        let record = read_record(&job.state).or_else(|| job.record.clone());
-        job.killed = Some(match record {
-            Some(record) => process::kill_verified(&record).map_err(|e| format!("{e:#}")),
-            None => Err("WORKER_RECORD_MISSING: no worker.json to kill by".into()),
-        });
-        killing = true;
+        if job.outcome.is_some() {
+            job.outcome = None;
+            let wait = kill_at.saturating_duration_since(Instant::now());
+            job.results = stop_thread(job.slot.clone(), true, wait);
+        } else if let Some(link) = job.link.clone() {
+            let deadline = kill_at.saturating_duration_since(Instant::now());
+            let _ = thread::Builder::new()
+                .name("tkfs-shutdown-force".into())
+                .spawn(move || {
+                    let _ = link.call("shutdown", json!({"force": true}), Vec::new(), deadline);
+                });
+        }
+    }
+    collect(&mut jobs, kill_at, |job| !job.unresolved());
+    // 3. Kill every worker not shown gone, a starting one included.
+    let mut killing = false;
+    for job in &mut jobs {
+        if job.unresolved() {
+            job.forced = true;
+            job.kill = Some(job.kill());
+            killing = true;
+        }
     }
     if killing {
-        collect(&mut jobs, Instant::now() + KILL_SETTLE, |job| {
-            job.killed.is_none() || job.outcome.is_some()
+        collect(&mut jobs, Instant::now() + timings.settle, |job| {
+            job.kill.is_none() || job.outcome.is_some()
         });
     }
     let elapsed_ms = started.elapsed().as_millis() as u64;
     jobs.iter()
         .map(|job| {
-            let (outcome, error) = match (&job.killed, &job.outcome) {
-                (Some(Ok(true)), _) => ("killed", None),
-                (_, Some(Ok(outcome))) => match outcome {
-                    StopOutcome::LeftRunning(reason) => ("left_running", Some(reason.clone())),
-                    outcome => (outcome_name(outcome), None),
-                },
-                (Some(Err(error)), _) => ("left_running", Some(error.clone())),
-                (_, Some(Err(error))) => ("error", Some(error.clone())),
-                (Some(Ok(false)), None) => (
-                    "left_running",
-                    Some("STOP_UNCONFIRMED: the worker could not be killed by its record".into()),
-                ),
-                (None, None) => ("error", Some("STOP_UNCONFIRMED".into())),
-            };
+            let (outcome, error) = job.result();
             if job.forced {
                 event!(warn, FORCED_STOP, {
                     "folder": job.id.clone(),
@@ -1075,10 +1184,228 @@ fn optional_path(payload: &Value, key: &str) -> Result<Option<PathBuf>> {
 mod tests {
     use super::*;
 
+    use crate::{
+        model::orchestrator::CallError,
+        orchestrator::{
+            process::{LaunchSpec, ProcessEvent, WorkerProcess},
+            worker::Ready,
+        },
+    };
+    use std::sync::mpsc::Sender;
+
     #[test]
-    fn the_sequence_forces_and_kills_within_the_bound() {
+    fn the_sequence_forces_kills_and_drains_within_the_bound() {
         assert_eq!(FORCE_AT, Duration::from_secs(15));
-        assert!(KILL_AT > FORCE_AT && KILL_AT + KILL_SETTLE < SHUTDOWN_BOUND);
+        assert!(KILL_AT > FORCE_AT);
+        // The kill, the settle and the longest drain all end within the bound.
+        assert!(KILL_AT + KILL_SETTLE + REQUEST_DRAIN <= SHUTDOWN_BOUND);
+    }
+
+    /// Spawns workers that never print Ready; kills are recorded (and
+    /// succeed).
+    #[derive(Default)]
+    struct NeverReady {
+        kills: Mutex<Vec<u32>>,
+    }
+
+    impl Launcher for NeverReady {
+        fn spawn(&self, _: &LaunchSpec, sink: Sender<ProcessEvent>) -> Result<WorkerProcess> {
+            // Kept open: the worker never exits on its own.
+            std::mem::forget(sink);
+            Ok(WorkerProcess::detached(PID))
+        }
+
+        fn adopt(
+            &self,
+            _: &Path,
+            _: Sender<ProcessEvent>,
+        ) -> Result<Option<(WorkerRecord, WorkerProcess)>> {
+            Ok(None)
+        }
+
+        fn connect(&self, _: &Ready, _: usize) -> Result<Arc<WorkerLink>, CallError> {
+            unreachable!("never Ready")
+        }
+
+        fn kill_verified(&self, record: &WorkerRecord) -> Result<bool> {
+            lock(&self.kills).push(record.pid);
+            Ok(true)
+        }
+    }
+
+    const PID: u32 = 4242;
+
+    fn record(id: &str, state: &Path) -> FolderRecord {
+        FolderRecord {
+            id: id.into(),
+            label: id.into(),
+            state: state.to_owned(),
+            repo: "repo".into(),
+            mount: None,
+            desired_running: true,
+            paused: false,
+            created_ms: 1,
+        }
+    }
+
+    fn slot(launcher: &Arc<NeverReady>, record: FolderRecord, start: bool) -> Arc<Slot> {
+        let mut controller = Controller::new(
+            record,
+            PathBuf::from("tkfs-test"),
+            1,
+            launcher.clone(),
+            Arc::new(SystemClock),
+        );
+        if start {
+            controller.start();
+        }
+        Slot::new(controller)
+    }
+
+    fn worker_record(pid: u32) -> WorkerRecord {
+        WorkerRecord {
+            format: 1,
+            pid,
+            start_ms: 1,
+            image: PathBuf::from("tkfs-test"),
+            version: "test".into(),
+            instance: "instance".into(),
+            address: "127.0.0.1:1".into(),
+            ipc: 1,
+        }
+    }
+
+    #[test]
+    fn a_worker_still_starting_at_the_kill_is_killed_or_stranded_never_not_running() {
+        let launcher = Arc::new(NeverReady::default());
+        let root = tempfile::tempdir().unwrap();
+        // Starting, with the record a worker writes before Ready.
+        let recorded = root.path().join("recorded");
+        fs::create_dir_all(&recorded).unwrap();
+        fs::write(
+            recorded.join(RECORD_FILE),
+            serde_json::to_vec(&worker_record(PID)).unwrap(),
+        )
+        .unwrap();
+        // Starting, hung before writing any record, with no handle that can
+        // kill it (a detached stand-in).
+        let unrecorded = root.path().join("unrecorded");
+        let slots = vec![
+            slot(&launcher, record("recorded", &recorded), true),
+            slot(&launcher, record("unrecorded", &unrecorded), true),
+            slot(&launcher, record("stopped", &root.path().join("s")), false),
+        ];
+        let timings = Timings {
+            force_at: Duration::from_millis(100),
+            kill_at: Duration::from_millis(300),
+            settle: Duration::from_millis(100),
+        };
+        let started = Instant::now();
+        let folders = shutdown_folders(slots.clone(), timings);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let outcome = |id: &str| {
+            folders
+                .iter()
+                .find(|folder| folder["state"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(outcome("recorded")["outcome"], "killed", "{folders:?}");
+        assert_eq!(lock(&launcher.kills).as_slice(), &[PID]);
+        assert_eq!(slots[0].lock().phase(), &Phase::Stopped);
+        let stranded = outcome("unrecorded");
+        assert_eq!(stranded["outcome"], "stranded", "{folders:?}");
+        assert!(
+            stranded["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("PROCESS_DETACHED")),
+            "{stranded}"
+        );
+        assert_eq!(outcome("stopped")["outcome"], "not_running");
+        assert!(outcome("stopped")["error"].is_null());
+    }
+
+    #[test]
+    fn a_killed_or_gone_worker_is_never_reported_running_and_a_failed_kill_is_stranded() {
+        let launcher = Arc::new(NeverReady::default());
+        let root = tempfile::tempdir().unwrap();
+        let slot = slot(&launcher, record("f", root.path()), false);
+        let (_sender, results) = mpsc::channel();
+        let mut job = Job {
+            slot,
+            id: "f".into(),
+            label: "f".into(),
+            state: root.path().to_owned(),
+            link: None,
+            record: None,
+            results,
+            outcome: Some(Ok(StopOutcome::NotRunning)),
+            forced: true,
+            kill: Some(Kill::Failed("WORKER_KILL_FAILED: denied".into())),
+        };
+        assert_eq!(
+            job.result(),
+            ("stranded", Some("WORKER_KILL_FAILED: denied".into()))
+        );
+        job.outcome = Some(Ok(StopOutcome::Stopped));
+        assert_eq!(job.result(), ("stopped", None));
+        job.outcome = Some(Ok(StopOutcome::LeftRunning("BUSY_VIEW: 1".into())));
+        job.kill = Some(Kill::Gone);
+        assert_eq!(job.result(), ("stopped", None));
+        job.kill = Some(Kill::Killed);
+        assert_eq!(job.result(), ("killed", None));
+        job.kill = None;
+        job.outcome = None;
+        assert_eq!(job.result().0, "stranded");
+    }
+
+    /// A daemon on `root` that never listens for peers.
+    fn daemon(root: &Path) -> Arc<Daemon> {
+        let path = root.join("orchestrator.toml");
+        let mut config = Config::initialize(&path).unwrap();
+        config.network.listen = String::new();
+        fs::create_dir_all(&config.data_directory).unwrap();
+        let lock = File::create(config.data_directory.join(LOCK_FILE)).unwrap();
+        Daemon::new(config, path, lock).unwrap()
+    }
+
+    #[test]
+    fn starts_are_refused_once_shutdown_began() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = daemon(root.path());
+        let record = daemon
+            .catalog
+            .create_folder("Project", "repo", None)
+            .unwrap();
+        daemon.catalog.set_desired(&record.id, false).unwrap();
+        let record = daemon.catalog.resolve(&record.id).unwrap();
+        let slot = daemon.register(record.clone());
+        daemon.stopping.cancel();
+        for retry in [false, true] {
+            let error = format!("{:#}", daemon.start(&record, retry).unwrap_err());
+            assert!(error.starts_with("ORCHESTRATOR_STOPPING"), "{error}");
+        }
+        assert_eq!(slot.lock().phase(), &Phase::Stopped);
+        assert!(!daemon.catalog.resolve(&record.id).unwrap().desired_running);
+        // `create` registers the folder but does not start it.
+        let error = format!(
+            "{:#}",
+            daemon.create(&json!({"label": "Other"})).unwrap_err()
+        );
+        assert!(error.starts_with("ORCHESTRATOR_STOPPING"), "{error}");
+        let other = daemon.catalog.resolve("Other").unwrap();
+        assert_eq!(
+            daemon.slot(&other.id).unwrap().lock().phase(),
+            &Phase::Stopped
+        );
+        // The action itself is refused on arrival.
+        let error = format!(
+            "{:#}",
+            daemon
+                .execute("start", &json!({"state": "Project"}))
+                .unwrap_err()
+        );
+        assert!(error.starts_with("ORCHESTRATOR_STOPPING"), "{error}");
     }
 
     #[test]

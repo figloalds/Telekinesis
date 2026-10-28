@@ -442,6 +442,40 @@ impl Controller {
         }
     }
 
+    /// Starting → Stopped by killing the worker that is still starting (no
+    /// Ready line yet, or adopted and not yet linked): through the handle
+    /// that observes it (a child this daemon spawned, so its identity is
+    /// known, with no `worker.json` needed), else by its verified record.
+    /// `Ok(true)` killed, `Ok(false)` it had already exited. An error leaves
+    /// the phase alone; any phase but Starting is left alone (`Ok(false)`).
+    pub fn abort_start(&mut self) -> Result<bool> {
+        if !matches!(self.phase, Phase::Starting { .. }) {
+            return Ok(false);
+        }
+        let by_handle = self.process.as_ref().map(WorkerProcess::kill);
+        let killed = match by_handle {
+            Some(Ok(killed)) => {
+                event!(warn, FOLDER_WORKER_KILLED, {
+                    "folder": self.record.id.clone(),
+                    "pid": self.process.as_ref().map(|process| process.pid),
+                    "killed": killed,
+                    "starting": true,
+                });
+                killed
+            }
+            by_handle => match self.kill_current() {
+                Some(result) => result?,
+                None => match by_handle {
+                    Some(Err(error)) => return Err(error),
+                    _ => false,
+                },
+            },
+        };
+        self.teardown();
+        self.phase = Phase::Stopped;
+        Ok(killed)
+    }
+
     /// Drains process events and watch results, checks liveness and the
     /// Ready deadline, and ends an expired backoff. Blocks only in bounded
     /// calls: a loopback dial or the 2 s `hello` probe.
@@ -995,6 +1029,68 @@ mod tests {
             code: Some(code),
             tail: "tail".into(),
         }
+    }
+
+    #[test]
+    fn abort_start_kills_a_worker_that_never_became_ready() {
+        let clock = Arc::new(ManualClock::new(1_800_000_000_000));
+        let stub = Stub::new(vec![]);
+        // A spawned worker that wrote its record but no Ready line yet.
+        let state = tempfile::tempdir().unwrap();
+        let mut record = folder();
+        record.state = state.path().to_owned();
+        let mut c = Controller::new(
+            record,
+            PathBuf::from("tkfs-test"),
+            1,
+            stub.clone(),
+            clock.clone(),
+        );
+        c.start();
+        assert!(matches!(
+            c.phase(),
+            Phase::Starting {
+                adopting: false,
+                ..
+            }
+        ));
+        let worker = WorkerRecord {
+            format: 1,
+            pid: PID,
+            start_ms: 1,
+            image: PathBuf::from("tkfs-test"),
+            version: "test".into(),
+            instance: "instance".into(),
+            address: "127.0.0.1:1".into(),
+            ipc: 1,
+        };
+        fs::write(
+            state.path().join(RECORD_FILE),
+            serde_json::to_vec(&worker).unwrap(),
+        )
+        .unwrap();
+        assert!(c.abort_start().unwrap());
+        assert_eq!(c.phase(), &Phase::Stopped);
+        assert_eq!(stub.kills(), vec![PID]);
+        // Not Starting: nothing to abort.
+        assert!(!c.abort_start().unwrap());
+        assert_eq!(stub.kills(), vec![PID]);
+    }
+
+    #[test]
+    fn abort_start_without_a_handle_or_record_is_an_error_and_keeps_starting() {
+        let clock = Arc::new(ManualClock::new(1_800_000_000_000));
+        let stub = Stub::new(vec![]);
+        let mut c = controller(&stub, &clock);
+        c.start();
+        // The stub's process is detached and folder() has no worker.json.
+        let error = c.abort_start().unwrap_err();
+        assert!(
+            format!("{error:#}").contains("PROCESS_DETACHED"),
+            "{error:#}"
+        );
+        assert!(matches!(c.phase(), Phase::Starting { .. }));
+        assert!(stub.kills().is_empty());
     }
 
     #[test]

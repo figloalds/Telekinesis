@@ -117,6 +117,18 @@ impl WorkerProcess {
             None => anyhow::bail!("PROCESS_DETACHED: pid {} is not observed", self.pid),
         }
     }
+
+    /// Kills this very process through the handle (Windows) or pidfd
+    /// (Linux) that observes it, so a recycled pid is never hit: `Ok(true)`
+    /// killed, `Ok(false)` already exited. A spawned worker's handle may
+    /// terminate; an adopted one's may not on Windows (an error: use
+    /// [`kill_verified`] with its record).
+    pub fn kill(&self) -> Result<bool> {
+        match &self.process {
+            Some(process) => process.terminate(),
+            None => anyhow::bail!("PROCESS_DETACHED: pid {} is not observed", self.pid),
+        }
+    }
 }
 
 /// Spawns a worker for `spec`; its events go to `sink`.
@@ -165,7 +177,7 @@ pub fn spawn(spec: &LaunchSpec, sink: mpsc::Sender<ProcessEvent>) -> Result<Work
     drop(command);
     let pid = child.id();
     let started = (|| {
-        let process = Arc::new(ObservedProcess::open(pid)?);
+        let process = Arc::new(ObservedProcess::open_child(pid)?);
         let stdout = child.stdout.take().context("stdout is not piped")?;
         let emitter = Arc::new(Emitter::new(sink));
         let (drained, drained_rx) = mpsc::channel::<()>();
@@ -540,6 +552,69 @@ impl ObservedProcess {
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         Ok(Self { pid })
+    }
+
+    /// [`Self::open`] for a child this process just spawned (and so knows):
+    /// on Windows the handle may also terminate it ([`Self::terminate`]).
+    fn open_child(pid: u32) -> Result<Self> {
+        #[cfg(windows)]
+        {
+            Self::open_with(pid, os::QUERY | os::SYNCHRONIZE | os::TERMINATE)
+        }
+        #[cfg(not(windows))]
+        {
+            Self::open(pid)
+        }
+    }
+
+    /// Kills the observed process: `Ok(false)` when it already exited.
+    fn terminate(&self) -> Result<bool> {
+        if self.exited()? {
+            return Ok(false);
+        }
+        #[cfg(windows)]
+        {
+            if let Err(error) = self.kill() {
+                if self.exited()? {
+                    return Ok(false);
+                }
+                return Err(error.context(format!("WORKER_KILL_FAILED: pid {}", self.pid)));
+            }
+            Ok(true)
+        }
+        #[cfg(unix)]
+        {
+            // Linux signals the pidfd itself; elsewhere the pid of an
+            // unreaped child of this process (it cannot be recycled).
+            #[cfg(target_os = "linux")]
+            let sent = {
+                use std::os::fd::AsRawFd;
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.pidfd.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                }
+            };
+            #[cfg(not(target_os = "linux"))]
+            let sent = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGKILL) };
+            if sent != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(false);
+                }
+                return Err(anyhow::Error::new(error)
+                    .context(format!("WORKER_KILL_FAILED: pid {}", self.pid)));
+            }
+            Ok(true)
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            anyhow::bail!("WORKER_KILL_UNSUPPORTED: pid {}", self.pid)
+        }
     }
 
     #[cfg(windows)]

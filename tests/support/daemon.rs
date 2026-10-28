@@ -1,8 +1,11 @@
 //! `TestDaemon`: a real `tkfs start` orchestrator in a temporary home, driven
 //! through `tkfs manage --json`. Every wait is bounded. A daemon still alive
 //! when the harness lets go of it is killed and reported as
-//! `STRANDED_PROCESS`; so is a worker left running in the data directory
-//! once the home is dropped. Headless only: never passes `--mount`.
+//! `STRANDED_PROCESS`. Workers are checked whenever the harness lets go of a
+//! home: `shutdown`, `shutdown_keep_home` and `into_home` kill any worker
+//! `DATA/*/worker.json` still names alive and fail with `STRANDED_PROCESS`;
+//! `Drop` (a test already failing) kills and reports them. Headless only:
+//! never passes `--mount`.
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use std::{
@@ -117,27 +120,74 @@ impl TestDaemon {
         Self::start_in(home)
     }
 
+    /// A daemon on a fresh, empty home: it creates `orchestrator.toml`
+    /// (auto-init), whose default `listen` is `127.0.0.1:43180`. When that
+    /// port is taken (`LISTEN_FAILED`), the auto-created file is checked
+    /// (format 2, defaults), its `listen` rewritten to `127.0.0.1:0`, and the
+    /// daemon started again.
+    pub fn start_empty_home() -> Result<Self> {
+        let home = tempfile::tempdir()?;
+        let config = home.path().join("orchestrator.toml");
+        let (home, error) = match Self::launch(home) {
+            Ok(daemon) => return Ok(daemon),
+            Err((Some(home), error)) if format!("{error:#}").contains("LISTEN_FAILED") => {
+                (home, error)
+            }
+            Err((_, error)) => return Err(error),
+        };
+        let written = fs::read_to_string(&config)
+            .with_context(|| format!("no auto-created orchestrator.toml after {error:#}"))?;
+        let loaded = tkfs::orchestrator::config::Config::load(&config)?;
+        if loaded.format_version != 2
+            || loaded.network.listen != "127.0.0.1:43180"
+            || loaded.maximum_running != 8
+            || loaded.data_directory != home.path().join("data")
+        {
+            bail!("auto-init wrote unexpected defaults:\n{written}");
+        }
+        let rewritten = written.replace("\"127.0.0.1:43180\"", "\"127.0.0.1:0\"");
+        if rewritten == written {
+            bail!("no listen = \"127.0.0.1:43180\" line to rewrite:\n{written}");
+        }
+        fs::write(&config, rewritten)?;
+        eprintln!("start_empty_home: 127.0.0.1:43180 is taken; restarting on 127.0.0.1:0");
+        Self::start_in(home)
+    }
+
     /// A daemon on `home` as it is: with no `orchestrator.toml` the daemon
     /// creates one (auto-init); an existing one (and catalog) is reused.
     pub fn start_in(home: TempDir) -> Result<Self> {
+        Self::launch(home).map_err(|(_, error)| error)
+    }
+
+    /// [`Self::start_in`]; a daemon that exits before writing
+    /// `orchestrator.json` hands the home back with the error.
+    fn launch(home: TempDir) -> std::result::Result<Self, (Option<TempDir>, anyhow::Error)> {
+        let failed = |home, error| (Some(home), error);
         static LOGS: AtomicUsize = AtomicUsize::new(0);
         let config = home.path().join("orchestrator.toml");
         let log = home.path().join(format!(
             "daemon-{}.log",
             LOGS.fetch_add(1, Ordering::Relaxed)
         ));
-        let file = fs::File::create(&log)?;
+        let file = match fs::File::create(&log).and_then(|file| Ok((file.try_clone()?, file))) {
+            Ok(files) => files,
+            Err(error) => return Err(failed(home, error.into())),
+        };
         let child = Command::new(env!("CARGO_BIN_EXE_tkfs"))
             .arg("-f")
             .arg(&config)
             .arg("start")
             .stdin(Stdio::null())
-            .stdout(file.try_clone()?)
-            .stderr(file)
+            .stdout(file.0)
+            .stderr(file.1)
             .env_remove("TKFS_FAKE_NOW_MS")
             .env_remove("TKFS_UNSUPERVISED_EXIT_S")
-            .spawn()
-            .context("spawn tkfs start")?;
+            .spawn();
+        let child = match child {
+            Ok(child) => child,
+            Err(error) => return Err(failed(home, anyhow!("spawn tkfs start: {error}"))),
+        };
         let mut daemon = Self {
             home: Some(home),
             config,
@@ -150,17 +200,24 @@ impl TestDaemon {
             if discovery.exists() {
                 return Ok(daemon);
             }
-            if let Some(status) = daemon.child.as_mut().unwrap().try_wait()? {
-                bail!(
-                    "the daemon exited ({status}) before writing orchestrator.json; log:\n{}",
-                    daemon.log_text()
-                );
+            match daemon.child.as_mut().unwrap().try_wait() {
+                Ok(Some(status)) => {
+                    daemon.child = None;
+                    let error = anyhow!(
+                        "the daemon exited ({status}) before writing orchestrator.json; log:\n{}",
+                        daemon.log_text()
+                    );
+                    return Err((daemon.home.take(), error));
+                }
+                Ok(None) => {}
+                Err(error) => return Err((None, error.into())),
             }
             if Instant::now() >= end {
-                bail!(
+                let error = anyhow!(
                     "no orchestrator.json within {START_BOUND:?}; log:\n{}",
                     daemon.log_text()
                 );
+                return Err((None, error));
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -348,7 +405,7 @@ impl TestDaemon {
         if self.data().join("orchestrator.json").exists() {
             bail!("orchestrator.json left behind after shutdown");
         }
-        Ok(self.home.take().unwrap())
+        self.release_home()
     }
 
     /// The home of a daemon that has exited (see [`Self::wait_exit`]).
@@ -356,8 +413,50 @@ impl TestDaemon {
         if self.child.is_some() {
             bail!("the daemon is still running");
         }
+        self.release_home()
+    }
+
+    /// Hands the home over once no worker of it survives: a live one is
+    /// killed and fails the call (the home is then cleaned up by `Drop`).
+    fn release_home(&mut self) -> Result<TempDir> {
+        let stranded = kill_stranded_workers(&self.data());
+        if !stranded.is_empty() {
+            bail!("{}", stranded.join("; "));
+        }
         Ok(self.home.take().unwrap())
     }
+}
+
+/// Kills every worker a `DATA/*/worker.json` names that is still that live
+/// process (identity-checked by `kill_verified`); one message per worker.
+fn kill_stranded_workers(data: &Path) -> Vec<String> {
+    let mut stranded = Vec::new();
+    let Ok(folders) = fs::read_dir(data) else {
+        return stranded;
+    };
+    for folder in folders.flatten() {
+        let Ok(bytes) = fs::read(folder.path().join("worker.json")) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<tkfs::orchestrator::worker::WorkerRecord>(&bytes)
+        else {
+            continue;
+        };
+        match tkfs::orchestrator::process::kill_verified(&record) {
+            Ok(true) => stranded.push(format!(
+                "STRANDED_PROCESS: worker {} of {} survived its daemon (killed)",
+                record.pid,
+                folder.path().display()
+            )),
+            Ok(false) => {}
+            Err(error) => stranded.push(format!(
+                "STRANDED_PROCESS: worker {} of {} survived its daemon and could not be killed: {error:#}",
+                record.pid,
+                folder.path().display()
+            )),
+        }
+    }
+    stranded
 }
 
 impl Drop for TestDaemon {
@@ -375,26 +474,8 @@ impl Drop for TestDaemon {
         let Some(home) = &self.home else {
             return;
         };
-        let Ok(folders) = fs::read_dir(home.path().join("data")) else {
-            return;
-        };
-        for folder in folders.flatten() {
-            let record = folder.path().join("worker.json");
-            let Ok(bytes) = fs::read(&record) else {
-                continue;
-            };
-            let Ok(record) =
-                serde_json::from_slice::<tkfs::orchestrator::worker::WorkerRecord>(&bytes)
-            else {
-                continue;
-            };
-            if let Ok(true) = tkfs::orchestrator::process::kill_verified(&record) {
-                eprintln!(
-                    "STRANDED_PROCESS: worker pid {} of {} was still running; killed",
-                    record.pid,
-                    folder.path().display()
-                );
-            }
+        for message in kill_stranded_workers(&home.path().join("data")) {
+            eprintln!("{message}");
         }
     }
 }

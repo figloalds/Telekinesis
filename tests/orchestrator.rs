@@ -48,11 +48,10 @@ fn error_of(result: Result<Value>) -> String {
 
 #[test]
 fn start_auto_inits_config_creates_headless_folders_and_shuts_down_cleanly() -> Result<()> {
-    let home = tempfile::tempdir()?;
-    let config = home.path().join("orchestrator.toml");
-    assert!(!config.exists());
-    let d = TestDaemon::start_in(home)?;
-    let written = fs::read_to_string(&config)?;
+    // The empty home gets an auto-created orchestrator.toml (checked by the
+    // harness when the default port is taken and the file is rewritten).
+    let d = TestDaemon::start_empty_home()?;
+    let written = fs::read_to_string(&d.config)?;
     assert!(
         written.contains("format_version = 2"),
         "auto-init wrote:\n{written}"
@@ -314,7 +313,7 @@ fn sigterm_runs_the_shutdown_sequence_and_forces_a_hung_worker_within_the_bound(
     let elapsed = started.elapsed();
     assert_eq!(code, 0, "log:\n{}", d.log_text());
     assert!(
-        elapsed <= SHUTDOWN_BOUND + Duration::from_secs(5),
+        elapsed <= SHUTDOWN_BOUND + Duration::from_secs(2),
         "shutdown took {elapsed:?}"
     );
     let log = d.log_text();
