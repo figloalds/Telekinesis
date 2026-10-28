@@ -8,8 +8,13 @@
 //! - `feed.apply {}`, body `Vec<Event>` → `{"applied": usize}`.
 //! - `meta.exchange {repo}`, body [`FeedRequest`] → [`FeedReply`].
 //! - `objects.missing {limit}` → `Vec<(Digest, Kind)>`, `limit` ≤ [`BATCH`].
-//! - `objects.fetch {repo}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`.
-//! - `objects.write {repo}`, body `Vec<Object>` → `{"stored": usize}`.
+//! - `objects.fetch {repo}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`,
+//!   at most [`OBJECT_BATCH`] objects.
+//! - `objects.write {repo}`, body `Vec<Object>` → `{"stored": usize}`, at
+//!   most [`OBJECT_BATCH`] objects.
+//!
+//! Object bytes travel as JSON number arrays (up to 4 bytes per byte), so the
+//! batch bounds are set to what fits `protocol::max_body` of each op.
 use super::demand::Demand;
 use crate::{
     content::{Kind, working::lock},
@@ -26,13 +31,20 @@ use std::{
     sync::Arc,
 };
 
+/// Most objects one `objects.missing` reply lists.
 pub const BATCH: usize = 64;
+/// Most objects one `objects.fetch` request or `objects.write` body carries:
+/// 32 full 64 KiB chunks encode to about 8 MiB, within the 16 MiB default
+/// session body bound.
+pub const OBJECT_BATCH: usize = BATCH / 2;
+/// Most raw object bytes one `objects.fetch` reply or `objects.write` carries.
 pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 pub const FETCH_OP: &str = "objects.fetch";
 /// Events per `feed.outgoing` page and per `meta.exchange` request or reply.
 pub const FEED_PAGE: usize = 256;
-/// Most events one `feed.apply` takes (the store's own read bound).
-pub const MAX_APPLY: usize = 4096;
+/// Most events one `feed.apply` takes: one feed page, as `feed.outgoing` and
+/// `meta.exchange` hand them out, which fits `max_body("feed.apply")`.
+pub const MAX_APPLY: usize = FEED_PAGE;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Object {
     pub digest: Digest,
@@ -160,7 +172,7 @@ impl Service {
         Ok(wanted)
     }
     fn fetch(&self, wanted: Vec<(Digest, Kind)>) -> Result<Vec<Object>> {
-        ensure!(wanted.len() <= BATCH, "OBJECT_BATCH_TOO_LARGE");
+        ensure!(wanted.len() <= OBJECT_BATCH, "OBJECT_BATCH_TOO_LARGE");
         let content = self.engine.working.content();
         let _pins = content.packs.pin(wanted.iter().map(|(d, _)| *d));
         let mut objects = Vec::new();
@@ -182,7 +194,7 @@ impl Service {
     /// wakes the readers waiting for them.
     fn write(&self, objects: Vec<Object>) -> Result<usize> {
         ensure!(
-            objects.len() <= BATCH
+            objects.len() <= OBJECT_BATCH
                 && objects.iter().map(|o| o.bytes.len()).sum::<usize>() <= MAX_BATCH_BYTES,
             "OBJECT_BATCH_TOO_LARGE"
         );
@@ -656,21 +668,35 @@ mod tests {
         assert_eq!(empty.cursor, 300, "an empty page keeps the cursor");
 
         let incoming = service(&target);
-        let applied: serde_json::Value = serde_json::from_slice(&call(
+        // More than one page is refused before anything is applied.
+        let error = call(
             &incoming,
             "feed.apply",
             json!({}),
             &serde_json::to_vec(&events)?,
-        )?)?;
-        assert_eq!(applied, json!({"applied":300}));
+        )
+        .unwrap_err();
+        assert_eq!(code(&error), "FEED_BATCH_TOO_LARGE", "{error:#}");
+        assert!(journal(&target)?.is_empty());
+        let apply = |events: &[Event]| -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(&call(
+                &incoming,
+                "feed.apply",
+                json!({}),
+                &serde_json::to_vec(events)?,
+            )?)?)
+        };
+        let applied = apply(&first.events)?["applied"].as_u64().unwrap()
+            + apply(&last.events)?["applied"].as_u64().unwrap();
+        assert_eq!(applied, 300);
         assert_eq!(journal(&target)?, events);
-        let again: serde_json::Value = serde_json::from_slice(&call(
-            &incoming,
-            "feed.apply",
-            json!({}),
-            &serde_json::to_vec(&events)?,
-        )?)?;
-        assert_eq!(again, json!({"applied":0}), "re-applying is idempotent");
+        for page in [&first.events, &last.events] {
+            assert_eq!(
+                apply(page)?,
+                json!({"applied":0}),
+                "re-applying is idempotent"
+            );
+        }
         assert_eq!(journal(&target)?, events);
         source.shutdown()?;
         target.shutdown()?;
@@ -816,7 +842,8 @@ mod tests {
         let demand = incoming.demand.clone();
         let wanted = chunks[0];
         let waiter = std::thread::spawn(move || {
-            let _ = sent.send(demand.fetch(&[(wanted, Kind::Chunk)]));
+            let result = demand.fetch(&[(wanted, Kind::Chunk)]);
+            let _ = sent.send((result, Instant::now()));
         });
         let end = Instant::now() + Duration::from_secs(5);
         while !incoming.demand.pending().contains(&(wanted, Kind::Chunk)) {
@@ -835,10 +862,23 @@ mod tests {
             json!({"repo":"repo"}),
             &fetched,
         )?)?;
+        let written = Instant::now();
         assert_eq!(stored, json!({"stored":1}));
-        received
+        // `objects.write` itself retires the demand (`Demand::arrived`), not
+        // the waiter's own periodic re-check of the packs.
+        assert!(
+            !incoming.demand.pending().contains(&(wanted, Kind::Chunk)),
+            "objects.write must retire the demand it satisfied"
+        );
+        let (result, woken) = received
             .recv_timeout(Duration::from_secs(1))
-            .context("the blocked fetch was not woken within 1 s")??;
+            .context("the blocked fetch was not woken within 1 s")?;
+        result?;
+        let delay = woken.saturating_duration_since(written);
+        assert!(
+            delay < Duration::from_millis(100),
+            "the waiter was woken {delay:?} after objects.write, not promptly"
+        );
         waiter.join().unwrap();
         assert!(incoming.demand.pending().is_empty());
         assert_eq!(
@@ -847,6 +887,115 @@ mod tests {
         );
         source.shutdown()?;
         target.shutdown()?;
+        Ok(())
+    }
+
+    /// The bound a session applies to `op`'s request and reply bodies.
+    fn session_limit(op: &str) -> usize {
+        crate::model::protocol::max_body(op).min(crate::session::ConnOptions::default().max_body)
+    }
+
+    #[test]
+    fn largest_object_and_feed_batches_fit_their_session_body_bounds() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+        let chunk = crate::model::content::CHUNK_SIZE as usize;
+        let objects: Vec<Object> = (0..=OBJECT_BATCH)
+            .map(|n| {
+                // 0xFF is the widest byte in a JSON number array ("255,").
+                let mut bytes = vec![0xFF; chunk];
+                bytes[..8].copy_from_slice(&(n as u64).to_le_bytes());
+                Object {
+                    digest: Digest::bytes(&bytes),
+                    kind: Kind::Chunk,
+                    bytes,
+                }
+            })
+            .collect();
+        let (largest, beyond) = (&objects[..OBJECT_BATCH], &objects[..=OBJECT_BATCH]);
+
+        // objects.write: the largest batch fits; one more object is refused.
+        let body = serde_json::to_vec(largest)?;
+        assert!(body.len() > 8 * 1024 * 1024, "{} bytes", body.len());
+        assert!(
+            body.len() <= session_limit("objects.write"),
+            "{} bytes",
+            body.len()
+        );
+        let error = call(
+            &service,
+            "objects.write",
+            json!({"repo":"repo"}),
+            &serde_json::to_vec(beyond)?,
+        )
+        .unwrap_err();
+        assert_eq!(code(&error), "OBJECT_BATCH_TOO_LARGE");
+        let stored: serde_json::Value = serde_json::from_slice(&call(
+            &service,
+            "objects.write",
+            json!({"repo":"repo"}),
+            &body,
+        )?)?;
+        assert_eq!(stored, json!({"stored":OBJECT_BATCH}));
+
+        // objects.fetch: the reply to the largest request fits; more is refused.
+        let wanted: Vec<_> = largest.iter().map(|o| (o.digest, o.kind)).collect();
+        let reply = call(
+            &service,
+            FETCH_OP,
+            json!({"repo":"repo"}),
+            &serde_json::to_vec(&wanted)?,
+        )?;
+        assert_eq!(
+            serde_json::from_slice::<Vec<Object>>(&reply)?.len(),
+            OBJECT_BATCH
+        );
+        assert!(
+            reply.len() <= session_limit(FETCH_OP),
+            "{} bytes",
+            reply.len()
+        );
+        let mut too_many = wanted.clone();
+        too_many.push((beyond[OBJECT_BATCH].digest, Kind::Chunk));
+        let error = call(
+            &service,
+            FETCH_OP,
+            json!({"repo":"repo"}),
+            &serde_json::to_vec(&too_many)?,
+        )
+        .unwrap_err();
+        assert_eq!(code(&error), "OBJECT_BATCH_TOO_LARGE");
+
+        // feed.apply / feed.outgoing: a full page of wide content events.
+        let h = engine.open_file("f", true, false, true)?;
+        engine.write(h, 0, &vec![1; chunk + 1], false, false)?;
+        engine.flush(Some(h))?;
+        engine.close(h)?;
+        let mut event = journal(&engine)?
+            .into_iter()
+            .rfind(|event| event.state.content.is_some())
+            .unwrap();
+        event.state.name = "n".repeat(255);
+        event.parents = vec![event.id.clone(); 4];
+        let page = vec![event; MAX_APPLY];
+        let body = serde_json::to_vec(&page)?;
+        assert!(
+            body.len() <= session_limit("feed.apply"),
+            "{} bytes",
+            body.len()
+        );
+        let reply = serde_json::to_vec(&FeedPage {
+            cursor: u64::MAX,
+            events: page,
+            more: true,
+        })?;
+        assert!(
+            reply.len() <= session_limit("feed.outgoing"),
+            "{} bytes",
+            reply.len()
+        );
+        engine.shutdown()?;
         Ok(())
     }
 

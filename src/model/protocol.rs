@@ -91,11 +91,17 @@ pub fn op_allowed(op: &str, role: LaneRole) -> bool {
     }
 }
 pub fn max_body(op: &str) -> usize {
-    if op == "objects.fetch" {
+    if matches!(op, "objects.fetch" | "objects.write") {
         32 * 1024 * 1024
     } else if matches!(
         op,
-        "meta.exchange" | "cat" | "tree" | "events" | "desktop-snapshot"
+        "meta.exchange"
+            | "feed.apply"
+            | "feed.outgoing"
+            | "cat"
+            | "tree"
+            | "events"
+            | "desktop-snapshot"
     ) {
         16 * 1024 * 1024
     } else {
@@ -413,5 +419,14 @@ mod tests {
         assert_eq!(max_body("cat"), 16 * 1024 * 1024);
         assert_eq!(max_body("tree"), max_body("meta.exchange"));
         assert_eq!(max_body("hello"), 1024 * 1024);
+    }
+
+    #[test]
+    fn worker_sync_ops_get_bodies_that_fit_their_batches() {
+        assert_eq!(max_body("objects.fetch"), 32 * 1024 * 1024);
+        assert_eq!(max_body("objects.write"), 32 * 1024 * 1024);
+        assert_eq!(max_body("feed.apply"), 16 * 1024 * 1024);
+        assert_eq!(max_body("feed.outgoing"), 16 * 1024 * 1024);
+        assert_eq!(max_body("objects.missing"), 1024 * 1024);
     }
 }
