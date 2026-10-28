@@ -177,6 +177,7 @@ pub struct Conflict {
     pub entity: String,
     pub branch: String,
     pub visible: String,
+    pub current_heads: BTreeSet<String>,
     pub heads: Vec<Event>,
     pub resolved: bool,
 }
@@ -1306,11 +1307,13 @@ impl Store {
         versions
             .into_iter()
             .map(|(entity, heads)| {
-                let resolved = self
+                let current_heads = self
                     .projection()
                     .heads
                     .get(&entity)
-                    .is_none_or(|h| h.len() < 2);
+                    .cloned()
+                    .unwrap_or_default();
+                let resolved = current_heads.len() < 2;
                 let visible = self
                     .projection()
                     .visible
@@ -1325,6 +1328,7 @@ impl Store {
                     entity,
                     branch: self.active.clone(),
                     visible,
+                    current_heads,
                     heads,
                     resolved,
                 })

@@ -1,8 +1,11 @@
 # W6-P0-MOUNT-LIFECYCLE: kernel cleanup hang
 
 Status: **OPEN, P0 — fixed-driver lifecycle/build checks pass; performance acceptance fails**
-(2026-10-26). Resolve this before
-other Wave 6 feature work, runtime cutover or mounted performance qualification.
+(2026-10-28). Runtime cutover and host mounted qualification remain blocked.
+The user directed correctness/implementation work to proceed with performance
+gates last on 2026-10-28, superseding the earlier prerequisite for all other
+Wave 6 work. Isolation and lifecycle/cache/durability/access invariants still apply;
+this scheduling change does not close P0 or turn failed metrics into passes.
 Documentation and diagnosis do not close this demand. The fix below is
 implemented in this checkout ([note](notes/mount-lifecycle-fix.md)); the demand
 closes only when all acceptance checks, including the purge-cost decision, pass.
@@ -28,6 +31,25 @@ fail, and the purge-off delivery proof is still open, so P0 stays open.
 
 ## Current work and executable acceptance
 
+The 2026-10-28 correctness pass fixes pending-save ordering during conflict
+resolution, invalidation of both names after a selected rename, and notification
+actions for unselected delete alternatives. Failed delete cleanup now retires
+writers and Close releases their handles while preserving the error and draft.
+Import validates its source before destination mutation; a refused large `cat`
+releases its read handle. Conflict history exposes current heads so the desktop
+cannot offer stale alternatives as new choices. Seven new host regressions pass (221 Rust tests total),
+along with strict Clippy, formatting, five inert binding fixtures and a release
+build. The real-mount smoke now exercises offline peer edits, cached rename
+resolution and retention of the pending local alternative. Final candidate
+`24042550...` passes all 44 isolated lifecycle cases and four additional timestamp
+cases, including both expanded conflict smokes. Forced exit is at most 0.004 s
+and ordinary matrix graceful exit 0.113 s; no process is stranded. Linux has
+218 passing tests and a release build. The
+[correctness record](../../test-evidence/wave-6/correctness-20261028.json) retains
+the exact source/binary identities, successful controller exit and CRC/SHA/size-
+verified native export. No performance workload ran in this correctness pass;
+the final performance gate remains deferred/open and P0 is not closed.
+
 The earlier full gate (`e8ee0871...`, 2026-10-24) **stranded the daemon and .NET**
 on WinFsp 2.1.25156. This supersedes the earlier short lifecycle passes as a
 safety conclusion. A full guest kernel dump proves the notification/rename
@@ -39,10 +61,12 @@ and [retained evidence](../../test-evidence/wave-6/lazy-notify-hang-20261024.jso
 No further mounts ran in the stranded guest; native stores, exact timestamps,
 process state and kernel/user dumps were exported before disposal.
 
-The new native preflight refuses unrecognized dependencies before creating a
-volume. Its current exact allowlist is official WinFsp **2.2.26286.0 (2026 Beta5)**,
-including both DLL/SYS hashes and selected loaded-driver identity. This is a
-prerelease dependency and still needs this project's complete acceptance.
+The native preflight refuses WinFsp older than **2.2.26286 (2026 Beta5)**, the
+first release with that fix, before creating a volume. As of 2026-10-28 this is a
+minimum version, not an exact DLL/SYS hash allowlist: the user directed that the
+project must not pin one build of an external dependency, so newer WinFsp
+releases load without a code change. Qualification evidence below was recorded
+against Beta5.
 The expanded matrix's **42 cases pass**, including concurrent notification/rename
 stops and legacy receipt recovery. Maximum forced exit is **0.010 s** and
 ordinary graceful exit **0.199 s**; the

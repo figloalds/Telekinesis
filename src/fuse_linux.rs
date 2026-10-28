@@ -96,6 +96,9 @@ fn unmount(path: &Path, lazy: bool) -> Result<()> {
 
 const MAX_IO: usize = 1024 * 1024;
 static MOUNT: Mutex<Option<(PathBuf, Arc<AtomicBool>)>> = Mutex::new(None);
+pub fn mounted_path() -> Option<PathBuf> {
+    lock(&MOUNT).as_ref().map(|(path, _)| path.clone())
+}
 #[derive(Default)]
 struct Nodes {
     entities: BTreeMap<u64, String>,

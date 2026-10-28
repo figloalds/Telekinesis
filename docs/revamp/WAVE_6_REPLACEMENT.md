@@ -1,6 +1,6 @@
 # Wave 6 replacement: objects, snapshots and a passthrough working layer
 
-Status: implementation in progress, 2026-10-24. Supersedes the scope of [WAVE_6_PLAN.md](WAVE_6_PLAN.md)
+Status: implementation and correctness qualification in progress, 2026-10-28. Supersedes the scope of [WAVE_6_PLAN.md](WAVE_6_PLAN.md)
 and the WP6.G interlude. Steps 1–6 have implementation commits; runtime cutover
 and benchmark qualification are blocked by W6-P0-MOUNT-LIFECYCLE. See the
 replacement step notes. The
@@ -9,25 +9,18 @@ boundary, TLS/WSS or VPN for the channel) is unchanged.
 
 ## 0. Immediate blocking demand
 
-**W6-P0-MOUNT-LIFECYCLE is OPEN and takes precedence over all remaining Wave 6
-work.** [Fix the kernel cleanup hang](WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md) before
-new feature work, runtime cutover or mounted benchmark qualification. The daemon
-can remain permanently deleting while Windows cleans up a mounted-root handle.
-The demand contains the dump evidence, unsafe shutdown/test sequence and the
-small mandatory exit/responsiveness checks. Reproduction belongs in an isolated
-Windows VM until those checks pass; folder mounts do not bypass this gate.
+**W6-P0-MOUNT-LIFECYCLE remains OPEN.** The user's 2026-10-28 decision is to
+proceed with correctness and remaining Wave 6 implementation, leaving performance
+gates for last. This supersedes the earlier ordering that blocked all other work
+on performance acceptance. It does not waive the no-self-handle, cache delivery,
+durability, bounded cleanup or dependency checks, or authorize host mounts/cutover.
+
 The no-self-handle fix is implemented ([note](notes/mount-lifecycle-fix.md),
-invariants in section 3a). The final binary passes 32 isolated VM lifecycle
-checks, including early self-open refusal under the store lock. The full-gate
-attempt failed during Git fixture preparation and exceeded measured I/O targets;
-Git status/build purge-cost acceptance remains open. The blocker is not closed.
-The [file-fsync cost follow-up](notes/fsync-cost.md) retains a passing 32-case
-lifecycle matrix for its WAL release, but its full performance gate also failed.
-The metadata-cost candidate exposed a timestamp recovery hole; its corrected
-release passes the expanded 34-case VM matrix, while copy still fails at 11.59x
-native ([recovery note](notes/recovery-timestamps.md)). Git/build cost and the
-subsequent create-path candidate remain under isolated VM qualification.
-Before the next VM lap, read the blocker's
+invariants in section 3a). Repeated expanded 44-case isolated lifecycle matrices
+pass with the pinned WinFsp Beta5 dependency. Full performance acceptance remains
+open; the blocker retains exact candidate identities and earlier failures.
+All mounted correctness and performance runs still belong in an isolated Windows
+VM; folder mounts use the same driver and callbacks. Before a performance lap, read the blocker's
 [performance triage](WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md#performance-triage-read-the-counters-before-the-next-vm-lap):
 retained callback counters show that opening an existing file copies it into a
 scratch, which dominates Git/build cost, and that metadata work is secondary.
@@ -286,14 +279,18 @@ process, a reader opened before a writer with no access error).
 
 ## 9. Order of work
 
-0. Close [W6-P0-MOUNT-LIFECYCLE](WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md) before proceeding.
+0. Preserve the [mount safety invariants](WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md)
+   throughout implementation; run mounted correctness checks only in an isolated VM.
 1. Benchmark script and the native baseline numbers.
 2. Pack store with the digest index and LRU; port `LocalContent` reads.
 3. Scratch-file working layer and passthrough adapters with caching on.
 4. Seal on close with batched events; tree objects and the cached projection.
 5. Per-entity conflicts and the conflicts view.
 6. Digest fetch over the existing sessions; remove the admission engine.
-7. Delete the removed modules and tables; trim tests; re-run the gate.
+7. Delete the removed modules and tables; trim tests; finish correctness/recovery
+   and mounted lifecycle qualification, then run the section 8 performance gate last.
 
-Each step lands when the gate table does not regress and its exact tests pass.
+Steps 1–6 and canonical-path removal are implemented. Per the 2026-10-28 ordering,
+correctness fixes proceed with exact regression checks while final performance
+acceptance stays open; cutover requires all gates, including performance, to pass.
 Notes per step are at most one page.

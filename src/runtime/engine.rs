@@ -138,6 +138,7 @@ pub struct Engine {
     shutdown_error: Mutex<Option<String>>,
     _owner: File,
     pub last_applied: Mutex<BTreeMap<String, u128>>,
+    pub peer_status: Mutex<BTreeMap<String, serde_json::Value>>,
     publication: Mutex<()>,
     faults: Mutex<std::collections::BTreeSet<String>>,
 }
@@ -180,6 +181,7 @@ impl Engine {
             shutdown_error: Mutex::new(None),
             _owner: owner,
             last_applied: Mutex::new(BTreeMap::new()),
+            peer_status: Mutex::new(BTreeMap::new()),
             publication: Mutex::new(()),
             faults: Mutex::new(Default::default()),
         });
@@ -654,6 +656,9 @@ impl Engine {
     fn flush_impl(&self, token: Option<u64>, native_drained: bool) -> Result<()> {
         self.fault("flush")?;
         let _publication = lock(&self.publication);
+        self.flush_locked(token, native_drained)
+    }
+    fn flush_locked(&self, token: Option<u64>, native_drained: bool) -> Result<()> {
         let files = if let Some(token) = token {
             let handle = self.handle(token)?;
             if native_drained {
@@ -686,6 +691,35 @@ impl Engine {
         *lock(&self.error) = None;
         Ok(())
     }
+    /// Include pending local saves in the alternatives before choosing a head.
+    /// A seal after resolution would otherwise reopen the conflict immediately.
+    pub fn resolve(&self, entity: &str, selected: &str) -> Result<Event> {
+        self.fault("flush")?;
+        let publication = lock(&self.publication);
+        self.flush_locked(None, false)?;
+        let (event, durability) = {
+            let mut store = lock(&self.store);
+            let previous = store.projection().path(entity)?;
+            let event = store.resolve(entity, selected)?;
+            let current = store.projection().path(entity)?;
+            let mut notifications = lock(&self.notifications);
+            notifications.insert(previous, 3);
+            notifications.insert(current, if event.state.deleted { 2 } else { 3 });
+            drop(notifications);
+            (event, store.sync_metadata())
+        };
+        drop(publication);
+        // Commit and notification have independent outcomes. Keep failed
+        // invalidations queued rather than reporting a committed choice as lost.
+        if let Err(error) = self.retry_notifications() {
+            *lock(&self.error) = Some(format!("{error:#}"));
+        }
+        if let Err(error) = durability {
+            *lock(&self.error) = Some(format!("{error:#}"));
+            return Err(error);
+        }
+        Ok(event)
+    }
     fn queue_sealed(&self, files: &[Arc<Mutex<Scratch>>], count: usize) -> Result<()> {
         #[cfg(target_os = "linux")]
         if count != 0 {
@@ -706,19 +740,24 @@ impl Engine {
     }
     pub fn cleanup(&self, token: u64, delete: bool) -> Result<()> {
         let h = self.handle(token)?;
-        if delete || h.delete.load(Ordering::Acquire) {
-            let entity = lock(&h.entry).id.clone();
-            let mut store = lock(&self.store);
-            if !store.entry(&entity)?.deleted {
-                store.delete(&entity)?;
+        let deletion = (|| -> Result<()> {
+            if delete || h.delete.load(Ordering::Acquire) {
+                let entity = lock(&h.entry).id.clone();
+                let mut store = lock(&self.store);
+                if !store.entry(&entity)?.deleted {
+                    store.delete(&entity)?;
+                }
             }
-        }
+            Ok(())
+        })();
+        // Cleanup retires a writer even if its namespace mutation failed.
+        // Otherwise its dirty scratch can never enter the delayed seal queue.
         if !h.closed.swap(true, Ordering::AcqRel)
             && let Some(s) = &h.scratch
         {
             self.working.cleanup(s, h.writable);
         }
-        Ok(())
+        deletion
     }
     pub fn cleanup_native(&self, token: u64, delete: bool, update_write_time: bool) -> Result<()> {
         let timestamp = (|| -> Result<()> {
@@ -785,7 +824,7 @@ impl Engine {
         result
     }
     pub fn close(&self, token: u64) -> Result<()> {
-        self.cleanup(token, false)?;
+        let cleanup = self.cleanup(token, false);
         // Scratch release can wait for a batched seal. Do not hold the global
         // handle map across that wait and stall every other file callback.
         let handle = self.handles.write().unwrap().remove(&token);
@@ -794,7 +833,7 @@ impl Engine {
         {
             self.working.release(scratch);
         }
-        Ok(())
+        cleanup
     }
     pub fn children(&self, token: u64, restart: bool) -> Result<Arc<Vec<Entry>>> {
         let h = self.handle(token)?;
@@ -973,7 +1012,10 @@ impl Engine {
                         notifications.insert(path.clone(), 3);
                     }
                     if let Ok(path) = store.projection().path(&event.entity) {
-                        notifications.insert(path, if event.state.deleted { 2 } else { 3 });
+                        // A conflicting incoming deletion can remain an
+                        // unselected alternative. Notify the projected state.
+                        let deleted = store.entry(&event.entity)?.deleted;
+                        notifications.insert(path, if deleted { 2 } else { 3 });
                     }
                 }
             }

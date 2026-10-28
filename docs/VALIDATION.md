@@ -5,7 +5,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 python scripts/mount_lifecycle.py
-python -m unittest discover -s scripts -p test_peer_readiness.py
+python -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 Mounted runs belong in an isolated Windows VM until
@@ -73,13 +73,23 @@ later namespace, catalog or schema writes. A completed FULL-synchronous seal
 remains durable in the WAL without requiring a second checkpoint.
 
 The real-mount smoke checks both mounted bytes and committed bytes, then pairs
-two peers and updates an already-cached file. It runs on Windows and Linux;
+two peers and updates an already-cached file. It also stops both peers within
+the shutdown bounds, makes offline content/rename edits, reconnects them, and
+resolves the conflict through cached mounted names. The old name must disappear,
+the selected bytes must be visible, and the pending local edit must remain in
+history without reopening the conflict. Earlier logs and exit records are retained
+across that restart. It runs on Windows and Linux;
 use `--binary` and `--home` to select the executable and disposable test directory.
 Use `--mount-a` and `--mount-b` for free drive letters or nonexistent directory
 mount points. Explicit file `fsync` drains an open writer's Windows cache; a
 control RPC can seal only bytes already delivered to the server's scratch.
 
 ## Performance gate
+
+Per the user's 2026-10-28 instruction, complete correctness/implementation and
+isolated lifecycle qualification first; run this performance gate last. P0 and
+cutover stay open until the complete gate passes. The scheduling change does
+not change thresholds or cache/durability/access policy.
 
 Only `scripts/bench.py` defines the performance gate. It runs one warm-up and
 five samples and reports medians for small-file copy, .NET clean/no-op builds,
@@ -89,7 +99,8 @@ five samples and reports medians for small-file copy, .NET clean/no-op builds,
 ```powershell
 python scripts/bench.py --label native
 python scripts/bench.py --label mounted --root X:/bench --compare test-evidence/bench/native.json
-python scripts/bench.py --label wave6 --matrix-tkfs target/release/tkfs.exe
+# After measuring the pinned memory filesystem in this same guest/session:
+python scripts/bench.py --label wave6 --matrix-tkfs target/release/tkfs.exe --matrix-reference test-evidence/bench/memory-reference.json --matrix-cache-policy purge
 ```
 
 The matrix uses disposable stores on X: and Y: by default. `--matrix-mount` and
@@ -98,6 +109,13 @@ and mounted with one paired peer, using identical workload dimensions.
 Reports are under `test-evidence/bench/`. An exceeded target, failed workload or
 incompatible baseline fails the command. Partial `--only` runs are diagnostic;
 they do not establish completion of the full gate.
+
+Copy, sequential write and Git use the same-session pinned memory-filesystem
+reference with matching cleanup policy; all native ratios are retained. Git
+runs with `core.fscache=true` in native/reference/candidate phases. See
+[section 8](revamp/WAVE_6_REPLACEMENT.md#8-the-benchmark-gate) for the complete
+target table and reference requirements. A reference from an earlier guest or
+client configuration cannot establish acceptance.
 
 Before the idle-peer phase, the matrix waits for the source's captured metadata
 head and all current active file roots/chunks in the receiver's committed

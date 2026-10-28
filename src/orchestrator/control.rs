@@ -79,9 +79,79 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
         #[cfg(windows)]
         "mount-stats" => Ok(serde_json::to_value(crate::mount::stats())?),
         "status" => {
+            let endpoint = catalog.get("advertise")?;
+            #[cfg(any(windows, target_os = "linux"))]
+            let mount = crate::mount::mounted_path();
+            #[cfg(not(any(windows, target_os = "linux")))]
+            let mount: Option<std::path::PathBuf> = None;
             let s = lock(&engine.store);
             Ok(
-                json!({"device":s.device,"repo":s.repo,"branch":s.active,"entries":s.projection().entries.len(),"conflicts":s.conflicts(false)?.len(),"error":*lock(&engine.error)}),
+                json!({"pid":std::process::id(),"endpoint":endpoint,"mount":mount,"device":s.device,"repo":s.repo,"branch":s.active,"entries":s.projection().entries.len(),"conflicts":s.conflicts(false)?.len(),"error":*lock(&engine.error)}),
+            )
+        }
+        "set-label" => {
+            catalog.set("label", text("label")?)?;
+            engine.flush(None)?;
+            Ok(json!({}))
+        }
+        "peer-info" => catalog.inspect_peer(text("endpoint")?),
+        "preview-version" => {
+            let event = {
+                lock(&engine.store)
+                    .version(text("version")?)?
+                    .context("VERSION_NOT_FOUND")?
+            };
+            let mut preview = format!(
+                "{} · {:?}\nVersion: {}\nPeer: {}\n",
+                event.state.name, event.operation, event.id, event.author
+            );
+            if let Some(reference) = &event.state.content {
+                let content = engine.working.content();
+                let _pin = content.pin(reference)?;
+                let mut bytes = vec![0; reference.total_len.min(65536) as usize];
+                content.read_range(reference, 0, &mut bytes)?;
+                preview.push_str(&format!("Length: {} bytes\n\n", reference.total_len));
+                if bytes.contains(&0) {
+                    preview.push_str("Binary content");
+                } else {
+                    preview.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                if reference.total_len > bytes.len() as u64 {
+                    preview.push_str("\n\n[Preview limited to the first 64 KiB]");
+                }
+            }
+            Ok(json!({"preview":preview}))
+        }
+        "desktop-snapshot" => {
+            let status = execute(engine, catalog, "status", &json!({}))?;
+            let runtime = lock(&engine.peer_status).clone();
+            let peers: Vec<_> = catalog
+                .peers()?
+                .into_iter()
+                .map(|peer| json!({"endpoint":peer.endpoint,"installation":peer.installation,"runtime":runtime.get(&peer.endpoint)}))
+                .collect();
+            let store = lock(&engine.store);
+            let branches = store
+                .db
+                .prepare("SELECT id,name FROM branches ORDER BY name")?
+                .query_map([], |row| {
+                    Ok(json!({"id":row.get::<_,String>(0)?,"name":row.get::<_,String>(1)?}))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let snapshots = store
+                .db
+                .prepare("SELECT id FROM snapshots ORDER BY rowid DESC LIMIT 64")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let last: u64 =
+                store
+                    .db
+                    .query_row("SELECT coalesce(max(seq),0) FROM events", [], |row| {
+                        row.get(0)
+                    })?;
+            Ok(
+                json!({"status":status,"peers":peers,"branches":branches,"snapshots":snapshots,
+                "conflicts":store.conflicts(true)?,"events":store.events_after(last.saturating_sub(128),128)?}),
             )
         }
         "tree" => Ok(serde_json::to_value(
@@ -102,10 +172,7 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
             lock(&engine.store).conflicts(p["history"].as_bool().unwrap_or(false))?,
         )?),
         "resolve" => {
-            let event = lock(&engine.store).resolve(text("entity")?, text("version")?)?;
-            engine.flush(None)?;
-            let path = lock(&engine.store).projection().path(&event.entity)?;
-            engine.invalidate_paths([path])?;
+            let event = engine.resolve(text("entity")?, text("version")?)?;
             Ok(serde_json::to_value(event)?)
         }
         "checkpoint" => {
@@ -171,10 +238,11 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
         }
         "import" => {
             let path = text("path")?;
+            let mut input = std::fs::File::open(text("source")?)?;
+            ensure!(input.metadata()?.is_file(), "IMPORT_SOURCE_NOT_A_FILE");
             let h = engine.open_file(path, engine.lookup(path).is_err(), false, true)?;
             let result = (|| -> Result<()> {
                 engine.truncate(h, 0, false)?;
-                let mut input = std::fs::File::open(text("source")?)?;
                 let mut bytes = vec![0; 1024 * 1024];
                 let mut offset = 0;
                 loop {
@@ -196,13 +264,17 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
         }
         "cat" => {
             let h = engine.open_file(text("path")?, false, false, false)?;
-            let (_, len) = engine.info(h)?;
-            ensure!(len <= 16 * 1024 * 1024, "USE_EXPORT_FOR_LARGE_FILES");
-            let mut bytes = vec![0; len as usize];
-            let result = engine.read(h, 0, &mut bytes);
-            engine.close(h)?;
-            result?;
-            Ok(json!({"bytes":bytes}))
+            let result = (|| -> Result<Value> {
+                let (_, len) = engine.info(h)?;
+                ensure!(len <= 16 * 1024 * 1024, "USE_EXPORT_FOR_LARGE_FILES");
+                let mut bytes = vec![0; len as usize];
+                engine.read(h, 0, &mut bytes)?;
+                Ok(json!({"bytes":bytes}))
+            })();
+            let closed = engine.close(h);
+            let result = result?;
+            closed?;
+            Ok(result)
         }
         "pairing-code" => Ok(json!({"code":catalog.reset_code()?})),
         "pair" => Ok(json!({"installation":catalog.pair(text("endpoint")?,text("code")?)?})),

@@ -15,10 +15,13 @@ mod gui;
     about = "Telekinesis: versioned folders with host filesystem I/O"
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = ".tkfs")]
-    state: PathBuf,
+    #[arg(long, global = true)]
+    state: Option<PathBuf>,
+    /// Desktop configuration (created automatically on first launch).
+    #[arg(short = 'f', long = "defaults-file", alias = "config", global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
@@ -101,8 +104,24 @@ fn main() {
 }
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let root = std::path::absolute(&cli.state)?;
-    match cli.command {
+    let command = cli.command.unwrap_or(Command::Gui);
+    if matches!(command, Command::Gui) {
+        #[cfg(windows)]
+        {
+            let config = if let Some(config) = cli.config {
+                config
+            } else if let Some(state) = &cli.state {
+                state.join("desktop.toml")
+            } else {
+                std::env::current_exe()?.with_file_name("orchestrator.toml")
+            };
+            return gui::run(std::path::absolute(config)?, cli.state);
+        }
+        #[cfg(not(windows))]
+        anyhow::bail!("DESKTOP_REQUIRES_WINDOWS: use --help for headless commands");
+    }
+    let root = std::path::absolute(cli.state.unwrap_or_else(|| PathBuf::from(".tkfs")))?;
+    match command {
         Command::Init { repo } => {
             let engine = Engine::open(&root, repo.as_deref())?;
             let result = {
@@ -125,12 +144,7 @@ fn run() -> Result<()> {
             }
             orchestrator::run(engine, &listen, advertise.as_deref())
         }
-        Command::Gui => {
-            #[cfg(windows)]
-            return gui::run(root);
-            #[cfg(not(windows))]
-            anyhow::bail!("DESKTOP_REQUIRES_WINDOWS");
-        }
+        Command::Gui => unreachable!(),
         command => {
             let (operation, payload) = match command {
                 Command::Status => ("status", json!({})),

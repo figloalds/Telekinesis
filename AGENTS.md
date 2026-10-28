@@ -1,8 +1,10 @@
 # Repository instructions
 
-The immediate priority is [W6-P0-MOUNT-LIFECYCLE](docs/revamp/WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md).
-It blocks other Wave 6 feature work, cutover and mounted qualification until its
-acceptance checks pass. Read it before modifying or running a filesystem mount.
+Read [W6-P0-MOUNT-LIFECYCLE](docs/revamp/WAVE_6_MOUNT_LIFECYCLE_BLOCKER.md)
+before modifying or running a filesystem mount. The user's 2026-10-28 instruction
+is to proceed with Wave 6 correctness/implementation and leave performance gates
+for last. This supersedes the earlier performance prerequisite for other work;
+it does not close P0 or authorize host mounts or cutover before full acceptance.
 
 - The user-mode filesystem server must not have a crash/termination dependency
   on I/O or retained handles to its own served namespace. This includes root

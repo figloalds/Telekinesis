@@ -24,7 +24,7 @@ def cli(state, *args, timeout=60):
 
 
 def daemon(state, letter, repo, processes):
-    state.mkdir(parents=True)
+    state.mkdir(parents=True, exist_ok=True)
     cli(state, "init", "--repo", repo)
     log = (state / "daemon.log").open("w")
     proc = subprocess.Popen([str(EXE), "--state", str(state), "daemon", "--mount", letter,
@@ -166,6 +166,7 @@ def main():
         assert held.read() == expected
         held.close()
         print("cached remote delete/recreate and subsequent local write passed", flush=True)
+        conflict_resolution_check(a, b, mount, other, mount_a, mount_b, processes)
         print(json.dumps({"home": str(HOME), "visibility_ms": elapsed}), flush=True)
         if args.forced_kill:
             forced_kill_check(processes, mount)
@@ -184,6 +185,64 @@ def main():
                    if "mount I/O operation" in line or "refused self-open" in line]
         if refused:
             raise RuntimeError("mount I/O errors logged: " + "; ".join(refused))
+
+
+def conflict_resolution_check(a, b, mount, other, mount_a, mount_b, processes):
+    """Make actual offline edits, then resolve through cached mounted names."""
+    import shutil
+    relative = "folder/conflict.txt"
+    renamed = "folder/conflict-renamed.txt"
+    (mount / relative).write_bytes(b"shared conflict base")
+    cli(a, "flush")
+    wait_for(lambda: (other / relative).read_bytes() == b"shared conflict base")
+    entity = cli(a, "rpc", "lookup", json.dumps({"path":relative}))["entry"]["id"]
+    previous = processes[:]
+    processes.clear()  # no retry or new mounts after a failed bounded stop
+    try:
+        stop_all([(lambda timeout, s=state: cli(s, "stop", timeout=timeout),
+                   proc, state / "daemon.log", letter)
+                  for state, proc, _, letter in previous])
+    finally:
+        for state, _, log, _ in previous:
+            log.close()
+            shutil.copy2(state / "daemon.log", state / "before-conflict-daemon.log")
+            shutil.copy2(state / "daemon-exit-state.json", state / "before-conflict-exit-state.json")
+    for state, *_ in previous:
+        errors = [line for line in (state / "before-conflict-daemon.log").read_text(errors="replace").splitlines()
+                  if "mount I/O operation" in line or "refused self-open" in line]
+        if errors:
+            raise RuntimeError("pre-conflict mount I/O errors: " + "; ".join(errors))
+    for state in (a, b):
+        for peer in cli(state, "peers"):
+            cli(state, "unpair", peer["installation"])
+    source = HOME / "offline-import.bin"  # native backing disk, outside both mounts
+    source.write_bytes(b"local conflict edit")
+    cli(a, "import", relative, str(source))
+    cli(b, "rename", relative, renamed)
+    source.write_bytes(b"remote renamed edit")
+    cli(b, "import", renamed, str(source))
+    selected = [event for _, event in cli(b, "events") if event["entity"] == entity][-1]["id"]
+    daemon(a, mount_a, "replacement-smoke", processes)
+    daemon(b, mount_b, "replacement-smoke", processes)
+    assert (mount / relative).read_bytes() == b"local conflict edit"
+    endpoint = json.loads((a / "daemon.log").read_text().splitlines()[0])["peer"]
+    cli(b, "pair", endpoint, cli(a, "pairing-code")["code"])
+    wait_for(lambda: any(c["entity"] == entity for c in cli(a, "conflicts")))
+    assert (mount / relative).read_bytes() == b"local conflict edit"
+    # Cleanup delivers these bytes; resolution must seal them before choosing
+    # the remote head, so its later delayed seal cannot reopen the conflict.
+    pending = b"pending local alternative"
+    (mount / relative).write_bytes(pending)
+    cli(a, "resolve", entity, selected)
+    wait_for(lambda: not (mount / relative).exists()
+             and (mount / renamed).read_bytes() == b"remote renamed edit")
+    wait_for(lambda: not cli(b, "conflicts"))
+    assert not cli(a, "conflicts"), "resolution reopened a local conflict"
+    history = cli(a, "conflicts", "--history")
+    digest = hashlib.sha256(pending).hexdigest()
+    assert any((event["state"].get("content") or {}).get("digest") == digest
+               for conflict in history for event in conflict["heads"]), "pending alternative was lost"
+    print("offline conflict, pending edit retention and cached rename resolution passed", flush=True)
 
 
 def hold_cached(target, ready):

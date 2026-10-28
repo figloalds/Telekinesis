@@ -13,3 +13,17 @@ form the GC closure; active scratch/read handles add pins in the pack layer.
 Tests cover concurrent edits, local-head visibility, resolution convergence,
 retention of the discarded alternative, and remote invalidation while an
 existing handle continues to read its opened version.
+
+The 2026-10-28 correctness fix seals pending local edits before resolving under
+the publication lock. Sealing after resolution reopened the conflict and omitted
+the latest local bytes from the reviewed alternatives. A failed pre-resolution
+flush leaves the choice unapplied. Resolution notifies both the previous and
+selected names; incoming delete conflicts notify the actual visible head.
+Host regressions cover retained bytes/restart, rename/delete cache actions and
+the failed-flush retry. The real-mount smoke exercises offline peer edits and
+cached rename resolution on both drive-letter and directory mounts.
+
+Conflict responses also distinguish `current_heads` from retained history.
+When an entity conflicts again after a resolution, its earlier alternatives
+remain visible as history but the desktop enables selection only for current
+heads. A regression covers both conflict generations and rejects stale choices.

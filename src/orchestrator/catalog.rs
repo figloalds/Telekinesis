@@ -29,7 +29,65 @@ impl Peer {
 pub struct Catalog {
     pub engine: Arc<Engine>,
 }
+/// Pairing-code-authenticated discovery for receiving a fresh current-format folder.
+pub fn probe(endpoint: &str, code: &str) -> Result<Value> {
+    let hello = session::client_hello(
+        &crate::core::id(),
+        crate::model::protocol::LaneRole::Probe,
+        None,
+        1,
+    );
+    let (conn, _) = session::dial(
+        endpoint,
+        hello,
+        &session::CodeAuth { code: code.into() },
+        None,
+        session::ConnOptions::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let reply = conn
+        .call(
+            "folder.info",
+            json!({}),
+            Vec::new(),
+            session::Priority::Control,
+            std::time::Duration::from_secs(10),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"));
+    conn.close();
+    Ok(serde_json::from_slice(&reply?.body)?)
+}
 impl Catalog {
+    pub fn inspect_peer(&self, endpoint: &str) -> Result<Value> {
+        let peer = self
+            .peers()?
+            .into_iter()
+            .find(|peer| peer.endpoint == endpoint)
+            .context("PAIRING_CODE_REQUIRED")?;
+        let device = lock(&self.engine.store).device.clone();
+        let hello =
+            session::client_hello(&device, crate::model::protocol::LaneRole::Probe, None, 1);
+        let (conn, _) = session::dial_expecting(
+            endpoint,
+            hello,
+            &session::auth::PeerAuth { key: peer.key()? },
+            Some(&peer.installation),
+            None,
+            session::ConnOptions::default(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let reply = conn
+            .call(
+                "folder.info",
+                json!({}),
+                Vec::new(),
+                session::Priority::Control,
+                std::time::Duration::from_secs(10),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"));
+        conn.close();
+        Ok(serde_json::from_slice(&reply?.body)?)
+    }
     pub fn open(engine: Arc<Engine>) -> Result<Arc<Self>> {
         lock(&engine.store).db.execute_batch("CREATE TABLE IF NOT EXISTS peers(endpoint TEXT PRIMARY KEY,installation TEXT NOT NULL,credential TEXT NOT NULL);CREATE TABLE IF NOT EXISTS paired(installation TEXT PRIMARY KEY,credential TEXT NOT NULL);")?;
         let catalog = Arc::new(Self { engine });
@@ -178,6 +236,20 @@ pub struct PeerService {
 }
 impl Handler for PeerService {
     fn handle(&self, req: Incoming) {
+        if req.op == "folder.info" {
+            // The session has already authenticated by pairing code or a
+            // persisted peer key. This is not an unauthenticated discovery API.
+            let label = self.catalog.get("label").ok().flatten();
+            let store = lock(&self.engine.store);
+            req.responder.reply(
+                json!({}),
+                serde_json::to_vec(&json!({
+                    "repo":store.repo,"label":label,"installation":store.device
+                }))
+                .unwrap(),
+            );
+            return;
+        }
         if req.op == "peer.enroll" {
             let result = (|| -> Result<()> {
                 let request: session::auth::EnrollRequest = serde_json::from_slice(&req.body)?;

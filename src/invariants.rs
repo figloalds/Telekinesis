@@ -1042,6 +1042,49 @@ fn entity_conflicts_keep_local_head_and_resolution_converges() -> Result<()> {
 }
 
 #[test]
+fn reopened_conflict_history_distinguishes_current_heads_from_retired_alternatives() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut store = Store::open(root.path(), None)?;
+    let entity = store.create("file", EntryKind::File)?.id;
+    let parent = store.basis(&entity)?.version;
+    let state = store.entry(&entity)?;
+    let local = store.event(MAIN, state.clone(), vec![parent.clone()], Operation::Times);
+    let mut remote = store.event(MAIN, state.clone(), vec![parent], Operation::Times);
+    remote.author = "peer".into();
+    store.apply(&[local.clone(), remote])?;
+    let resolved = store.resolve(&entity, &local.id)?;
+    let next_local = store.event(
+        MAIN,
+        state.clone(),
+        vec![resolved.id.clone()],
+        Operation::Times,
+    );
+    let mut next_remote = store.event(MAIN, state, vec![resolved.id], Operation::Times);
+    next_remote.author = "peer".into();
+    store.apply(&[next_local.clone(), next_remote.clone()])?;
+    let conflict = store.conflicts(true)?.remove(0);
+    assert!(!conflict.resolved);
+    assert_eq!(conflict.heads.len(), 4);
+    assert_eq!(
+        conflict.current_heads,
+        [next_local.id.clone(), next_remote.id.clone()]
+            .into_iter()
+            .collect()
+    );
+    assert!(conflict.heads.iter().any(|event| event.id == local.id));
+    assert!(!conflict.current_heads.contains(&local.id));
+    assert!(store.resolve(&entity, &local.id).is_err());
+    store.resolve(&entity, &next_remote.id)?;
+    assert!(
+        store
+            .conflicts(true)?
+            .iter()
+            .all(|conflict| conflict.resolved)
+    );
+    Ok(())
+}
+
+#[test]
 fn remote_apply_invalidates_cached_paths_without_changing_open_version() -> Result<()> {
     let root = tempfile::tempdir()?;
     let engine = crate::runtime::Engine::open(root.path(), Some("repo"))?;
@@ -1078,6 +1121,289 @@ fn remote_apply_invalidates_cached_paths_without_changing_open_version() -> Resu
     engine.close(h)?;
     engine.close(new)?;
     engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn resolving_a_conflict_seals_pending_local_edits_before_selecting_the_remote_head() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let handle = engine.open_file("file", true, false, true)?;
+    engine.write(handle, 0, b"base", false, false)?;
+    engine.flush(Some(handle))?;
+    let (entity, parent) = {
+        let store = lock(&engine.store);
+        let entity = store.lookup("file")?.id;
+        let parent = store.basis(&entity)?.version;
+        (entity, parent)
+    };
+    engine.write(handle, 0, b"mine", false, false)?;
+    engine.flush(Some(handle))?;
+    let remote = {
+        let mut store = lock(&engine.store);
+        let mut state = store.entry(&entity)?;
+        state.content = Some(store.content.import(b"peer")?);
+        let mut event = store.event(MAIN, state, vec![parent], Operation::Content);
+        event.author = "peer".into();
+        event
+    };
+    engine.apply_remote(std::slice::from_ref(&remote))?;
+    engine.write(handle, 0, b"last", false, false)?;
+    crate::orchestrator::control::execute(
+        &engine,
+        &catalog,
+        "resolve",
+        &serde_json::json!({"entity":entity,"version":remote.id}),
+    )?;
+    {
+        let store = lock(&engine.store);
+        assert!(
+            store.conflicts(false)?.is_empty(),
+            "resolution left a new local conflict"
+        );
+        assert_eq!(store.lookup("file")?.content, remote.state.content);
+        let last = crate::model::content::Digest::bytes(b"last");
+        assert!(
+            store
+                .conflicts(true)?
+                .iter()
+                .flat_map(|c| &c.heads)
+                .any(|e| e.state.content.as_ref().is_some_and(|c| c.digest == last)),
+            "resolution lost the pending local alternative"
+        );
+    }
+    engine.close(handle)?;
+    engine.shutdown()?;
+    drop(catalog);
+    drop(engine);
+    let reopened = crate::runtime::Engine::open(root.path(), None)?;
+    assert!(lock(&reopened.store).conflicts(false)?.is_empty());
+    assert_eq!(reopened.lookup("file")?.content, remote.state.content);
+    reopened.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn conflict_notifications_follow_the_visible_head_and_invalidate_both_resolution_names()
+-> Result<()> {
+    for deleted in [false, true] {
+        let root = tempfile::tempdir()?;
+        let engine = crate::runtime::Engine::open(root.path(), None)?;
+        let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+        let handle = engine.open_file("original", true, false, true)?;
+        let (entity, parent) = {
+            let store = lock(&engine.store);
+            let entity = store.lookup("original")?.id;
+            let parent = store.basis(&entity)?.version;
+            (entity, parent)
+        };
+        engine.write(handle, 0, b"mine", false, false)?;
+        engine.flush(Some(handle))?;
+        let remote = {
+            let mut store = lock(&engine.store);
+            let mut state = store.entry(&entity)?;
+            state.deleted = deleted;
+            if !deleted {
+                state.name = "renamed".into();
+            }
+            let operation = if deleted {
+                Operation::Delete
+            } else {
+                Operation::Rename
+            };
+            let mut event = store.event(MAIN, state, vec![parent], operation);
+            event.author = "peer".into();
+            event
+        };
+        let observed = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        engine.set_invalidator(std::sync::Arc::new(move |path, action| {
+            lock(&sink).push((path.to_owned(), action));
+            Ok(())
+        }));
+        engine.apply_remote(std::slice::from_ref(&remote))?;
+        assert_eq!(engine.lookup("original")?.id, entity);
+        assert!(
+            !lock(&observed).iter().any(|(_, action)| *action == 2),
+            "an unselected delete invalidated the visible local file as removed"
+        );
+        lock(&observed).clear();
+        crate::orchestrator::control::execute(
+            &engine,
+            &catalog,
+            "resolve",
+            &serde_json::json!({"entity":entity,"version":remote.id}),
+        )?;
+        assert!(
+            lock(&observed).iter().any(|(path, _)| path == "/original"),
+            "resolution left the previous pathname cached"
+        );
+        if deleted {
+            assert!(engine.lookup("original").is_err());
+            assert!(lock(&observed).contains(&("/original".into(), 2)));
+        } else {
+            assert!(engine.lookup("original").is_err());
+            assert_eq!(engine.lookup("renamed")?.id, entity);
+            assert!(lock(&observed).contains(&("/renamed".into(), 3)));
+        }
+        engine.close(handle)?;
+        engine.shutdown()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn an_unreadable_import_source_cannot_truncate_or_create_the_destination() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let handle = engine.open_file("existing", true, false, true)?;
+    engine.write(handle, 0, b"keep these bytes", false, false)?;
+    engine.flush(Some(handle))?;
+    engine.close(handle)?;
+    for (path, source) in [
+        ("existing", root.path().join("absent")),
+        ("new", root.path().join("absent")),
+        ("existing", root.path().to_owned()),
+        ("new", root.path().to_owned()),
+    ] {
+        assert!(
+            crate::orchestrator::control::execute(
+                &engine,
+                &catalog,
+                "import",
+                &serde_json::json!({"path":path,"source":source}),
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        engine.lookup("new").is_err(),
+        "failed import created an empty destination"
+    );
+    let handle = engine.open_file("existing", false, false, false)?;
+    let mut bytes = [0; 16];
+    assert_eq!(engine.read(handle, 0, &mut bytes)?, bytes.len());
+    assert_eq!(&bytes, b"keep these bytes");
+    engine.close(handle)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_failed_resolution_flush_leaves_the_conflict_and_edit_intact() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let handle = engine.open_file("file", true, false, true)?;
+    engine.write(handle, 0, b"base", false, false)?;
+    engine.flush(Some(handle))?;
+    let (entity, parent) = {
+        let store = lock(&engine.store);
+        let entity = store.lookup("file")?.id;
+        let parent = store.basis(&entity)?.version;
+        (entity, parent)
+    };
+    engine.write(handle, 0, b"mine", false, false)?;
+    engine.flush(Some(handle))?;
+    let remote = {
+        let mut store = lock(&engine.store);
+        let mut state = store.entry(&entity)?;
+        state.content = Some(store.content.import(b"peer")?);
+        let mut event = store.event(MAIN, state, vec![parent], Operation::Content);
+        event.author = "peer".into();
+        event
+    };
+    engine.apply_remote(std::slice::from_ref(&remote))?;
+    let heads = lock(&engine.store).projection().heads[&entity].clone();
+    engine.write(handle, 0, b"last", false, false)?;
+    engine.inject_fault("flush");
+    assert!(engine.resolve(&entity, &remote.id).is_err());
+    assert_eq!(lock(&engine.store).projection().heads[&entity], heads);
+    let mut bytes = [0; 4];
+    engine.read(handle, 0, &mut bytes)?;
+    assert_eq!(&bytes, b"last");
+    engine.resolve(&entity, &remote.id)?;
+    assert!(lock(&engine.store).conflicts(false)?.is_empty());
+    engine.close(handle)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_refused_large_cat_releases_its_read_handle() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let handle = engine.open_file("large", true, false, true)?;
+    engine.truncate(handle, 16 * 1024 * 1024 + 1, false)?;
+    let scratch = engine.handle(handle)?.scratch.clone().unwrap();
+    assert_eq!(lock(&scratch).handles, 1);
+    let result = crate::orchestrator::control::execute(
+        &engine,
+        &catalog,
+        "cat",
+        &serde_json::json!({"path":"large"}),
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("USE_EXPORT_FOR_LARGE_FILES")
+    );
+    assert_eq!(
+        lock(&scratch).handles,
+        1,
+        "refused cat retained an extra handle"
+    );
+    engine.close(handle)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn failed_delete_cleanup_still_retires_the_writer_and_close_releases_the_handle() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let handle = engine.open_file("file", true, false, true)?;
+    engine.write(handle, 0, b"retain on failed delete", false, false)?;
+    let scratch = engine.handle(handle)?.scratch.clone().unwrap();
+    {
+        let mut store = lock(&engine.store);
+        store.sync_metadata()?;
+        store.db.execute_batch(
+            "CREATE TRIGGER refuse_delete BEFORE INSERT ON events
+             WHEN json_extract(NEW.event,'$.operation')='delete'
+             BEGIN SELECT RAISE(ABORT,'test delete failure'); END;",
+        )?;
+    }
+    engine
+        .handle(handle)?
+        .delete
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(engine.cleanup(handle, false).is_err());
+    assert_eq!(
+        lock(&scratch).writers,
+        0,
+        "failed delete retained the closed writer"
+    );
+    assert!(engine.close(handle).is_err());
+    assert!(
+        engine.handle(handle).is_err(),
+        "Close kept an unreachable native context"
+    );
+    assert_eq!(lock(&scratch).handles, 0);
+    lock(&engine.store)
+        .db
+        .execute_batch("DROP TRIGGER refuse_delete")?;
+    engine.shutdown()?;
+    let entry = engine.lookup("file")?;
+    let mut bytes = vec![0; 23];
+    engine
+        .working
+        .content()
+        .read_range(entry.content.as_ref().unwrap(), 0, &mut bytes)?;
+    assert_eq!(bytes, b"retain on failed delete");
     Ok(())
 }
 

@@ -6,7 +6,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TKFS_NATIVE_CACHE_PROBE");
     #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        slint_build::compile("ui/replacement.slint").expect("compile desktop UI");
+        slint_build::compile("ui/app.slint").expect("compile desktop UI");
         let root =
             std::env::var("WINFSP_DIR").unwrap_or_else(|_| "C:/Program Files (x86)/WinFsp".into());
         let mut native = cc::Build::new();
@@ -34,7 +34,6 @@ fn main() {
         println!("cargo:rustc-link-search=native={root}/lib");
         println!("cargo:rustc-link-lib=winfsp-x64");
         println!("cargo:rustc-link-lib=advapi32");
-        println!("cargo:rustc-link-lib=bcrypt");
         println!("cargo:rustc-link-lib=version");
         // Start CLI/core tests without WinFsp's bin on PATH. The mount bridge
         // loads the installed DLL by absolute path before calling WinFsp.

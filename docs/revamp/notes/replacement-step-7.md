@@ -16,6 +16,33 @@ and exposed stale unsealed sizes to Git. The current working projection now
 supplies draft sizes; further full-gate runs are required. These are measured
 failures, not passing qualification. See `test-evidence/bench/wave6-*.json` and
 the benchmark command in `docs/VALIDATION.md`.
+
+## Correctness-first continuation (2026-10-28)
+
+The user directed remaining implementation/correctness work to proceed and
+performance gates to run last. Host mounts and cutover still require full P0
+acceptance; all mounted checks remain in an isolated Windows VM.
+
+Conflict resolution now seals pending local saves before selecting a head,
+invalidates both names when the choice renames the file, and retains unselected
+local bytes through restart. Delete-conflict notifications follow the projected
+state. The desktop distinguishes current heads from retired history. Failed
+delete cleanup retires writers and Close releases handles while reporting the
+failure; import opens/validates its source before mutation, and a refused large
+`cat` releases its reader. Seven focused regressions cover these failures.
+
+Windows has 221 passing Rust tests; Linux has 218. Both pass strict Clippy and
+formatting and build release runnables. The 28 Python harness tests, bounded
+lifecycle-helper selftest and five inert WinFsp binding fixtures pass. The
+expanded real-mount smoke adds offline conflict/rename resolution and pending
+alternative retention. Final binary `24042550...` passes all 44 isolated
+lifecycle cases and four extra timestamp cases, with no stranded process;
+forced exit max is 0.004 s and ordinary matrix graceful exit max 0.113 s.
+The [retained report](../../../test-evidence/wave-6/correctness-20261028.json)
+includes exact source/binary identities, controller exit 0 and a verified
+25.2 MB native evidence export. Performance acceptance remains deferred and open;
+these correctness results do not close P0 or authorize host mounted cutover.
+
 # Windows cache follow-up
 
 **Historical design, superseded by

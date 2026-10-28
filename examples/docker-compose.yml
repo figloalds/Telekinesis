@@ -4,27 +4,61 @@ services:
     container_name: tkfs_daemon
     restart: unless-stopped
     network_mode: host
-    ipc: host
     working_dir: /app
+    # Leaves time for `tkfs stop` (see the trap below) before Docker sends SIGKILL.
+    stop_grace_period: 60s
 
-    # --- CONFIGURAÇÕES PARA O FUSE FUNCIONAR ---
-    devices:
-      - /dev/fuse:/dev/fuse  # Compartilha o driver FUSE do host com o container
-    cap_add:
-      - SYS_ADMIN            # Dá permissão para o container realizar operações de mount
-    security_opt:
-      - apparmor:unconfined  # Evita que o AppArmor bloqueie a montagem (comum no Ubuntu)
-    # -------------------------------------------
+    # --- MOUNTING (disabled by default: the folder runs headless) ---
+    # To expose the folder through FUSE inside the container:
+    #   1. uncomment the block below;
+    #   2. add "fuse3" to PACKAGES in the command;
+    #   3. set TKFS_MOUNT, e.g. TKFS_MOUNT: /mnt/tkfs (keep it outside /app).
+    # The mount lives in the container's mount namespace; seeing it on the host
+    # needs mount propagation configured by you.
+    # devices:
+    #   - /dev/fuse:/dev/fuse  # Shares the host's FUSE device with the container
+    # cap_add:
+    #   - SYS_ADMIN            # Allows the container to mount
+    # security_opt:
+    #   - apparmor:unconfined  # Keeps AppArmor from blocking the mount (common on Ubuntu)
+    # -----------------------------------------------------------------
+
+    environment:
+      TKFS_STATE: /app/.tkfs
+      # Peer endpoint. The default 127.0.0.1:43180 is only reachable from this
+      # host; for remote peers use 0.0.0.0:43180 and set TKFS_ADVERTISE to the
+      # URL they connect to (wss:// behind your TLS proxy).
+      TKFS_LISTEN: 127.0.0.1:43180
+      TKFS_ADVERTISE: ""
+      TKFS_MOUNT: ""
 
     volumes:
       - .:/app
     # Platform packages only; TKFS does not install device certificates or CA roots.
-    command: >
-      sh -c "if ! dpkg -s fuse3 ca-certificates libssl3t64 >/dev/null 2>&1; then
-               apt-get update &&
-               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends fuse3 ca-certificates libssl3t64 || exit 1;
-             fi &&
-             if [ ! -f orchestrator.toml ]; then
-               ./tkfs init || exit 1;
-             fi &&
-             exec ./tkfs start"
+    # One container serves one folder (one state directory). For more folders,
+    # duplicate the service with another TKFS_STATE and TKFS_LISTEN port.
+    command:
+      - sh
+      - -c
+      - |
+        PACKAGES="ca-certificates libssl3t64"
+        if ! dpkg -s $$PACKAGES >/dev/null 2>&1; then
+          apt-get update &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $$PACKAGES || exit 1
+        fi
+        if [ ! -d "$$TKFS_STATE" ]; then
+          ./tkfs --state "$$TKFS_STATE" init || exit 1
+        fi
+        set -- --state "$$TKFS_STATE" daemon --listen "$$TKFS_LISTEN"
+        [ -n "$$TKFS_ADVERTISE" ] && set -- "$$@" --advertise "$$TKFS_ADVERTISE"
+        [ -n "$$TKFS_MOUNT" ] && set -- "$$@" --mount "$$TKFS_MOUNT"
+        # The daemon does not handle SIGTERM itself: turn `docker compose stop`
+        # into an orderly `tkfs stop` (store shutdown and unmount) instead of a kill.
+        ./tkfs "$$@" &
+        daemon=$$!
+        trap './tkfs --state "$$TKFS_STATE" stop' TERM INT
+        wait $$daemon
+        status=$$?
+        # A trapped signal interrupts the first wait; wait again for the real exit.
+        kill -0 $$daemon 2>/dev/null && { wait $$daemon; status=$$?; }
+        exit $$status

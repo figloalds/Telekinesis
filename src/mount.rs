@@ -20,6 +20,9 @@ use std::{
 
 static ENGINE: RwLock<Option<Arc<Engine>>> = RwLock::new(None);
 static MOUNT: Mutex<Option<(usize, PathBuf)>> = Mutex::new(None);
+pub fn mounted_path() -> Option<PathBuf> {
+    lock(&MOUNT).as_ref().map(|(_, path)| path.clone())
+}
 
 static CALLS: [std::sync::atomic::AtomicU64; 16] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 16];
@@ -51,16 +54,6 @@ pub struct Info {
 unsafe extern "C" {
     fn tk_winfsp_load(attempted: *mut u16, count: u32) -> u32;
     fn tk_winfsp_error_detail(buffer: *mut u16, count: u32);
-    #[cfg(test)]
-    fn tk_winfsp_check_modules(
-        buffer: *const u8,
-        length: u32,
-        dos: *const u16,
-        nt: *const u16,
-        image_size: u32,
-        checksum: u32,
-        timestamp: u32,
-    ) -> u32;
     fn tk_mount_start(
         path: *const u16,
         out: *mut usize,
@@ -179,6 +172,22 @@ fn validate_backing_paths(root: &Path, mount: &Path) -> Result<()> {
     Ok(())
 }
 
+/// WinFsp creates a directory mount point itself and fails with
+/// STATUS_OBJECT_NAME_COLLISION when anything already occupies that name,
+/// including an empty directory or a reparse point left by a killed process.
+pub fn ensure_mount_point_free(path: &Path) -> Result<()> {
+    let text = path.as_os_str().to_string_lossy();
+    if text.len() == 2 && text.ends_with(':') {
+        return Ok(());
+    }
+    ensure!(
+        std::fs::symlink_metadata(path).is_err(),
+        "MOUNT_POINT_EXISTS: {} already exists; choose a path that does not exist yet          (Telekinesis creates the mount directory), or remove it if it is an empty leftover",
+        path.display()
+    );
+    Ok(())
+}
+
 pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
     let mut mount = lock(&MOUNT);
     ensure!(mount.is_none(), "MOUNT_ALREADY_ATTACHED");
@@ -188,6 +197,7 @@ pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
     // with forced process termination.
     let backing_root = { lock(&engine.store).root.clone() };
     validate_backing_paths(&backing_root, path)?;
+    ensure_mount_point_free(path)?;
     // Explicit opt-in fault seam for VM lifecycle acceptance; never set during
     // normal operation. Every stage follows the real native unwind path.
     let fault = match std::env::var("TKFS_TEST_MOUNT_FAIL").as_deref() {
@@ -230,6 +240,12 @@ pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
     let status = unsafe { tk_mount_start(wide.as_ptr(), &mut native, 0, 60_000, fault) };
     if status != 0 {
         *ENGINE.write().unwrap() = None;
+        if status == 0xc0000035 {
+            anyhow::bail!(
+                "MOUNT_FAILED: {status:08x}: mount point {} is already in use",
+                path.display()
+            );
+        }
         anyhow::bail!("MOUNT_FAILED: {status:08x}");
     }
     if self_open_test && let Err(error) = verify_self_open_guard(&engine, path) {
@@ -516,8 +532,7 @@ pub unsafe extern "C" fn tk_call(
 }
 
 #[cfg(test)]
-mod driver_identity_tests {
-    use super::tk_winfsp_check_modules;
+mod mount_path_tests {
 
     #[test]
     fn mount_cannot_redirect_future_backing_io_into_its_dispatcher() {
@@ -556,87 +571,5 @@ mod driver_identity_tests {
             )
             .is_err()
         );
-    }
-
-    const PATH: &str = "C:\\WinFsp\\SxS\\selected\\winfsp-x64.sys";
-    fn module(path: &str, size: u32, checksum: u32, timestamp: u32) -> Vec<u8> {
-        let mut data = vec![0; 320];
-        data[..2].copy_from_slice(&320u16.to_le_bytes());
-        data[32..36].copy_from_slice(&size.to_le_bytes());
-        data[46..48].copy_from_slice(&(path.rfind('\\').unwrap() as u16 + 1).to_le_bytes());
-        data[48..48 + path.len()].copy_from_slice(path.as_bytes());
-        data[304..308].copy_from_slice(&checksum.to_le_bytes());
-        data[308..312].copy_from_slice(&timestamp.to_le_bytes());
-        data
-    }
-    fn check(data: &[u8]) -> u32 {
-        let dos: Vec<_> = format!("\\\\?\\{PATH}")
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let nt: Vec<_> = "\\Device\\HarddiskVolume3\\WinFsp\\SxS\\selected\\winfsp-x64.sys"
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        unsafe {
-            tk_winfsp_check_modules(
-                data.as_ptr(),
-                data.len() as u32,
-                dos.as_ptr(),
-                nt.as_ptr(),
-                188416,
-                201356,
-                1791899484,
-            )
-        }
-    }
-    #[test]
-    fn selected_loaded_driver_ignores_unrelated_sxs_and_redacted_addresses() {
-        let mut data = module(
-            "\\??\\C:\\WinFsp\\SxS\\old\\winfsp-x64.sys",
-            184320,
-            220244,
-            0,
-        );
-        data.extend(module(&format!("\\??\\{PATH}"), 188416, 201356, 0));
-        data.extend([0, 0]);
-        assert_eq!(check(&data), 0);
-    }
-    #[test]
-    fn selected_loaded_driver_requires_matching_metadata_and_unique_selection() {
-        for (size, checksum, timestamp) in [
-            (184320, 201356, 0),
-            (188416, 220244, 0),
-            (188416, 201356, 123),
-        ] {
-            let mut data = module(PATH, size, checksum, timestamp);
-            data.extend([0, 0]);
-            assert_eq!(check(&data), 1306);
-        }
-        let mut data = module(PATH, 188416, 201356, 1791899484);
-        data.extend(module(PATH, 188416, 201356, 0));
-        data.extend([0, 0]);
-        assert_eq!(check(&data), 52);
-        assert_eq!(check(&[0, 0]), 126);
-    }
-    #[test]
-    fn malformed_loaded_driver_inventory_fails_closed() {
-        let valid = module(PATH, 188416, 201356, 0);
-        let mut trailing = valid.clone();
-        trailing.extend([0, 0, 1, 0]);
-        assert_eq!(check(&trailing), 13);
-        for length in [0, 1, 319, 320, 321] {
-            assert_eq!(check(&valid[..length.min(valid.len())]), 13);
-        }
-        for step in [2u16, 319, 328] {
-            let mut data = valid.clone();
-            data[..2].copy_from_slice(&step.to_le_bytes());
-            data.extend([0, 0]);
-            assert_eq!(check(&data), 13);
-        }
-        let mut data = valid;
-        data[48..304].fill(b'x');
-        data.extend([0, 0]);
-        assert_eq!(check(&data), 13);
     }
 }

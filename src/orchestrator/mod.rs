@@ -150,6 +150,7 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                     Ok(key) => key,
                                     Err(_) => break,
                                 };
+                                lock(&engine.peer_status).insert(peer.endpoint.clone(),serde_json::json!({"state":"Connecting"}));
                                 match session::dial_expecting(
                                     &peer.endpoint,
                                     hello,
@@ -159,6 +160,7 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                     ConnOptions::default(),
                                 ) {
                                     Ok((conn, _)) => {
+                                        lock(&engine.peer_status).insert(peer.endpoint.clone(),serde_json::json!({"state":"Connected","health":conn.health()}));
                                         fetch.add(
                                             peer.endpoint.clone(),
                                             Arc::new(SessionSource {
@@ -173,11 +175,13 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                         {
                                             match sync::exchange(&engine, &conn, &mut cursor) {
                                                 Ok(more) => {
+                                                    lock(&engine.peer_status).insert(peer.endpoint.clone(),serde_json::json!({"state":"Connected","health":conn.health()}));
                                                     if more {
                                                         continue;
                                                     }
                                                 }
                                                 Err(error) => {
+                                                    lock(&engine.peer_status).insert(peer.endpoint.clone(),serde_json::json!({"state":"Retrying","error":format!("{error:#}")}));
                                                     eprintln!("peer {}: {error:#}", peer.endpoint);
                                                     break;
                                                 }
@@ -194,8 +198,15 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                         }
                                         conn.close();
                                         fetch.remove(&peer.endpoint);
+                                        let mut statuses=lock(&engine.peer_status);
+                                        if statuses.get(&peer.endpoint).is_some_and(|status|status["state"]=="Connected") {
+                                            statuses.insert(peer.endpoint.clone(),serde_json::json!({"state":"Reconnecting"}));
+                                        }
                                     }
-                                    Err(error) => eprintln!("peer {}: {error}", peer.endpoint),
+                                    Err(error) => {
+                                        lock(&engine.peer_status).insert(peer.endpoint.clone(),serde_json::json!({"state":"Unreachable","error":format!("{error}")}));
+                                        eprintln!("peer {}: {error}", peer.endpoint);
+                                    }
                                 }
                                 drop(engine);
                                 for _ in 0..delay * 10 {
@@ -210,6 +221,7 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                 }
                                 delay = (delay * 2).min(60);
                             }
+                            if let Some(engine)=weak.upgrade() {lock(&engine.peer_status).remove(&peer.endpoint);}
                         })?;
                 started.insert(endpoint, thread);
             }

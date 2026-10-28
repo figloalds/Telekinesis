@@ -1,6 +1,7 @@
 //! Entity events, immutable packs, and a scratch-file working filesystem.
 pub mod content;
 pub mod core;
+pub mod desktop;
 #[cfg(test)]
 mod invariants;
 pub mod model;
