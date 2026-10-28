@@ -29,9 +29,16 @@ pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// Deadline of a [`request`] for an op that moves file bytes or seals.
 pub const LONG_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Largest file `cat` returns. Its reply is a JSON number array (up to 4
+/// characters per byte), which must fit the 16 MiB `cat` body bound.
+pub const CAT_MAX_BYTES: u64 = 3 * 1024 * 1024;
+
 /// The [`request`] deadline of `operation`.
 pub fn request_deadline(operation: &str) -> Duration {
-    if matches!(operation, "import" | "cat" | "gc" | "checkpoint" | "flush") {
+    if matches!(
+        operation,
+        "import" | "cat" | "gc" | "checkpoint" | "flush" | "shutdown"
+    ) {
         LONG_REQUEST_DEADLINE
     } else {
         REQUEST_DEADLINE
@@ -381,7 +388,10 @@ pub fn execute(engine: &Engine, settings: &Settings, operation: &str, p: &Value)
             let h = engine.open_file(text("path")?, false, false, false)?;
             let result = (|| -> Result<Value> {
                 let (_, len) = engine.info(h)?;
-                ensure!(len <= 16 * 1024 * 1024, "USE_EXPORT_FOR_LARGE_FILES");
+                ensure!(
+                    len <= CAT_MAX_BYTES,
+                    "USE_EXPORT_FOR_LARGE_FILES: {len} bytes exceed the {CAT_MAX_BYTES}-byte cat limit"
+                );
                 let mut bytes = vec![0; len as usize];
                 engine.read(h, 0, &mut bytes)?;
                 Ok(json!({"bytes":bytes}))
@@ -450,6 +460,48 @@ mod tests {
         engine.close(h)?;
         engine.shutdown()?;
         Ok(())
+    }
+
+    #[test]
+    fn cat_refuses_files_its_reply_cannot_carry_and_serves_smaller_ones() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Engine::open(root.path(), None)?;
+        let settings = Settings {
+            engine: engine.clone(),
+        };
+        for (path, len) in [("large", 4 * 1024 * 1024), ("small", 2 * 1024 * 1024)] {
+            let h = engine.open_file(path, true, false, true)?;
+            // 0xFF is the widest byte in a JSON number array ("255,").
+            engine.write(h, 0, &vec![0xFF; len], false, false)?;
+            engine.flush(Some(h))?;
+            engine.close(h)?;
+        }
+        let error = execute(&engine, &settings, "cat", &json!({"path":"large"})).unwrap_err();
+        assert_eq!(
+            error_wire(&error).code,
+            "USE_EXPORT_FOR_LARGE_FILES",
+            "{error:#}"
+        );
+        let reply = execute(&engine, &settings, "cat", &json!({"path":"small"}))?;
+        assert_eq!(reply["bytes"].as_array().unwrap().len(), 2 * 1024 * 1024);
+        assert!(
+            serde_json::to_vec(&reply)?.len() <= crate::model::protocol::max_body("cat"),
+            "a 2 MiB cat reply must fit the cat body bound"
+        );
+        // Even the largest accepted file fits.
+        assert!(CAT_MAX_BYTES * 4 + 64 <= crate::model::protocol::max_body("cat") as u64);
+        assert!(engine.writable_tokens().is_empty());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn byte_moving_and_sealing_ops_get_the_long_deadline() {
+        for op in ["import", "cat", "gc", "checkpoint", "flush", "shutdown"] {
+            assert_eq!(request_deadline(op), LONG_REQUEST_DEADLINE, "{op}");
+        }
+        assert_eq!(request_deadline("hello"), REQUEST_DEADLINE);
+        assert_eq!(request_deadline("watch"), REQUEST_DEADLINE);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc,
     time::{Duration, Instant},
@@ -19,8 +19,19 @@ use tkfs::orchestrator::{
 const BOUND: Duration = Duration::from_secs(30);
 const RUNTIME_FILES: [&str; 3] = ["runtime.json", "runtime.token", "worker.json"];
 
-/// Kills a still-running child on drop, so a failed assertion never strands it.
-struct Guard(Child);
+/// Kills a still-running child on drop, so a failed assertion never strands
+/// it. A child still alive 10 s after the kill is reported as stranded, and
+/// fails the test unless it is already failing.
+struct Guard(Child, PathBuf);
+impl Guard {
+    fn spawn(state: &Path, command: &mut Command) -> Self {
+        Guard(command.spawn().unwrap(), stderr_log(state))
+    }
+    /// The child's stderr so far, for failure messages.
+    fn stderr(&self) -> String {
+        fs::read_to_string(&self.1).unwrap_or_default()
+    }
+}
 impl Drop for Guard {
     fn drop(&mut self) {
         if matches!(self.0.try_wait(), Ok(None)) {
@@ -29,16 +40,37 @@ impl Drop for Guard {
             while matches!(self.0.try_wait(), Ok(None)) && Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(20));
             }
+            if matches!(self.0.try_wait(), Ok(None)) {
+                let message = format!("STRANDED_PROCESS: pid {}", self.0.id());
+                eprintln!("{message}");
+                if !std::thread::panicking() {
+                    panic!("{message}");
+                }
+            }
         }
     }
 }
 
+fn stderr_log(state: &Path) -> PathBuf {
+    let mut log = state.as_os_str().to_owned();
+    log.push(".stderr.log");
+    log.into()
+}
+
+/// The child's stderr goes to `<state>.stderr.log` (inside the test's temp
+/// directory): out of the test console, quoted in failure messages.
 fn tkfs(state: &Path) -> Command {
+    let stderr = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(stderr_log(state))
+        .unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_tkfs"));
     command
         .arg("--state")
         .arg(state)
         .stdin(Stdio::null())
+        .stderr(stderr)
         .env_remove("TKFS_FAKE_NOW_MS")
         .env_remove("TKFS_UNSUPERVISED_EXIT_S");
     command
@@ -53,7 +85,12 @@ fn wait_status(guard: &mut Guard, bound: Duration) -> ExitStatus {
         }
         if Instant::now() >= end {
             let _ = guard.0.kill();
-            panic!("process {} did not exit within {bound:?}", guard.0.id());
+            panic!(
+                "process {} did not exit within {bound:?}; stderr:
+{}",
+                guard.0.id(),
+                guard.stderr()
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -61,7 +98,13 @@ fn wait_status(guard: &mut Guard, bound: Duration) -> ExitStatus {
 
 fn wait_exit(guard: &mut Guard, bound: Duration) {
     let status = wait_status(guard, bound);
-    assert_eq!(status.code(), Some(0), "worker exit status {status}");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "worker exit status {status}; stderr:
+{}",
+        guard.stderr()
+    );
 }
 
 /// Reads stdout lines on a thread so line waits can be bounded.
@@ -80,15 +123,14 @@ fn lines(child: &mut Child) -> mpsc::Receiver<String> {
 }
 
 fn init(state: &Path) {
-    let mut guard = Guard(
-        tkfs(state)
-            .arg("init")
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
+    let mut guard = Guard::spawn(state, tkfs(state).arg("init").stdout(Stdio::null()));
     let status = wait_status(&mut guard, BOUND);
-    assert!(status.success(), "init failed: {status}");
+    assert!(
+        status.success(),
+        "init failed: {status}; stderr:
+{}",
+        guard.stderr()
+    );
 }
 
 /// Runs `init`, then `daemon [--supervised]`, and reads stdout until the
@@ -103,7 +145,7 @@ fn spawn_worker(state: &Path, supervised: bool, env: &[(&str, &str)]) -> (Guard,
     for (key, value) in env {
         command.env(key, value);
     }
-    let mut guard = Guard(command.stdout(Stdio::piped()).spawn().unwrap());
+    let mut guard = Guard::spawn(state, command.stdout(Stdio::piped()));
     let rx = lines(&mut guard.0);
     let end = Instant::now() + BOUND;
     loop {
@@ -118,7 +160,11 @@ fn spawn_worker(state: &Path, supervised: bool, env: &[(&str, &str)]) -> (Guard,
             }
             Err(error) => {
                 let _ = guard.0.kill();
-                panic!("no Ready line within {BOUND:?}: {error}");
+                panic!(
+                    "no Ready line within {BOUND:?}: {error}; stderr:
+{}",
+                    guard.stderr()
+                );
             }
         }
     }
@@ -290,21 +336,20 @@ fn unsupervised_worker_exits_quietly_after_no_contact() {
 }
 
 #[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "TKFS_FAKE_NOW_MS is only honoured by debug builds"
+)]
 fn worker_refuses_to_start_when_the_clock_is_invalid() {
-    if !cfg!(debug_assertions) {
-        eprintln!("TKFS_FAKE_NOW_MS is only honoured by debug builds; skipped");
-        return;
-    }
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join("s");
-    let mut child = Guard(
+    let mut child = Guard::spawn(
+        &state,
         tkfs(&state)
             .arg("daemon")
             .arg("--supervised")
             .env("TKFS_FAKE_NOW_MS", "1000000000000")
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap(),
+            .stdout(Stdio::piped()),
     );
     let rx = lines(&mut child.0);
     let status = wait_status(&mut child, BOUND);
