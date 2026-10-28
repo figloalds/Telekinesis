@@ -1,4 +1,5 @@
 //! Desktop configuration and bounded child ownership. No served paths are opened.
+use crate::orchestrator::process::{ObservedProcess, terminate};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -484,7 +485,7 @@ impl Desktop {
                 )?;
                 anyhow::bail!("DAEMON_STOP_UNCONFIRMED: no further starts until exit is verified");
             }
-            observed.success()?;
+            observed.success().context("DAEMON_SHUTDOWN_FAILED")?;
         }
         result?;
         self.errors.remove(id);
@@ -635,123 +636,6 @@ impl Desktop {
         json!({"config":self.config,"config_path":self.config_path,"folders":rows,"detail":detail,"selected":selected,"blocked":self.blocked})
     }
 }
-fn terminate(child: &mut Child) -> Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-    let killed = child.kill();
-    let end = Instant::now() + Duration::from_secs(10);
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(());
-        }
-        ensure!(
-            Instant::now() < end,
-            "STRANDED_PROCESS: {} ({killed:?})",
-            child.id()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-struct ObservedProcess {
-    pid: u32,
-    #[cfg(windows)]
-    handle: *mut std::ffi::c_void,
-    #[cfg(target_os = "linux")]
-    pidfd: File,
-}
-#[cfg(windows)]
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut std::ffi::c_void;
-    fn WaitForSingleObject(handle: *mut std::ffi::c_void, milliseconds: u32) -> u32;
-    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
-    fn GetExitCodeProcess(handle: *mut std::ffi::c_void, code: *mut u32) -> i32;
-}
-impl ObservedProcess {
-    fn open(pid: u32) -> Result<Self> {
-        ensure!(pid != std::process::id() && pid != 0, "INVALID_DAEMON_PID");
-        #[cfg(windows)]
-        {
-            let handle = unsafe { OpenProcess(0x00101000, 0, pid) };
-            ensure!(
-                !handle.is_null(),
-                "DAEMON_PROCESS_UNAVAILABLE: {}",
-                std::io::Error::last_os_error()
-            );
-            Ok(Self { pid, handle })
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::FromRawFd;
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-            ensure!(
-                fd >= 0,
-                "DAEMON_PROCESS_UNAVAILABLE: {}",
-                std::io::Error::last_os_error()
-            );
-            Ok(Self {
-                pid,
-                pidfd: unsafe { File::from_raw_fd(fd as i32) },
-            })
-        }
-        #[cfg(not(any(windows, target_os = "linux")))]
-        Ok(Self { pid })
-    }
-    fn exited(&self) -> Result<bool> {
-        #[cfg(windows)]
-        {
-            let result = unsafe { WaitForSingleObject(self.handle, 0) };
-            ensure!(
-                result == 0 || result == 258,
-                "DAEMON_WAIT_FAILED: {}",
-                std::io::Error::last_os_error()
-            );
-            Ok(result == 0)
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            let mut descriptor = libc::pollfd {
-                fd: self.pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            ensure!(
-                unsafe { libc::poll(&mut descriptor, 1, 0) } >= 0,
-                "DAEMON_WAIT_FAILED"
-            );
-            Ok(descriptor.revents & libc::POLLIN != 0)
-        }
-        #[cfg(all(unix, not(target_os = "linux")))]
-        {
-            let result = unsafe { libc::kill(self.pid as i32, 0) };
-            Ok(result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
-        }
-        #[cfg(not(any(windows, unix)))]
-        anyhow::bail!("PROCESS_WAIT_UNSUPPORTED")
-    }
-    fn success(&self) -> Result<()> {
-        #[cfg(windows)]
-        {
-            let mut code = 0;
-            ensure!(
-                unsafe { GetExitCodeProcess(self.handle, &mut code) } != 0,
-                "DAEMON_EXIT_STATUS_UNAVAILABLE"
-            );
-            ensure!(code == 0, "DAEMON_SHUTDOWN_FAILED: exit code {code}");
-        }
-        Ok(())
-    }
-}
-#[cfg(windows)]
-impl Drop for ObservedProcess {
-    fn drop(&mut self) {
-        unsafe { CloseHandle(self.handle) };
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

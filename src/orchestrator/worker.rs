@@ -357,12 +357,25 @@ fn serve(engine: Arc<Engine>, options: &Options, root: &Path) -> Result<()> {
     let mounts = control::mounts();
     let pid = std::process::id();
     let version = env!("CARGO_PKG_VERSION").to_owned();
+    // The OS identity, so that a later daemon adopts (or kills) this very
+    // process and never a recycled pid.
+    #[cfg(any(windows, target_os = "linux"))]
+    let (start_ms, image) = startup(
+        super::process::process_identity(pid),
+        "PROCESS_IDENTITY_FAILED",
+        EXIT_INTERNAL,
+    )?;
+    // No OS identity here: such a record never matches, so it is never adopted.
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let (start_ms, image) = (
+        crate::util::time::now_ms(),
+        std::env::current_exe().unwrap_or_default(),
+    );
     let record = WorkerRecord {
         format: 1,
         pid,
-        // Task 7 replaces these with the process identity.
-        start_ms: crate::util::time::now_ms(),
-        image: std::env::current_exe().unwrap_or_default(),
+        start_ms,
+        image,
         version: version.clone(),
         instance: instance.clone(),
         address: address.clone(),

@@ -8,11 +8,12 @@ use std::{
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc,
+    sync::mpsc::{self, RecvTimeoutError},
     time::{Duration, Instant},
 };
 use tkfs::orchestrator::{
     control,
+    process::{self, LaunchSpec, ObservedProcess, ProcessEvent},
     worker::{Ready, WorkerRecord},
 };
 
@@ -409,4 +410,253 @@ fn worker_refuses_to_start_when_the_clock_is_invalid() {
     for f in RUNTIME_FILES {
         assert!(!state.join(f).exists(), "{f} written by a refused start");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The launcher (`orchestrator::process`): spawn, adoption, verified kill.
+
+/// A `WorkerProcess` never kills on drop (workers outlive the daemon), so a
+/// launcher-spawned worker gets this instead: on drop it kills the process if
+/// it is still the same one (`kill_verified`) and waits ≤ 10 s for it to go,
+/// reporting a survivor as `STRANDED_PROCESS`.
+struct Reaper {
+    record: WorkerRecord,
+    observed: Option<ObservedProcess>,
+}
+impl Reaper {
+    fn new(pid: u32) -> Self {
+        let observed = ObservedProcess::open(pid).ok();
+        let (start_ms, image) = process::process_identity(pid).unwrap_or_default();
+        let record = WorkerRecord {
+            format: 1,
+            pid,
+            start_ms,
+            image,
+            version: String::new(),
+            instance: String::new(),
+            address: String::new(),
+            ipc: 4,
+        };
+        Reaper { record, observed }
+    }
+}
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        let Some(observed) = &self.observed else {
+            return;
+        };
+        if matches!(observed.exited(), Ok(true)) {
+            return;
+        }
+        let killed = process::kill_verified(&self.record);
+        if !matches!(observed.wait(Duration::from_secs(10)), Ok(true)) {
+            let message = format!("STRANDED_PROCESS: pid {} ({killed:?})", observed.pid);
+            eprintln!("{message}");
+            if !std::thread::panicking() {
+                panic!("{message}");
+            }
+        }
+    }
+}
+
+fn spec(state: &Path) -> LaunchSpec {
+    LaunchSpec {
+        executable: env!("CARGO_BIN_EXE_tkfs").into(),
+        state: state.to_path_buf(),
+        mount: None,
+    }
+}
+
+/// The next launcher event within `bound`; fails with `worker.log` otherwise.
+fn next_event(rx: &mpsc::Receiver<ProcessEvent>, state: &Path, bound: Duration) -> ProcessEvent {
+    rx.recv_timeout(bound).unwrap_or_else(|error| {
+        panic!(
+            "no process event within {bound:?}: {error}; worker.log:\n{}",
+            fs::read_to_string(state.join("worker.log")).unwrap_or_default()
+        )
+    })
+}
+
+fn expect_ready(rx: &mpsc::Receiver<ProcessEvent>, state: &Path) -> Ready {
+    match next_event(rx, state, BOUND) {
+        ProcessEvent::Ready(ready) => ready,
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}
+
+fn expect_exited(
+    rx: &mpsc::Receiver<ProcessEvent>,
+    state: &Path,
+    bound: Duration,
+) -> (Option<i32>, String) {
+    match next_event(rx, state, bound) {
+        ProcessEvent::Exited { code, tail } => (code, tail),
+        other => panic!("expected Exited, got {other:?}"),
+    }
+}
+
+/// `Exited` was the last event: every sender of the process is gone.
+fn expect_closed(rx: &mpsc::Receiver<ProcessEvent>) {
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Err(RecvTimeoutError::Disconnected) => {}
+        other => panic!("an event after Exited, or the sink is still held: {other:?}"),
+    }
+}
+
+#[test]
+fn spawn_reports_ready_then_exited_and_logs_redacted_ready_line() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("s");
+    init(&state);
+    let (tx, rx) = mpsc::channel();
+    let worker = process::spawn(&spec(&state), tx).unwrap();
+    let _reaper = Reaper::new(worker.pid);
+    let ready = expect_ready(&rx, &state);
+    assert_eq!(ready.pid, worker.pid);
+    assert_eq!(ready.token.len(), 64);
+
+    let log = fs::read_to_string(state.join("worker.log")).unwrap();
+    assert!(log.contains("\"ready\":true"), "{log}");
+    assert!(!log.contains(&ready.token), "worker.log carries the token");
+
+    // The record names this very process: its OS start time and image.
+    let record: WorkerRecord = json_file(&state.join("worker.json"));
+    let (start_ms, image) = process::process_identity(worker.pid).unwrap();
+    assert_eq!(record.pid, worker.pid);
+    assert_eq!(record.start_ms, start_ms);
+    assert_eq!(record.image, image);
+
+    control::request(&state, "shutdown", json!({"force": false})).unwrap();
+    let (code, tail) = expect_exited(&rx, &state, BOUND);
+    assert_eq!(code, Some(0), "tail:\n{tail}");
+    assert!(!tail.is_empty() && tail.len() <= process::TAIL_BYTES);
+    assert!(!tail.contains(&ready.token));
+    expect_closed(&rx);
+}
+
+#[test]
+fn spawn_reports_a_fatal_line_then_exited() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("s");
+    init(&state);
+    let (tx, rx) = mpsc::channel();
+    let first = process::spawn(&spec(&state), tx).unwrap();
+    let _first_reaper = Reaper::new(first.pid);
+    let ready = expect_ready(&rx, &state);
+
+    // A second worker on the same store is refused: a fatal line, exit 75.
+    let (tx, second_rx) = mpsc::channel();
+    let second = process::spawn(&spec(&state), tx).unwrap();
+    let _second_reaper = Reaper::new(second.pid);
+    let mut fatal = None;
+    let code = loop {
+        match next_event(&second_rx, &state, BOUND) {
+            ProcessEvent::Fatal { code, message } => fatal = Some((code, message)),
+            ProcessEvent::Exited { code, .. } => break code,
+            ProcessEvent::Ready(ready) => panic!("a second worker got Ready: {ready:?}"),
+        }
+    };
+    let (fatal_code, message) = fatal.expect("a Fatal event before Exited");
+    assert_eq!(fatal_code, "STORE_ALREADY_OPEN", "{message}");
+    assert_eq!(code, Some(75));
+    expect_closed(&second_rx);
+
+    assert_eq!(
+        control::request(&state, "hello", json!({})).unwrap()["pid"],
+        ready.pid
+    );
+    control::request(&state, "shutdown", json!({"force": false})).unwrap();
+    assert_eq!(expect_exited(&rx, &state, BOUND).0, Some(0));
+}
+
+#[test]
+fn adopt_matches_identity_and_rejects_a_stale_record() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("s");
+    init(&state);
+    let (tx, rx) = mpsc::channel();
+    let worker = process::spawn(&spec(&state), tx).unwrap();
+    let _reaper = Reaper::new(worker.pid);
+    let ready = expect_ready(&rx, &state);
+    // Dropping the handle never kills: the worker keeps answering.
+    drop(worker);
+    assert_eq!(
+        control::request(&state, "hello", json!({})).unwrap()["pid"],
+        ready.pid
+    );
+
+    let (adopt_tx, adopt_rx) = mpsc::channel();
+    let (record, adopted) = process::adopt(&state, adopt_tx)
+        .unwrap()
+        .expect("the live worker is adopted");
+    assert_eq!(record.pid, ready.pid);
+    assert_eq!(adopted.pid, ready.pid);
+    assert_eq!(record.instance, ready.instance);
+
+    // A record whose start time differs names another process. Linux allows
+    // ±2 s (tick rounding), so the stale record is 5 s off there.
+    let mut stale = record.clone();
+    stale.start_ms += if cfg!(target_os = "linux") { 5000 } else { 1 };
+    fs::write(
+        state.join("worker.json"),
+        serde_json::to_vec(&stale).unwrap(),
+    )
+    .unwrap();
+    let (stale_tx, _stale_rx) = mpsc::channel();
+    assert!(process::adopt(&state, stale_tx).unwrap().is_none());
+    assert!(!process::kill_verified(&stale).unwrap());
+    assert_eq!(
+        control::request(&state, "hello", json!({})).unwrap()["pid"],
+        ready.pid,
+        "kill_verified of a stale record must not kill"
+    );
+
+    // The real identity is killed; the spawn's waiter and the adopter both
+    // observe the exit.
+    fs::write(
+        state.join("worker.json"),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+    assert!(process::kill_verified(&record).unwrap());
+    let kill_bound = Duration::from_secs(10);
+    let (code, _) = expect_exited(&adopt_rx, &state, kill_bound);
+    assert_ne!(code, Some(0));
+    let (code, _) = expect_exited(&rx, &state, kill_bound);
+    assert_ne!(code, Some(0));
+    expect_closed(&rx);
+    drop(adopted);
+    expect_closed(&adopt_rx);
+
+    // The crash left the runtime files behind; they name a dead process.
+    assert!(state.join("worker.json").exists());
+    let (gone_tx, _gone_rx) = mpsc::channel();
+    assert!(process::adopt(&state, gone_tx).unwrap().is_none());
+    assert!(!process::kill_verified(&record).unwrap());
+
+    // The next spawn still starts.
+    let (tx, rx) = mpsc::channel();
+    let worker = process::spawn(&spec(&state), tx).unwrap();
+    let _next_reaper = Reaper::new(worker.pid);
+    let next = expect_ready(&rx, &state);
+    assert_ne!(next.instance, ready.instance);
+    control::request(&state, "shutdown", json!({"force": false})).unwrap();
+    let (code, tail) = expect_exited(&rx, &state, BOUND);
+    assert_eq!(code, Some(0), "tail:\n{tail}");
+}
+
+#[test]
+fn process_identity_of_self_is_stable() {
+    let a = process::process_identity(std::process::id()).unwrap();
+    let b = process::process_identity(std::process::id()).unwrap();
+    assert_eq!(a, b);
+    let exe = std::env::current_exe().unwrap();
+    assert!(
+        a.1.ends_with(exe.file_name().unwrap()),
+        "{} vs {}",
+        a.1.display(),
+        exe.display()
+    );
+    assert!(a.0 >= tkfs::clock::FLOOR_MS, "{}", a.0);
+    assert!(a.0 <= tkfs::util::time::now_ms() + 2000, "{}", a.0);
 }
