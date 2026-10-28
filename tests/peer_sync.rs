@@ -89,15 +89,23 @@ fn pair_opens_control_and_bulk_lanes_and_reset_code_revokes() -> Result<()> {
     assert_eq!(peers_b.as_array().map(Vec::len), Some(0), "{peers_b}");
     std::thread::sleep(Duration::from_secs(2));
     let peers = a.manage(&["peers"])?;
-    let lanes = peer_at(&peers, &endpoint_b)?["lanes"].clone();
     ensure!(
-        lanes
-            .as_array()
-            .into_iter()
-            .flatten()
-            .all(|lane| lane["state"] == "Unauthorized"),
-        "a lane left Unauthorized: {lanes}"
+        all_lanes(&peers, "Unauthorized"),
+        "a lane left Unauthorized: {peers}"
     );
+
+    // Re-pairing with the new code (A still holds B's old key) enrolls a
+    // fresh credential and brings the lanes back.
+    let new_code = rotated["code"].as_str().context("no rotated code")?;
+    a.manage(&[
+        "pair",
+        &endpoint_b,
+        "--code",
+        new_code,
+        "--connections",
+        "2",
+    ])?;
+    a.wait_lanes(&endpoint_b, 2, "Ready", LANES_READY)?;
 
     a.shutdown()?;
     b.shutdown()?;
@@ -211,5 +219,84 @@ fn shutdown_closes_peer_lanes_and_sessions_first_and_promptly() -> Result<()> {
     drop(home_a);
     assert_eq!(stopped["peers"], 1, "{stopped}");
     assert_eq!(stopped["lane_threads_left"], 0, "{stopped}");
+    Ok(())
+}
+
+/// Every lane of every peer entry in `peers` is in `state`.
+fn all_lanes(peers: &Value, state: &str) -> bool {
+    peers.as_array().into_iter().flatten().all(|peer| {
+        peer["lanes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|lane| lane["state"] == state)
+    })
+}
+
+/// A loopback address with a port that was free a moment ago.
+fn free_address() -> Result<String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    Ok(listener.local_addr()?.to_string())
+}
+
+/// `daemon`'s `peers`: exactly one entry, for `other` at `endpoint`, with two
+/// lanes all Ready and two inbound sessions from it (its lanes to us).
+fn check_mutual(daemon: &TestDaemon, other: &str, endpoint: &str) -> Result<()> {
+    let peers = daemon.manage(&["peers"])?;
+    let list = peers.as_array().context("peers is not a list")?;
+    ensure!(list.len() == 1, "{peers}");
+    ensure!(list[0]["installation"] == other, "{peers}");
+    ensure!(list[0]["endpoint"] == endpoint, "{peers}");
+    ensure!(
+        list[0]["lanes"].as_array().map(Vec::len) == Some(2),
+        "{peers}"
+    );
+    ensure!(all_lanes(&peers, "Ready"), "a lane left Ready: {peers}");
+    ensure!(list[0]["inbound"] == 2, "{peers}");
+    Ok(())
+}
+
+#[test]
+fn mutual_pairing_keeps_both_directions_ready() -> Result<()> {
+    let a = TestDaemon::start()?;
+    // B on a fixed port, so A's lanes find it again after B restarts.
+    let b = TestDaemon::start_listening(&free_address()?, "")?;
+    let code_a = a.manage(&["reset-pairing-code"])?["code"]
+        .as_str()
+        .context("no code")?
+        .to_string();
+    let code_b = b.manage(&["reset-pairing-code"])?["code"]
+        .as_str()
+        .context("no code")?
+        .to_string();
+    let (endpoint_a, endpoint_b) = (a.listen_endpoint()?, b.listen_endpoint()?);
+    let (installation_a, installation_b) = (installation(&a)?, installation(&b)?);
+
+    a.manage(&["pair", &endpoint_b, "--code", &code_b, "--connections", "2"])?;
+    a.wait_lanes(&endpoint_b, 2, "Ready", LANES_READY)?;
+    b.manage(&["pair", &endpoint_a, "--code", &code_a, "--connections", "2"])?;
+    b.wait_lanes(&endpoint_a, 2, "Ready", LANES_READY)?;
+    a.wait_lanes(&endpoint_b, 2, "Ready", LANES_READY)?;
+
+    // Both directions stay up.
+    std::thread::sleep(Duration::from_secs(3));
+    check_mutual(&a, &installation_b, &endpoint_b)?;
+    check_mutual(&b, &installation_a, &endpoint_a)?;
+
+    // B restarts: A's lanes redial with the credential they hold, B's lanes
+    // come back from its catalog. Both directions are Ready again.
+    let b = TestDaemon::start_in(b.shutdown_keep_home()?)?;
+    let end = Instant::now() + LANES_READY;
+    while let Err(error) = check_mutual(&a, &installation_b, &endpoint_b)
+        .and_then(|()| check_mutual(&b, &installation_a, &endpoint_a))
+    {
+        ensure!(
+            Instant::now() < end,
+            "not mutually Ready again within {LANES_READY:?}: {error:#}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    a.shutdown()?;
+    b.shutdown()?;
     Ok(())
 }

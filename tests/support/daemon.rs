@@ -108,13 +108,19 @@ impl TestDaemon {
 
     /// [`Self::start`] with extra `[network]` lines.
     pub fn start_with(network_toml: &str) -> Result<Self> {
+        Self::start_listening("127.0.0.1:0", network_toml)
+    }
+
+    /// A daemon on a fresh home listening on `listen` (a fixed port keeps
+    /// its endpoint across a restart with [`Self::start_in`]).
+    pub fn start_listening(listen: &str, network_toml: &str) -> Result<Self> {
         let home = tempfile::tempdir()?;
         fs::write(
             home.path().join("orchestrator.toml"),
             format!(
                 "format_version = 2\ndata_directory = \"data\"\n\
                  default_mount_directory = \"mounts\"\n\n[network]\n\
-                 listen = \"127.0.0.1:0\"\n{network_toml}\n"
+                 listen = \"{listen}\"\n{network_toml}\n"
             ),
         )?;
         Self::start_in(home)

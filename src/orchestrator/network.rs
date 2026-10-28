@@ -47,7 +47,12 @@ use crate::{
         Priority, Side,
         auth::{self, PeerAuth},
     },
-    util::{cancel::Cancel, lock::lock, log::event, time::now_ms},
+    util::{
+        cancel::Cancel,
+        lock::lock,
+        log::{event, register_secret},
+        time::now_ms,
+    },
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use rand::Rng;
@@ -314,7 +319,7 @@ pub fn start(
     }
     for peer in network.catalog.peers()? {
         if network.catalog.paired_key(&peer.installation).is_ok() {
-            network.open_lanes(&peer)?;
+            network.open_lanes_or_log(&peer);
         }
     }
     Ok(network)
@@ -335,6 +340,7 @@ impl Network {
             "ADVERTISE_REQUIRED: set [network] advertise (or listen) so the peer learns this \
              orchestrator's endpoint",
         )?;
+        register_secret(code);
         clock::check()?;
         let hello = session::client_hello(&self.installation, LaneRole::Probe, None, 1);
         let (conn, server) = session::dial_cancellable(
@@ -349,34 +355,93 @@ impl Network {
             &self.stopping,
         )
         .map_err(|error| anyhow!("PAIRING_FAILED: {}", error.to_wire()))?;
-        let secret = auth::new_secret();
-        let enrolled = serde_json::to_vec(&auth::enrollment_request(&secret))
-            .map_err(|error| anyhow!("PAIRING_FAILED: {error}"))
-            .and_then(|body| {
-                conn.call(
-                    PEER_ENROLL,
-                    json!({"endpoint": advertise}),
-                    body,
-                    Priority::Control,
-                    auth::ENROLL_DEADLINE,
-                )
-                .map_err(|error| anyhow!("PAIRING_FAILED: {error}"))
-            });
-        conn.close();
-        enrolled?;
-        self.catalog.save_peer(
-            endpoint,
-            &server.installation,
-            auth::peer_key(&secret),
-            connections,
-        )?;
-        self.open_lanes(&self.catalog.peer(endpoint)?)?;
+        // Paired the other way already (it enrolled with us, or we with
+        // it): reuse that credential when the peer still accepts it, so the
+        // two directions keep one key. Otherwise enroll a fresh one.
+        let reused = self
+            .catalog
+            .paired_key(&server.installation)
+            .ok()
+            .filter(|key| self.accepts(endpoint, &server.installation, *key));
+        let key = match reused {
+            Some(key) => {
+                conn.close();
+                key
+            }
+            None => {
+                let secret = auth::new_secret();
+                let enrolled = serde_json::to_vec(&auth::enrollment_request(&secret))
+                    .map_err(|error| anyhow!("PAIRING_FAILED: {error}"))
+                    .and_then(|body| {
+                        conn.call(
+                            PEER_ENROLL,
+                            json!({"endpoint": advertise}),
+                            body,
+                            Priority::Control,
+                            auth::ENROLL_DEADLINE,
+                        )
+                        .map_err(|error| anyhow!("PAIRING_FAILED: {error}"))
+                    });
+                conn.close();
+                enrolled?;
+                auth::peer_key(&secret)
+            }
+        };
+        self.catalog
+            .save_peer(endpoint, &server.installation, key, connections)?;
+        // Every row of this installation now carries `key`.
+        self.reopen(&server.installation);
         event!(info, PEER_PAIRED, {
             "endpoint": endpoint,
             "installation": server.installation.clone(),
             "connections": connections,
+            "enrolled": reused.is_none(),
         });
         Ok(server.installation)
+    }
+
+    /// Whether `endpoint` (installation `installation`) accepts `key`: a
+    /// probe session with it authenticates.
+    fn accepts(&self, endpoint: &str, installation: &str, key: [u8; 32]) -> bool {
+        let hello = session::client_hello(&self.installation, LaneRole::Probe, None, 1);
+        match session::dial_cancellable(
+            endpoint,
+            hello,
+            &PeerAuth { key },
+            Some(installation),
+            None,
+            ConnOptions::for_role(LaneRole::Probe),
+            &self.stopping,
+        ) {
+            Ok((conn, _)) => {
+                conn.close();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// (Re)opens the lanes of every paired `peers` row of `installation`
+    /// with the key the catalog now holds.
+    fn reopen(&self, installation: &str) {
+        if self.catalog.paired_key(installation).is_err() {
+            return;
+        }
+        for peer in self.catalog.peers().unwrap_or_default() {
+            if peer.installation == installation {
+                self.open_lanes_or_log(&peer);
+            }
+        }
+    }
+
+    fn open_lanes_or_log(&self, peer: &Peer) {
+        if let Err(error) = self.open_lanes(peer) {
+            event!(warn, PEER_LANES_SKIPPED, {
+                "endpoint": peer.endpoint.clone(),
+                "installation": peer.installation.clone(),
+                "error": format!("{error:#}"),
+            });
+        }
     }
 
     /// Forgets `installation`: best-effort `peer.revoke` on its control lane,
@@ -457,6 +522,7 @@ impl Network {
     /// closed (the `peers` rows stay for a re-pair).
     pub fn reset_pairing_code(&self) -> Result<String> {
         let code = self.catalog.reset_code()?;
+        register_secret(&code);
         {
             let mut inbound = lock(&self.inbound);
             inbound.retain(|conn| conn.closed().is_none());
@@ -975,12 +1041,18 @@ impl PeerService {
                 let request: auth::EnrollRequest = serde_json::from_slice(&body)
                     .map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))?;
                 let secret = auth::enrollment_secret(&request)?;
-                catalog
+                let updated = catalog
                     .save_paired(&self.peer.installation, auth::peer_key(&secret))
                     .map_err(|error| ErrorWire::from_error(&error))?;
+                // The rows we dial this installation with took the new key:
+                // their lanes redial with it.
+                if updated > 0 {
+                    self.network.reopen(&self.peer.installation);
+                }
                 event!(info, PEER_ENROLLED, {
                     "installation": self.peer.installation.clone(),
                     "endpoint": header["endpoint"].clone(),
+                    "outbound_rows": updated,
                 });
                 Ok((json!({}), encode(&auth::EnrollReply { enrolled: true })?))
             }
@@ -1220,6 +1292,26 @@ mod tests {
         assert_eq!(code(&bulk, "objects.fetch", wanted), "REPO_NOT_PUBLISHED");
         control.close();
         bulk.close();
+    }
+
+    #[test]
+    fn a_bad_peer_row_is_skipped_and_the_network_still_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::initialize(&root.path().join("orchestrator.toml")).unwrap();
+        config.network.listen = String::new();
+        let catalog = Catalog::open(&config.data_directory).unwrap();
+        catalog
+            .save_peer("ws://127.0.0.1:9", "broken", [1; 32], None)
+            .unwrap();
+        rusqlite::Connection::open(config.data_directory.join("folders.sqlite"))
+            .unwrap()
+            .execute("UPDATE peers SET credential='not hex'", [])
+            .unwrap();
+        let network = start(&config, catalog, Arc::new(NoFolders), Cancel::new(), None).unwrap();
+        let peers = network.peers();
+        assert_eq!(peers[0]["installation"], "broken", "{peers}");
+        assert_eq!(peers[0]["lanes"], json!([]), "{peers}");
+        network.shutdown(Duration::from_secs(1));
     }
 
     #[test]

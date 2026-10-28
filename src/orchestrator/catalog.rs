@@ -365,7 +365,8 @@ impl Catalog {
             .with_context(|| format!("PEER_NOT_FOUND: no peer at {endpoint:?}"))
     }
 
-    /// Outbound pairing: remember the peer and trust its key.
+    /// Outbound pairing: remember the peer and trust its key. An
+    /// installation has one credential: its other `peers` rows take the key.
     pub fn save_peer(
         &self,
         endpoint: &str,
@@ -382,6 +383,10 @@ impl Catalog {
             params![installation, key],
         )?;
         tx.execute_cached(
+            "UPDATE peers SET credential=?2 WHERE installation=?1",
+            params![installation, key],
+        )?;
+        tx.execute_cached(
             "INSERT OR REPLACE INTO peers VALUES(?1,?2,?3,?4)",
             params![endpoint, installation, key, connections],
         )?;
@@ -389,13 +394,24 @@ impl Catalog {
         Ok(())
     }
 
-    /// Inbound enrollment: trust the key without a dialable endpoint.
-    pub fn save_paired(&self, installation: &str, key: [u8; 32]) -> Result<()> {
-        self.db()?.execute_cached(
+    /// Inbound enrollment: trust the key without a dialable endpoint. An
+    /// installation has one credential, so the `peers` rows this side dials
+    /// it with take the new key too (a replaced key would be refused).
+    /// Returns how many `peers` rows changed.
+    pub fn save_paired(&self, installation: &str, key: [u8; 32]) -> Result<usize> {
+        let key = hex::encode(key);
+        let db = self.db()?;
+        let tx = db.unchecked_transaction()?;
+        tx.execute_cached(
             "INSERT OR REPLACE INTO paired VALUES(?1,?2)",
-            params![installation, hex::encode(key)],
+            params![installation, key],
         )?;
-        Ok(())
+        let updated = tx.execute_cached(
+            "UPDATE peers SET credential=?2 WHERE installation=?1",
+            params![installation, key],
+        )?;
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn unpair(&self, installation: &str) -> Result<()> {
@@ -677,6 +693,27 @@ mod tests {
             code(&catalog.paired_key("inst").unwrap_err()),
             "PEER_REVOKED"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn an_installation_has_one_credential_across_paired_and_peers() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = Catalog::open(home.path())?;
+        catalog.save_peer("ws://b:1", "b", [1; 32], None)?;
+        catalog.save_peer("ws://other:2", "c", [3; 32], None)?;
+        // B enrolls a new key inbound: the row this side dials B with follows.
+        assert_eq!(catalog.save_paired("b", [2; 32])?, 1);
+        assert_eq!(catalog.paired_key("b")?, [2; 32]);
+        assert_eq!(catalog.peer("ws://b:1")?.key()?, [2; 32]);
+        assert_eq!(catalog.peer("ws://other:2")?.key()?, [3; 32]);
+        // A second endpoint for B takes over the key for every row of B.
+        catalog.save_peer("ws://b-alias:1", "b", [4; 32], None)?;
+        assert_eq!(catalog.peer("ws://b:1")?.key()?, [4; 32]);
+        assert_eq!(catalog.peer("ws://b-alias:1")?.key()?, [4; 32]);
+        assert_eq!(catalog.paired_key("b")?, [4; 32]);
+        // An inbound-only installation has no rows to update.
+        assert_eq!(catalog.save_paired("d", [5; 32])?, 0);
         Ok(())
     }
 
