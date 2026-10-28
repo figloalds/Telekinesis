@@ -34,17 +34,25 @@
 //!    in flight get what is left of [`SHUTDOWN_BOUND`] (at most 2 s).
 //!
 //! Before step 1 the peer network closes (spec §7.1: close peers, then stop
-//! folders), within [`NETWORK_SHUTDOWN`]; the folder steps keep their times
-//! from the sequence's start.
+//! folders), within [`NETWORK_SHUTDOWN`], then the sync driver's threads get
+//! [`SYNC_SHUTDOWN`]; the folder steps keep their times from the sequence's
+//! start.
+//!
+//! The sync driver (`sync_driver`) runs beside the main loop once the network
+//! is up: it reads Running, unpaused folders through [`Directory`] (never
+//! waiting for a busy controller) and each folder's watch demand, which wakes
+//! its object pump through the daemon's `wake`.
 use super::{
     catalog::{Catalog, FolderRecord},
     config::Config,
+    demand::Seq,
     endpoint,
     folder::{Controller, FORCE_STOP_WAIT, Launcher, Phase, RealLauncher, STOP_WAIT, StopOutcome},
     network::{self, FolderDirectory, Network},
     process::{self, READY_TIMEOUT},
     signals,
-    worker::{RECORD_FILE, WorkerRecord},
+    sync_driver::{self, Driver, SyncFolder, SyncFolders},
+    worker::{EXIT_CONFIG, RECORD_FILE, WorkerRecord},
     worker_client::{CALL_DEADLINE, WorkerLink},
 };
 use crate::{
@@ -91,6 +99,9 @@ pub const START_WAIT: Duration = Duration::from_secs(READY_TIMEOUT.as_secs() + 5
 const REQUEST_DRAIN: Duration = Duration::from_secs(2);
 /// How long the shutdown sequence gives the peer network to close.
 pub const NETWORK_SHUTDOWN: Duration = Duration::from_secs(2);
+/// Then how long it waits for the sync driver's threads (a thread still in a
+/// bounded worker call ends on its own once its folder stops).
+pub const SYNC_SHUTDOWN: Duration = Duration::from_millis(500);
 /// How long `inspect`, `folder` and the shutdown sequence wait for a
 /// controller before falling back to its cached view.
 const BRIEF_LOCK: Duration = Duration::from_millis(500);
@@ -115,6 +126,7 @@ const MUTATIONS: &[&str] = &[
     "reset-pairing-code",
     "pair",
     "unpair",
+    "receive",
 ];
 /// Worker ops the `folder` action forwards.
 pub const FOLDER_OPS: &[&str] = &[
@@ -317,6 +329,10 @@ pub struct Daemon {
     listener: Mutex<Option<TcpListener>>,
     /// The peer network, once `run` started it.
     network: OnceLock<Arc<Network>>,
+    /// The sync driver, started with the network.
+    sync: OnceLock<Arc<Driver>>,
+    /// Bumped by folder watch threads on new demand; wakes the object pump.
+    wake: Arc<Seq>,
     /// Serializes `maximum_running` admission with the start it admits.
     admission: Mutex<()>,
     requests: AtomicUsize,
@@ -335,13 +351,20 @@ impl Drop for RequestGuard<'_> {
     }
 }
 
-/// Runs the orchestrator until `manage shutdown` or a signal. A second one
-/// on the same data directory prints `ALREADY_RUNNING` and exits 75 before
-/// touching anything but `orchestrator.toml`.
+/// Runs the orchestrator until `manage shutdown` or a signal. An invalid
+/// system clock prints `CLOCK_INVALID` and exits 78 before touching
+/// anything. A second one on the same data directory prints
+/// `ALREADY_RUNNING` and exits 75 before touching anything but
+/// `orchestrator.toml`.
 pub fn run(config_path: &Path) -> Result<()> {
     let config_path = std::path::absolute(config_path)?;
+    if let Err(error) = crate::clock::check() {
+        // A configuration error of the host (`EX_CONFIG`), before anything
+        // is written (`orchestrator.toml` included) or binds.
+        eprintln!("{error:#}");
+        std::process::exit(EXIT_CONFIG);
+    }
     let config = Config::load_or_init(&config_path)?;
-    crate::clock::check()?;
     let data = config.data_directory.clone();
     fs::create_dir_all(&data)
         .with_context(|| format!("DATA_DIRECTORY_UNAVAILABLE: {}", data.display()))?;
@@ -457,6 +480,8 @@ impl Daemon {
             listen,
             listener: Mutex::new(listener),
             network: OnceLock::new(),
+            sync: OnceLock::new(),
+            wake: Seq::new(),
             admission: Mutex::new(()),
             requests: AtomicUsize::new(0),
             latch: Latch::default(),
@@ -472,13 +497,16 @@ impl Daemon {
 
     fn register(&self, record: FolderRecord) -> Arc<Slot> {
         let id = record.id.clone();
-        let slot = Slot::new(Controller::new(
-            record,
-            self.executable.clone(),
-            self.config.network.worker_lanes,
-            self.launcher.clone(),
-            self.clock.clone(),
-        ));
+        let slot = Slot::new(
+            Controller::new(
+                record,
+                self.executable.clone(),
+                self.config.network.worker_lanes,
+                self.launcher.clone(),
+                self.clock.clone(),
+            )
+            .with_wake(self.wake.clone()),
+        );
         lock(&self.folders).insert(id, slot.clone());
         slot
     }
@@ -494,18 +522,35 @@ impl Daemon {
             .with_context(|| format!("FOLDER_NOT_FOUND: no folder {id:?}"))
     }
 
-    /// Starts the peer network on the bound listener.
+    /// Starts the peer network on the bound listener, then the sync driver.
     fn start_network(self: &Arc<Self>) -> Result<()> {
         let listener = lock(&self.listener).take();
+        let directory = Arc::new(Directory(Arc::downgrade(self)));
         let network = network::start(
             &self.config,
             self.catalog.clone(),
-            Arc::new(Directory(Arc::downgrade(self))),
+            directory.clone(),
             self.stopping.clone(),
             listener,
         )?;
-        let _ = self.network.set(network);
+        let _ = self.network.set(network.clone());
+        let driver = sync_driver::start(
+            network,
+            self.catalog.clone(),
+            directory,
+            self.wake.clone(),
+            Duration::from_millis(self.config.network.sync_interval_ms),
+            self.stopping.child(),
+        )?;
+        let _ = self.sync.set(driver);
         Ok(())
+    }
+
+    /// `{endpoint: {sent, received, last_exchange_ms, error}}` of `repo`.
+    fn sync_view(&self, repo: &str) -> Value {
+        self.sync
+            .get()
+            .map_or_else(|| json!({}), |driver| driver.view(repo))
     }
 
     fn network(&self) -> Result<&Arc<Network>> {
@@ -719,6 +764,7 @@ impl Daemon {
                 Ok(json!({}))
             }
             "peers" => Ok(self.network()?.peers()),
+            "receive" => self.receive(payload),
             "remote-list" => {
                 let endpoint = payload["endpoint"]
                     .as_str()
@@ -744,9 +790,29 @@ impl Daemon {
         let worker = link
             .and_then(|link| link.call_json("status", json!({})).ok())
             .unwrap_or(Value::Null);
-        view["sync"] = json!({});
+        view["sync"] = self.sync_view(&record.repo);
         view["worker"] = worker;
         Ok(view)
+    }
+
+    /// `receive {endpoint, repo, label, mount?}`: a folder of a repo the
+    /// paired `endpoint` publishes, created and started like `create`.
+    fn receive(&self, payload: &Value) -> Result<Value> {
+        let endpoint = payload["endpoint"]
+            .as_str()
+            .context("ARGUMENT_REQUIRED: endpoint")?;
+        let repo = payload["repo"]
+            .as_str()
+            .context("ARGUMENT_REQUIRED: repo")?;
+        payload["label"]
+            .as_str()
+            .context("ARGUMENT_REQUIRED: label")?;
+        let published = self.network()?.remote_list(endpoint)?;
+        ensure!(
+            published.iter().any(|folder| folder["repo"] == repo),
+            "REPO_NOT_PUBLISHED: {endpoint} publishes no folder of repo {repo}"
+        );
+        self.create(payload)
     }
 
     fn create(&self, payload: &Value) -> Result<Value> {
@@ -886,7 +952,12 @@ impl Daemon {
         let folders: Vec<Value> = self
             .slots()
             .iter()
-            .map(|slot| folder_entry(slot.view()))
+            .map(|slot| {
+                let mut entry = folder_entry(slot.view());
+                let repo = entry["record"]["repo"].as_str().unwrap_or_default();
+                entry["sync"] = self.sync_view(repo);
+                entry
+            })
             .collect();
         json!({
             "daemon": {
@@ -923,6 +994,9 @@ impl Daemon {
         if let Some(network) = self.network.get() {
             network.shutdown(NETWORK_SHUTDOWN);
         }
+        if let Some(driver) = self.sync.get() {
+            driver.stop(SYNC_SHUTDOWN);
+        }
         let folders = shutdown_folders(self.slots(), TIMINGS.after(started.elapsed()));
         let reply = json!({"stopped": true, "folders": folders});
         self.latch.finish(reply.clone());
@@ -958,6 +1032,32 @@ impl Timings {
 
 /// The daemon's folders as the peer network sees them.
 struct Directory(Weak<Daemon>);
+
+impl SyncFolders for Directory {
+    /// Never waits for a busy controller: one is skipped this round.
+    fn syncing(&self) -> Vec<SyncFolder> {
+        let Some(daemon) = self.0.upgrade() else {
+            return Vec::new();
+        };
+        daemon
+            .slots()
+            .iter()
+            .filter_map(|slot| {
+                let controller = slot.try_lock()?;
+                let record = controller.record();
+                if record.paused || !matches!(controller.phase(), Phase::Running { .. }) {
+                    return None;
+                }
+                Some(SyncFolder {
+                    id: record.id.clone(),
+                    repo: record.repo.clone(),
+                    link: controller.link()?,
+                    demand: controller.demand(),
+                })
+            })
+            .collect()
+    }
+}
 
 impl FolderDirectory for Directory {
     fn link_by_repo(&self, repo: &str) -> Option<Arc<WorkerLink>> {
@@ -1316,7 +1416,7 @@ mod tests {
         assert_eq!(FORCE_AT, Duration::from_secs(15));
         assert!(KILL_AT > FORCE_AT);
         // The network closes before the folders, well before forcing.
-        assert!(NETWORK_SHUTDOWN < FORCE_AT);
+        assert!(NETWORK_SHUTDOWN + SYNC_SHUTDOWN < FORCE_AT);
         let shifted = TIMINGS.after(NETWORK_SHUTDOWN);
         assert_eq!(shifted.kill_at + NETWORK_SHUTDOWN, KILL_AT);
         assert_eq!(shifted.force_at + NETWORK_SHUTDOWN, FORCE_AT);

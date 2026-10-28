@@ -262,7 +262,7 @@ impl Handler for Service {
 }
 /// Cursors advance only after successful metadata apply. Retrying a feed page
 /// is safe because event identity and explicit parent versions are immutable.
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FeedCursor {
     pub sent: u64,
     pub received: u64,

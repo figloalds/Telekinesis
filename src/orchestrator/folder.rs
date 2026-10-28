@@ -8,7 +8,10 @@
 //!   every result over a channel. No heartbeat for [`HEARTBEAT_LOST`], or
 //!   [`FAILED_WATCHES`] failed watches in a row, or a closed link, makes
 //!   `tick` probe `hello` ([`PROBE_DEADLINE`]); a failed probe kills the
-//!   worker (`kill_verified`) and counts as a failure.
+//!   worker (`kill_verified`) and counts as a failure. The watch thread
+//!   also keeps the worker's latest object demand ([`Controller::demand`])
+//!   and, when it changes to a non-empty set, bumps the wake the sync
+//!   driver's object pump sleeps on ([`Controller::with_wake`]).
 //! * Failures (an exit while starting or running, a lost heartbeat, a failed
 //!   connect, spawn or adoption, no Ready line in time) back off by
 //!   [`backoff_delay`]; [`BREAKER_FAILURES`] within [`BREAKER_WINDOW`] trip
@@ -21,13 +24,15 @@
 //! Dropping a controller never kills its worker: the next daemon adopts it.
 use super::{
     catalog::FolderRecord,
+    demand::Seq,
     process::{self, LaunchSpec, ProcessEvent, READY_TIMEOUT, WorkerProcess},
     worker::{RECORD_FILE, Ready, TOKEN_FILE, WorkerRecord},
     worker_client::{Watch, WorkerLink},
 };
 use crate::{
-    model::{errors::ErrorWire, orchestrator::CallError},
-    util::{log::event, time::Clock},
+    content::Kind,
+    model::{content::Digest, errors::ErrorWire, orchestrator::CallError},
+    util::{lock::lock, log::event, time::Clock},
 };
 use anyhow::Result;
 use rand::Rng;
@@ -38,7 +43,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
@@ -65,6 +70,9 @@ pub const PROBE_DEADLINE: Duration = Duration::from_secs(2);
 const JITTER: f64 = 0.2;
 /// After a failed watch the watch thread pauses this long (real time).
 const WATCH_RETRY: Duration = Duration::from_millis(500);
+/// While demand is pending the worker answers `watch` at once: the watch
+/// thread then pauses this long between watches that bring nothing new.
+const DEMAND_POLL: Duration = Duration::from_millis(100);
 /// `stop` re-reads the clock at least this often while waiting for an exit.
 const STOP_POLL: Duration = Duration::from_millis(50);
 
@@ -172,8 +180,13 @@ struct WatchThread {
 
 impl WatchThread {
     /// Loops `link.watch(after)` and sends every result; ends once the stop
-    /// flag is set, the link is closed or the receiver is gone.
-    fn start(link: Arc<WorkerLink>) -> std::io::Result<Self> {
+    /// flag is set, the link is closed or the receiver is gone. Each result's
+    /// demand replaces `demand`; a change to a non-empty set bumps `wake`.
+    fn start(
+        link: Arc<WorkerLink>,
+        demand: Arc<Mutex<Vec<(Digest, Kind)>>>,
+        wake: Option<Arc<Seq>>,
+    ) -> std::io::Result<Self> {
         let (sender, results) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
@@ -184,7 +197,17 @@ impl WatchThread {
                 while !stopped.load(Ordering::Acquire) {
                     let result = link.watch(after);
                     let failed = result.is_err();
+                    let mut idle_demand = false;
                     if let Ok(watch) = &result {
+                        let mut current = lock(&demand);
+                        let changed = *current != watch.demand;
+                        idle_demand = !watch.demand.is_empty() && watch.seq == after && !changed;
+                        if changed {
+                            current.clone_from(&watch.demand);
+                            if let (false, Some(wake)) = (current.is_empty(), &wake) {
+                                wake.bump();
+                            }
+                        }
                         after = watch.seq;
                     }
                     if sender.send(result).is_err() || (failed && !link.alive()) {
@@ -192,6 +215,8 @@ impl WatchThread {
                     }
                     if failed && !stopped.load(Ordering::Acquire) {
                         thread::sleep(WATCH_RETRY);
+                    } else if idle_demand {
+                        thread::sleep(DEMAND_POLL);
                     }
                 }
             })?;
@@ -226,6 +251,10 @@ pub struct Controller {
     link: Option<Arc<WorkerLink>>,
     watch: Option<WatchThread>,
     heartbeat: Option<Value>,
+    /// The running worker's latest object demand (its watch thread's).
+    demand: Arc<Mutex<Vec<(Digest, Kind)>>>,
+    /// Bumped when that demand changes to a non-empty set.
+    wake: Option<Arc<Seq>>,
     last_beat: Instant,
     watch_errors: u32,
     /// When the current Starting or Running phase began.
@@ -262,6 +291,8 @@ impl Controller {
             link: None,
             watch: None,
             heartbeat: None,
+            demand: Arc::new(Mutex::new(Vec::new())),
+            wake: None,
             last_beat: now,
             watch_errors: 0,
             phase_start: now,
@@ -276,6 +307,19 @@ impl Controller {
     pub fn with_jitter(mut self, jitter: f64) -> Self {
         self.jitter = Some(jitter);
         self
+    }
+
+    /// Bumps `wake` whenever the worker's demand changes to a non-empty set
+    /// (the sync driver's object pump sleeps on it).
+    pub fn with_wake(mut self, wake: Arc<Seq>) -> Self {
+        self.wake = Some(wake);
+        self
+    }
+
+    /// The objects the running worker's readers wait for, as of its last
+    /// `watch`; empty when it is not running.
+    pub fn demand(&self) -> Vec<(Digest, Kind)> {
+        lock(&self.demand).clone()
     }
 
     pub fn record(&self) -> &FolderRecord {
@@ -611,7 +655,8 @@ impl Controller {
         self.last_beat = now;
         self.watch_errors = 0;
         // Without a watch thread the probe still runs every HEARTBEAT_LOST.
-        self.watch = match WatchThread::start(link.clone()) {
+        self.watch = match WatchThread::start(link.clone(), self.demand.clone(), self.wake.clone())
+        {
             Ok(watch) => Some(watch),
             Err(error) => {
                 event!(error, FOLDER_WATCH_START_FAILED, {
@@ -823,6 +868,8 @@ impl Controller {
         self.process = None;
         self.worker = None;
         self.heartbeat = None;
+        // A fresh set: the old watch thread may still write to its own.
+        self.demand = Arc::new(Mutex::new(Vec::new()));
         self.watch_errors = 0;
     }
 }
@@ -1029,6 +1076,56 @@ mod tests {
             code: Some(code),
             tail: "tail".into(),
         }
+    }
+
+    /// A worker whose `watch` answers at once with seq 1 and `demand` (as
+    /// the real one does while demand is pending); counts the watches.
+    fn demanding_worker(demand: Value, watches: Arc<Mutex<u32>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        let handler: Arc<dyn Handler> = Arc::new(FnHandler(move |req: Incoming| {
+            *lock(&watches) += 1;
+            let body = json!({"seq": 1, "heartbeat": {}, "demand": demand});
+            req.responder
+                .reply(json!({}), serde_json::to_vec(&body).unwrap());
+        }));
+        thread::spawn(move || {
+            let mut conns = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let accepted = session::accept_loopback(
+                    stream,
+                    Some(TOKEN),
+                    ConnOptions::for_role(LaneRole::Control),
+                );
+                if let Ok(conn) = accepted {
+                    conn.serve(handler.clone());
+                    conns.push(conn);
+                }
+            }
+        });
+        address
+    }
+
+    #[test]
+    fn the_watch_thread_keeps_demand_wakes_the_pump_once_and_does_not_spin() {
+        let wanted = vec![(Digest::bytes(b"chunk"), Kind::Chunk)];
+        let watches = Arc::new(Mutex::new(0));
+        let address = demanding_worker(serde_json::to_value(&wanted).unwrap(), watches.clone());
+        let link = WorkerLink::connect(&ready(&address, PID), 1).unwrap();
+        let demand = Arc::new(Mutex::new(Vec::new()));
+        let wake = Seq::new();
+        let watch = WatchThread::start(link.clone(), demand.clone(), Some(wake.clone())).unwrap();
+        assert_eq!(wake.wait_past(0, Duration::from_secs(5)), 1);
+        assert_eq!(*lock(&demand), wanted);
+        // The same demand again: no further wake, and the thread paces its
+        // watches instead of spinning on immediate answers.
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(wake.current(), 1);
+        let count = *lock(&watches);
+        assert!((2..=12).contains(&count), "{count} watches in 600 ms");
+        drop(watch);
+        link.close();
     }
 
     #[test]

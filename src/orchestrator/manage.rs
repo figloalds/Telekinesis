@@ -94,6 +94,17 @@ pub enum ManagementCommand {
     Peers,
     /// The folders a paired orchestrator publishes.
     RemoteList { endpoint: String },
+    /// Create a folder of REPO, which the paired orchestrator at ENDPOINT
+    /// publishes, and start syncing it (headless unless `--mount`).
+    Receive {
+        endpoint: String,
+        repo: String,
+        label: String,
+        #[arg(long, conflicts_with = "headless")]
+        mount: Option<PathBuf>,
+        #[arg(long)]
+        headless: bool,
+    },
     /// Stop every folder and the orchestrator.
     Shutdown,
 }
@@ -184,6 +195,22 @@ fn request(command: ManagementCommand) -> Result<(&'static str, Value, bool)> {
         C::Unpair { installation } => ("unpair", json!({"installation": installation}), false),
         C::Peers => ("peers", json!({}), true),
         C::RemoteList { endpoint } => ("remote-list", json!({"endpoint": endpoint}), true),
+        C::Receive {
+            endpoint,
+            repo,
+            label,
+            mount,
+            ..
+        } => (
+            "receive",
+            json!({
+                "endpoint": endpoint,
+                "repo": repo,
+                "label": label,
+                "mount": absolute(mount)?,
+            }),
+            false,
+        ),
         C::Shutdown => ("shutdown", json!({}), false),
     })
 }
@@ -355,6 +382,21 @@ rest"[..]
         assert_eq!(
             request(ManagementCommand::ResetPairingCode).unwrap().0,
             "reset-pairing-code"
+        );
+        assert_eq!(
+            request(ManagementCommand::Receive {
+                endpoint: "ws://h:1".into(),
+                repo: "r1".into(),
+                label: "Shared".into(),
+                mount: None,
+                headless: true,
+            })
+            .unwrap(),
+            (
+                "receive",
+                json!({"endpoint": "ws://h:1", "repo": "r1", "label": "Shared", "mount": null}),
+                false
+            )
         );
     }
 }

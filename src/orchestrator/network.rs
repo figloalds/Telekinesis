@@ -237,6 +237,8 @@ impl Lane {
 /// Where a peer's lanes dial and with which credential. `Debug` is not
 /// derived: `key` is a secret.
 struct Target {
+    /// The clock check before every dial (`clock::check`; tests swap it).
+    check_clock: fn() -> Result<()>,
     endpoint: String,
     /// The peer's installation (`dial_expecting`).
     remote: String,
@@ -263,6 +265,15 @@ impl PeerLanes {
     fn finished(&self) -> bool {
         self.threads.iter().all(JoinHandle::is_finished)
     }
+}
+
+/// A peer with a Ready control lane.
+pub struct ReadyPeer {
+    pub endpoint: String,
+    pub installation: String,
+    /// The control session's id (a new one is a Ready transition).
+    pub session: String,
+    pub control: Conn,
 }
 
 pub struct Network {
@@ -654,6 +665,37 @@ impl Network {
         Value::Array(list)
     }
 
+    /// Every outbound peer whose control lane is Ready and open, with that
+    /// session (the sync driver's scheduler and clock probes).
+    pub fn ready_peers(&self) -> Vec<ReadyPeer> {
+        lock(&self.peers)
+            .iter()
+            .filter_map(|(endpoint, lanes)| {
+                let control = lanes.lanes.first()?.ready()?;
+                Some(ReadyPeer {
+                    endpoint: endpoint.clone(),
+                    installation: lanes.installation.clone(),
+                    session: control.peer().session.clone(),
+                    control,
+                })
+            })
+            .collect()
+    }
+
+    /// The endpoints with at least one Ready bulk lane (the object pump).
+    pub fn bulk_endpoints(&self) -> Vec<String> {
+        lock(&self.peers)
+            .iter()
+            .filter(|(_, lanes)| {
+                lanes
+                    .lanes
+                    .iter()
+                    .any(|lane| lane.role == LaneRole::Bulk && lane.ready().is_some())
+            })
+            .map(|(endpoint, _)| endpoint.clone())
+            .collect()
+    }
+
     /// The Ready control lane to `endpoint`.
     pub fn control_lane(&self, endpoint: &str) -> Option<Conn> {
         lock(&self.peers).get(endpoint)?.lanes.first()?.ready()
@@ -701,6 +743,7 @@ impl Network {
     fn open_lanes(&self, peer: &Peer) -> Result<()> {
         let pool = peer.connections.unwrap_or(self.pool).clamp(2, MAX_POOL);
         let target = Arc::new(Target {
+            check_clock: clock::check,
             endpoint: peer.endpoint.clone(),
             remote: peer.installation.clone(),
             key: peer.key()?,
@@ -875,7 +918,7 @@ fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
     let mut attempt: u32 = 0;
     while !cancel.is_cancelled() {
         lane.set(LaneState::Dialing { since_ms: now_ms() });
-        let dialed = clock::check()
+        let dialed = (target.check_clock)()
             .map_err(|error| ErrorWire::new("CLOCK_INVALID", format!("{error:#}")))
             .and_then(|()| {
                 let hello =
@@ -1338,6 +1381,53 @@ mod tests {
         for code in ["WS_CONNECT_FAILED", "CLOCK_INVALID", "TOO_MANY_SESSIONS"] {
             assert_eq!(refusal(&wire(code)), Refusal::Transient, "{code}");
         }
+    }
+
+    /// A peer daemon with an invalid clock never starts, so the dial side of
+    /// `CLOCK_INVALID` is checked here: the lane backs off before any dial.
+    #[test]
+    fn a_lane_with_an_invalid_clock_backs_off_without_dialing() {
+        fn invalid() -> Result<()> {
+            clock::check_ms(1_000_000_000_000)
+        }
+        // Nothing listens on port 9: a dial would fail with WS_CONNECT_FAILED.
+        let target = Target {
+            check_clock: invalid,
+            endpoint: "ws://127.0.0.1:9".into(),
+            remote: "peer-b".into(),
+            key: [7; 32],
+            local: "peer-a".into(),
+            pool: 2,
+        };
+        let lanes: Vec<Arc<Lane>> = (0..2).map(|index| Lane::new(index, 2)).collect();
+        let cancel = Cancel::new();
+        let target = Arc::new(target);
+        let threads: Vec<_> = lanes
+            .iter()
+            .map(|lane| {
+                let (lane, target, cancel) = (lane.clone(), target.clone(), cancel.clone());
+                thread::spawn(move || run_lane(&lane, &target, &cancel))
+            })
+            .collect();
+        let end = Instant::now() + Duration::from_secs(10);
+        for lane in &lanes {
+            loop {
+                let view = lane.view();
+                if view["state"] == "Backoff" {
+                    let error = view["error"].as_str().unwrap_or_default();
+                    assert!(error.contains("CLOCK_INVALID"), "{view}");
+                    assert_eq!(view["attempt"], 1, "{view}");
+                    break;
+                }
+                assert!(Instant::now() < end, "lane not in Backoff: {view}");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        cancel.cancel();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert!(lanes.iter().all(|lane| lane.view()["state"] == "Idle"));
     }
 
     #[test]

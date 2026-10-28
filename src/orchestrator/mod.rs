@@ -16,6 +16,7 @@ pub mod process;
 pub mod settings;
 pub mod signals;
 pub mod sync;
+pub mod sync_driver;
 pub mod worker;
 pub mod worker_client;
 

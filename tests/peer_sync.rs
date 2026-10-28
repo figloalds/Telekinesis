@@ -1,5 +1,6 @@
 //! Two real orchestrators on loopback: pairing, peer lanes, pairing-code
-//! resets and remote listings. Headless only: never passes `--mount`. Every
+//! resets, remote listings, `receive` with metadata and object sync, pause,
+//! clock offsets and an invalid clock. Headless only: never passes `--mount`. Every
 //! wait is bounded (see `support::daemon`).
 mod support;
 
@@ -7,9 +8,10 @@ use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{
     fs,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use support::daemon::TestDaemon;
+use support::daemon::{TestDaemon, run_tkfs};
 
 const LANES_READY: Duration = Duration::from_secs(30);
 const LANES_REVOKED: Duration = Duration::from_secs(15);
@@ -298,5 +300,327 @@ fn mutual_pairing_keeps_both_directions_ready() -> Result<()> {
     }
     a.shutdown()?;
     b.shutdown()?;
+    Ok(())
+}
+
+/// How long a replicated file may take to appear (brief: 60 s).
+const REPLICATED: Duration = Duration::from_secs(60);
+/// Bound of one folder CLI command against a worker.
+const FOLDER_COMMAND: Duration = Duration::from_secs(30);
+
+/// `tkfs --state STATE ARGS…`: its stdout, or an error with its stderr.
+fn folder(state: &Path, args: &[&str]) -> Result<String> {
+    let state = state.to_str().context("state path is not UTF-8")?;
+    let mut full = vec!["--state", state];
+    full.extend_from_slice(args);
+    let output = run_tkfs(&full, FOLDER_COMMAND)?;
+    ensure!(
+        output.code == Some(0),
+        "tkfs {args:?} exited {:?}: {}",
+        output.code,
+        output.stderr.trim()
+    );
+    Ok(output.stdout)
+}
+
+/// `len` bytes of pseudo-random lowercase text: no two 64 KiB chunks alike,
+/// and the raw output of `cat` stays valid UTF-8.
+fn text(len: usize, seed: u64) -> String {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(b'a' + (state % 26) as u8)
+        })
+        .collect()
+}
+
+/// Polls `tkfs --state STATE cat PATH` until it prints `expected`.
+fn wait_file(state: &Path, path: &str, expected: &str, bound: Duration) -> Result<()> {
+    let end = Instant::now() + bound;
+    loop {
+        let last = match folder(state, &["cat", path]) {
+            Ok(bytes) if bytes == expected => return Ok(()),
+            Ok(bytes) => format!("{} bytes, not the {} expected", bytes.len(), expected.len()),
+            Err(error) => format!("{error:#}"),
+        };
+        ensure!(
+            Instant::now() < end,
+            "{path} not replicated within {bound:?}; last cat: {last}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Two daemons sharing a folder (see [`shared_pair`]).
+struct Shared {
+    a: TestDaemon,
+    b: TestDaemon,
+    endpoint_b: String,
+    state_a: PathBuf,
+    state_b: PathBuf,
+}
+
+/// B with a running headless folder "Shared" holding `files`, and A paired
+/// with B (default pool, lanes Ready) and receiving it, Running.
+fn shared_pair(files: &[(&str, &str)]) -> Result<Shared> {
+    let a = TestDaemon::start()?;
+    let b = TestDaemon::start()?;
+    let shared = b.manage(&["create", "Shared", "--headless"])?;
+    let repo = shared["repo"]
+        .as_str()
+        .context("create gave no repo")?
+        .to_owned();
+    b.wait_phase("Shared", "Running", REPLICATED)?;
+    let state_b = b.state_dir("Shared")?;
+    for (path, content) in files {
+        import(&b, &state_b, path, content)?;
+    }
+    let code = b.manage(&["reset-pairing-code"])?["code"]
+        .as_str()
+        .context("no code")?
+        .to_string();
+    let endpoint_b = b.listen_endpoint()?;
+    a.manage(&["pair", &endpoint_b, "--code", &code])?;
+    a.wait_lanes(&endpoint_b, 4, "Ready", LANES_READY)?;
+    let received = a.manage(&["receive", &endpoint_b, &repo, "Shared", "--headless"])?;
+    ensure!(received["repo"] == repo.as_str(), "{received}");
+    a.wait_phase("Shared", "Running", REPLICATED)?;
+    let state_a = a.state_dir("Shared")?;
+    Ok(Shared {
+        a,
+        b,
+        endpoint_b,
+        state_a,
+        state_b,
+    })
+}
+
+/// Imports `content` as `path` into the running folder at `state`.
+fn import(daemon: &TestDaemon, state: &Path, path: &str, content: &str) -> Result<()> {
+    let source = daemon.home().join(format!("source-{path}"));
+    fs::write(&source, content)?;
+    folder(state, &["import", path, source.to_str().unwrap()]).map(drop)
+}
+
+#[test]
+fn receive_replicates_metadata_and_objects_across_two_orchestrators() -> Result<()> {
+    // 2.5 MiB: a manifest and 40 chunks, more than one object batch.
+    let notes = text(5 * 512 * 1024, 7);
+    let Shared {
+        a,
+        b,
+        endpoint_b,
+        state_a,
+        ..
+    } = shared_pair(&[("notes.txt", &notes)])?;
+    // Metadata first, then the object pump pulls every object unasked: no
+    // read on A creates demand before B is gone.
+    wait_until(REPLICATED, "notes.txt in A's tree", || {
+        Ok(folder(&state_a, &["tree"])?.contains("notes.txt"))
+    })?;
+    wait_until(REPLICATED, "A's packs to hold notes.txt", || {
+        Ok(pack_bytes(&state_a) >= notes.len() as u64)
+    })?;
+
+    let inspected = a.manage(&["inspect", "Shared"])?;
+    let sync = &inspected["sync"][endpoint_b.as_str()];
+    ensure!(
+        sync["received"].as_u64().unwrap_or(0) >= 2,
+        "sync[{endpoint_b}] = {sync}; inspect: {inspected}"
+    );
+    ensure!(sync["last_exchange_ms"].as_u64().unwrap_or(0) > 0, "{sync}");
+    ensure!(sync["error"].is_null(), "{sync}");
+    // The objects went over bulk lanes: the control lane carried metadata.
+    let peers = a.manage(&["peers"])?;
+    let control = &peer_at(&peers, &endpoint_b)?["lanes"][0];
+    ensure!(control["role"] == "control", "{peers}");
+    let down = control["health"]["bytes_down"]
+        .as_u64()
+        .context("no bytes_down")?;
+    ensure!(down < 1024 * 1024, "control lane received {down} bytes");
+
+    // A repo B does not publish is refused.
+    let refused = error_of(a.manage(&[
+        "receive",
+        &endpoint_b,
+        "no-such-repo",
+        "Other",
+        "--headless",
+    ]));
+    assert!(refused.contains("REPO_NOT_PUBLISHED"), "{refused}");
+
+    // With B gone, A serves the file from its own packs.
+    b.shutdown()?;
+    let bytes = folder(&state_a, &["cat", "notes.txt"])?;
+    ensure!(
+        bytes == notes,
+        "A's notes.txt differs from the source ({} of {} bytes)",
+        bytes.len(),
+        notes.len()
+    );
+    a.shutdown()?;
+    Ok(())
+}
+
+/// Polls `check` until it holds, at most `bound`.
+fn wait_until(bound: Duration, what: &str, mut check: impl FnMut() -> Result<bool>) -> Result<()> {
+    let end = Instant::now() + bound;
+    loop {
+        let last = match check() {
+            Ok(true) => return Ok(()),
+            Ok(false) => "not yet".to_owned(),
+            Err(error) => format!("{error:#}"),
+        };
+        ensure!(Instant::now() < end, "no {what} within {bound:?}: {last}");
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Bytes in the pack files under `state` (every `packs` directory).
+fn pack_bytes(state: &Path) -> u64 {
+    fn walk(dir: &Path, packs: bool) -> u64 {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => walk(&path, packs || entry.file_name() == "packs"),
+                    Ok(_) if packs => entry.metadata().map_or(0, |m| m.len()),
+                    _ => 0,
+                }
+            })
+            .sum()
+    }
+    walk(state, false)
+}
+
+#[test]
+fn paused_folder_stops_exchanging_and_resume_catches_up() -> Result<()> {
+    let first = text(1000, 3);
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair(&[("first.txt", &first)])?;
+    wait_file(&state_a, "first.txt", &first, REPLICATED)?;
+
+    let paused = a.manage(&["pause", "Shared"])?;
+    ensure!(paused["paused"] == true, "{paused}");
+    let before = folder(&state_a, &["tree"])?;
+    let second = text(2000, 5);
+    import(&b, &state_b, "second.txt", &second)?;
+    std::thread::sleep(Duration::from_secs(5));
+    let after = folder(&state_a, &["tree"])?;
+    ensure!(
+        before == after,
+        "a paused folder changed:\n{before}\n→\n{after}"
+    );
+    ensure!(
+        folder(&state_a, &["cat", "second.txt"]).is_err(),
+        "second.txt reached a paused folder"
+    );
+
+    a.manage(&["resume", "Shared"])?;
+    wait_file(&state_a, "second.txt", &second, Duration::from_secs(30))?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn clock_offset_is_measured_and_stored() -> Result<()> {
+    let a = TestDaemon::start()?;
+    let b = TestDaemon::start()?;
+    let code = b.manage(&["reset-pairing-code"])?["code"]
+        .as_str()
+        .context("no code")?
+        .to_string();
+    let endpoint_b = b.listen_endpoint()?;
+    a.manage(&["pair", &endpoint_b, "--code", &code, "--connections", "2"])?;
+    a.wait_lanes(&endpoint_b, 2, "Ready", LANES_READY)?;
+    // Probed at Ready: within a few scheduler rounds.
+    let end = Instant::now() + Duration::from_secs(15);
+    let clock = loop {
+        let peers = a.manage(&["peers"])?;
+        let clock = peer_at(&peers, &endpoint_b)?["clock"].clone();
+        if !clock.is_null() {
+            break clock;
+        }
+        ensure!(Instant::now() < end, "no clock measured: {peers}");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let offset = clock["offset_ms"].as_i64().context("no offset_ms")?;
+    let rtt = clock["rtt_ms"].as_u64().context("no rtt_ms")?;
+    let measured_at = clock["measured_at"].as_u64().context("no measured_at")?;
+    ensure!(offset.abs() <= 2000, "{clock}");
+    ensure!(rtt < 1000, "{clock}");
+    ensure!(measured_at >= tkfs::clock::FLOOR_MS, "{clock}");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+/// The daemon side of an invalid clock: `tkfs start` refuses (exit 78,
+/// `CLOCK_INVALID`) before it listens or writes `orchestrator.json`. The dial
+/// side cannot run end to end (a daemon with that clock never starts), so
+/// the lane's pre-dial check is the unit test
+/// `network::tests::a_lane_with_an_invalid_clock_backs_off_without_dialing`.
+#[test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "TKFS_FAKE_NOW_MS is only honoured by debug builds"
+)]
+fn peer_with_invalid_clock_is_refused() -> Result<()> {
+    use std::process::{Command, Stdio};
+    let home = tempfile::tempdir()?;
+    let listen = free_address()?;
+    let config = home.path().join("orchestrator.toml");
+    fs::write(
+        &config,
+        format!(
+            "format_version = 2\ndata_directory = \"data\"\n\
+             default_mount_directory = \"mounts\"\n\n[network]\nlisten = \"{listen}\"\n"
+        ),
+    )?;
+    let log = home.path().join("daemon.log");
+    let file = fs::File::create(&log)?;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tkfs"))
+        .arg("-f")
+        .arg(&config)
+        .arg("start")
+        .stdin(Stdio::null())
+        .stdout(file.try_clone()?)
+        .stderr(file)
+        .env("TKFS_FAKE_NOW_MS", "1000000000000")
+        .env_remove("TKFS_UNSUPERVISED_EXIT_S")
+        .spawn()?;
+    let end = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= end {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("STRANDED_PROCESS: the daemon with an invalid clock did not exit");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = fs::read_to_string(&log)?;
+    assert_eq!(status.code(), Some(78), "{status}: {output}");
+    assert!(output.contains("CLOCK_INVALID"), "{output}");
+    assert!(!home.path().join("data").join("orchestrator.json").exists());
+    ensure!(
+        std::net::TcpStream::connect(&listen).is_err(),
+        "{listen} accepted a connection"
+    );
     Ok(())
 }
