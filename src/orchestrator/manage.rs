@@ -75,6 +75,25 @@ pub enum ManagementCommand {
         #[arg(value_name = "STATE")]
         folder: String,
     },
+    /// Rotate this orchestrator's pairing code: every pairing made with the
+    /// old one is revoked. Prints the new code.
+    ResetPairingCode,
+    /// Pair with the orchestrator at ENDPOINT (`ws://host:port`); the code is
+    /// read from stdin unless `--code` is given.
+    Pair {
+        endpoint: String,
+        /// Lanes to this peer (1–16; at least 2 are opened).
+        #[arg(long)]
+        connections: Option<usize>,
+        #[arg(long)]
+        code: Option<String>,
+    },
+    /// Forget a paired installation (and ask it to forget this one).
+    Unpair { installation: String },
+    /// Paired peers and their lanes.
+    Peers,
+    /// The folders a paired orchestrator publishes.
+    RemoteList { endpoint: String },
     /// Stop every folder and the orchestrator.
     Shutdown,
 }
@@ -146,8 +165,39 @@ fn request(command: ManagementCommand) -> Result<(&'static str, Value, bool)> {
         C::Retry { folder } => ("retry", json!({"state": folder}), false),
         C::Pause { folder } => ("pause", json!({"state": folder}), false),
         C::Resume { folder } => ("resume", json!({"state": folder}), false),
+        C::ResetPairingCode => ("reset-pairing-code", json!({}), false),
+        C::Pair {
+            endpoint,
+            connections,
+            code,
+        } => {
+            let code = match code {
+                Some(code) => code,
+                None => read_code(std::io::stdin().lock())?,
+            };
+            (
+                "pair",
+                json!({"endpoint": endpoint, "code": code.trim(), "connections": connections}),
+                false,
+            )
+        }
+        C::Unpair { installation } => ("unpair", json!({"installation": installation}), false),
+        C::Peers => ("peers", json!({}), true),
+        C::RemoteList { endpoint } => ("remote-list", json!({"endpoint": endpoint}), true),
         C::Shutdown => ("shutdown", json!({}), false),
     })
+}
+
+/// The pairing code: the first line of `input`.
+fn read_code(mut input: impl std::io::BufRead) -> Result<String> {
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let code = line.trim();
+    anyhow::ensure!(
+        !code.is_empty(),
+        "PAIRING_CODE_REQUIRED: give the peer's pairing code on stdin or with --code"
+    );
+    Ok(code.to_owned())
 }
 
 fn short(id: &str) -> &str {
@@ -266,5 +316,45 @@ mod tests {
         assert_eq!(payload, json!({"state": "P", "wait": false}));
         assert!(request(ManagementCommand::Status).unwrap().2);
         assert!(!request(ManagementCommand::Shutdown).unwrap().2);
+    }
+
+    #[test]
+    fn pairing_commands_map_to_actions_and_the_code_comes_from_stdin() {
+        let (action, payload, read) = request(ManagementCommand::Pair {
+            endpoint: "ws://h:1".into(),
+            connections: Some(2),
+            code: Some(
+                " abc 
+"
+                .into(),
+            ),
+        })
+        .unwrap();
+        assert_eq!((action, read), ("pair", false));
+        assert_eq!(
+            payload,
+            json!({"endpoint": "ws://h:1", "code": "abc", "connections": 2})
+        );
+        assert_eq!(
+            read_code(
+                &b"c0de
+rest"[..]
+            )
+            .unwrap(),
+            "c0de"
+        );
+        let missing = read_code(&b""[..]).unwrap_err().to_string();
+        assert!(missing.starts_with("PAIRING_CODE_REQUIRED"), "{missing}");
+        assert_eq!(
+            request(ManagementCommand::RemoteList {
+                endpoint: "ws://h:1".into()
+            })
+            .unwrap(),
+            ("remote-list", json!({"endpoint": "ws://h:1"}), true)
+        );
+        assert_eq!(
+            request(ManagementCommand::ResetPairingCode).unwrap().0,
+            "reset-pairing-code"
+        );
     }
 }

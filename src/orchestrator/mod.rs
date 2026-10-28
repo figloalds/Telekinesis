@@ -11,6 +11,7 @@ pub mod endpoint;
 pub mod folder;
 pub mod hub;
 pub mod manage;
+pub mod network;
 pub mod process;
 pub mod settings;
 pub mod signals;

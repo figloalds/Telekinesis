@@ -32,11 +32,16 @@
 //!    `stranded` with the reason, never `not_running`;
 //! 4. every folder that needed step 2 or 3 logs `FORCED_STOP`; then requests
 //!    in flight get what is left of [`SHUTDOWN_BOUND`] (at most 2 s).
+//!
+//! Before step 1 the peer network closes (spec §7.1: close peers, then stop
+//! folders), within [`NETWORK_SHUTDOWN`]; the folder steps keep their times
+//! from the sequence's start.
 use super::{
     catalog::{Catalog, FolderRecord},
     config::Config,
     endpoint,
     folder::{Controller, FORCE_STOP_WAIT, Launcher, Phase, RealLauncher, STOP_WAIT, StopOutcome},
+    network::{self, FolderDirectory, Network},
     process::{self, READY_TIMEOUT},
     signals,
     worker::{RECORD_FILE, WorkerRecord},
@@ -59,7 +64,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, TryRecvError},
     },
@@ -84,6 +89,8 @@ pub const START_WAIT: Duration = Duration::from_secs(READY_TIMEOUT.as_secs() + 5
 /// (the `shutdown` reply among them) before exiting; never past
 /// [`SHUTDOWN_BOUND`] from the sequence's start.
 const REQUEST_DRAIN: Duration = Duration::from_secs(2);
+/// How long the shutdown sequence gives the peer network to close.
+pub const NETWORK_SHUTDOWN: Duration = Duration::from_secs(2);
 /// How long `inspect`, `folder` and the shutdown sequence wait for a
 /// controller before falling back to its cached view.
 const BRIEF_LOCK: Duration = Duration::from_millis(500);
@@ -105,6 +112,9 @@ const MUTATIONS: &[&str] = &[
     "resume",
     "configure-mount",
     "folder",
+    "reset-pairing-code",
+    "pair",
+    "unpair",
 ];
 /// Worker ops the `folder` action forwards.
 pub const FOLDER_OPS: &[&str] = &[
@@ -303,9 +313,10 @@ pub struct Daemon {
     /// The bound peer listen address (`host:port`), if listening.
     listen: Option<String>,
     /// The peer listener, bound at startup so a configured port 0 has its
-    /// real port in `orchestrator.json`; the network (Task 11) takes it over.
-    /// Until then it accepts nothing.
-    pub listener: Mutex<Option<TcpListener>>,
+    /// real port in `orchestrator.json`; `start_network` hands it over.
+    listener: Mutex<Option<TcpListener>>,
+    /// The peer network, once `run` started it.
+    network: OnceLock<Arc<Network>>,
     /// Serializes `maximum_running` admission with the start it admits.
     admission: Mutex<()>,
     requests: AtomicUsize,
@@ -359,6 +370,7 @@ pub fn run(config_path: &Path) -> Result<()> {
     let daemon = Daemon::new(config, config_path, lock)?;
     // From here a signal is a shutdown, never the default termination.
     signals::install(daemon.stopping.clone())?;
+    daemon.start_network()?;
     let discovery = Discovery(data.clone());
     let control = endpoint::serve(daemon.clone())?;
     event!(info, ORCHESTRATOR_STARTED, {
@@ -444,6 +456,7 @@ impl Daemon {
             control: OnceLock::new(),
             listen,
             listener: Mutex::new(listener),
+            network: OnceLock::new(),
             admission: Mutex::new(()),
             requests: AtomicUsize::new(0),
             latch: Latch::default(),
@@ -479,6 +492,26 @@ impl Daemon {
             .get(id)
             .cloned()
             .with_context(|| format!("FOLDER_NOT_FOUND: no folder {id:?}"))
+    }
+
+    /// Starts the peer network on the bound listener.
+    fn start_network(self: &Arc<Self>) -> Result<()> {
+        let listener = lock(&self.listener).take();
+        let network = network::start(
+            &self.config,
+            self.catalog.clone(),
+            Arc::new(Directory(Arc::downgrade(self))),
+            self.stopping.clone(),
+            listener,
+        )?;
+        let _ = self.network.set(network);
+        Ok(())
+    }
+
+    fn network(&self) -> Result<&Arc<Network>> {
+        self.network
+            .get()
+            .context("NETWORK_UNAVAILABLE: the peer network is not running")
     }
 
     /// The endpoint's address, once (`endpoint::serve`).
@@ -658,6 +691,40 @@ impl Daemon {
             }
             "configure-mount" => self.configure_mount(&selector()?, payload),
             "folder" => self.folder(&selector()?, payload),
+            "reset-pairing-code" => Ok(json!({"code": self.network()?.reset_pairing_code()?})),
+            "pair" => {
+                let endpoint = payload["endpoint"]
+                    .as_str()
+                    .context("ARGUMENT_REQUIRED: endpoint")?;
+                let code = payload["code"]
+                    .as_str()
+                    .context("ARGUMENT_REQUIRED: code")?;
+                let connections = match &payload["connections"] {
+                    Value::Null => None,
+                    value => Some(
+                        value
+                            .as_u64()
+                            .and_then(|n| usize::try_from(n).ok())
+                            .context("INVALID_REQUEST: connections must be a number")?,
+                    ),
+                };
+                let installation = self.network()?.pair(endpoint, code, connections)?;
+                Ok(json!({"installation": installation}))
+            }
+            "unpair" => {
+                let installation = payload["installation"]
+                    .as_str()
+                    .context("ARGUMENT_REQUIRED: installation")?;
+                self.network()?.unpair(installation)?;
+                Ok(json!({}))
+            }
+            "peers" => Ok(self.network()?.peers()),
+            "remote-list" => {
+                let endpoint = payload["endpoint"]
+                    .as_str()
+                    .context("ARGUMENT_REQUIRED: endpoint")?;
+                Ok(Value::Array(self.network()?.remote_list(endpoint)?))
+            }
             "shutdown" => {
                 self.stopping.cancel();
                 Ok(self.shutdown())
@@ -835,7 +902,7 @@ impl Daemon {
                 "stopping": self.stopping.is_cancelled(),
             },
             "folders": folders,
-            "peers": [],
+            "peers": self.network.get().map_or_else(|| json!([]), |network| network.peers()),
         })
     }
 
@@ -852,7 +919,11 @@ impl Daemon {
         let _ = self.shutdown_started.set(Instant::now());
         self.stopping.cancel();
         event!(info, ORCHESTRATOR_STOPPING, { "folders": self.slots().len() });
-        let folders = shutdown_folders(self.slots(), TIMINGS);
+        let started = Instant::now();
+        if let Some(network) = self.network.get() {
+            network.shutdown(NETWORK_SHUTDOWN);
+        }
+        let folders = shutdown_folders(self.slots(), TIMINGS.after(started.elapsed()));
         let reply = json!({"stopped": true, "folders": folders});
         self.latch.finish(reply.clone());
         reply
@@ -872,6 +943,53 @@ const TIMINGS: Timings = Timings {
     kill_at: KILL_AT,
     settle: KILL_SETTLE,
 };
+
+impl Timings {
+    /// The same points in time for a sequence whose folder steps begin
+    /// `elapsed` after its start (the peer network closed first).
+    fn after(self, elapsed: Duration) -> Self {
+        Self {
+            force_at: self.force_at.saturating_sub(elapsed),
+            kill_at: self.kill_at.saturating_sub(elapsed),
+            settle: self.settle,
+        }
+    }
+}
+
+/// The daemon's folders as the peer network sees them.
+struct Directory(Weak<Daemon>);
+
+impl FolderDirectory for Directory {
+    fn link_by_repo(&self, repo: &str) -> Option<Arc<WorkerLink>> {
+        let daemon = self.0.upgrade()?;
+        daemon
+            .catalog
+            .folders()
+            .ok()?
+            .into_iter()
+            .filter(|record| record.repo == repo && !record.paused)
+            .find_map(|record| {
+                let slot = daemon.slot(&record.id).ok()?;
+                let controller = slot.lock_briefly()?;
+                matches!(controller.phase(), Phase::Running { .. })
+                    .then(|| controller.link())
+                    .flatten()
+            })
+    }
+
+    fn published(&self) -> Vec<Value> {
+        let Some(daemon) = self.0.upgrade() else {
+            return Vec::new();
+        };
+        daemon
+            .catalog
+            .folders()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| json!({"repo": record.repo, "label": record.label}))
+            .collect()
+    }
+}
 
 /// How a kill of the sequence's step 3 went.
 #[derive(Debug)]
@@ -1197,6 +1315,11 @@ mod tests {
     fn the_sequence_forces_kills_and_drains_within_the_bound() {
         assert_eq!(FORCE_AT, Duration::from_secs(15));
         assert!(KILL_AT > FORCE_AT);
+        // The network closes before the folders, well before forcing.
+        assert!(NETWORK_SHUTDOWN < FORCE_AT);
+        let shifted = TIMINGS.after(NETWORK_SHUTDOWN);
+        assert_eq!(shifted.kill_at + NETWORK_SHUTDOWN, KILL_AT);
+        assert_eq!(shifted.force_at + NETWORK_SHUTDOWN, FORCE_AT);
         // The kill, the settle and the longest drain all end within the bound.
         assert!(KILL_AT + KILL_SETTLE + REQUEST_DRAIN <= SHUTDOWN_BOUND);
     }

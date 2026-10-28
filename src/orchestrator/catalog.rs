@@ -411,6 +411,16 @@ impl Catalog {
         Ok(())
     }
 
+    /// Every installation whose credential is trusted (outbound pairings and
+    /// inbound enrollments), in pairing order.
+    pub fn paired_installations(&self) -> Result<Vec<String>> {
+        let db = self.db()?;
+        let mut query = db.prepare_cached("SELECT installation FROM paired ORDER BY rowid")?;
+        Ok(query
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn paired_key(&self, installation: &str) -> Result<[u8; 32]> {
         let credential: String = self
             .db()?
