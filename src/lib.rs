@@ -1,4 +1,5 @@
 //! Entity events, immutable packs, and a scratch-file working filesystem.
+pub mod clock;
 pub mod content;
 pub mod core;
 pub mod desktop;
