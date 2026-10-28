@@ -220,7 +220,8 @@ pub struct Controller {
     events: Option<Receiver<ProcessEvent>>,
     /// The fatal line of the current worker, reported with its exit.
     fatal: Option<String>,
-    /// `shutdown` was accepted: the worker's exit is a stop, not a failure.
+    /// `shutdown` was accepted: the worker is exiting. Its exit is a stop,
+    /// not a failure, and liveness no longer probes or kills it.
     stop_requested: bool,
     link: Option<Arc<WorkerLink>>,
     watch: Option<WatchThread>,
@@ -401,6 +402,9 @@ impl Controller {
             self.phase = Phase::Stopped;
             return Ok(StopOutcome::Stopped);
         }
+        // The wait is not a lost heartbeat.
+        self.last_beat = self.clock.instant();
+        self.watch_errors = 0;
         if !force {
             self.phase = running;
             return Ok(StopOutcome::LeftRunning(format!(
@@ -644,6 +648,13 @@ impl Controller {
         let Some(link) = self.link.clone() else {
             return;
         };
+        // The worker accepted `shutdown` and is exiting (flushing, say): a
+        // quiet heartbeat or a closed link is expected, never a reason to
+        // kill it or a failure. Its exit is a stop; `stop(true)` can still
+        // force it.
+        if self.stop_requested {
+            return;
+        }
         let now = self.clock.instant();
         let quiet = now.saturating_duration_since(self.last_beat);
         if quiet < HEARTBEAT_LOST && self.watch_errors < FAILED_WATCHES && link.alive() {
@@ -840,15 +851,17 @@ mod tests {
 
     /// An in-process loopback server standing in for a worker: `watch` is
     /// parked and never answered (its heartbeat goes quiet), `shutdown` is
-    /// refused with `BUSY_VIEW` and anything else (the `hello` probe) fails.
-    /// Its address, for a [`Ready`].
-    fn fake_worker() -> String {
+    /// accepted (without exiting) when `accept_shutdown`, else refused with
+    /// `BUSY_VIEW`, and anything else (the `hello` probe) fails. Its address,
+    /// for a [`Ready`].
+    fn fake_worker(accept_shutdown: bool) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("ws://{}", listener.local_addr().unwrap());
         let parked = Arc::new(Mutex::new(Vec::<Incoming>::new()));
         let handler: Arc<dyn Handler> =
             Arc::new(FnHandler(move |req: Incoming| match req.op.as_str() {
                 "watch" => lock(&parked).push(req),
+                "shutdown" if accept_shutdown => req.responder.reply(json!({}), b"{}".to_vec()),
                 "shutdown" => req
                     .responder
                     .error(ErrorWire::coded("BUSY_VIEW", "1 files open")),
@@ -998,7 +1011,7 @@ mod tests {
 
     #[test]
     fn exit_while_running_backs_off_then_restarts_on_monotonic_time_only() {
-        let address = fake_worker();
+        let address = fake_worker(false);
         let stub = Stub::new(vec![vec![ProcessEvent::Ready(ready(&address, PID))]]);
         let clock = Arc::new(ManualClock::default());
         let mut controller = controller(&stub, &clock);
@@ -1120,7 +1133,7 @@ mod tests {
 
     #[test]
     fn stop_without_force_passes_busy_view_through_as_left_running() {
-        let address = fake_worker();
+        let address = fake_worker(false);
         let stub = Stub::new(vec![vec![ProcessEvent::Ready(ready(&address, PID))]]);
         let clock = Arc::new(ManualClock::default());
         let mut controller = controller(&stub, &clock);
@@ -1157,7 +1170,7 @@ mod tests {
 
     #[test]
     fn lost_heartbeat_probes_then_kills() {
-        let address = fake_worker();
+        let address = fake_worker(false);
         let stub = Stub::new(vec![vec![ProcessEvent::Ready(ready(&address, PID))]]);
         let clock = Arc::new(ManualClock::default());
         let mut controller = controller(&stub, &clock);
@@ -1183,5 +1196,54 @@ mod tests {
         assert!(controller.link().is_none());
         controller.tick();
         assert_eq!(stub.kills(), vec![PID]);
+    }
+
+    #[test]
+    fn stop_timeout_leaves_worker_running_and_later_exit_is_a_clean_stop() {
+        let address = fake_worker(true);
+        let stub = Stub::new(vec![vec![ProcessEvent::Ready(ready(&address, PID))]]);
+        let clock = Arc::new(ManualClock::default());
+        let mut controller = controller(&stub, &clock);
+        controller.start();
+        controller.tick();
+        assert!(matches!(controller.phase(), Phase::Running { .. }));
+
+        // The stop wait runs on the clock: pass STOP_WAIT while it waits.
+        let advancer = {
+            let clock = clock.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                clock.advance(STOP_WAIT);
+            })
+        };
+        let waited = Instant::now();
+        match controller.stop(false).unwrap() {
+            StopOutcome::LeftRunning(message) => {
+                assert!(message.starts_with("STOP_TIMEOUT"), "{message}")
+            }
+            other => panic!("not left running: {other:?}"),
+        }
+        assert!(waited.elapsed() < STOP_WAIT, "the wait ignored the clock");
+        advancer.join().unwrap();
+        assert!(matches!(controller.phase(), Phase::Running { .. }));
+
+        // The worker is exiting: a quiet heartbeat is neither probed to
+        // death nor a failure.
+        clock.advance(Duration::from_secs(10));
+        controller.tick();
+        assert!(stub.kills().is_empty());
+        assert!(
+            matches!(controller.phase(), Phase::Running { .. }),
+            "{:?}",
+            controller.phase()
+        );
+        assert!(controller.failures.is_empty());
+
+        stub.emit(exited(0));
+        controller.tick();
+        assert_eq!(controller.phase(), &Phase::Stopped);
+        assert!(controller.link().is_none());
+        assert!(stub.kills().is_empty());
+        assert!(controller.failures.is_empty());
     }
 }
