@@ -58,7 +58,7 @@ pub struct FolderRecord {
     pub created_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Peer {
     pub endpoint: String,
     pub installation: String,
@@ -66,6 +66,18 @@ pub struct Peer {
     #[serde(default, skip_serializing)]
     credential: String,
     pub connections: Option<usize>,
+}
+
+/// `credential` is an application secret, so `Debug` never prints it.
+impl std::fmt::Debug for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Peer")
+            .field("endpoint", &self.endpoint)
+            .field("installation", &self.installation)
+            .field("credential", &"<redacted>")
+            .field("connections", &self.connections)
+            .finish()
+    }
 }
 
 impl Peer {
@@ -612,6 +624,70 @@ mod tests {
         catalog.set_clock("x", offset, 1_700_000_000_000)?;
         assert_eq!(catalog.clock("x")?, Some((offset, 1_700_000_000_000)));
         assert_eq!(catalog.clock("y")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn save_peer_round_trips_and_hides_the_credential() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = Catalog::open(home.path())?;
+        let key = [9; 32];
+        catalog.save_peer("ws://host:1", "inst", key, Some(3))?;
+        assert_eq!(catalog.paired_key("inst")?, key);
+        let peer = catalog.peer("ws://host:1")?;
+        assert_eq!(peer.key()?, key);
+        let peers = catalog.peers()?;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].connections, Some(3));
+        assert_eq!(peers[0].installation, "inst");
+        assert_eq!(
+            code(&catalog.peer("ws://other:2").unwrap_err()),
+            "PEER_NOT_FOUND"
+        );
+        let printed = format!("{peer:?} {peer:#?}");
+        assert!(!printed.contains(&hex::encode(key)));
+        assert!(printed.contains("<redacted>"));
+        let json = serde_json::to_value(&peer)?;
+        assert!(json.get("credential").is_none());
+        assert_eq!(json["connections"], 3);
+        Ok(())
+    }
+
+    #[test]
+    fn save_peer_refuses_a_non_websocket_endpoint_and_stores_nothing() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = Catalog::open(home.path())?;
+        assert!(
+            catalog
+                .save_peer("http://x", "inst", [1; 32], None)
+                .is_err()
+        );
+        assert!(catalog.peers()?.is_empty());
+        assert_eq!(
+            code(&catalog.paired_key("inst").unwrap_err()),
+            "PEER_REVOKED"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unpair_removes_peer_pairing_and_clock() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = Catalog::open(home.path())?;
+        catalog.save_peer("ws://host:1", "inst", [4; 32], None)?;
+        let offset = Offset {
+            offset_ms: -5,
+            rtt_ms: 2,
+        };
+        catalog.set_clock("inst", offset, 42)?;
+        assert_eq!(catalog.clock("inst")?, Some((offset, 42)));
+        catalog.unpair("inst")?;
+        assert_eq!(
+            code(&catalog.paired_key("inst").unwrap_err()),
+            "PEER_REVOKED"
+        );
+        assert!(catalog.peers()?.is_empty());
+        assert_eq!(catalog.clock("inst")?, None);
         Ok(())
     }
 }
