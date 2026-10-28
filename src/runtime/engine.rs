@@ -645,6 +645,11 @@ impl Engine {
     pub fn inject_fault(&self, name: &str) {
         lock(&self.faults).insert(name.to_owned());
     }
+    /// Whether fault `name` (or `name-persistent`) is injected; a one-shot
+    /// fault is consumed.
+    pub fn take_fault(&self, name: &str) -> bool {
+        self.fault(name).is_err()
+    }
     fn fault(&self, name: &str) -> Result<()> {
         let mut faults = lock(&self.faults);
         ensure!(

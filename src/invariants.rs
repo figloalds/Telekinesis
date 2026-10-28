@@ -1128,7 +1128,9 @@ fn remote_apply_invalidates_cached_paths_without_changing_open_version() -> Resu
 fn resolving_a_conflict_seals_pending_local_edits_before_selecting_the_remote_head() -> Result<()> {
     let root = tempfile::tempdir()?;
     let engine = crate::runtime::Engine::open(root.path(), None)?;
-    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let settings = crate::orchestrator::settings::Settings {
+        engine: engine.clone(),
+    };
     let handle = engine.open_file("file", true, false, true)?;
     engine.write(handle, 0, b"base", false, false)?;
     engine.flush(Some(handle))?;
@@ -1152,7 +1154,7 @@ fn resolving_a_conflict_seals_pending_local_edits_before_selecting_the_remote_he
     engine.write(handle, 0, b"last", false, false)?;
     crate::orchestrator::control::execute(
         &engine,
-        &catalog,
+        &settings,
         "resolve",
         &serde_json::json!({"entity":entity,"version":remote.id}),
     )?;
@@ -1175,7 +1177,7 @@ fn resolving_a_conflict_seals_pending_local_edits_before_selecting_the_remote_he
     }
     engine.close(handle)?;
     engine.shutdown()?;
-    drop(catalog);
+    drop(settings);
     drop(engine);
     let reopened = crate::runtime::Engine::open(root.path(), None)?;
     assert!(lock(&reopened.store).conflicts(false)?.is_empty());
@@ -1190,7 +1192,9 @@ fn conflict_notifications_follow_the_visible_head_and_invalidate_both_resolution
     for deleted in [false, true] {
         let root = tempfile::tempdir()?;
         let engine = crate::runtime::Engine::open(root.path(), None)?;
-        let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+        let settings = crate::orchestrator::settings::Settings {
+            engine: engine.clone(),
+        };
         let handle = engine.open_file("original", true, false, true)?;
         let (entity, parent) = {
             let store = lock(&engine.store);
@@ -1231,7 +1235,7 @@ fn conflict_notifications_follow_the_visible_head_and_invalidate_both_resolution
         lock(&observed).clear();
         crate::orchestrator::control::execute(
             &engine,
-            &catalog,
+            &settings,
             "resolve",
             &serde_json::json!({"entity":entity,"version":remote.id}),
         )?;
@@ -1257,7 +1261,9 @@ fn conflict_notifications_follow_the_visible_head_and_invalidate_both_resolution
 fn an_unreadable_import_source_cannot_truncate_or_create_the_destination() -> Result<()> {
     let root = tempfile::tempdir()?;
     let engine = crate::runtime::Engine::open(root.path(), None)?;
-    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let settings = crate::orchestrator::settings::Settings {
+        engine: engine.clone(),
+    };
     let handle = engine.open_file("existing", true, false, true)?;
     engine.write(handle, 0, b"keep these bytes", false, false)?;
     engine.flush(Some(handle))?;
@@ -1271,7 +1277,7 @@ fn an_unreadable_import_source_cannot_truncate_or_create_the_destination() -> Re
         assert!(
             crate::orchestrator::control::execute(
                 &engine,
-                &catalog,
+                &settings,
                 "import",
                 &serde_json::json!({"path":path,"source":source}),
             )
@@ -1334,14 +1340,16 @@ fn a_failed_resolution_flush_leaves_the_conflict_and_edit_intact() -> Result<()>
 fn a_refused_large_cat_releases_its_read_handle() -> Result<()> {
     let root = tempfile::tempdir()?;
     let engine = crate::runtime::Engine::open(root.path(), None)?;
-    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let settings = crate::orchestrator::settings::Settings {
+        engine: engine.clone(),
+    };
     let handle = engine.open_file("large", true, false, true)?;
     engine.truncate(handle, 16 * 1024 * 1024 + 1, false)?;
     let scratch = engine.handle(handle)?.scratch.clone().unwrap();
     assert_eq!(lock(&scratch).handles, 1);
     let result = crate::orchestrator::control::execute(
         &engine,
-        &catalog,
+        &settings,
         "cat",
         &serde_json::json!({"path":"large"}),
     );
@@ -2000,7 +2008,9 @@ fn a_paging_write_after_cleanup_is_sealed_again() -> Result<()> {
 fn a_failed_flush_still_stops_the_daemon_and_keeps_recoverable_scratch() -> Result<()> {
     let root = tempfile::tempdir()?;
     let engine = crate::runtime::Engine::open(root.path(), None)?;
-    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let settings = crate::orchestrator::settings::Settings {
+        engine: engine.clone(),
+    };
     let h = engine.open_file("file", true, false, true)?;
     engine.write(h, 0, b"unsaved", false, false)?;
     let scratch_path = lock(engine.handle(h)?.scratch.as_ref().unwrap())
@@ -2009,9 +2019,10 @@ fn a_failed_flush_still_stops_the_daemon_and_keeps_recoverable_scratch() -> Resu
     engine.inject_fault("flush");
     let result = crate::orchestrator::control::execute(
         &engine,
-        &catalog,
+        &settings,
         "shutdown",
-        &serde_json::json!({}),
+        // `h` is still open for writing; an unforced stop is refused.
+        &serde_json::json!({"force": true}),
     );
     let error = format!("{:#}", result.unwrap_err());
     assert!(error.contains("FAULT_INJECTED: flush"), "{error}");
@@ -2035,16 +2046,28 @@ fn daemon_startup_failure_still_shuts_down_the_engine() -> Result<()> {
     let engine = crate::runtime::Engine::open(root.path(), None)?;
     let h = engine.open_file("file", true, false, true)?;
     engine.write(h, 0, b"save on failed startup", false, false)?;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let result =
-        crate::orchestrator::run(engine.clone(), &listener.local_addr()?.to_string(), None);
-    assert!(result.is_err());
+    // A directory where the token file goes makes the runtime files fail.
+    std::fs::create_dir(root.path().join("runtime.token"))?;
+    std::fs::write(root.path().join("runtime.json"), "stale")?;
+    let result = crate::orchestrator::run(
+        engine.clone(),
+        crate::orchestrator::worker::Options {
+            supervised: false,
+            mount: None,
+        },
+    );
+    let fatal = result
+        .unwrap_err()
+        .downcast::<crate::orchestrator::worker::Fatal>()?;
+    assert_eq!(fatal.exit, crate::orchestrator::worker::EXIT_STORE);
     assert!(engine.stopping.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(
         engine.lookup("file")?.content.unwrap().digest,
         crate::model::content::Digest::bytes(b"save on failed startup")
     );
-    assert!(!root.path().join("control.json").exists());
+    for file in ["runtime.json", "worker.json", "control.json"] {
+        assert!(!root.path().join(file).exists(), "{file}");
+    }
     Ok(())
 }
 

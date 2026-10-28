@@ -89,9 +89,18 @@ fn desktop_recovers_stale_control_records_and_reports_real_startup_failures() ->
     let id = desktop.config.folders[0].id.clone();
     desktop.request(&id, "status", json!({}))?;
     desktop.stop(&id)?;
-    desktop.configure(&id, None, "not-a-listener".into(), None)?;
+    // A real worker startup failure after a successful `init`: a directory
+    // where the worker writes `runtime.token` (fatal RUNTIME_FILES_FAILED, 73).
+    std::fs::create_dir(state.join("runtime.token"))?;
     let error = desktop.start(&id).unwrap_err();
-    assert!(error.to_string().contains("DAEMON_START_FAILED"));
+    assert!(
+        error.to_string().contains("DAEMON_START_FAILED"),
+        "{error:#}"
+    );
+    assert!(
+        error.to_string().contains("RUNTIME_FILES_FAILED"),
+        "{error:#}"
+    );
     let value = desktop.snapshot(&id);
     assert_eq!(value["folders"][0]["online"], false);
     assert!(
@@ -103,6 +112,7 @@ fn desktop_recovers_stale_control_records_and_reports_real_startup_failures() ->
 }
 
 #[test]
+#[ignore = "worker peer listener removed by design; pairing/sync return at the orchestrator level (Task 11) and the desktop becomes an orchestrator client in the GUI plan"]
 fn desktop_can_receive_pair_and_manage_versions_over_the_current_protocol() -> Result<()> {
     let home = tempfile::tempdir()?;
     let mut desktop = open(home.path(), None)?;

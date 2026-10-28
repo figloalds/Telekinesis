@@ -13,7 +13,20 @@ pub trait Clock: Send + Sync {
 }
 
 /// Wall-clock milliseconds since the Unix epoch (0 if the clock is before it).
+///
+/// Test hook: debug builds return `TKFS_FAKE_NOW_MS` when it parses as `u64`
+/// (read once per process). Release builds never read it.
 pub fn now_ms() -> u64 {
+    if cfg!(debug_assertions) {
+        static FAKE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        if let Some(fake) = *FAKE.get_or_init(|| {
+            std::env::var("TKFS_FAKE_NOW_MS")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+        }) {
+            return fake;
+        }
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))

@@ -316,24 +316,19 @@ impl Desktop {
         // Init is idempotent and validates the current store before daemon launch.
         self.run(&folder, &["init".into()], Duration::from_secs(30))?;
         let log_path = folder.state.join("daemon.log");
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)?;
+        // The worker's Ready line carries its loopback token.
+        let log = crate::orchestrator::worker::open_private(
+            OpenOptions::new().create(true).append(true),
+            &log_path,
+        )?;
         let mut command = self.command();
-        command
-            .arg("--state")
-            .arg(&folder.state)
-            .arg("daemon")
-            .arg("--listen")
-            .arg(&folder.listen);
+        // Workers never listen for peers: `listen`/`advertise` stay in the
+        // configuration for the orchestrator, not the worker command.
+        command.arg("--state").arg(&folder.state).arg("daemon");
         if let Some(mount) = &folder.mount
             && folder.mount_enabled
         {
             command.arg("--mount").arg(mount);
-        }
-        if let Some(advertise) = &folder.advertise {
-            command.arg("--advertise").arg(advertise);
         }
         command.stdout(log.try_clone()?).stderr(log);
         self.children.insert(id.into(), command.spawn()?);
@@ -428,7 +423,9 @@ impl Desktop {
                 status["pid"].as_u64().context("DAEMON_PID_REQUIRED")? as u32,
             )?)
         };
-        let result = self.request(id, "shutdown", json!({}));
+        // An explicit desktop stop proceeds with files open, as it always has;
+        // the worker's `BUSY_VIEW` refusal is for unforced stops.
+        let result = self.request(id, "shutdown", json!({"force": true}));
         // A shutdown RPC may report a durability failure. Still wait for exit,
         // but preserve that error even if the daemon subsequently exits cleanly.
         if let Some(child) = self.children.get_mut(id) {

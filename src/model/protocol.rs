@@ -93,7 +93,10 @@ pub fn op_allowed(op: &str, role: LaneRole) -> bool {
 pub fn max_body(op: &str) -> usize {
     if op == "objects.fetch" {
         32 * 1024 * 1024
-    } else if op == "meta.exchange" {
+    } else if matches!(
+        op,
+        "meta.exchange" | "cat" | "tree" | "events" | "desktop-snapshot"
+    ) {
         16 * 1024 * 1024
     } else {
         1024 * 1024
@@ -403,5 +406,12 @@ mod tests {
         assert_eq!(UPGRADE_V3, "4");
         assert_eq!(UPGRADE_LOOPBACK, "4-loopback");
         assert_eq!(IPC_VERSION, 4);
+    }
+
+    #[test]
+    fn worker_bulk_replies_get_the_metadata_body_bound() {
+        assert_eq!(max_body("cat"), 16 * 1024 * 1024);
+        assert_eq!(max_body("tree"), max_body("meta.exchange"));
+        assert_eq!(max_body("hello"), 1024 * 1024);
     }
 }

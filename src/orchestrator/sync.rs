@@ -29,6 +29,8 @@ pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 // hold 2 MiB raw, or about 8 MiB as JSON byte arrays plus metadata. A 64-chunk
 // reply can exceed the unchanged default 16 MiB reassembled-body bound.
 const FETCH_BATCH: usize = BATCH / 2;
+// The worker no longer prefetches from peers; Task 4 removes `DigestFetch`.
+#[allow(dead_code)]
 pub(crate) const DIRECT_PREFETCH_BATCH: usize = FETCH_BATCH;
 pub const FETCH_OP: &str = "objects.fetch";
 #[derive(Clone, Serialize, Deserialize)]
@@ -138,6 +140,7 @@ impl DigestFetch {
     pub fn prefetch(&self, wanted: &[(Digest, Kind)]) -> Result<()> {
         self.run(wanted, true)
     }
+    #[allow(dead_code)]
     pub(crate) fn prefetch_direct_roots(
         &self,
         references: &[FileContentRef],
@@ -181,6 +184,33 @@ impl ObjectFetcher for DigestFetch {
         self.foreground.fetch_add(1, Ordering::AcqRel);
         let _guard = Foreground(&self.foreground);
         self.run(wanted, false)
+    }
+}
+/// The worker's former peer prefetch pass, kept for the `DigestFetch` tests
+/// until Task 4 removes `DigestFetch`.
+#[cfg(test)]
+pub(crate) fn prefetch_pass(engine: &Engine, fetch: &DigestFetch, references: &[FileContentRef]) {
+    for batch in references.chunks(DIRECT_PREFETCH_BATCH) {
+        if engine.stopping.load(Ordering::Acquire) {
+            break;
+        }
+        fetch.prefetch_direct_roots(batch, &engine.stopping);
+        for reference in batch.iter().filter(|r| r.kind == ContentKind::Manifest) {
+            if engine.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            if fetch
+                .prefetch(&[(reference.digest, Kind::Manifest)])
+                .is_ok()
+                && let Ok(chunks) = engine.working.content().chunks(reference)
+            {
+                let wanted = chunks
+                    .into_iter()
+                    .map(|d| (d, Kind::Chunk))
+                    .collect::<Vec<_>>();
+                let _ = fetch.prefetch(&wanted);
+            }
+        }
     }
 }
 pub struct SessionSource {
@@ -835,7 +865,7 @@ mod tests {
         let engine = Engine::open(target_home.path(), None)?;
         let fetch = DigestFetch::new(engine.working.content().packs.clone());
         fetch.add("source".into(), source);
-        super::super::prefetch_pass(
+        crate::orchestrator::sync::prefetch_pass(
             &engine,
             &fetch,
             &[direct.clone(), manifest.clone(), empty.clone()],
@@ -1020,7 +1050,7 @@ mod tests {
                 vec![32, 32]
             }
             MaximumFetchPath::ManifestPrefetch => {
-                super::super::prefetch_pass(
+                crate::orchestrator::sync::prefetch_pass(
                     &target,
                     &fetch,
                     std::slice::from_ref(manifest.as_ref().unwrap()),

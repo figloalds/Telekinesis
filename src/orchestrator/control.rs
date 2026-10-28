@@ -1,85 +1,206 @@
-//! Token-authenticated local control. CLI and desktop use the same operations.
-use super::catalog::Catalog;
-use crate::{content::working::lock, core::EntryKind, runtime::Engine, ws};
+//! Worker control operations. Local clients (CLI, desktop, orchestrator) call
+//! them over the worker's token-authenticated loopback session.
+//!
+//! Reply convention: success is header `{}` with a JSON body; failure is an
+//! error reply whose code is the message's leading `SCREAMING_CASE` token
+//! (before `:`), or `WORKER_ERROR`.
+use super::{
+    catalog::Catalog,
+    demand::{Demand, Seq},
+    settings::Settings,
+    worker::{RUNTIME_FILE, TOKEN_FILE, WATCH_MAX_WAIT_MS},
+};
+use crate::{
+    content::working::lock,
+    core::EntryKind,
+    model::{errors::ErrorWire, protocol::LaneRole},
+    runtime::Engine,
+    session::{self, ConnOptions, Priority},
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    net::TcpListener,
-    path::Path,
-    sync::{Arc, atomic::Ordering},
+    path::{Path, PathBuf},
+    time::Duration,
 };
 
+/// Deadline of one [`request`].
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// Deadline of a [`request`] for an op that moves file bytes or seals.
+pub const LONG_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The [`request`] deadline of `operation`.
+pub fn request_deadline(operation: &str) -> Duration {
+    if matches!(operation, "import" | "cat" | "gc" | "checkpoint" | "flush") {
+        LONG_REQUEST_DEADLINE
+    } else {
+        REQUEST_DEADLINE
+    }
+}
+
+/// Calls `operation` on the worker serving the store at `root`: reads
+/// `runtime.json` and `runtime.token`, dials the loopback session and parses
+/// the reply body as JSON. No `runtime.json` means `WORKER_NOT_RUNNING`.
 pub fn request(root: &Path, operation: &str, payload: Value) -> Result<Value> {
-    let info: Value = serde_json::from_slice(&std::fs::read(root.join("control.json"))?)?;
-    let mut socket = ws::connect_authorized(
-        info["endpoint"].as_str().context("INVALID_CONTROL")?,
-        info["token"].as_str(),
-    )?;
-    ws::call(
-        &mut socket,
-        &json!({"operation":operation,"payload":payload}),
-    )
-}
-pub fn start(engine: Arc<Engine>, catalog: Arc<Catalog>) -> Result<String> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    listener.set_nonblocking(true)?;
-    let endpoint = format!("ws://{}", listener.local_addr()?);
-    let token = hex::encode(crate::session::auth::new_secret());
-    let root = lock(&engine.store).root.clone();
-    std::fs::write(
-        root.join("control.json"),
-        serde_json::to_vec(&json!({"endpoint":endpoint,"token":token}))?,
-    )?;
-    std::thread::spawn(move || {
-        while !engine.stopping.load(Ordering::Acquire) {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let e = engine.clone();
-                    let c = catalog.clone();
-                    let t = token.clone();
-                    std::thread::spawn(move || {
-                        let result = (|| -> Result<()> {
-                            let mut socket = ws::accept_authorized(stream, Some(&t))?;
-                            loop {
-                                let req: Value = ws::receive(&mut socket)?;
-                                let reply = match execute(
-                                    &e,
-                                    &c,
-                                    req["operation"].as_str().context("OPERATION_REQUIRED")?,
-                                    &req["payload"],
-                                ) {
-                                    Ok(value) => json!({"ok":true,"result":value}),
-                                    Err(error) => json!({"ok":false,"error":format!("{error:#}")}),
-                                };
-                                ws::send(&mut socket, &reply)?;
-                                if e.stopping.load(Ordering::Acquire) {
-                                    return Ok(());
-                                }
-                            }
-                        })();
-                        if let Err(error) = result
-                            && !error.to_string().contains("Connection closed")
-                        {
-                            eprintln!("control: {error:#}");
-                        }
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(20))
-                }
-                Err(_) => break,
-            }
+    let runtime: Value = match std::fs::read(root.join(RUNTIME_FILE)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("INVALID_RUNTIME_RECORD")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("WORKER_NOT_RUNNING: no worker serves {}", root.display())
         }
-    });
-    Ok(endpoint)
+        Err(error) => return Err(error).context("INVALID_RUNTIME_RECORD"),
+    };
+    let address = runtime["address"]
+        .as_str()
+        .context("INVALID_RUNTIME_RECORD: address missing")?;
+    let token = std::fs::read_to_string(root.join(TOKEN_FILE))
+        .context("WORKER_NOT_RUNNING: runtime.token unreadable")?;
+    let token = token.trim();
+    crate::util::log::register_secret(token);
+    let conn = session::dial_loopback(
+        address,
+        Some(token),
+        ConnOptions::for_role(LaneRole::Control),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let reply = conn.call(
+        operation,
+        payload,
+        Vec::new(),
+        Priority::Control,
+        request_deadline(operation),
+    );
+    conn.close();
+    let reply = reply.map_err(|error| anyhow::anyhow!("{error}"))?;
+    if reply.body.is_empty() {
+        return Ok(Value::Null);
+    }
+    Ok(serde_json::from_slice(&reply.body)?)
 }
-pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -> Result<Value> {
+
+/// The error reply for a failed op (see the module's reply convention).
+pub fn error_wire(error: &anyhow::Error) -> ErrorWire {
+    let message = format!("{error:#}");
+    match leading_code(&message) {
+        Some(code) => ErrorWire::new(code, message.clone()),
+        None => ErrorWire::coded("WORKER_ERROR", message),
+    }
+}
+
+fn leading_code(message: &str) -> Option<&str> {
+    let head = message.split(':').next()?.trim();
+    let mut bytes = head.bytes();
+    (bytes.next().is_some_and(|b| b.is_ascii_uppercase())
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'))
+    .then_some(head)
+}
+
+/// Paths this process serves as a filesystem mount.
+pub fn mounts() -> Vec<PathBuf> {
+    #[cfg(any(windows, target_os = "linux"))]
+    return crate::mount::mounted_path().into_iter().collect();
+    #[cfg(not(any(windows, target_os = "linux")))]
+    Vec::new()
+}
+
+/// `hello` → `{repo, device, instance, pid, version, ipc, mounts}`.
+pub fn hello(engine: &Engine, instance: &str) -> Value {
+    let (repo, device) = {
+        let store = lock(&engine.store);
+        (store.repo.clone(), store.device.clone())
+    };
+    json!({
+        "repo": repo,
+        "device": device,
+        "instance": instance,
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "ipc": crate::model::protocol::IPC_VERSION,
+        "mounts": mounts(),
+    })
+}
+
+/// The worker's health summary carried by every `watch` reply.
+pub fn heartbeat(engine: &Engine) -> Result<Value> {
+    let writable = engine.writable_tokens().len();
+    let error = lock(&engine.error).clone();
+    let store = lock(&engine.store);
+    Ok(json!({
+        "at_ms": crate::util::time::now_ms(),
+        "entries": store.projection().entries.len(),
+        "conflicts": store.conflicts(false)?.len(),
+        "writable_handles": writable,
+        "error": error,
+    }))
+}
+
+/// `watch {after_seq, wait_ms}` → `{seq, heartbeat, demand}`. Returns at once
+/// when `seq > after_seq` or objects are wanted; otherwise waits at most
+/// `min(wait_ms, WATCH_MAX_WAIT_MS)` for the next wake-up.
+pub fn watch(engine: &Engine, seq: &Seq, demand: &Demand, p: &Value) -> Result<Value> {
+    let after = p["after_seq"].as_u64().unwrap_or(0);
+    let wait = p["wait_ms"].as_u64().unwrap_or(0).min(WATCH_MAX_WAIT_MS);
+    let current = seq.current();
+    let seq = if current > after || !demand.pending().is_empty() {
+        current
+    } else {
+        seq.wait_past(after, Duration::from_millis(wait))
+    };
+    Ok(json!({
+        "seq": seq,
+        "heartbeat": heartbeat(engine)?,
+        "demand": demand.pending(),
+    }))
+}
+
+/// The worker's pairing ops, which still use the store's pairing catalog;
+/// `None` for any other op. `desktop-snapshot` is [`execute`]'s plus peers.
+pub fn pairing(
+    catalog: &Catalog,
+    engine: &Engine,
+    settings: &Settings,
+    operation: &str,
+    p: &Value,
+) -> Option<Result<Value>> {
+    let text = |key: &str| -> Result<&str> { p[key].as_str().context("ARGUMENT_REQUIRED") };
+    let result = match operation {
+        "peer-info" => text("endpoint").and_then(|endpoint| catalog.inspect_peer(endpoint)),
+        "pairing-code" => catalog.reset_code().map(|code| json!({"code":code})),
+        "pair" => text("endpoint")
+            .and_then(|endpoint| catalog.pair(endpoint, text("code")?))
+            .map(|installation| json!({"installation":installation})),
+        "peers" => catalog.peers().map(|peers| {
+            peers
+                .into_iter()
+                .map(|p| json!({"endpoint":p.endpoint,"installation":p.installation}))
+                .collect()
+        }),
+        "unpair" => text("installation")
+            .and_then(|installation| catalog.unpair(installation))
+            .map(|()| json!({})),
+        "desktop-snapshot" => execute(engine, settings, operation, p).and_then(|mut snapshot| {
+            let runtime = lock(&engine.peer_status).clone();
+            snapshot["peers"] = catalog
+                .peers()?
+                .into_iter()
+                .map(|peer| json!({"endpoint":peer.endpoint,"installation":peer.installation,"runtime":runtime.get(&peer.endpoint)}))
+                .collect();
+            Ok(snapshot)
+        }),
+        _ => return None,
+    };
+    Some(result)
+}
+
+/// The worker's engine and filesystem ops: everything but `hello`, `watch`
+/// and [`pairing`].
+pub fn execute(engine: &Engine, settings: &Settings, operation: &str, p: &Value) -> Result<Value> {
     let text = |key: &str| -> Result<&str> { p[key].as_str().context("ARGUMENT_REQUIRED") };
     match operation {
         #[cfg(windows)]
         "mount-stats" => Ok(serde_json::to_value(crate::mount::stats())?),
         "status" => {
-            let endpoint = catalog.get("advertise")?;
+            // Workers never listen for peers; the orchestrator owns the network.
+            let endpoint: Option<String> = None;
             #[cfg(any(windows, target_os = "linux"))]
             let mount = crate::mount::mounted_path();
             #[cfg(not(any(windows, target_os = "linux")))]
@@ -90,11 +211,10 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
             )
         }
         "set-label" => {
-            catalog.set("label", text("label")?)?;
+            settings.set("label", text("label")?)?;
             engine.flush(None)?;
             Ok(json!({}))
         }
-        "peer-info" => catalog.inspect_peer(text("endpoint")?),
         "preview-version" => {
             let event = {
                 lock(&engine.store)
@@ -123,13 +243,8 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
             Ok(json!({"preview":preview}))
         }
         "desktop-snapshot" => {
-            let status = execute(engine, catalog, "status", &json!({}))?;
-            let runtime = lock(&engine.peer_status).clone();
-            let peers: Vec<_> = catalog
-                .peers()?
-                .into_iter()
-                .map(|peer| json!({"endpoint":peer.endpoint,"installation":peer.installation,"runtime":runtime.get(&peer.endpoint)}))
-                .collect();
+            let status = execute(engine, settings, "status", &json!({}))?;
+            let peers: Vec<Value> = Vec::new();
             let store = lock(&engine.store);
             let branches = store
                 .db
@@ -276,27 +391,22 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
             closed?;
             Ok(result)
         }
-        "pairing-code" => Ok(json!({"code":catalog.reset_code()?})),
-        "pair" => Ok(json!({"installation":catalog.pair(text("endpoint")?,text("code")?)?})),
-        "peers" => Ok(Value::Array(
-            catalog
-                .peers()?
-                .into_iter()
-                .map(|p| json!({"endpoint":p.endpoint,"installation":p.installation}))
-                .collect(),
-        )),
-        "unpair" => {
-            catalog.unpair(text("installation")?)?;
-            Ok(json!({}))
-        }
         "gc" => Ok(json!({"removed":engine.collect()?})),
         "flush" => {
             engine.flush(None)?;
             Ok(json!({}))
         }
         "shutdown" => {
+            if engine.take_fault("shutdown.hang") {
+                std::thread::sleep(Duration::from_secs(60));
+            }
+            let open = engine.writable_tokens().len();
+            ensure!(
+                p["force"].as_bool().unwrap_or(false) || open == 0,
+                "BUSY_VIEW: {open} files open"
+            );
             // A failed final seal is a reported durability failure; it never
-            // keeps the daemon (and its mount) alive.
+            // keeps the worker (and its mount) alive.
             engine.request_shutdown()?;
             Ok(json!({"stopping":true}))
         }
@@ -305,5 +415,53 @@ pub fn execute(engine: &Engine, catalog: &Catalog, operation: &str, p: &Value) -
             Ok(json!({}))
         }
         _ => anyhow::bail!("UNSUPPORTED_OPERATION"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn shutdown_without_force_is_refused_while_a_writable_handle_is_open() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Engine::open(root.path(), None)?;
+        let settings = Settings {
+            engine: engine.clone(),
+        };
+        let h = engine.open_file("f", true, false, true)?;
+        let error = execute(&engine, &settings, "shutdown", &json!({"force": false}))
+            .expect_err("shutdown with a writable handle open");
+        assert!(
+            error.to_string().starts_with("BUSY_VIEW: 1 files open"),
+            "{error:#}"
+        );
+        assert_eq!(error_wire(&error).code, "BUSY_VIEW");
+        assert!(!engine.stopping.load(Ordering::Acquire));
+        // Absent `force` is `false`.
+        assert!(execute(&engine, &settings, "shutdown", &json!({})).is_err());
+        assert!(!engine.stopping.load(Ordering::Acquire));
+        assert_eq!(
+            execute(&engine, &settings, "shutdown", &json!({"force": true}))?,
+            json!({"stopping": true})
+        );
+        assert!(engine.stopping.load(Ordering::Acquire));
+        engine.close(h)?;
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn error_replies_carry_the_leading_code_or_worker_error() {
+        let coded = error_wire(&anyhow::anyhow!("VERSION_NOT_FOUND"));
+        assert_eq!(coded.code, "VERSION_NOT_FOUND");
+        assert_eq!(coded.message, "VERSION_NOT_FOUND");
+        let detailed = error_wire(&anyhow::anyhow!("BUSY_VIEW: 2 files open"));
+        assert_eq!(detailed.code, "BUSY_VIEW");
+        assert_eq!(detailed.message, "BUSY_VIEW: 2 files open");
+        let plain = error_wire(&anyhow::anyhow!("No such file: x"));
+        assert_eq!(plain.code, "WORKER_ERROR");
+        assert_eq!(plain.message, "WORKER_ERROR: No such file: x");
     }
 }

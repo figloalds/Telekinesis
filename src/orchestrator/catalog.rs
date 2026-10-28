@@ -8,7 +8,7 @@ use crate::{
     session::{self, AcceptPolicy, Handler, Incoming},
 };
 use anyhow::{Context, Result};
-use rusqlite::{OptionalExtension, params};
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{net::SocketAddr, sync::Arc};
@@ -97,18 +97,16 @@ impl Catalog {
         }
         Ok(catalog)
     }
+    fn settings(&self) -> super::settings::Settings {
+        super::settings::Settings {
+            engine: self.engine.clone(),
+        }
+    }
     pub fn get(&self, key: &str) -> Result<Option<String>> {
-        Ok(lock(&self.engine.store)
-            .db
-            .query_cached("SELECT value FROM config WHERE key=?1", [key], |r| r.get(0))
-            .optional()?)
+        self.settings().get(key)
     }
     pub fn set(&self, key: &str, value: &str) -> Result<()> {
-        lock(&self.engine.store).db.execute_cached(
-            "INSERT OR REPLACE INTO config VALUES(?1,?2)",
-            params![key, value],
-        )?;
-        Ok(())
+        self.settings().set(key, value)
     }
     pub fn reset_code(&self) -> Result<String> {
         let (code, verifier) = Verifier::generate();

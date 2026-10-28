@@ -3,7 +3,12 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tkfs::{
-    orchestrator::{self, catalog::Catalog, control},
+    orchestrator::{
+        catalog::Catalog,
+        control,
+        settings::Settings,
+        worker::{self, EXIT_CONFIG, Fatal},
+    },
     runtime::Engine,
 };
 #[cfg(windows)]
@@ -29,13 +34,14 @@ enum Command {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Run the folder's worker: a loopback session for local clients.
     Daemon {
         #[arg(long)]
         mount: Option<PathBuf>,
-        #[arg(long, default_value = "127.0.0.1:43180")]
-        listen: String,
+        /// Started by a supervisor: exit quietly after a period without
+        /// contact (`TKFS_UNSUPERVISED_EXIT_S`, default 600 s).
         #[arg(long)]
-        advertise: Option<String>,
+        supervised: bool,
     },
     Status,
     Tree,
@@ -132,17 +138,25 @@ fn run() -> Result<()> {
             println!("{result}");
             Ok(())
         }
-        Command::Daemon {
-            mount,
-            listen,
-            advertise,
-        } => {
-            let engine = Engine::open(&root, None)?;
-            if let Some(path) = mount {
-                #[cfg(any(windows, target_os = "linux"))]
-                tkfs::mount::attach(engine.clone(), &path)?;
+        Command::Daemon { mount, supervised } => {
+            if let Err(error) = tkfs::clock::check() {
+                worker::exit_fatal(&Fatal::new(
+                    "CLOCK_INVALID",
+                    format!("{error:#}"),
+                    EXIT_CONFIG,
+                ));
             }
-            orchestrator::run(engine, &listen, advertise.as_deref())
+            let engine = match Engine::open(&root, None) {
+                Ok(engine) => engine,
+                Err(error) => worker::exit_fatal(&Fatal::store_open(&error)),
+            };
+            match worker::run(engine, worker::Options { supervised, mount }) {
+                Err(error) => match error.downcast::<Fatal>() {
+                    Ok(fatal) => worker::exit_fatal(&fatal),
+                    Err(error) => Err(error),
+                },
+                Ok(()) => Ok(()),
+            }
         }
         Command::Gui => unreachable!(),
         command => {
@@ -193,12 +207,19 @@ fn run() -> Result<()> {
                 }
                 _ => unreachable!(),
             };
-            let result = if root.join("control.json").exists() {
+            let result = if root.join(worker::RUNTIME_FILE).exists() {
                 control::request(&root, operation, payload)?
             } else {
                 let engine = Engine::open(&root, None).context("OPEN_FOLDER_FAILED")?;
-                let catalog = Catalog::open(engine.clone())?;
-                let result = control::execute(&engine, &catalog, operation, &payload);
+                let settings = Settings {
+                    engine: engine.clone(),
+                };
+                let result = Catalog::open(engine.clone()).and_then(|catalog| {
+                    control::pairing(&catalog, &engine, &settings, operation, &payload)
+                        .unwrap_or_else(|| {
+                            control::execute(&engine, &settings, operation, &payload)
+                        })
+                });
                 engine.shutdown()?;
                 result?
             };
