@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod config;
 pub mod control;
 pub mod demand;
+pub mod folder;
 pub mod process;
 pub mod settings;
 pub mod sync;

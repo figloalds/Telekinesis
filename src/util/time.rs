@@ -45,12 +45,14 @@ impl Clock for SystemClock {
     }
 }
 
-/// A clock that only moves when told to. Both readings advance together.
+/// A clock that only moves when told to. [`ManualClock::advance`] moves both
+/// readings together; [`ManualClock::advance_wall`] steps the wall clock alone.
 #[derive(Debug)]
 pub struct ManualClock {
     start_ms: u64,
     start: Instant,
     offset: Mutex<Duration>,
+    wall_step: Mutex<Duration>,
 }
 
 impl ManualClock {
@@ -59,6 +61,7 @@ impl ManualClock {
             start_ms,
             start: Instant::now(),
             offset: Mutex::new(Duration::ZERO),
+            wall_step: Mutex::new(Duration::ZERO),
         }
     }
 
@@ -67,7 +70,14 @@ impl ManualClock {
         *offset = offset.saturating_add(by);
     }
 
-    /// Time advanced since construction.
+    /// Steps the wall clock (`now_ms`) forward without moving the monotonic
+    /// `instant`, as an NTP correction or a user clock change would.
+    pub fn advance_wall(&self, by: Duration) {
+        let mut step = crate::util::lock::lock(&self.wall_step);
+        *step = step.saturating_add(by);
+    }
+
+    /// Monotonic time advanced since construction.
     pub fn elapsed(&self) -> Duration {
         *crate::util::lock::lock(&self.offset)
     }
@@ -81,7 +91,10 @@ impl Default for ManualClock {
 
 impl Clock for ManualClock {
     fn now_ms(&self) -> u64 {
-        let offset = u64::try_from(self.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let wall = self
+            .elapsed()
+            .saturating_add(*crate::util::lock::lock(&self.wall_step));
+        let offset = u64::try_from(wall.as_millis()).unwrap_or(u64::MAX);
         self.start_ms.saturating_add(offset)
     }
     fn instant(&self) -> Instant {

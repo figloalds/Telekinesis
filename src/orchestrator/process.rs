@@ -99,12 +99,23 @@ pub struct WorkerProcess {
     pub pid: u32,
     /// Spawned: an observer next to the `Child` the exit waiter owns.
     /// Adopted: the observer the watcher waits on (it ends once this is gone).
-    process: Arc<ObservedProcess>,
+    /// `None` only for a test stand-in ([`WorkerProcess::detached`]).
+    process: Option<Arc<ObservedProcess>>,
 }
 
 impl WorkerProcess {
+    /// A stand-in naming `pid` without observing any process, for scripted
+    /// launchers in tests; [`Self::exited`] fails on it.
+    #[cfg(test)]
+    pub(crate) fn detached(pid: u32) -> Self {
+        Self { pid, process: None }
+    }
+
     pub fn exited(&self) -> Result<bool> {
-        self.process.exited()
+        match &self.process {
+            Some(process) => process.exited(),
+            None => anyhow::bail!("PROCESS_DETACHED: pid {} is not observed", self.pid),
+        }
     }
 }
 
@@ -181,7 +192,10 @@ pub fn spawn(spec: &LaunchSpec, sink: mpsc::Sender<ProcessEvent>) -> Result<Work
     })();
     match started {
         Ok((process, child_tx)) => match child_tx.send(child) {
-            Ok(()) => Ok(WorkerProcess { pid, process }),
+            Ok(()) => Ok(WorkerProcess {
+                pid,
+                process: Some(process),
+            }),
             Err(mpsc::SendError(mut child)) => {
                 let error = anyhow::anyhow!(failed("start exit waiter"));
                 Err(with_cleanup(error, terminate(&mut child)))
@@ -242,7 +256,13 @@ pub fn adopt(
         .spawn(move || watch_adopted(&watched, &emitter, &log))
         .context("WORKER_ADOPT_FAILED: start watcher")?;
     let pid = record.pid;
-    Ok(Some((record, WorkerProcess { pid, process })))
+    Ok(Some((
+        record,
+        WorkerProcess {
+            pid,
+            process: Some(process),
+        },
+    )))
 }
 
 /// Sends `Exited` when the adopted process exits; ends without an event once
