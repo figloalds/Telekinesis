@@ -9,5 +9,6 @@ pub mod process;
 pub mod settings;
 pub mod sync;
 pub mod worker;
+pub mod worker_client;
 
 pub use worker::run;

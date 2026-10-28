@@ -31,5 +31,5 @@ pub use conn::{
 pub use handshake::{
     AcceptPolicy, ClientAuth, DialError, UpgradeKind, accept, accept_loopback, accept_v3,
     client_handshake, client_hello, connect_v3, dial, dial_cancellable, dial_expecting,
-    dial_loopback, server_handshake, upgrade_kind,
+    dial_loopback, dial_loopback_as, server_handshake, upgrade_kind,
 };

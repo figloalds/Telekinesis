@@ -19,7 +19,8 @@ use tkfs::{
     model::{
         errors::{ErrorClass, ErrorWire},
         protocol::{
-            LEGACY_NEEDS_UPGRADE_REPLY, LaneRole, LaneSpec, PROTOCOL_NAME,
+            LANE_HEADER, LEGACY_NEEDS_UPGRADE_REPLY, LaneRole, LaneSpec, PROTOCOL_NAME,
+            TOKEN_HEADER, UPGRADE_HEADER, UPGRADE_LOOPBACK,
             frame::{ClientHello, Limits, ServerHello},
         },
     },
@@ -1514,4 +1515,113 @@ fn loopback_sessions_check_header_and_token() {
     let error = session::dial_loopback(&legacy, None, ConnOptions::default()).unwrap_err();
     assert!(matches!(error, DialError::NeedsUpgrade { .. }), "{error:?}");
     assert!(received.join().unwrap().is_empty());
+}
+
+struct Echo;
+impl session::Handler for Echo {
+    fn handle(&self, req: session::Incoming) {
+        req.responder.reply(json!({}), req.body);
+    }
+}
+
+/// One loopback accept (token `t0k3n`) serving [`Echo`].
+fn loopback_server() -> (String, JoinHandle<Result<session::Conn, ErrorWire>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let conn = session::accept_loopback(stream, Some("t0k3n"), ConnOptions::default())?;
+        conn.serve(Arc::new(Echo));
+        Ok(conn)
+    });
+    (endpoint, server)
+}
+
+#[test]
+fn loopback_lane_header_sets_the_accepted_role_and_its_op_policy() {
+    let call = |conn: &session::Conn, op: &str| {
+        conn.call(
+            op,
+            json!({}),
+            b"[]".to_vec(),
+            session::Priority::Control,
+            Duration::from_secs(10),
+        )
+    };
+    let refused = |result: Result<session::Reply, session::CallError>| match result {
+        Err(session::CallError::Remote(wire)) => wire.code,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+
+    // A bulk lane serves object ops only.
+    let (endpoint, server) = loopback_server();
+    let bulk = session::dial_loopback_as(
+        &endpoint,
+        Some("t0k3n"),
+        LaneRole::Bulk,
+        ConnOptions::for_role(LaneRole::Bulk),
+    )
+    .unwrap();
+    let accepted = server.join().unwrap().unwrap();
+    assert_eq!(accepted.peer().role, LaneRole::Bulk);
+    assert_eq!(bulk.peer().role, LaneRole::Bulk);
+    assert_eq!(call(&bulk, "objects.fetch").unwrap().body, b"[]");
+    assert_eq!(refused(call(&bulk, "hello")), "OP_NOT_ALLOWED");
+    bulk.close();
+    accepted.close();
+
+    // A control lane (`dial_loopback`, as the CLI dials) refuses them.
+    let (endpoint, server) = loopback_server();
+    let control = session::dial_loopback(&endpoint, Some("t0k3n"), ConnOptions::default()).unwrap();
+    let accepted = server.join().unwrap().unwrap();
+    assert_eq!(accepted.peer().role, LaneRole::Control);
+    assert_eq!(refused(call(&control, "objects.fetch")), "OP_NOT_ALLOWED");
+    assert_eq!(call(&control, "hello").unwrap().body, b"[]");
+    control.close();
+    accepted.close();
+
+    // No lane header (an older dialer) is a control lane.
+    let (endpoint, server) = loopback_server();
+    let mut raw = ws::connect_with(
+        &endpoint,
+        &[(UPGRADE_HEADER, UPGRADE_LOOPBACK), (TOKEN_HEADER, "t0k3n")],
+        None,
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .0;
+    let accepted = server.join().unwrap().unwrap();
+    assert_eq!(accepted.peer().role, LaneRole::Control);
+    accepted.close();
+    let _ = raw.close(None);
+
+    // An unknown lane is refused at the upgrade.
+    for lane in ["probe", "objects"] {
+        let (endpoint, server) = loopback_server();
+        let error = ws::connect_with(
+            &endpoint,
+            &[
+                (UPGRADE_HEADER, UPGRADE_LOOPBACK),
+                (TOKEN_HEADER, "t0k3n"),
+                (LANE_HEADER, lane),
+            ],
+            None,
+            Duration::from_secs(5),
+        );
+        assert!(error.is_err(), "lane {lane} was upgraded");
+        assert_eq!(
+            server.join().unwrap().unwrap_err().code,
+            "PROTOCOL_VIOLATION",
+            "lane {lane}"
+        );
+    }
+    // A dialer cannot ask for a probe loopback lane.
+    let error = session::dial_loopback_as(
+        "ws://127.0.0.1:9",
+        Some("t0k3n"),
+        LaneRole::Probe,
+        ConnOptions::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, DialError::Protocol(_)), "{error:?}");
 }

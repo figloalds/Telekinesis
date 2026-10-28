@@ -11,10 +11,19 @@ use std::{
     sync::mpsc::{self, RecvTimeoutError},
     time::{Duration, Instant},
 };
-use tkfs::orchestrator::{
-    control,
-    process::{self, LaunchSpec, ObservedProcess, ProcessEvent},
-    worker::{Ready, WorkerRecord},
+use tkfs::{
+    content::Kind,
+    model::{content::Digest, protocol::LaneRole},
+    orchestrator::{
+        control,
+        process::{self, LaunchSpec, ObservedProcess, ProcessEvent},
+        sync::{OBJECT_BATCH, Object},
+        worker::{Ready, WorkerRecord},
+        worker_client::{CALL_DEADLINE, WorkerLink},
+    },
+    runtime::Engine,
+    session::{self, CallError, Conn, ConnOptions, Priority},
+    util::lock::lock,
 };
 
 const BOUND: Duration = Duration::from_secs(30);
@@ -124,7 +133,17 @@ fn lines(child: &mut Child) -> mpsc::Receiver<String> {
 }
 
 fn init(state: &Path) {
-    let mut guard = Guard::spawn(state, tkfs(state).arg("init").stdout(Stdio::null()));
+    init_repo(state, None);
+}
+
+/// `init`, with `--repo <repo>` when given.
+fn init_repo(state: &Path, repo: Option<&str>) {
+    let mut command = tkfs(state);
+    command.arg("init");
+    if let Some(repo) = repo {
+        command.arg("--repo").arg(repo);
+    }
+    let mut guard = Guard::spawn(state, command.stdout(Stdio::null()));
     let status = wait_status(&mut guard, BOUND);
     assert!(
         status.success(),
@@ -138,6 +157,12 @@ fn init(state: &Path) {
 /// Ready line (≤ 30 s).
 fn spawn_worker(state: &Path, supervised: bool, env: &[(&str, &str)]) -> (Guard, Ready) {
     init(state);
+    start_worker(state, supervised, env)
+}
+
+/// `daemon [--supervised]` on an initialised store, up to its Ready line
+/// (≤ 30 s).
+fn start_worker(state: &Path, supervised: bool, env: &[(&str, &str)]) -> (Guard, Ready) {
     let mut command = tkfs(state);
     command.arg("daemon");
     if supervised {
@@ -669,4 +694,260 @@ fn process_identity_of_self_is_stable() {
     );
     assert!(a.0 >= tkfs::clock::FLOOR_MS, "{}", a.0);
     assert!(a.0 <= tkfs::util::time::now_ms() + 2000, "{}", a.0);
+}
+
+// ---------------------------------------------------------------------------
+// The orchestrator's worker link: one control lane and N bulk lanes.
+
+/// 1 MiB of objects: 16 distinct full 64 KiB chunks (the largest a chunk may
+/// be), whose bytes vary so their JSON encoding is not trivially short.
+fn one_mib_of_chunks() -> Vec<Object> {
+    (0..16u32)
+        .map(|n| {
+            let bytes: Vec<u8> = (0..64 * 1024u32)
+                .map(|i| ((i * 31 + n * 7) % 251) as u8)
+                .collect();
+            Object {
+                digest: Digest::bytes(&bytes),
+                kind: Kind::Chunk,
+                bytes,
+            }
+        })
+        .collect()
+}
+
+fn remote_code<T>(result: Result<T, CallError>) -> String {
+    match result {
+        Err(CallError::Remote(wire)) => wire.code,
+        Err(other) => panic!("expected a coded remote error, got {other:?}"),
+        Ok(_) => panic!("expected a coded remote error, the call succeeded"),
+    }
+}
+
+/// Waits ≤ 5 s for every lane of `link` to report closed.
+fn wait_link_closed(link: &WorkerLink) {
+    let end = Instant::now() + Duration::from_secs(5);
+    while link.alive() {
+        assert!(Instant::now() < end, "lanes still open 5 s after close()");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn worker_link_uses_control_for_rpc_and_bulk_for_objects() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("s");
+    let (mut child, ready) = spawn_worker(&state, true, &[]);
+    let link = WorkerLink::connect(&ready, 2).unwrap();
+    assert!(link.alive());
+    let roles: Vec<LaneRole> = link.health().iter().map(|(role, _)| *role).collect();
+    assert_eq!(roles, [LaneRole::Control, LaneRole::Bulk, LaneRole::Bulk]);
+
+    let hello = link.call_json("hello", json!({})).unwrap();
+    assert_eq!(hello["repo"], ready.repo);
+    assert_eq!(hello["instance"], ready.instance);
+
+    // A batch's object bytes travel on the bulk lane of its first digest;
+    // the control lane carries none of them.
+    let objects = one_mib_of_chunks();
+    let object = objects[0].clone();
+    let lane = link.lane_for(&object.digest);
+    assert_eq!(lane, object.digest.0[0] as usize % 2);
+    let control_before = link.health()[0].1.bytes_up;
+    let bulk_before = link.health()[1 + lane].1.bytes_up;
+    assert_eq!(link.write(objects.clone()).unwrap(), objects.len());
+    let health = link.health();
+    let control_sent = health[0].1.bytes_up - control_before;
+    assert!(
+        control_sent < 4096,
+        "control lane sent {control_sent} bytes"
+    );
+    let bulk_sent = health[1 + lane].1.bytes_up - bulk_before;
+    assert!(bulk_sent >= 1024 * 1024, "bulk lane sent {bulk_sent} bytes");
+
+    let wanted: Vec<(Digest, Kind)> = objects.iter().map(|o| (o.digest, o.kind)).collect();
+    let fetched = link.fetch(&wanted).unwrap();
+    assert_eq!(fetched.len(), objects.len());
+    for (fetched, object) in fetched.iter().zip(&objects) {
+        assert_eq!(fetched.digest, object.digest);
+        assert_eq!(fetched.bytes, object.bytes);
+    }
+
+    // Empty batches make no call; oversized ones are refused locally.
+    assert!(link.fetch(&[]).unwrap().is_empty());
+    assert_eq!(link.write(Vec::new()).unwrap(), 0);
+    let too_many = vec![(object.digest, Kind::Chunk); OBJECT_BATCH + 1];
+    assert_eq!(remote_code(link.fetch(&too_many)), "OBJECT_BATCH_TOO_LARGE");
+    let small = Object {
+        digest: Digest::bytes(b"x"),
+        kind: Kind::Chunk,
+        bytes: b"x".to_vec(),
+    };
+    assert_eq!(
+        remote_code(link.write(vec![small; OBJECT_BATCH + 1])),
+        "OBJECT_BATCH_TOO_LARGE"
+    );
+
+    // Object ops are refused on the control lane before anything is sent.
+    let before = link.health()[0].1.bytes_up;
+    let body = serde_json::to_vec(&vec![(object.digest, Kind::Chunk)]).unwrap();
+    assert_eq!(
+        remote_code(link.call(
+            "objects.fetch",
+            json!({"repo": ready.repo}),
+            body,
+            CALL_DEADLINE
+        )),
+        "OP_NOT_ALLOWED"
+    );
+    assert_eq!(
+        link.health()[0].1.bytes_up,
+        before,
+        "the refusal sent bytes"
+    );
+
+    link.close();
+    wait_link_closed(&link);
+    control::request(&state, "shutdown", json!({"force": false})).unwrap();
+    wait_exit(&mut child, BOUND);
+}
+
+#[test]
+fn loopback_lane_header_selects_the_served_op_policy() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("s");
+    let (mut child, ready) = spawn_worker(&state, true, &[]);
+    let dial = |role| {
+        session::dial_loopback_as(
+            &ready.address,
+            Some(&ready.token),
+            role,
+            ConnOptions::for_role(role),
+        )
+        .unwrap()
+    };
+    let fetch_body = serde_json::to_vec(&Vec::<(Digest, Kind)>::new()).unwrap();
+    let call = |conn: &Conn, op: &str, body: Vec<u8>| {
+        conn.call(
+            op,
+            json!({"repo": ready.repo}),
+            body,
+            Priority::Control,
+            CALL_DEADLINE,
+        )
+    };
+
+    let bulk = dial(LaneRole::Bulk);
+    let fetched = call(&bulk, "objects.fetch", fetch_body.clone()).unwrap();
+    assert_eq!(fetched.body, b"[]");
+    assert_eq!(
+        remote_code(call(&bulk, "hello", Vec::new())),
+        "OP_NOT_ALLOWED"
+    );
+    bulk.close();
+
+    let control_lane = dial(LaneRole::Control);
+    assert_eq!(
+        remote_code(call(&control_lane, "objects.fetch", fetch_body)),
+        "OP_NOT_ALLOWED"
+    );
+    assert!(call(&control_lane, "hello", Vec::new()).is_ok());
+    control_lane.close();
+
+    control::request(&state, "shutdown", json!({"force": false})).unwrap();
+    wait_exit(&mut child, BOUND);
+}
+
+#[test]
+fn watch_long_poll_returns_demand_promptly() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("s");
+    init_repo(&state, Some("linked"));
+
+    // An entry with content, written by another replica of the same
+    // repository: only its event reaches the worker, not its chunk.
+    let source_home = tempfile::tempdir().unwrap();
+    let source = Engine::open(source_home.path(), Some("linked")).unwrap();
+    let content = b"bytes the worker does not have yet".to_vec();
+    let h = source.open_file("f", true, false, true).unwrap();
+    source.write(h, 0, &content, false, false).unwrap();
+    source.flush(Some(h)).unwrap();
+    source.close(h).unwrap();
+    let events: Vec<_> = {
+        let mut store = lock(&source.store);
+        store.sync_metadata().unwrap();
+        store
+            .events_after(0, 4096)
+            .unwrap()
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    };
+    let digest = source.lookup("f").unwrap().content.unwrap().digest;
+    source.shutdown().unwrap();
+
+    let (mut child, ready) = start_worker(&state, true, &[]);
+    assert_eq!(ready.repo, "linked");
+    let link = WorkerLink::connect(&ready, 2).unwrap();
+    let applied = link
+        .call(
+            "feed.apply",
+            json!({}),
+            serde_json::to_vec(&events).unwrap(),
+            CALL_DEADLINE,
+        )
+        .unwrap();
+    let applied: Value = serde_json::from_slice(&applied.body).unwrap();
+    assert!(applied["applied"].as_u64().unwrap() >= 1, "{applied}");
+
+    let started = Instant::now();
+    let first = link.watch(0).unwrap();
+    assert!(started.elapsed() <= Duration::from_secs(2));
+    assert!(first.seq >= 1, "{first:?}");
+    assert!(first.demand.is_empty(), "{first:?}");
+
+    // A reader of the entry blocks on the missing chunk; the parked watch
+    // reports it at once.
+    let (sent, received) = mpsc::channel();
+    let reader_state = state.clone();
+    let asked = Instant::now();
+    std::thread::spawn(move || {
+        let _ = sent.send(control::request(&reader_state, "cat", json!({"path": "f"})));
+    });
+    let mut seq = first.seq;
+    let demanded = loop {
+        let watch = link.watch(seq).unwrap();
+        if watch.demand.contains(&(digest, Kind::Chunk)) {
+            break asked.elapsed();
+        }
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "no demand for {digest} within 5 s: {watch:?}"
+        );
+        seq = watch.seq;
+    };
+    assert!(
+        demanded <= Duration::from_millis(500),
+        "demand reported after {demanded:?}"
+    );
+
+    // Answering the demand completes the read.
+    let chunk = Object {
+        digest,
+        kind: Kind::Chunk,
+        bytes: content.clone(),
+    };
+    assert_eq!(link.write(vec![chunk]).unwrap(), 1);
+    let read = received
+        .recv_timeout(BOUND)
+        .expect("cat did not finish within 30 s")
+        .unwrap();
+    let bytes: Vec<u8> = serde_json::from_value(read["bytes"].clone()).unwrap();
+    assert_eq!(bytes, content);
+    assert!(link.watch(seq).unwrap().demand.is_empty());
+
+    link.close();
+    wait_link_closed(&link);
+    control::request(&state, "shutdown", json!({"force": false})).unwrap();
+    wait_exit(&mut child, BOUND);
 }

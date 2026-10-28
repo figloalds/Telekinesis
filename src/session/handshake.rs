@@ -7,8 +7,8 @@ use crate::{
     model::{
         errors::{ErrorClass, ErrorWire},
         protocol::{
-            LaneRole, LaneSpec, PROTOCOL_NAME, PROTOCOL_VERSION, SUPPORTED_VERSIONS, TOKEN_HEADER,
-            UPGRADE_HEADER, UPGRADE_LOOPBACK, UPGRADE_V3,
+            LANE_HEADER, LaneRole, LaneSpec, PROTOCOL_NAME, PROTOCOL_VERSION, SUPPORTED_VERSIONS,
+            TOKEN_HEADER, UPGRADE_HEADER, UPGRADE_LOOPBACK, UPGRADE_V3,
             frame::{
                 Auth, AuthOk, ClientHello, DIAL_ATTEMPT, FrameKind, GOAWAY_HANDSHAKE_CODES, Goaway,
                 HANDSHAKE_TIMEOUT, KNOWN_FLAGS, Limits, MAX_CHUNK, MAX_HEADER, MAX_HEADER_PRE_AUTH,
@@ -489,22 +489,44 @@ pub fn server_handshake(
     server_steps(guarded, policy, Limits::default())
 }
 
-/// Dials a worker's loopback endpoint (`X-Tkfs-Sync: 3-loopback`, plus
-/// `X-Tkfs-Token`). There is no HELLO/AUTH: loopback sessions are local and
-/// token-checked (WP4.1). With `token: None`, the token this process knows
-/// for the address (`ws::tokens::lookup`) is presented, if any. A worker that
-/// does not echo the header gives `NeedsUpgrade`; a refused token gives
-/// `Unauthorized(ACCESS_DENIED)`.
+/// Dials a worker's loopback endpoint as a control lane (see
+/// [`dial_loopback_as`]).
 pub fn dial_loopback(
     address: &str,
     token: Option<&str>,
     o: ConnOptions,
 ) -> Result<Conn, DialError> {
+    dial_loopback_as(address, token, LaneRole::Control, o)
+}
+
+/// Dials a worker's loopback endpoint (`X-Tkfs-Sync: 3-loopback`, plus
+/// `X-Tkfs-Token` and `X-Tkfs-Lane: control|bulk`). There is no HELLO/AUTH:
+/// loopback sessions are local and token-checked (WP4.1); the lane header
+/// selects the role whose op policy the worker enforces. With `token: None`,
+/// the token this process knows for the address (`ws::tokens::lookup`) is
+/// presented, if any. A worker that does not echo the header gives
+/// `NeedsUpgrade`; a refused token gives `Unauthorized(ACCESS_DENIED)`. A
+/// probe lane has no loopback form: `Protocol`, before dialing.
+pub fn dial_loopback_as(
+    address: &str,
+    token: Option<&str>,
+    role: LaneRole,
+    o: ConnOptions,
+) -> Result<Conn, DialError> {
+    if loopback_role(role.as_str()) != Some(role) {
+        return Err(DialError::Protocol(format!(
+            "a loopback lane is control or bulk, not {}",
+            role.as_str()
+        )));
+    }
     let known = match token {
         Some(_) => None,
         None => ws::tokens::lookup_endpoint(address),
     };
-    let mut headers = vec![(UPGRADE_HEADER, UPGRADE_LOOPBACK)];
+    let mut headers = vec![
+        (UPGRADE_HEADER, UPGRADE_LOOPBACK),
+        (LANE_HEADER, role.as_str()),
+    ];
     if let Some(token) = token.or(known.as_deref()) {
         headers.push((TOKEN_HEADER, token));
     }
@@ -516,14 +538,17 @@ pub fn dial_loopback(
             detail: format!("{address} does not serve loopback sessions ({UPGRADE_HEADER})"),
         });
     }
-    into_conn(ws, Side::Client, loopback_peer(), o)
+    into_conn(ws, Side::Client, loopback_peer(role), o)
         .map_err(|error| DialError::Connect(format!("session I/O did not start: {error}")))
 }
 
 /// Accepts a loopback session upgrade (≤ 5 s). Anything but
 /// `X-Tkfs-Sync: 3-loopback` is refused with HTTP 400; with `token` set, a
 /// missing or different `X-Tkfs-Token` is refused with HTTP 403
-/// (`ACCESS_DENIED`, constant-time compare).
+/// (`ACCESS_DENIED`, constant-time compare). `X-Tkfs-Lane` sets the accepted
+/// session's role, which decides the ops it may carry (`op_allowed`):
+/// `control` (also when absent) or `bulk`; any other value is refused with
+/// HTTP 400 (`PROTOCOL_VIOLATION`).
 pub fn accept_loopback(
     stream: TcpStream,
     token: Option<&str>,
@@ -534,6 +559,7 @@ pub fn accept_loopback(
     watchdog.arm(HANDSHAKE_TIMEOUT);
     let mut kind = None;
     let mut authorized = false;
+    let mut role = None;
     let upgraded = ws::accept_with(
         stream,
         session_message_bound(o.max_header, o.max_chunk),
@@ -554,6 +580,14 @@ pub fn accept_loopback(
                 *response.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
                 return;
             }
+            role = match request.headers().get(LANE_HEADER) {
+                None => Some(LaneRole::Control),
+                Some(lane) => lane.to_str().ok().and_then(loopback_role),
+            };
+            if role.is_none() {
+                *response.status_mut() = tungstenite::http::StatusCode::BAD_REQUEST;
+                return;
+            }
             response.headers_mut().insert(
                 UPGRADE_HEADER,
                 tungstenite::http::HeaderValue::from_static(UPGRADE_LOOPBACK),
@@ -568,6 +602,10 @@ pub fn accept_loopback(
         (Some(UpgradeKind::Loopback), false) => {
             ErrorWire::coded("ACCESS_DENIED", "loopback session token refused")
         }
+        (Some(UpgradeKind::Loopback), true) if role.is_none() => ErrorWire::coded(
+            "PROTOCOL_VIOLATION",
+            format!("unknown loopback lane ({LANE_HEADER}: control|bulk)"),
+        ),
         (Some(UpgradeKind::V3 | UpgradeKind::Legacy), _) => ErrorWire::coded(
             "PROTOCOL_VIOLATION",
             "not a loopback session upgrade (X-Tkfs-Sync: 3-loopback)",
@@ -575,7 +613,8 @@ pub fn accept_loopback(
         _ => upgrade_wire(&error),
     })?;
     drop(watchdog);
-    into_conn(ws, Side::Server, loopback_peer(), o).map_err(|error| {
+    let role = role.unwrap_or_default();
+    into_conn(ws, Side::Server, loopback_peer(role), o).map_err(|error| {
         ErrorWire::coded(
             "CONNECTION_LOST",
             format!("session I/O did not start: {error}"),
@@ -1002,10 +1041,19 @@ fn session_message_bound(max_header: usize, max_chunk: usize) -> usize {
     PREFIX_LEN + max_header + max_chunk
 }
 
-fn loopback_peer() -> PeerInfo {
+/// The role a loopback lane header names: `control` or `bulk`.
+fn loopback_role(lane: &str) -> Option<LaneRole> {
+    match lane.trim() {
+        "control" => Some(LaneRole::Control),
+        "bulk" => Some(LaneRole::Bulk),
+        _ => None,
+    }
+}
+
+fn loopback_peer(role: LaneRole) -> PeerInfo {
     PeerInfo {
         installation: String::new(),
-        role: LaneRole::Control,
+        role,
         lane: None,
         session: uuid::Uuid::new_v4().to_string(),
         verifier_generation: 0,

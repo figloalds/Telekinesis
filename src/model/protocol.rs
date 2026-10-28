@@ -9,6 +9,8 @@ pub const UPGRADE_HEADER: &str = "X-Tkfs-Sync";
 pub const UPGRADE_V3: &str = "4";
 pub const UPGRADE_LOOPBACK: &str = "4-loopback";
 pub const TOKEN_HEADER: &str = "X-Tkfs-Token";
+/// The role of a loopback lane (`control` or `bulk`); absent means control.
+pub const LANE_HEADER: &str = "X-Tkfs-Lane";
 pub const LEGACY_NEEDS_UPGRADE_REPLY: &str =
     r#"{"ok":false,"error":"PEER_NEEDS_UPGRADE: use an authenticated session"}"#;
 /// The role of a session (`ClientHello.role`).
