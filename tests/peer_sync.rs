@@ -451,6 +451,15 @@ fn receive_replicates_metadata_and_objects_across_two_orchestrators() -> Result<
         "--headless",
     ]));
     assert!(refused.contains("REPO_NOT_PUBLISHED"), "{refused}");
+    // One folder per repo: a second `receive` of it is refused, nothing added.
+    let listed = a.manage(&["list"])?;
+    let repo = inspected["record"]["repo"]
+        .as_str()
+        .context("no repo")?
+        .to_owned();
+    let twice = error_of(a.manage(&["receive", &endpoint_b, &repo, "Again", "--headless"]));
+    assert!(twice.contains("REPO_ALREADY_PRESENT"), "{twice}");
+    assert_eq!(a.manage(&["list"])?, listed);
 
     // With B gone, A serves the file from its own packs.
     b.shutdown()?;

@@ -110,13 +110,18 @@ impl WorkerLink {
         parse("watch", &reply.body)
     }
 
-    /// `objects.missing {limit}` on the first bulk lane (object ops are
-    /// refused on the control lane): up to `limit` content objects the
-    /// worker's live entries need and its packs lack.
-    pub fn missing(&self, limit: usize) -> Result<Vec<(Digest, Kind)>, CallError> {
+    /// `objects.missing {limit, exclude}` on the first bulk lane (object ops
+    /// are refused on the control lane): up to `limit` content objects the
+    /// worker's live entries need and its packs lack, `exclude` (at most
+    /// `sync::MAX_EXCLUDE`) left out.
+    pub fn missing(
+        &self,
+        limit: usize,
+        exclude: &[Digest],
+    ) -> Result<Vec<(Digest, Kind)>, CallError> {
         let reply = self.bulk[0].call(
             "objects.missing",
-            json!({"limit": limit}),
+            json!({"limit": limit, "exclude": exclude}),
             Vec::new(),
             Priority::Data,
             CALL_DEADLINE,

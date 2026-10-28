@@ -807,12 +807,31 @@ impl Daemon {
         payload["label"]
             .as_str()
             .context("ARGUMENT_REQUIRED: label")?;
+        // Checked again by `create` under the admission lock; this one
+        // spares the remote listing.
+        self.refuse_held_repo(repo)?;
         let published = self.network()?.remote_list(endpoint)?;
         ensure!(
             published.iter().any(|folder| folder["repo"] == repo),
             "REPO_NOT_PUBLISHED: {endpoint} publishes no folder of repo {repo}"
         );
         self.create(payload)
+    }
+
+    /// `REPO_ALREADY_PRESENT` when a folder of this daemon holds `repo`.
+    fn refuse_held_repo(&self, repo: &str) -> Result<()> {
+        if let Some(held) = self
+            .catalog
+            .folders()?
+            .into_iter()
+            .find(|record| record.repo == repo)
+        {
+            bail!(
+                "REPO_ALREADY_PRESENT: folder {} already holds repo {repo}",
+                held.label
+            );
+        }
+        Ok(())
     }
 
     fn create(&self, payload: &Value) -> Result<Value> {
@@ -825,6 +844,9 @@ impl Daemon {
             .unwrap_or_else(crate::core::id);
         let mount = optional_path(payload, "mount")?;
         let _admission = lock(&self.admission);
+        // One folder per repo: sync jobs, `link_by_repo` and the peers'
+        // view of this daemon all key folders by repo.
+        self.refuse_held_repo(&repo)?;
         self.admit(None)?;
         let record = self.catalog.create_folder(label, &repo, mount)?;
         // Initialize the store, then release it (`owner.lock`) for the worker.
@@ -1629,6 +1651,31 @@ mod tests {
                 .unwrap_err()
         );
         assert!(error.starts_with("ORCHESTRATOR_STOPPING"), "{error}");
+    }
+
+    #[test]
+    fn a_repo_already_held_is_refused_before_any_catalog_write() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = daemon(root.path());
+        let held = daemon
+            .catalog
+            .create_folder("Project", "repo-1", None)
+            .unwrap();
+        daemon.register(held.clone());
+        let before = serde_json::to_value(daemon.catalog.folders().unwrap()).unwrap();
+        for action in ["create", "receive"] {
+            let payload = json!({
+                "label": "Second",
+                "repo": "repo-1",
+                "endpoint": "ws://127.0.0.1:9",
+            });
+            let error = format!("{:#}", daemon.execute(action, &payload).unwrap_err());
+            assert!(
+                error.starts_with("REPO_ALREADY_PRESENT: folder Project already holds repo repo-1"),
+                "{action}: {error}"
+            );
+        }
+        assert_eq!(daemon.execute("list", &json!({})).unwrap(), before);
     }
 
     #[test]

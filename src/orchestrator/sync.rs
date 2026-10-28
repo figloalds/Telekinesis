@@ -7,7 +7,8 @@
 //! - `feed.outgoing {after}` → [`FeedPage`] of at most [`FEED_PAGE`] events.
 //! - `feed.apply {}`, body `Vec<Event>` → `{"applied": usize}`.
 //! - `meta.exchange {repo}`, body [`FeedRequest`] → [`FeedReply`].
-//! - `objects.missing {limit}` → `Vec<(Digest, Kind)>`, `limit` ≤ [`BATCH`].
+//! - `objects.missing {limit, exclude?}` → `Vec<(Digest, Kind)>`, `limit` ≤
+//!   [`BATCH`], skipping the digests of `exclude` (≤ [`MAX_EXCLUDE`]).
 //! - `objects.fetch {repo}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`,
 //!   at most [`OBJECT_BATCH`] objects.
 //! - `objects.write {repo}`, body `Vec<Object>` → `{"stored": usize}`, at
@@ -33,6 +34,8 @@ use std::{
 
 /// Most objects one `objects.missing` reply lists.
 pub const BATCH: usize = 64;
+/// Most digests one `objects.missing` may exclude (the ones no peer had).
+pub const MAX_EXCLUDE: usize = 256;
 /// Most objects one `objects.fetch` request or `objects.write` body carries:
 /// 32 full 64 KiB chunks encode to about 8 MiB, within the 16 MiB default
 /// session body bound.
@@ -119,8 +122,9 @@ impl Service {
     }
     /// Content objects of live entries in the current projection that the
     /// packs lack: every file's root first, then the chunks of manifests that
-    /// are present. At most `limit` (clamped to [`BATCH`]), without duplicates.
-    fn missing(&self, limit: usize) -> Result<Vec<(Digest, Kind)>> {
+    /// are present. At most `limit` (clamped to [`BATCH`]), without duplicates
+    /// and without the digests of `exclude`.
+    fn missing(&self, limit: usize, exclude: &BTreeSet<Digest>) -> Result<Vec<(Digest, Kind)>> {
         let limit = limit.min(BATCH);
         let mut wanted = Vec::new();
         if limit == 0 {
@@ -137,7 +141,10 @@ impl Service {
         let mut seen = BTreeSet::new();
         // Adds an absent object; true once `limit` objects are listed.
         let mut full = |wanted: &mut Vec<_>, digest: Digest, kind: Kind| -> Result<bool> {
-            if seen.insert(digest) && !content.packs.contains(digest)? {
+            if !exclude.contains(&digest)
+                && seen.insert(digest)
+                && !content.packs.contains(digest)?
+            {
                 wanted.push((digest, kind));
             }
             Ok(wanted.len() >= limit)
@@ -240,7 +247,9 @@ impl Service {
             "objects.missing" => {
                 let limit = header["limit"].as_u64().unwrap_or(BATCH as u64);
                 let limit = usize::try_from(limit).unwrap_or(BATCH);
-                Ok(serde_json::to_vec(&self.missing(limit)?)?)
+                Ok(serde_json::to_vec(
+                    &self.missing(limit, &exclusions(header)?)?,
+                )?)
             }
             FETCH_OP => Ok(serde_json::to_vec(
                 &self.fetch(serde_json::from_slice(body)?)?,
@@ -252,6 +261,28 @@ impl Service {
         }
     }
 }
+/// `objects.missing`'s `exclude`: absent or a list of at most
+/// [`MAX_EXCLUDE`] digests.
+fn exclusions(header: &Value) -> Result<BTreeSet<Digest>> {
+    let Some(exclude) = header.get("exclude").filter(|value| !value.is_null()) else {
+        return Ok(BTreeSet::new());
+    };
+    let list = exclude
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("INVALID_REQUEST: exclude must be a list of digests"))?;
+    ensure!(
+        list.len() <= MAX_EXCLUDE,
+        "ARGUMENT_TOO_LARGE: exclude lists {} digests (at most {MAX_EXCLUDE})",
+        list.len()
+    );
+    list.iter()
+        .map(|digest| {
+            serde_json::from_value(digest.clone())
+                .map_err(|error| anyhow::anyhow!("INVALID_REQUEST: exclude: {error}"))
+        })
+        .collect()
+}
+
 impl Handler for Service {
     fn handle(&self, req: Incoming) {
         match self.handle_request(&req.op, &req.header, &req.body) {
@@ -816,6 +847,44 @@ mod tests {
         assert!(roots.contains(&(manifest.digest, Kind::Manifest)));
         assert_eq!(missing(1)?.len(), 1);
         assert_eq!(missing(0)?.len(), 0);
+        // Excluded digests are skipped: the next ones are listed instead.
+        let skipping = |exclude: Vec<Digest>| -> Result<Vec<(Digest, Kind)>> {
+            Ok(serde_json::from_slice(&call(
+                &incoming,
+                "objects.missing",
+                json!({"limit": 64, "exclude": exclude}),
+                &[],
+            )?)?)
+        };
+        assert_eq!(
+            skipping(vec![manifest.digest])?,
+            vec![(small.digest, Kind::Chunk)]
+        );
+        assert_eq!(skipping(vec![manifest.digest, small.digest])?, vec![]);
+        let one = call(
+            &incoming,
+            "objects.missing",
+            json!({"limit": 1, "exclude": [roots[0].0]}),
+            &[],
+        )?;
+        let one: Vec<(Digest, Kind)> = serde_json::from_slice(&one)?;
+        assert_eq!(one, vec![roots[1]]);
+        let error = call(
+            &incoming,
+            "objects.missing",
+            json!({"limit": 64, "exclude": vec![small.digest; MAX_EXCLUDE + 1]}),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(code(&error), "ARGUMENT_TOO_LARGE", "{error:#}");
+        let error = call(
+            &incoming,
+            "objects.missing",
+            json!({"limit": 64, "exclude": "nope"}),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(code(&error), "INVALID_REQUEST", "{error:#}");
 
         // Supply the manifest the way the orchestrator would: fetch from the
         // source, write into the target.

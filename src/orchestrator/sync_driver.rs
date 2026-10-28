@@ -1,6 +1,7 @@
 //! The orchestrator's sync driver (spec §7.3–§7.5): the metadata scheduler,
 //! the object pump and the peer clock probe. It only originates requests on
-//! this side's outbound lanes ([`Network`]); serving peers is `PeerService`'s.
+//! this side's outbound lanes ([`Lanes`], the [`Network`]); serving peers is
+//! `PeerService`'s.
 //!
 //! Threads (all end once the driver's [`Cancel`] fires; [`Driver::stop`]):
 //! * **scheduler** — every `sync_interval_ms`, for each paired peer with a
@@ -13,13 +14,18 @@
 //!   advance, and it repeats at once while either side has `more`. Cursors
 //!   live in memory per (peer, repo) ([`SyncJob`]) and start over when the
 //!   folder's worker or the peer's control session changes.
-//! * **object pump** — one thread for every Running, unpaused folder: each
-//!   round, `wanted` = the worker's last `watch` demand ∪ `objects.missing
-//!   {limit: OBJECT_BATCH}`, grouped by the Ready bulk lane that owns each
-//!   digest (across peers), fetched in batches of ≤ [`OBJECT_BATCH`] and
-//!   written to the worker. A round that stored nothing sleeps
-//!   `sync_interval_ms`, cut short by a new demand (the wake [`Seq`] the
-//!   folders' watch threads bump). A peer whose fetch failed sits out the
+//! * **object pump** — one thread for every Running, unpaused folder. Each
+//!   round has two passes (spec §7.8: demand never waits behind background
+//!   traffic). Pass 1 supplies every folder's pending `watch` demand; pass 2
+//!   prefetches `objects.missing {limit: OBJECT_BATCH, exclude}` per folder
+//!   and is abandoned before its next call as soon as a demand wake-up (the
+//!   wake [`Seq`] the folders' watch threads bump) arrives, so the next
+//!   round's pass 1 waits at most for one call in flight (≤ 10 s). Objects
+//!   are asked of each peer in turn, per owning Ready bulk lane, in batches
+//!   of ≤ [`OBJECT_BATCH`], and written to the worker. A digest every asked
+//!   peer omitted is excluded for a backoff (5 s doubling to 5 min), so
+//!   later objects are not starved. A round that stored nothing sleeps
+//!   `sync_interval_ms` unless woken. A peer whose fetch failed sits out the
 //!   next round. The pump never blocks the scheduler.
 //! * **clock probes** — a short thread per probe, at most one per peer: at
 //!   every new control session (a Ready transition) and every
@@ -30,7 +36,7 @@ use super::{
     catalog::Catalog,
     demand::Seq,
     network::{Network, ReadyPeer},
-    sync::{FeedCursor, FeedPage, FeedReply, FeedRequest, Object},
+    sync::{FeedCursor, FeedPage, FeedReply, FeedRequest, MAX_EXCLUDE, Object},
     worker_client::{CALL_DEADLINE, WorkerLink},
 };
 use crate::{
@@ -61,6 +67,37 @@ pub const OBJECT_BATCH: usize = super::sync::OBJECT_BATCH;
 pub const CLOCK_PROBE_EVERY: u64 = 60;
 /// Deadline of one request on a peer lane.
 pub const PEER_DEADLINE: Duration = Duration::from_secs(10);
+/// A digest no asked peer had is excluded this long at first…
+pub const UNAVAILABLE_FIRST: Duration = Duration::from_secs(5);
+/// …doubling each time to at most this.
+pub const UNAVAILABLE_MAX: Duration = Duration::from_secs(300);
+/// A demanded digest just written is not fetched again for this long (the
+/// worker's demand list catches up at its next `watch`).
+const DEMAND_SUPPLIED: Duration = super::worker_client::WATCH_DEADLINE;
+
+type Wanted = Vec<(Digest, Kind)>;
+
+/// The peer lanes the driver uses: the [`Network`] (tests stub it).
+pub trait Lanes: Send + Sync {
+    /// Every peer with a Ready control lane.
+    fn ready_peers(&self) -> Vec<ReadyPeer>;
+    /// The endpoints with at least one Ready bulk lane.
+    fn bulk_endpoints(&self) -> Vec<String>;
+    /// The Ready bulk lane to `endpoint` that owns `digest`.
+    fn bulk_lane(&self, endpoint: &str, digest: &Digest) -> Option<Conn>;
+}
+
+impl Lanes for Network {
+    fn ready_peers(&self) -> Vec<ReadyPeer> {
+        Network::ready_peers(self)
+    }
+    fn bulk_endpoints(&self) -> Vec<String> {
+        Network::bulk_endpoints(self)
+    }
+    fn bulk_lane(&self, endpoint: &str, digest: &Digest) -> Option<Conn> {
+        Network::bulk_lane(self, endpoint, digest)
+    }
+}
 
 /// A folder the driver syncs: Running, unpaused, with its worker link.
 pub struct SyncFolder {
@@ -115,11 +152,33 @@ struct ProbeState {
     running: bool,
 }
 
-/// The objects one peer bulk lane is asked for.
-struct Group {
-    endpoint: String,
-    conn: Conn,
-    batch: Vec<(Digest, Kind)>,
+/// The object pump's memory across rounds.
+#[derive(Default)]
+struct PumpState {
+    round: u64,
+    /// Peers sitting out: endpoint → the first round they are asked again.
+    resting: BTreeMap<String, u64>,
+    /// The last error logged per peer endpoint (fetch) or folder id
+    /// (`objects.missing`): logged again only when it changes.
+    logged: BTreeMap<String, String>,
+    /// Per folder id: the digests no asked peer had, and until when they are
+    /// excluded.
+    unavailable: BTreeMap<String, BTreeMap<Digest, Unavailable>>,
+    /// Digests written lately (not fetched again for a stale demand).
+    supplied: BTreeMap<Digest, Instant>,
+}
+
+struct Unavailable {
+    until: Instant,
+    backoff: Duration,
+}
+
+/// What one [`Driver::supply`] did.
+#[derive(Default)]
+struct Supplied {
+    stored: usize,
+    /// It stopped early (a wake-up, cancel or a failed write).
+    interrupted: bool,
 }
 
 /// Why an exchange or a fetch did not complete.
@@ -153,7 +212,7 @@ fn worker_failure(op: &str, error: impl std::fmt::Display) -> Failure {
 }
 
 pub struct Driver {
-    network: Arc<Network>,
+    lanes: Arc<dyn Lanes>,
     catalog: Arc<Catalog>,
     folders: Arc<dyn SyncFolders>,
     /// Bumped by folder watch threads when demand changes; wakes the pump.
@@ -170,25 +229,14 @@ pub struct Driver {
 /// Starts the scheduler, its exchange pool and the pump. `cancel` (a child
 /// of the daemon's stopping token) stops them.
 pub fn start(
-    network: Arc<Network>,
+    lanes: Arc<dyn Lanes>,
     catalog: Arc<Catalog>,
     folders: Arc<dyn SyncFolders>,
     wake: Arc<Seq>,
     interval: Duration,
     cancel: Cancel,
 ) -> Result<Arc<Driver>> {
-    let driver = Arc::new(Driver {
-        network,
-        catalog,
-        folders,
-        wake,
-        interval,
-        cancel,
-        jobs: Mutex::new(BTreeMap::new()),
-        busy: AtomicUsize::new(0),
-        probes: Arc::new(Mutex::new(BTreeMap::new())),
-        threads: Mutex::new(Vec::new()),
-    });
+    let driver = Driver::new(lanes, catalog, folders, wake, interval, cancel);
     let (tasks, queue) = mpsc::channel::<Task>();
     let queue = Arc::new(Mutex::new(queue));
     let mut threads = Vec::new();
@@ -224,6 +272,29 @@ pub fn start(
 }
 
 impl Driver {
+    /// A driver with no threads yet (see [`start`]).
+    fn new(
+        lanes: Arc<dyn Lanes>,
+        catalog: Arc<Catalog>,
+        folders: Arc<dyn SyncFolders>,
+        wake: Arc<Seq>,
+        interval: Duration,
+        cancel: Cancel,
+    ) -> Arc<Self> {
+        Arc::new(Driver {
+            lanes,
+            catalog,
+            folders,
+            wake,
+            interval,
+            cancel,
+            jobs: Mutex::new(BTreeMap::new()),
+            busy: AtomicUsize::new(0),
+            probes: Arc::new(Mutex::new(BTreeMap::new())),
+            threads: Mutex::new(Vec::new()),
+        })
+    }
+
     /// Stops every thread: cancels, wakes the pump and waits at most
     /// `budget` for them (a thread still in a bounded worker call is left to
     /// end on its own and reported).
@@ -267,7 +338,7 @@ impl Driver {
         let mut round: u64 = 0;
         while !self.cancel.is_cancelled() {
             round += 1;
-            let peers = self.network.ready_peers();
+            let peers = self.lanes.ready_peers();
             self.probe_clocks(round, &peers);
             self.dispatch(round, &peers, &tasks);
             if self.cancel.sleep(self.interval) {
@@ -434,147 +505,235 @@ impl Driver {
     // ---- pump ------------------------------------------------------------
 
     fn pump(&self) {
-        let mut round: u64 = 0;
-        // Peers sitting out: endpoint → the first round they are asked again.
-        let mut resting: BTreeMap<String, u64> = BTreeMap::new();
-        // The last error logged per peer endpoint (fetch) or folder id
-        // (`objects.missing`): logged again only when it changes.
-        let mut logged: BTreeMap<String, String> = BTreeMap::new();
+        let mut state = PumpState::default();
         while !self.cancel.is_cancelled() {
-            round += 1;
             let seen = self.wake.current();
-            let stored = self.pump_round(round, &mut resting, &mut logged);
+            let stored = self.pump_round(&mut state, seen);
             if self.cancel.is_cancelled() {
                 break;
             }
             if stored == 0 {
+                // Returns at once when a demand wake-up came meanwhile.
                 self.wake.wait_past(seen, self.interval);
             }
         }
     }
 
-    /// One pass over every syncing folder; the number of objects stored.
-    fn pump_round(
-        &self,
-        round: u64,
-        resting: &mut BTreeMap<String, u64>,
-        logged: &mut BTreeMap<String, String>,
-    ) -> usize {
-        let mut endpoints: Vec<String> = self
-            .network
-            .bulk_endpoints()
-            .into_iter()
-            .filter(|endpoint| resting.get(endpoint).is_none_or(|at| *at <= round))
-            .collect();
+    /// One round. Pass 1 supplies every folder's pending demand; pass 2 the
+    /// background `objects.missing` work, abandoned before its next call as
+    /// soon as the wake moves past `seen` (the next round starts with pass
+    /// 1). The number of objects stored.
+    fn pump_round(&self, state: &mut PumpState, seen: u64) -> usize {
+        state.round += 1;
+        let round = state.round;
+        state.resting.retain(|_, at| *at > round);
+        let mut endpoints = self.lanes.bulk_endpoints();
+        endpoints.retain(|endpoint| !state.resting.contains_key(endpoint));
         if endpoints.is_empty() {
             return 0;
         }
         let turn = (round as usize) % endpoints.len();
         endpoints.rotate_left(turn);
+        let folders = self.folders.syncing();
+        state
+            .unavailable
+            .retain(|id, _| folders.iter().any(|folder| folder.id == *id));
+        let now = Instant::now();
+        state
+            .supplied
+            .retain(|_, at| now.saturating_duration_since(*at) < DEMAND_SUPPLIED);
         let mut stored = 0;
-        for folder in self.folders.syncing() {
-            if self.cancel.is_cancelled() {
+        // Pass 1: what readers wait for. A digest just written may still be
+        // listed until the worker's next `watch`: it is not fetched again.
+        for folder in &folders {
+            let demand: Vec<(Digest, Kind)> = folder
+                .demand
+                .iter()
+                .filter(|(digest, _)| !state.supplied.contains_key(digest))
+                .copied()
+                .collect();
+            if !demand.is_empty() && !self.cancel.is_cancelled() {
+                stored += self.supply(state, &endpoints, folder, demand, None).stored;
+            }
+        }
+        // Pass 2: background prefetch.
+        for folder in &folders {
+            if self.cancel.is_cancelled() || self.wake.current() != seen {
                 break;
             }
-            let missing = match folder.link.missing(OBJECT_BATCH) {
-                Ok(missing) => {
-                    logged.remove(&folder.id);
-                    missing
+            let wanted = self.background(state, folder);
+            if wanted.is_empty() {
+                continue;
+            }
+            let supplied = self.supply(state, &endpoints, folder, wanted, Some(seen));
+            stored += supplied.stored;
+            if supplied.interrupted {
+                break;
+            }
+        }
+        stored
+    }
+
+    /// The folder's background work: `objects.missing` without the digests no
+    /// peer had lately (passed as `exclude`, and filtered here too).
+    fn background(&self, state: &mut PumpState, folder: &SyncFolder) -> Vec<(Digest, Kind)> {
+        let now = Instant::now();
+        let unavailable = state.unavailable.entry(folder.id.clone()).or_default();
+        let exclude: Vec<Digest> = unavailable
+            .iter()
+            .filter(|(_, entry)| entry.until > now)
+            .map(|(digest, _)| *digest)
+            .take(MAX_EXCLUDE)
+            .collect();
+        let missing = match folder.link.missing(OBJECT_BATCH, &exclude) {
+            Ok(missing) => {
+                state.logged.remove(&folder.id);
+                missing
+            }
+            Err(error) => {
+                let error = format!("objects.missing: {error}");
+                if state.logged.get(&folder.id) != Some(&error) {
+                    event!(warn, SYNC_MISSING_FAILED, {
+                        "folder": folder.id.clone(),
+                        "error": error.clone(),
+                    });
+                    state.logged.insert(folder.id.clone(), error);
                 }
-                Err(error) => {
-                    let error = format!("objects.missing: {error}");
-                    if logged.get(&folder.id) != Some(&error) {
-                        event!(warn, SYNC_MISSING_FAILED, {
-                            "folder": folder.id.clone(),
-                            "error": error.clone(),
-                        });
-                        logged.insert(folder.id.clone(), error);
-                    }
-                    Vec::new()
-                }
-            };
-            let wanted = wanted(&folder.demand, missing);
-            for Group {
-                endpoint,
-                conn,
-                batch,
-            } in self.group(&endpoints, &wanted)
-            {
-                if resting.get(&endpoint).is_some_and(|at| *at > round) {
-                    continue;
-                }
+                return Vec::new();
+            }
+        };
+        // An expired backoff is kept while its object is still missing (the
+        // next one doubles); one no longer missing is forgotten.
+        let listed: BTreeSet<Digest> = missing.iter().map(|(digest, _)| *digest).collect();
+        unavailable.retain(|digest, entry| entry.until > now || listed.contains(digest));
+        missing
+            .into_iter()
+            .filter(|(digest, _)| {
+                unavailable
+                    .get(digest)
+                    .is_none_or(|entry| entry.until <= now)
+            })
+            .collect()
+    }
+
+    /// Fetches `wanted` for `folder`: each endpoint in turn is asked, per
+    /// bulk lane and at most [`OBJECT_BATCH`] per call, for what is still
+    /// missing, and what arrives is written to the worker. A digest that
+    /// every asked peer omitted (none failing) is unavailable for a backoff
+    /// (5 s doubling to 5 min). A failing peer sits out the next round. With
+    /// `interrupt`, stops before the next call once the wake moved past it.
+    fn supply(
+        &self,
+        state: &mut PumpState,
+        endpoints: &[String],
+        folder: &SyncFolder,
+        wanted: Vec<(Digest, Kind)>,
+        interrupt: Option<u64>,
+    ) -> Supplied {
+        let mut remaining = wanted;
+        let mut asked = BTreeSet::new();
+        let mut failed = BTreeSet::new();
+        let mut result = Supplied::default();
+        'peers: for endpoint in endpoints {
+            if remaining.is_empty() {
+                break;
+            }
+            if state.resting.contains_key(endpoint) {
+                continue;
+            }
+            for (conn, batch) in self.lanes_for(endpoint, &remaining) {
                 for chunk in batch.chunks(OBJECT_BATCH) {
-                    match fetch(&conn, &folder.repo, chunk, &self.cancel) {
-                        Ok(objects) if objects.is_empty() => {}
-                        Ok(objects) => match folder.link.write(objects) {
-                            Ok(count) => {
-                                stored += count;
-                                logged.remove(&endpoint);
-                            }
-                            Err(error) => {
-                                event!(warn, SYNC_WRITE_FAILED, {
-                                    "folder": folder.id.clone(),
-                                    "error": error.to_string(),
-                                });
-                                break;
-                            }
-                        },
+                    let woken = interrupt.is_some_and(|seen| self.wake.current() != seen);
+                    if self.cancel.is_cancelled() || woken {
+                        result.interrupted = true;
+                        break 'peers;
+                    }
+                    asked.extend(chunk.iter().map(|(digest, _)| *digest));
+                    let mut objects = match fetch(&conn, &folder.repo, chunk, &self.cancel) {
+                        Ok(objects) => objects,
                         Err(failure) => {
-                            resting.insert(endpoint.clone(), round + 2);
+                            failed.extend(chunk.iter().map(|(digest, _)| *digest));
+                            state.resting.insert(endpoint.clone(), state.round + 2);
                             let error = failure.to_string();
-                            if logged.get(&endpoint) != Some(&error) {
+                            if state.logged.get(endpoint) != Some(&error) {
                                 event!(warn, SYNC_FETCH_FAILED, {
                                     "peer": endpoint.clone(),
                                     "repo": folder.repo.clone(),
                                     "error": error.clone(),
                                 });
-                                logged.insert(endpoint.clone(), error);
+                                state.logged.insert(endpoint.clone(), error);
                             }
-                            break;
+                            continue 'peers;
+                        }
+                    };
+                    // Only what was asked (the worker takes ≤ OBJECT_BATCH).
+                    objects.retain(|object| chunk.iter().any(|(d, _)| *d == object.digest));
+                    if objects.is_empty() {
+                        continue;
+                    }
+                    let received: BTreeSet<Digest> = objects.iter().map(|o| o.digest).collect();
+                    match folder.link.write(objects) {
+                        Ok(count) => {
+                            result.stored += count;
+                            state.logged.remove(endpoint);
+                            let now = Instant::now();
+                            for digest in &received {
+                                state.supplied.insert(*digest, now);
+                            }
+                            if let Some(unavailable) = state.unavailable.get_mut(&folder.id) {
+                                unavailable.retain(|digest, _| !received.contains(digest));
+                            }
+                            remaining.retain(|(digest, _)| !received.contains(digest));
+                        }
+                        Err(error) => {
+                            event!(warn, SYNC_WRITE_FAILED, {
+                                "folder": folder.id.clone(),
+                                "error": error.to_string(),
+                            });
+                            result.interrupted = true;
+                            break 'peers;
                         }
                     }
                 }
             }
         }
-        resting.retain(|_, at| *at > round);
-        stored
+        if !result.interrupted {
+            let now = Instant::now();
+            let unavailable = state.unavailable.entry(folder.id.clone()).or_default();
+            for (digest, _) in &remaining {
+                if asked.contains(digest) && !failed.contains(digest) {
+                    let backoff = unavailable
+                        .get(digest)
+                        .map_or(UNAVAILABLE_FIRST, |entry| entry.backoff * 2)
+                        .min(UNAVAILABLE_MAX);
+                    unavailable.insert(
+                        *digest,
+                        Unavailable {
+                            until: now + backoff,
+                            backoff,
+                        },
+                    );
+                }
+            }
+        }
+        result
     }
 
-    /// `wanted` grouped by the Ready bulk lane that owns each digest: per
-    /// digest, the first of `endpoints` with such a lane.
-    fn group(&self, endpoints: &[String], wanted: &[(Digest, Kind)]) -> Vec<Group> {
-        // Keyed by (endpoint, session): one group per lane.
-        let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
+    /// `wanted` grouped by the Ready bulk lane of `endpoint` that owns each
+    /// digest (digests no Ready lane owns are left out).
+    fn lanes_for(&self, endpoint: &str, wanted: &[(Digest, Kind)]) -> Vec<(Conn, Wanted)> {
+        let mut lanes: BTreeMap<String, (Conn, Wanted)> = BTreeMap::new();
         for object in wanted {
-            let lane = endpoints.iter().find_map(|endpoint| {
-                Some((endpoint, self.network.bulk_lane(endpoint, &object.0)?))
-            });
-            if let Some((endpoint, conn)) = lane {
-                let key = (endpoint.clone(), conn.peer().session.clone());
-                groups
-                    .entry(key)
-                    .or_insert_with(|| Group {
-                        endpoint: endpoint.clone(),
-                        conn,
-                        batch: Vec::new(),
-                    })
-                    .batch
+            if let Some(conn) = self.lanes.bulk_lane(endpoint, &object.0) {
+                lanes
+                    .entry(conn.peer().session.clone())
+                    .or_insert_with(|| (conn, Vec::new()))
+                    .1
                     .push(*object);
             }
         }
-        groups.into_values().collect()
+        lanes.into_values().collect()
     }
-}
-
-/// Demand first, then `missing`, without duplicates.
-fn wanted(demand: &[(Digest, Kind)], missing: Vec<(Digest, Kind)>) -> Vec<(Digest, Kind)> {
-    let mut seen = BTreeSet::new();
-    demand
-        .iter()
-        .copied()
-        .chain(missing)
-        .filter(|(digest, _)| seen.insert(*digest))
-        .collect()
 }
 
 /// One exchange of `repo` with the peer behind `conn`, repeated while either
@@ -714,25 +873,6 @@ mod tests {
     }
 
     #[test]
-    fn wanted_puts_demand_first_without_duplicates() {
-        let digest = |n: u8| Digest::bytes(&[n]);
-        let demand = vec![(digest(2), Kind::Chunk), (digest(1), Kind::Manifest)];
-        let missing = vec![
-            (digest(1), Kind::Manifest),
-            (digest(3), Kind::Chunk),
-            (digest(2), Kind::Chunk),
-        ];
-        assert_eq!(
-            wanted(&demand, missing),
-            vec![
-                (digest(2), Kind::Chunk),
-                (digest(1), Kind::Manifest),
-                (digest(3), Kind::Chunk),
-            ]
-        );
-    }
-
-    #[test]
     fn a_lost_lane_is_not_a_repo_error() {
         for error in [
             CallError::ConnectionLost("x".into()),
@@ -770,10 +910,10 @@ mod tests {
         }
     }
 
-    fn info() -> PeerInfo {
+    fn info_as(role: LaneRole) -> PeerInfo {
         PeerInfo {
             installation: "peer-b".into(),
-            role: LaneRole::Control,
+            role,
             lane: None,
             session: "session".into(),
             verifier_generation: 1,
@@ -782,6 +922,11 @@ mod tests {
 
     /// A client `Conn` whose server side is served by `handler`.
     fn served(handler: Arc<dyn Handler>) -> (Conn, Conn) {
+        served_as(LaneRole::Control, handler)
+    }
+
+    /// [`served`] as a session of `role`.
+    fn served_as(role: LaneRole, handler: Arc<dyn Handler>) -> (Conn, Conn) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
@@ -796,11 +941,12 @@ mod tests {
         .unwrap()
         .0;
         let client =
-            Conn::from_established(client, Side::Client, info(), ConnOptions::default()).unwrap();
+            Conn::from_established(client, Side::Client, info_as(role), ConnOptions::default())
+                .unwrap();
         let server = Conn::from_established(
             server.join().unwrap(),
             Side::Server,
-            info(),
+            info_as(role),
             ConnOptions::default(),
         )
         .unwrap();
@@ -832,5 +978,339 @@ mod tests {
         assert_eq!(catalog.clock("peer-b").unwrap().unwrap().0, second);
         client.close();
         server.close();
+    }
+
+    // ---- pump ------------------------------------------------------------
+
+    const TOKEN: &str = "pump-test-token";
+
+    struct FnHandler<F>(F);
+
+    impl<F: Fn(Incoming) + Send + Sync> Handler for FnHandler<F> {
+        fn handle(&self, req: Incoming) {
+            (self.0)(req)
+        }
+    }
+
+    /// `count` distinct objects (bytes and digest).
+    fn objects(tag: &str, count: usize) -> Vec<Object> {
+        (0..count)
+            .map(|i| {
+                let bytes = format!("{tag}-{i}").into_bytes();
+                Object {
+                    digest: Digest::bytes(&bytes),
+                    kind: Kind::Chunk,
+                    bytes,
+                }
+            })
+            .collect()
+    }
+
+    fn wanted_of(objects: &[Object]) -> Vec<(Digest, Kind)> {
+        objects.iter().map(|o| (o.digest, o.kind)).collect()
+    }
+
+    /// A worker standing in for one folder: `objects.missing {limit,
+    /// exclude}` lists `missing` in order minus what was written and what is
+    /// excluded; `objects.write` records each digest with its time.
+    #[derive(Default)]
+    struct FakeFolder {
+        missing: Vec<(Digest, Kind)>,
+        written: Mutex<Vec<(Digest, Instant)>>,
+        excludes: Mutex<Vec<usize>>,
+    }
+
+    impl FakeFolder {
+        fn written(&self) -> Vec<Digest> {
+            lock(&self.written)
+                .iter()
+                .map(|(digest, _)| *digest)
+                .collect()
+        }
+
+        fn written_at(&self, digest: &Digest) -> Option<Instant> {
+            lock(&self.written)
+                .iter()
+                .find(|(d, _)| d == digest)
+                .map(|(_, at)| *at)
+        }
+
+        fn serve(&self, req: Incoming) {
+            let reply = match req.op.as_str() {
+                "objects.missing" => {
+                    let limit = req.header["limit"].as_u64().unwrap() as usize;
+                    let exclude: BTreeSet<Digest> =
+                        serde_json::from_value(req.header["exclude"].clone()).unwrap();
+                    lock(&self.excludes).push(exclude.len());
+                    let written = self.written();
+                    let listed: Vec<(Digest, Kind)> = self
+                        .missing
+                        .iter()
+                        .filter(|(d, _)| !exclude.contains(d) && !written.contains(d))
+                        .take(limit)
+                        .copied()
+                        .collect();
+                    serde_json::to_vec(&listed).unwrap()
+                }
+                "objects.write" => {
+                    let objects: Vec<Object> = serde_json::from_slice(&req.body).unwrap();
+                    let now = Instant::now();
+                    lock(&self.written).extend(objects.iter().map(|o| (o.digest, now)));
+                    serde_json::to_vec(&json!({"stored": objects.len()})).unwrap()
+                }
+                op => {
+                    req.responder
+                        .error(ErrorWire::coded("UNSUPPORTED_OPERATION", op));
+                    return;
+                }
+            };
+            req.responder.reply(json!({}), reply);
+        }
+    }
+
+    /// A loopback worker serving `folder`, and its link.
+    fn fake_worker(folder: Arc<FakeFolder>) -> Arc<WorkerLink> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        let handler: Arc<dyn Handler> = Arc::new(FnHandler(move |req: Incoming| folder.serve(req)));
+        thread::spawn(move || {
+            let mut conns = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                if let Ok(conn) = crate::session::accept_loopback(
+                    stream,
+                    Some(TOKEN),
+                    ConnOptions::for_role(LaneRole::Control),
+                ) {
+                    conn.serve(handler.clone());
+                    conns.push(conn);
+                }
+            }
+        });
+        let ready = super::super::worker::Ready {
+            ready: true,
+            repo: "repo-1".into(),
+            device: "device-1".into(),
+            instance: "instance-1".into(),
+            pid: 1,
+            address,
+            token: TOKEN.into(),
+            version: "test".into(),
+            ipc: 1,
+            mounts: Vec::new(),
+        };
+        WorkerLink::connect(&ready, 2).unwrap()
+    }
+
+    /// A peer bulk lane that holds `held`; a fetch naming one of `slow`
+    /// takes `delay`. Counts the fetches.
+    struct Peer {
+        held: BTreeMap<Digest, Object>,
+        slow: BTreeSet<Digest>,
+        delay: Duration,
+        fetches: Mutex<u32>,
+    }
+
+    impl Peer {
+        fn new(held: &[Object], slow: &[Object], delay: Duration) -> Arc<Self> {
+            Arc::new(Self {
+                held: held.iter().map(|o| (o.digest, o.clone())).collect(),
+                slow: slow.iter().map(|o| o.digest).collect(),
+                delay,
+                fetches: Mutex::new(0),
+            })
+        }
+
+        fn lane(self: &Arc<Self>) -> Conn {
+            let peer = self.clone();
+            let (client, server) = served_as(
+                LaneRole::Bulk,
+                Arc::new(FnHandler(move |req: Incoming| {
+                    *lock(&peer.fetches) += 1;
+                    let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
+                    if wanted.iter().any(|(d, _)| peer.slow.contains(d)) {
+                        thread::sleep(peer.delay);
+                    }
+                    let objects: Vec<&Object> = wanted
+                        .iter()
+                        .filter_map(|(d, _)| peer.held.get(d))
+                        .collect();
+                    req.responder
+                        .reply(json!({}), serde_json::to_vec(&objects).unwrap());
+                })),
+            );
+            std::mem::forget(server);
+            client
+        }
+    }
+
+    /// One peer endpoint whose every digest goes to `conn`.
+    struct OneLane(Conn);
+
+    impl Lanes for OneLane {
+        fn ready_peers(&self) -> Vec<ReadyPeer> {
+            Vec::new()
+        }
+        fn bulk_endpoints(&self) -> Vec<String> {
+            vec!["ws://peer".into()]
+        }
+        fn bulk_lane(&self, _: &str, _: &Digest) -> Option<Conn> {
+            Some(self.0.clone())
+        }
+    }
+
+    /// Running folders with settable demand.
+    struct Folders(Vec<(String, Arc<WorkerLink>, Mutex<Wanted>)>);
+
+    impl SyncFolders for Folders {
+        fn syncing(&self) -> Vec<SyncFolder> {
+            self.0
+                .iter()
+                .map(|(id, link, demand)| SyncFolder {
+                    id: id.clone(),
+                    repo: "repo-1".into(),
+                    link: link.clone(),
+                    demand: lock(demand).clone(),
+                })
+                .collect()
+        }
+    }
+
+    fn driver(
+        lanes: OneLane,
+        folders: Arc<Folders>,
+        wake: Arc<Seq>,
+    ) -> (Arc<Driver>, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(root.path()).unwrap();
+        let driver = Driver::new(
+            Arc::new(lanes),
+            catalog,
+            folders,
+            wake,
+            Duration::from_millis(50),
+            Cancel::new(),
+        );
+        (driver, root)
+    }
+
+    #[test]
+    fn the_pump_moves_past_objects_no_peer_has_within_two_rounds() {
+        // 40 missing; the peer has none of the first 32 (the whole first
+        // `objects.missing` page) and all of the last 8.
+        let all = objects("object", 40);
+        let folder = Arc::new(FakeFolder {
+            missing: wanted_of(&all),
+            ..FakeFolder::default()
+        });
+        let link = fake_worker(folder.clone());
+        let peer = Peer::new(&all[32..], &[], Duration::ZERO);
+        let folders = Arc::new(Folders(vec![("f1".into(), link, Mutex::new(Vec::new()))]));
+        let (driver, _root) = driver(OneLane(peer.lane()), folders, Seq::new());
+        let mut state = PumpState::default();
+        let seen = driver.wake.current();
+        assert_eq!(driver.pump_round(&mut state, seen), 0);
+        let unavailable = &state.unavailable["f1"];
+        assert_eq!(unavailable.len(), 32);
+        assert!(unavailable.values().all(|u| u.backoff == UNAVAILABLE_FIRST));
+        assert_eq!(driver.pump_round(&mut state, seen), 8);
+        let expected: Vec<Digest> = all[32..].iter().map(|o| o.digest).collect();
+        assert_eq!(folder.written(), expected);
+        // The second `objects.missing` excluded the 32 no peer had.
+        assert_eq!(lock(&folder.excludes).as_slice(), &[0, 32]);
+        // An object asked again after its backoff and still absent doubles it.
+        for entry in state.unavailable.get_mut("f1").unwrap().values_mut() {
+            entry.until = Instant::now();
+        }
+        assert_eq!(driver.pump_round(&mut state, seen), 0);
+        assert!(
+            state.unavailable["f1"]
+                .values()
+                .all(|u| u.backoff == UNAVAILABLE_FIRST * 2 && u.until > Instant::now())
+        );
+    }
+
+    #[test]
+    fn demand_is_served_before_background_batches_of_other_folders() {
+        // Folder 1: 64 objects behind slow fetches (two background rounds);
+        // folder 3: 32 more; folder 2: nothing missing, one demanded object.
+        let first = objects("first", 64);
+        let third = objects("third", 32);
+        let demanded = objects("demanded", 1);
+        let delay = Duration::from_millis(500);
+        let held: Vec<Object> = first
+            .iter()
+            .chain(&third)
+            .chain(&demanded)
+            .cloned()
+            .collect();
+        let slow: Vec<Object> = first.iter().chain(&third).cloned().collect();
+        let peer = Peer::new(&held, &slow, delay);
+        let fakes: Vec<Arc<FakeFolder>> = [wanted_of(&first), Vec::new(), wanted_of(&third)]
+            .into_iter()
+            .map(|missing| {
+                Arc::new(FakeFolder {
+                    missing,
+                    ..FakeFolder::default()
+                })
+            })
+            .collect();
+        let folders = Arc::new(Folders(
+            fakes
+                .iter()
+                .enumerate()
+                .map(|(i, fake)| {
+                    (
+                        format!("f{}", i + 1),
+                        fake_worker(fake.clone()),
+                        Mutex::new(Vec::new()),
+                    )
+                })
+                .collect(),
+        ));
+        let wake = Seq::new();
+        let root = tempfile::tempdir().unwrap();
+        let driver = start(
+            Arc::new(OneLane(peer.lane())),
+            Catalog::open(root.path()).unwrap(),
+            folders.clone(),
+            wake.clone(),
+            Duration::from_millis(50),
+            Cancel::new(),
+        )
+        .unwrap();
+        // Folder 1's first background batch is in flight: a reader of
+        // folder 2 starts waiting.
+        let end = Instant::now() + Duration::from_secs(10);
+        while *lock(&peer.fetches) == 0 {
+            assert!(Instant::now() < end, "no background fetch started");
+            thread::sleep(Duration::from_millis(5));
+        }
+        *lock(&folders.0[1].2) = wanted_of(&demanded);
+        wake.bump();
+        while fakes[0].written().len() < 64 || fakes[2].written().len() < 32 {
+            assert!(
+                Instant::now() < end,
+                "not everything written: {} / {} / {}",
+                fakes[0].written().len(),
+                fakes[1].written().len(),
+                fakes[2].written().len()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        driver.stop(Duration::from_secs(2));
+        let served = fakes[1]
+            .written_at(&demanded[0].digest)
+            .expect("the demanded object was never written");
+        let last_first = fakes[0].written_at(&first[63].digest).unwrap();
+        let first_third = fakes[2].written_at(&third[0].digest).unwrap();
+        assert!(
+            served < last_first,
+            "demand waited for folder 1's second background batch"
+        );
+        assert!(
+            served < first_third,
+            "demand waited for folder 3's background batch"
+        );
     }
 }
