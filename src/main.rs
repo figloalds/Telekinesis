@@ -4,7 +4,9 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use tkfs::{
     orchestrator::{
-        control,
+        config::Config,
+        control, hub,
+        manage::{self, ManagementCommand},
         settings::Settings,
         worker::{self, EXIT_CONFIG, Fatal},
     },
@@ -19,19 +21,53 @@ mod gui;
     about = "Telekinesis: versioned folders with host filesystem I/O"
 )]
 struct Cli {
+    /// A folder's state directory (folder commands, `daemon`, `init`).
     #[arg(long, global = true)]
     state: Option<PathBuf>,
-    /// Desktop configuration (created automatically on first launch).
+    /// Orchestrator configuration (`orchestrator.toml`; created by `start`
+    /// when missing).
     #[arg(short = 'f', long = "defaults-file", alias = "config", global = true)]
     config: Option<PathBuf>,
+    /// A worker's `runtime.json`: its directory is the folder's state.
+    #[arg(long, global = true)]
+    runtime: Option<PathBuf>,
+    /// Passed with filesystem mutations.
+    #[arg(long, global = true)]
+    request_id: Option<String>,
+    /// Passed with filesystem mutations.
+    #[arg(long, global = true)]
+    generation: Option<u64>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Create the configuration (`-f`), or with `--state` a folder store.
     Init {
         #[arg(long)]
         repo: Option<String>,
+    },
+    /// Run the orchestrator: the catalog, one worker per folder and the
+    /// control endpoint.
+    #[command(alias = "start")]
+    Orchestrator,
+    /// Manage folders through the running orchestrator.
+    Manage {
+        /// Print the raw JSON reply.
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        command: ManagementCommand,
+    },
+    /// Create a folder (`manage create`).
+    Create {
+        label: String,
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long, conflicts_with = "headless")]
+        mount: Option<PathBuf>,
+        #[arg(long)]
+        headless: bool,
     },
     /// Run the folder's worker: a loopback session for local clients.
     Daemon {
@@ -92,6 +128,18 @@ enum Command {
         payload: String,
     },
 }
+/// Filesystem ops that `--request-id` and `--generation` accompany.
+const MUTATIONS: &[&str] = &[
+    "resolve",
+    "checkpoint",
+    "fork",
+    "checkout",
+    "mkdir",
+    "rename",
+    "delete",
+    "import",
+    "gc",
+];
 fn main() {
     if let Err(error) = run() {
         eprintln!("{error:#}");
@@ -116,7 +164,58 @@ fn run() -> Result<()> {
         #[cfg(not(windows))]
         anyhow::bail!("DESKTOP_REQUIRES_WINDOWS: use --help for headless commands");
     }
-    let root = std::path::absolute(cli.state.unwrap_or_else(|| PathBuf::from(".tkfs")))?;
+    let config_path = || {
+        std::path::absolute(
+            cli.config
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("orchestrator.toml")),
+        )
+    };
+    match command {
+        Command::Orchestrator => return hub::run(&config_path()?),
+        Command::Manage { json, command } => return manage::run(&config_path()?, command, json),
+        Command::Create {
+            label,
+            repo,
+            mount,
+            headless,
+        } => {
+            return manage::run(
+                &config_path()?,
+                ManagementCommand::Create {
+                    label,
+                    repo,
+                    mount,
+                    headless,
+                },
+                false,
+            );
+        }
+        Command::Init { repo } if cli.state.is_none() => {
+            anyhow::ensure!(
+                repo.is_none(),
+                "FOLDER_REQUIRED: --repo initializes a folder store: use --state DIR"
+            );
+            let path = config_path()?;
+            let config = Config::initialize(&path)?;
+            println!(
+                "{}",
+                json!({"config": path, "data_directory": config.data_directory})
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+    let root = std::path::absolute(match (cli.state, cli.runtime) {
+        (Some(state), _) => state,
+        (None, Some(runtime)) => std::path::absolute(&runtime)?
+            .parent()
+            .context("FOLDER_REQUIRED: --runtime has no parent directory")?
+            .to_owned(),
+        (None, None) => {
+            anyhow::bail!("FOLDER_REQUIRED: use --state DIR or --runtime STATE/runtime.json")
+        }
+    })?;
     match command {
         Command::Init { repo } => {
             let engine = Engine::open(&root, repo.as_deref())?;
@@ -148,7 +247,9 @@ fn run() -> Result<()> {
                 Ok(()) => Ok(()),
             }
         }
-        Command::Gui => unreachable!(),
+        Command::Gui | Command::Orchestrator | Command::Manage { .. } | Command::Create { .. } => {
+            unreachable!()
+        }
         command => {
             let (operation, payload) = match command {
                 Command::Status => ("status", json!({})),
@@ -189,6 +290,15 @@ fn run() -> Result<()> {
                 }
                 _ => unreachable!(),
             };
+            let mut payload = payload;
+            if MUTATIONS.contains(&operation) {
+                if let Some(id) = &cli.request_id {
+                    payload["request_id"] = json!(id);
+                }
+                if let Some(generation) = cli.generation {
+                    payload["generation"] = json!(generation);
+                }
+            }
             let result = if root.join(worker::RUNTIME_FILE).exists() {
                 control::request(&root, operation, payload)?
             } else {
