@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::{path::PathBuf, sync::mpsc, time::Duration};
-use tkfs::{core::Conflict, desktop::Desktop, orchestrator::catalog};
+use tkfs::{core::Conflict, desktop::Desktop};
 slint::include_modules!();
 
 enum Message {
@@ -21,6 +21,11 @@ fn model<T: Clone + 'static>(rows: Vec<T>) -> ModelRc<T> {
 }
 fn text(value: &Value, key: &str) -> String {
     value[key].as_str().unwrap_or_default().into()
+}
+/// Pairing moved out of the folder workers; until the desktop becomes an
+/// orchestrator client it cannot probe or pair peers.
+fn probe(_endpoint: &str, _code: &str) -> Result<Value> {
+    anyhow::bail!("PAIRING_UNAVAILABLE: pairing is managed by the orchestrator")
 }
 fn optional_path(value: &str) -> Option<PathBuf> {
     (!value.trim().is_empty()).then(|| PathBuf::from(value.trim()))
@@ -47,7 +52,7 @@ fn perform(
             Ok((Some(id), "Folder created and started".into()))
         }
         "receive" => {
-            let info = catalog::probe(b, c)?;
+            let info = probe(b, c)?;
             let repo = info["repo"]
                 .as_str()
                 .context("REMOTE_REPOSITORY_REQUIRED")?;
@@ -118,7 +123,7 @@ fn perform(
             Ok((None, "Folder configuration saved".into()))
         }
         "pair" => {
-            let info = catalog::probe(a, b)?;
+            let info = probe(a, b)?;
             let local = desktop.request(folder, "status", json!({}))?;
             ensure!(
                 info["repo"] == local["repo"],

@@ -262,6 +262,38 @@ fn worker_writes_runtime_files_and_ready_line_then_removes_them_on_shutdown() {
 }
 
 #[test]
+fn worker_serves_feed_ops_on_its_control_lane_and_no_pairing_ops() {
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("s");
+    let (mut child, _) = spawn_worker(&state, true, &[]);
+    control::request(&state, "mkdir", json!({"path":"d"})).unwrap();
+    let page = control::request(&state, "feed.outgoing", json!({"after":0})).unwrap();
+    let events = page["events"].as_array().unwrap();
+    assert!(!events.is_empty(), "{page}");
+    assert_eq!(page["cursor"], events.len());
+    assert_eq!(page["more"], false);
+    let empty = control::request(&state, "feed.outgoing", json!({"after":page["cursor"]})).unwrap();
+    assert_eq!(empty["events"], json!([]));
+    assert_eq!(empty["cursor"], page["cursor"]);
+    // Object ops never travel on a control lane (bulk loopback lanes come
+    // with the orchestrator's worker link).
+    let error = control::request(&state, "objects.missing", json!({"limit":1})).unwrap_err();
+    assert!(error.to_string().contains("OP_NOT_ALLOWED"), "{error:#}");
+    // Pairing is not a worker concern any more.
+    for op in ["pairing-code", "pair", "peers", "unpair", "peer-info"] {
+        let error = control::request(&state, op, json!({})).unwrap_err();
+        assert!(
+            error.to_string().starts_with("UNSUPPORTED_OPERATION"),
+            "{op}: {error:#}"
+        );
+    }
+    let snapshot = control::request(&state, "desktop-snapshot", json!({})).unwrap();
+    assert_eq!(snapshot["peers"], json!([]));
+    control::request(&state, "shutdown", json!({"force": false})).unwrap();
+    wait_exit(&mut child, BOUND);
+}
+
+#[test]
 fn a_wrong_token_is_refused() {
     let home = tempfile::tempdir().unwrap();
     let state = home.path().join("s");

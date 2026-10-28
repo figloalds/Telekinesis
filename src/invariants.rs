@@ -1671,7 +1671,9 @@ fn native_file_flush_finds_a_replacement_draft_without_sealing_other_files() -> 
 fn fsync_uses_a_durable_wal_and_reports_an_incomplete_metadata_barrier() -> Result<()> {
     let root = tempfile::tempdir()?;
     let engine = crate::runtime::Engine::open(root.path(), None)?;
-    let catalog = crate::orchestrator::catalog::Catalog::open(engine.clone())?;
+    let settings = crate::orchestrator::settings::Settings {
+        engine: engine.clone(),
+    };
     lock(&engine.store)
         .db
         .busy_timeout(std::time::Duration::from_millis(25))?;
@@ -1694,7 +1696,7 @@ fn fsync_uses_a_durable_wal_and_reports_an_incomplete_metadata_barrier() -> Resu
                 let entity = store.lookup("file")?.id;
                 store.rename(&entity, "renamed", false)?;
             }
-            "catalog" => catalog.set("durability-test", "value")?,
+            "catalog" => settings.set("durability-test", "value")?,
             "schema" => lock(&engine.store)
                 .db
                 .execute_batch("CREATE TABLE sync_probe(value);")?,
@@ -1712,7 +1714,7 @@ fn fsync_uses_a_durable_wal_and_reports_an_incomplete_metadata_barrier() -> Resu
         engine.lookup("renamed")?.content.unwrap().digest,
         crate::model::content::Digest::bytes(b"durable in the WAL")
     );
-    assert_eq!(catalog.get("durability-test")?.as_deref(), Some("value"));
+    assert_eq!(settings.get("durability-test")?.as_deref(), Some("value"));
     engine.close(writer)?;
     engine.shutdown()?;
     Ok(())
@@ -1760,29 +1762,16 @@ fn bound_lookup_reuses_its_locally_saved_draft_after_remote_apply() -> Result<()
 }
 
 #[test]
-fn hydrate_missing_chunk_over_authenticated_session() -> Result<()> {
-    use crate::{
-        model::{
-            errors::ErrorWire,
-            protocol::{LaneRole, frame::ClientHello},
-        },
-        pairing_code::Verifier,
-        session,
+fn hydrate_missing_chunk_through_worker_demand_and_object_ops() -> Result<()> {
+    use crate::content::Kind;
+    use crate::orchestrator::{
+        demand::{Demand, Seq},
+        sync::{FeedPage, Service},
     };
-    use std::sync::Arc;
-    struct Policy(Verifier);
-    impl session::AcceptPolicy for Policy {
-        fn installation(&self) -> String {
-            "source-peer".into()
-        }
-        fn verifier(&self) -> Option<(Verifier, u64)> {
-            Some((self.0.clone(), 1))
-        }
-        fn admit(&self, _: &ClientHello) -> std::result::Result<(), ErrorWire> {
-            Ok(())
-        }
-        fn legacy_attempt(&self, _: std::net::SocketAddr, _: &serde_json::Value) {}
-    }
+    use std::{
+        sync::{Arc, mpsc},
+        time::{Duration, Instant},
+    };
     let aroot = tempfile::tempdir()?;
     let broot = tempfile::tempdir()?;
     let a = crate::runtime::Engine::open(aroot.path(), Some("repo"))?;
@@ -1793,78 +1782,81 @@ fn hydrate_missing_chunk_over_authenticated_session() -> Result<()> {
     a.write(h, 0, &payload, false, false)?;
     a.flush(Some(h))?;
     a.close(h)?;
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let endpoint = format!("ws://{}", listener.local_addr()?);
-    let (code, verifier) = Verifier::generate();
-    let serve = a.clone();
-    // A control lane (metadata) and a bulk lane (objects): the control lane
-    // never carries `objects.*`.
-    let server = std::thread::spawn(move || -> Result<(session::Conn, session::Conn)> {
-        let mut accepted = Vec::new();
-        for _ in 0..2 {
-            let (stream, _) = listener.accept()?;
-            let (conn, _) = session::accept(
-                stream,
-                Arc::new(Policy(verifier.clone())),
-                session::ConnOptions::default(),
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-            conn.serve(Arc::new(crate::orchestrator::sync::Service {
-                engine: serve.clone(),
-            }));
-            accepted.push(conn);
-        }
-        let bulk = accepted.pop().unwrap();
-        Ok((accepted.pop().unwrap(), bulk))
-    });
-    let (conn, _) = session::dial(
-        &endpoint,
-        session::client_hello("target-peer", LaneRole::Control, None, 2),
-        &session::CodeAuth { code: code.clone() },
-        None,
-        session::ConnOptions::default(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (bulk, _) = session::dial(
-        &endpoint,
-        session::client_hello(
-            "target-peer",
-            LaneRole::Bulk,
-            Some(crate::model::protocol::LaneSpec::new(0, 1)),
-            2,
-        ),
-        &session::CodeAuth { code },
-        None,
-        session::ConnOptions::default(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (server, bulk_server) = server.join().unwrap()?;
-    let fetch = crate::orchestrator::sync::DigestFetch::new(b.working.content().packs.clone());
-    fetch.add(
-        "source-peer".into(),
-        Arc::new(crate::orchestrator::sync::SessionSource {
-            conn: bulk.clone(),
-            repo: "repo".into(),
-        }),
-    );
-    b.working.content().set_fetcher(fetch);
-    let mut cursor = crate::orchestrator::sync::FeedCursor::default();
-    crate::orchestrator::sync::exchange(&b, &conn, &mut cursor)?;
-    assert!(b.lookup("remote").is_ok());
+    let service = |engine: &Arc<crate::runtime::Engine>| Service {
+        engine: engine.clone(),
+        demand: Demand::new(Seq::new(), engine.working.content().packs.clone()),
+    };
+    let (source, target) = (service(&a), service(&b));
+    // The worker's fetcher is its demand, as in `worker::run`.
+    b.working.content().set_fetcher(target.demand.clone());
+    let page: FeedPage = serde_json::from_slice(&source.handle_request(
+        "feed.outgoing",
+        &serde_json::json!({"after":0}),
+        &[],
+    )?)?;
+    assert!(!page.more);
+    target.handle_request(
+        "feed.apply",
+        &serde_json::json!({}),
+        &serde_json::to_vec(&page.events)?,
+    )?;
     let content = b.lookup("remote")?.content.unwrap();
     assert!(!b.working.content().packs.contains(content.digest)?);
-    let h = b.open_file("remote", false, false, false)?;
-    let mut tail = [0; 4];
-    b.read(h, 65536, &mut tail)?;
-    assert_eq!(&tail, b"tail");
+    // A reader of the tail blocks on the worker's demand...
+    let (sent, received) = mpsc::channel();
+    let reader = {
+        let b = b.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<Vec<u8>> {
+                let h = b.open_file("remote", false, false, false)?;
+                let mut tail = [0; 4];
+                let read = b.read(h, 65536, &mut tail);
+                b.close(h)?;
+                read?;
+                Ok(tail.to_vec())
+            })();
+            let _ = sent.send(result);
+        })
+    };
+    // ...and the orchestrator's part supplies exactly what is demanded.
+    let end = Instant::now() + Duration::from_secs(10);
+    let mut supplied = Vec::new();
+    let tail = loop {
+        match received.recv_timeout(Duration::from_millis(10)) {
+            Ok(result) => break result?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(error) => anyhow::bail!("the reader ended without a result: {error}"),
+        }
+        anyhow::ensure!(
+            Instant::now() < end,
+            "the tail read was not satisfied in 10 s"
+        );
+        let pending = target.demand.pending();
+        if pending.is_empty() {
+            continue;
+        }
+        let objects = source.handle_request(
+            "objects.fetch",
+            &serde_json::json!({"repo":"repo"}),
+            &serde_json::to_vec(&pending)?,
+        )?;
+        target.handle_request(
+            "objects.write",
+            &serde_json::json!({"repo":"repo"}),
+            &objects,
+        )?;
+        supplied.extend(pending);
+    };
+    reader.join().unwrap();
+    assert_eq!(tail, b"tail");
     let chunks = b.working.content().chunks(&content)?;
+    assert_eq!(
+        supplied,
+        vec![(content.digest, Kind::Manifest), (chunks[1], Kind::Chunk)],
+        "only the manifest and the read chunk are fetched"
+    );
     assert!(!b.working.content().packs.contains(chunks[0])?);
     assert!(b.working.content().packs.contains(chunks[1])?);
-    b.close(h)?;
-    conn.close();
-    bulk.close();
-    server.close();
-    bulk_server.close();
     a.shutdown()?;
     b.shutdown()?;
     Ok(())

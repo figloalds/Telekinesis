@@ -947,7 +947,7 @@ pub fn run(config: PathBuf, single: Option<PathBuf>) -> Result<()> {
                 Ok(Message::Action{folder,operation,args,mount,pairing_generation})=>{
                     selected=folder.clone();
                     if operation=="probe" {
-                        let mut result=if args[1].is_empty(){value.request(&folder,"peer-info",json!({"endpoint":args[0]}))}else{catalog::probe(&args[0],&args[1])};
+                        let mut result=if args[1].is_empty(){value.request(&folder,"peer-info",json!({"endpoint":args[0]}))}else{probe(&args[0],&args[1])};
                         if !folder.is_empty() && !args[1].is_empty() && let Ok(info)=&result {
                             let remote_repo=info["repo"].clone();
                             if let Ok(local)=value.request(&folder,"status",json!({})) && local["repo"]==remote_repo

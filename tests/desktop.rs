@@ -111,6 +111,37 @@ fn desktop_recovers_stale_control_records_and_reports_real_startup_failures() ->
     Ok(())
 }
 
+/// Pairing-code discovery (`catalog.list` on a Probe lane). The worker-level
+/// catalog that provided it was removed; the orchestrator brings it back.
+fn probe(endpoint: &str, code: &str) -> Result<serde_json::Value> {
+    use tkfs::session;
+    let hello = session::client_hello(
+        "desktop-test-probe",
+        tkfs::model::protocol::LaneRole::Probe,
+        None,
+        1,
+    );
+    let (conn, _) = session::dial(
+        endpoint,
+        hello,
+        &session::CodeAuth { code: code.into() },
+        None,
+        session::ConnOptions::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let reply = conn
+        .call(
+            "catalog.list",
+            json!({}),
+            Vec::new(),
+            session::Priority::Control,
+            Duration::from_secs(10),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"));
+    conn.close();
+    Ok(serde_json::from_slice(&reply?.body)?)
+}
+
 #[test]
 #[ignore = "worker peer listener removed by design; pairing/sync return at the orchestrator level (Task 11) and the desktop becomes an orchestrator client in the GUI plan"]
 fn desktop_can_receive_pair_and_manage_versions_over_the_current_protocol() -> Result<()> {
@@ -123,8 +154,8 @@ fn desktop_can_receive_pair_and_manage_versions_over_the_current_protocol() -> R
         .as_str()
         .unwrap()
         .to_string();
-    assert!(tkfs::orchestrator::catalog::probe(endpoint, "wrong-code").is_err());
-    let info = tkfs::orchestrator::catalog::probe(endpoint, &code)?;
+    assert!(probe(endpoint, "wrong-code").is_err());
+    let info = probe(endpoint, &code)?;
     assert_eq!(info["label"], "Source");
     let target = desktop.create("Received", Some(info["repo"].as_str().unwrap()), None)?;
     desktop.request(&target, "pair", json!({"endpoint":endpoint,"code":code}))?;

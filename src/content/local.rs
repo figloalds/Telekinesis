@@ -296,19 +296,6 @@ impl PackStore {
     pub fn flush(&self) -> Result<()> {
         Self::flush_locked(&mut guard(&self.inner.state))
     }
-    /// Background presence checks must not commit an unrelated foreground
-    /// batch. Still persist requested objects left pending by any earlier call.
-    pub(crate) fn flush_if_pending(&self, digests: impl IntoIterator<Item = Digest>) -> Result<()> {
-        let mut state = guard(&self.inner.state);
-        if !state.pending.is_empty()
-            && digests
-                .into_iter()
-                .any(|digest| state.pending.contains_key(&digest))
-        {
-            Self::flush_locked(&mut state)?;
-        }
-        Ok(())
-    }
     pub fn get(&self, digest: Digest) -> Result<Arc<Vec<u8>>> {
         let mut state = guard(&self.inner.state);
         state.stamp += 1;

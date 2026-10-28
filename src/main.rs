@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use tkfs::{
     orchestrator::{
-        catalog::Catalog,
         control,
         settings::Settings,
         worker::{self, EXIT_CONFIG, Fatal},
@@ -81,15 +80,6 @@ enum Command {
     },
     Cat {
         path: String,
-    },
-    PairingCode,
-    Pair {
-        endpoint: String,
-        code: String,
-    },
-    Peers,
-    Unpair {
-        installation: String,
     },
     Flush,
     Gc,
@@ -188,14 +178,6 @@ fn run() -> Result<()> {
                     json!({"path":path,"source":std::path::absolute(source)?}),
                 ),
                 Command::Cat { path } => ("cat", json!({"path":path})),
-                Command::PairingCode => ("pairing-code", json!({})),
-                Command::Pair { endpoint, code } => {
-                    ("pair", json!({"endpoint":endpoint,"code":code}))
-                }
-                Command::Peers => ("peers", json!({})),
-                Command::Unpair { installation } => {
-                    ("unpair", json!({"installation":installation}))
-                }
                 Command::Flush => ("flush", json!({})),
                 Command::Gc => ("gc", json!({})),
                 Command::Stop => ("shutdown", json!({})),
@@ -214,12 +196,7 @@ fn run() -> Result<()> {
                 let settings = Settings {
                     engine: engine.clone(),
                 };
-                let result = Catalog::open(engine.clone()).and_then(|catalog| {
-                    control::pairing(&catalog, &engine, &settings, operation, &payload)
-                        .unwrap_or_else(|| {
-                            control::execute(&engine, &settings, operation, &payload)
-                        })
-                });
+                let result = control::execute(&engine, &settings, operation, &payload);
                 engine.shutdown()?;
                 result?
             };

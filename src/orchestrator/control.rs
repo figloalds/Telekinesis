@@ -5,7 +5,6 @@
 //! error reply whose code is the message's leading `SCREAMING_CASE` token
 //! (before `:`), or `WORKER_ERROR`.
 use super::{
-    catalog::Catalog,
     demand::{Demand, Seq},
     settings::Settings,
     worker::{RUNTIME_FILE, TOKEN_FILE, WATCH_MAX_WAIT_MS},
@@ -159,47 +158,8 @@ pub fn watch(engine: &Engine, seq: &Seq, demand: &Demand, p: &Value) -> Result<V
     }))
 }
 
-/// The worker's pairing ops, which still use the store's pairing catalog;
-/// `None` for any other op. `desktop-snapshot` is [`execute`]'s plus peers.
-pub fn pairing(
-    catalog: &Catalog,
-    engine: &Engine,
-    settings: &Settings,
-    operation: &str,
-    p: &Value,
-) -> Option<Result<Value>> {
-    let text = |key: &str| -> Result<&str> { p[key].as_str().context("ARGUMENT_REQUIRED") };
-    let result = match operation {
-        "peer-info" => text("endpoint").and_then(|endpoint| catalog.inspect_peer(endpoint)),
-        "pairing-code" => catalog.reset_code().map(|code| json!({"code":code})),
-        "pair" => text("endpoint")
-            .and_then(|endpoint| catalog.pair(endpoint, text("code")?))
-            .map(|installation| json!({"installation":installation})),
-        "peers" => catalog.peers().map(|peers| {
-            peers
-                .into_iter()
-                .map(|p| json!({"endpoint":p.endpoint,"installation":p.installation}))
-                .collect()
-        }),
-        "unpair" => text("installation")
-            .and_then(|installation| catalog.unpair(installation))
-            .map(|()| json!({})),
-        "desktop-snapshot" => execute(engine, settings, operation, p).and_then(|mut snapshot| {
-            let runtime = lock(&engine.peer_status).clone();
-            snapshot["peers"] = catalog
-                .peers()?
-                .into_iter()
-                .map(|peer| json!({"endpoint":peer.endpoint,"installation":peer.installation,"runtime":runtime.get(&peer.endpoint)}))
-                .collect();
-            Ok(snapshot)
-        }),
-        _ => return None,
-    };
-    Some(result)
-}
-
 /// The worker's engine and filesystem ops: everything but `hello`, `watch`
-/// and [`pairing`].
+/// and the sync ops of [`super::sync::Service`].
 pub fn execute(engine: &Engine, settings: &Settings, operation: &str, p: &Value) -> Result<Value> {
     let text = |key: &str| -> Result<&str> { p[key].as_str().context("ARGUMENT_REQUIRED") };
     match operation {
@@ -251,6 +211,7 @@ pub fn execute(engine: &Engine, settings: &Settings, operation: &str, p: &Value)
         }
         "desktop-snapshot" => {
             let status = execute(engine, settings, "status", &json!({}))?;
+            // Peers belong to the orchestrator; the desktop becomes its client.
             let peers: Vec<Value> = Vec::new();
             let store = lock(&engine.store);
             let branches = store

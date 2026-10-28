@@ -6,10 +6,10 @@
 //! prints one fatal line `{"fatal":true,"code","message","exit"}` instead and
 //! exits with that code. A clean exit removes the three files.
 use super::{
-    catalog::Catalog,
     control,
     demand::{Demand, Seq},
     settings::Settings,
+    sync,
 };
 use crate::{
     content::working::lock,
@@ -163,9 +163,8 @@ fn print_line(line: &str) {
 pub struct ControlService {
     pub engine: Arc<Engine>,
     pub settings: Settings,
-    /// Pairing ops still live in the worker until the orchestrator takes them.
-    pub catalog: Arc<Catalog>,
-    pub demand: Arc<Demand>,
+    /// `feed.*`, `meta.exchange` and `objects.*`; owns the object demand.
+    pub sync: sync::Service,
     pub seq: Arc<Seq>,
     pub instance: String,
     /// Last request from any client; drives the unsupervised quiet exit.
@@ -176,9 +175,8 @@ impl ControlService {
     pub fn execute(&self, operation: &str, p: &Value) -> Result<Value> {
         match operation {
             "hello" => Ok(control::hello(&self.engine, &self.instance)),
-            "watch" => control::watch(&self.engine, &self.seq, &self.demand, p),
-            _ => control::pairing(&self.catalog, &self.engine, &self.settings, operation, p)
-                .unwrap_or_else(|| control::execute(&self.engine, &self.settings, operation, p)),
+            "watch" => control::watch(&self.engine, &self.seq, &self.sync.demand, p),
+            _ => control::execute(&self.engine, &self.settings, operation, p),
         }
     }
 
@@ -190,6 +188,11 @@ impl ControlService {
 impl Handler for ControlService {
     fn handle(&self, req: Incoming) {
         self.touch();
+        if sync::Service::routes(&req.op) {
+            self.sync.handle(req);
+            self.touch();
+            return;
+        }
         let result = self
             .execute(&req.op, &req.header)
             .and_then(|value| Ok(serde_json::to_vec(&value)?));
@@ -340,11 +343,6 @@ fn serve(engine: Arc<Engine>, options: &Options, root: &Path) -> Result<()> {
         )
         .into());
     }
-    let catalog = startup(
-        Catalog::open(engine.clone()),
-        "STORE_OPEN_FAILED",
-        EXIT_STORE,
-    )?;
     let listener = startup(
         TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
@@ -395,8 +393,10 @@ fn serve(engine: Arc<Engine>, options: &Options, root: &Path) -> Result<()> {
         settings: Settings {
             engine: engine.clone(),
         },
-        catalog,
-        demand,
+        sync: sync::Service {
+            engine: engine.clone(),
+            demand,
+        },
         seq: seq.clone(),
         instance: instance.clone(),
         supervised_contact: Mutex::new(Instant::now()),
