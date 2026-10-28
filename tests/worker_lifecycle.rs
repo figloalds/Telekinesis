@@ -459,6 +459,15 @@ impl Drop for Reaper {
     }
 }
 
+/// Two readings of one process's start time: equal, or on Linux within the
+/// tolerance for a wall-clock step between them.
+fn assert_same_start(a: u64, b: u64) {
+    #[cfg(target_os = "linux")]
+    assert!(a.abs_diff(b) <= process::START_TOLERANCE_MS, "{a} vs {b}");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(a, b);
+}
+
 fn spec(state: &Path) -> LaunchSpec {
     LaunchSpec {
         executable: env!("CARGO_BIN_EXE_tkfs").into(),
@@ -523,7 +532,7 @@ fn spawn_reports_ready_then_exited_and_logs_redacted_ready_line() {
     let record: WorkerRecord = json_file(&state.join("worker.json"));
     let (start_ms, image) = process::process_identity(worker.pid).unwrap();
     assert_eq!(record.pid, worker.pid);
-    assert_eq!(record.start_ms, start_ms);
+    assert_same_start(record.start_ms, start_ms);
     assert_eq!(record.image, image);
 
     control::request(&state, "shutdown", json!({"force": false})).unwrap();
@@ -649,7 +658,8 @@ fn adopt_matches_identity_and_rejects_a_stale_record() {
 fn process_identity_of_self_is_stable() {
     let a = process::process_identity(std::process::id()).unwrap();
     let b = process::process_identity(std::process::id()).unwrap();
-    assert_eq!(a, b);
+    assert_same_start(a.0, b.0);
+    assert_eq!(a.1, b.1);
     let exe = std::env::current_exe().unwrap();
     assert!(
         a.1.ends_with(exe.file_name().unwrap()),

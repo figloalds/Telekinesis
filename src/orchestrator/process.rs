@@ -24,7 +24,7 @@ use crate::util::{
     lock::lock,
     log::{self, event},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde_json::Value;
 use std::{
     fs::{self, File, OpenOptions},
@@ -57,12 +57,14 @@ const ADOPTED_WAIT: Duration = Duration::from_secs(1);
 /// [`terminate`] gives a killed child this long to go.
 const TERMINATE_WAIT: Duration = Duration::from_secs(10);
 /// On Linux the start time of a record may differ this much from the OS's:
-/// it is derived from `/proc/<pid>/stat` clock ticks since boot plus the whole
-/// second `btime` of `/proc/stat`, which moves with clock adjustments, so two
-/// readings of one process can differ by about a second; ±2000 ms absorbs
-/// that. Windows reads the creation FILETIME itself and compares exactly.
+/// it is derived from `/proc/<pid>/stat` clock ticks since boot plus the
+/// whole-second `btime` of `/proc/stat`. Readings agree exactly while the wall
+/// clock runs (slewing moves boot and wall time alike), but `btime` moves when
+/// the wall clock is stepped, so a record written before a step reads
+/// differently after it; ±2000 ms absorbs small steps. Windows reads the
+/// creation FILETIME itself and compares exactly.
 #[cfg(target_os = "linux")]
-const START_TOLERANCE_MS: u64 = 2000;
+pub const START_TOLERANCE_MS: u64 = 2000;
 /// Windows `CREATE_NO_WINDOW`: the worker never gets a console.
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -181,14 +183,22 @@ pub fn spawn(spec: &LaunchSpec, sink: mpsc::Sender<ProcessEvent>) -> Result<Work
         Ok((process, child_tx)) => match child_tx.send(child) {
             Ok(()) => Ok(WorkerProcess { pid, process }),
             Err(mpsc::SendError(mut child)) => {
-                let _ = terminate(&mut child);
-                bail!(failed("start exit waiter"))
+                let error = anyhow::anyhow!(failed("start exit waiter"));
+                Err(with_cleanup(error, terminate(&mut child)))
             }
         },
         Err(error) => {
-            let _ = terminate(&mut child);
-            Err(error.context(failed("observe and start helper threads")))
+            let error = error.context(failed("observe and start helper threads"));
+            Err(with_cleanup(error, terminate(&mut child)))
         }
+    }
+}
+
+/// `error`, carrying a failed cleanup (`STRANDED_PROCESS`) along with it.
+fn with_cleanup(error: anyhow::Error, cleanup: Result<()>) -> anyhow::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!("cleanup: {cleanup:#}")),
     }
 }
 
@@ -277,16 +287,16 @@ pub fn process_identity(pid: u32) -> Result<(u64, PathBuf)> {
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
-        bail!("PROCESS_IDENTITY_UNSUPPORTED: pid {pid}")
+        anyhow::bail!("PROCESS_IDENTITY_UNSUPPORTED: pid {pid}")
     }
 }
 
 /// Kills the recorded worker if it is still that process: `Ok(true)` after a
 /// verified kill, `Ok(false)` without killing when the pid is gone or names
 /// another process now. Windows verifies the identity on the handle it
-/// terminates, so a recycled pid is never hit. Unix verifies on a pidfd and
-/// then signals the pid: a recycle would need the worker to exit and its pid
-/// to be reused within microseconds.
+/// terminates, and Linux on the pidfd it then signals
+/// (`pidfd_send_signal`), so a recycled pid is never hit. Other platforms
+/// cannot verify an identity and never kill (`Ok(false)`).
 pub fn kill_verified(record: &WorkerRecord) -> Result<bool> {
     let pid = record.pid;
     if pid == 0 || pid == std::process::id() {
@@ -332,7 +342,25 @@ pub fn kill_verified(record: &WorkerRecord) -> Result<bool> {
         {
             return Ok(false);
         }
-        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) } != 0 {
+        // Linux signals the verified pidfd itself: a worker reaped meanwhile
+        // gives ESRCH, never a recycled pid's process.
+        #[cfg(target_os = "linux")]
+        let sent = {
+            use std::os::fd::AsRawFd;
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    process.pidfd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            }
+        };
+        // Unreachable in practice: `identity` is unsupported here.
+        #[cfg(not(target_os = "linux"))]
+        let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        if sent != 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
                 return Ok(false);
@@ -546,7 +574,7 @@ impl ObservedProcess {
                     if error.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
-                    bail!("PROCESS_WAIT_FAILED: {error}");
+                    anyhow::bail!("PROCESS_WAIT_FAILED: {error}");
                 }
                 return Ok(descriptor.revents & libc::POLLIN != 0);
             }
@@ -566,7 +594,7 @@ impl ObservedProcess {
         #[cfg(not(any(windows, unix)))]
         {
             let _ = timeout;
-            bail!("PROCESS_WAIT_UNSUPPORTED")
+            anyhow::bail!("PROCESS_WAIT_UNSUPPORTED")
         }
     }
 
@@ -594,14 +622,19 @@ impl ObservedProcess {
     /// The identity of this very process: read, then confirmed still alive,
     /// so a recycled pid's identity is never reported.
     fn identity(&self) -> Result<(u64, PathBuf)> {
-        #[cfg(windows)]
-        let identity = os::identity(&self.handle)?;
-        #[cfg(target_os = "linux")]
-        let identity = os::identity(self.pid)?;
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            #[cfg(windows)]
+            let identity = os::identity(&self.handle)?;
+            #[cfg(target_os = "linux")]
+            let identity = os::identity(self.pid)?;
+            ensure!(!self.exited()?, "PROCESS_GONE: pid {}", self.pid);
+            Ok(identity)
+        }
         #[cfg(not(any(windows, target_os = "linux")))]
-        let identity: (u64, PathBuf) = bail!("PROCESS_IDENTITY_UNSUPPORTED: pid {}", self.pid);
-        ensure!(!self.exited()?, "PROCESS_GONE: pid {}", self.pid);
-        Ok(identity)
+        {
+            anyhow::bail!("PROCESS_IDENTITY_UNSUPPORTED: pid {}", self.pid)
+        }
     }
 
     #[cfg(windows)]
