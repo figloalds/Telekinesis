@@ -1789,33 +1789,53 @@ fn hydrate_missing_chunk_over_authenticated_session() -> Result<()> {
     let endpoint = format!("ws://{}", listener.local_addr()?);
     let (code, verifier) = Verifier::generate();
     let serve = a.clone();
-    let server = std::thread::spawn(move || -> Result<session::Conn> {
-        let (stream, _) = listener.accept()?;
-        let (conn, _) = session::accept(
-            stream,
-            Arc::new(Policy(verifier)),
-            session::ConnOptions::default(),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-        conn.serve(Arc::new(crate::orchestrator::sync::Service {
-            engine: serve,
-        }));
-        Ok(conn)
+    // A control lane (metadata) and a bulk lane (objects): the control lane
+    // never carries `objects.*`.
+    let server = std::thread::spawn(move || -> Result<(session::Conn, session::Conn)> {
+        let mut accepted = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept()?;
+            let (conn, _) = session::accept(
+                stream,
+                Arc::new(Policy(verifier.clone())),
+                session::ConnOptions::default(),
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            conn.serve(Arc::new(crate::orchestrator::sync::Service {
+                engine: serve.clone(),
+            }));
+            accepted.push(conn);
+        }
+        let bulk = accepted.pop().unwrap();
+        Ok((accepted.pop().unwrap(), bulk))
     });
     let (conn, _) = session::dial(
         &endpoint,
-        session::client_hello("target-peer", LaneRole::Control, None, 1),
+        session::client_hello("target-peer", LaneRole::Control, None, 2),
+        &session::CodeAuth { code: code.clone() },
+        None,
+        session::ConnOptions::default(),
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (bulk, _) = session::dial(
+        &endpoint,
+        session::client_hello(
+            "target-peer",
+            LaneRole::Bulk,
+            Some(crate::model::protocol::LaneSpec::new(0, 1)),
+            2,
+        ),
         &session::CodeAuth { code },
         None,
         session::ConnOptions::default(),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let server = server.join().unwrap()?;
+    let (server, bulk_server) = server.join().unwrap()?;
     let fetch = crate::orchestrator::sync::DigestFetch::new(b.working.content().packs.clone());
     fetch.add(
         "source-peer".into(),
         Arc::new(crate::orchestrator::sync::SessionSource {
-            conn: conn.clone(),
+            conn: bulk.clone(),
             repo: "repo".into(),
         }),
     );
@@ -1834,7 +1854,9 @@ fn hydrate_missing_chunk_over_authenticated_session() -> Result<()> {
     assert!(b.working.content().packs.contains(chunks[1])?);
     b.close(h)?;
     conn.close();
+    bulk.close();
     server.close();
+    bulk_server.close();
     a.shutdown()?;
     b.shutdown()?;
     Ok(())

@@ -2,11 +2,12 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 pub const PROTOCOL_NAME: &str = "tkfs-peer";
-pub const PROTOCOL_VERSION: u32 = 3;
-pub const SUPPORTED_VERSIONS: &[u32] = &[3];
+pub const PROTOCOL_VERSION: u32 = 4;
+pub const IPC_VERSION: u32 = 4;
+pub const SUPPORTED_VERSIONS: &[u32] = &[4];
 pub const UPGRADE_HEADER: &str = "X-Tkfs-Sync";
-pub const UPGRADE_V3: &str = "3";
-pub const UPGRADE_LOOPBACK: &str = "3-loopback";
+pub const UPGRADE_V3: &str = "4";
+pub const UPGRADE_LOOPBACK: &str = "4-loopback";
 pub const TOKEN_HEADER: &str = "X-Tkfs-Token";
 pub const LEGACY_NEEDS_UPGRADE_REPLY: &str =
     r#"{"ok":false,"error":"PEER_NEEDS_UPGRADE: use an authenticated session"}"#;
@@ -80,8 +81,14 @@ pub mod deadlines {
 pub fn op_deadline(_op: &str) -> Option<Duration> {
     Some(Duration::from_secs(10))
 }
+/// Per-lane op policy: the control lane never carries object bytes, bulk
+/// lanes carry only `objects.*` (and `ping`), probe lanes a fixed short list.
 pub fn op_allowed(op: &str, role: LaneRole) -> bool {
-    role != LaneRole::Probe || matches!(op, "ping" | "peer.enroll" | "catalog.list")
+    match role {
+        LaneRole::Probe => matches!(op, "ping" | "peer.enroll" | "catalog.list" | "clock.probe"),
+        LaneRole::Bulk => op == "ping" || op.starts_with("objects."),
+        LaneRole::Control => !op.starts_with("objects."),
+    }
 }
 pub fn max_body(op: &str) -> usize {
     if op == "objects.fetch" {
@@ -371,5 +378,30 @@ pub mod frame {
     pub struct Goaway {
         pub code: String,
         pub message: String,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_lane_never_carries_objects_and_bulk_only_does() {
+        assert!(!op_allowed("objects.fetch", LaneRole::Control));
+        assert!(!op_allowed("objects.write", LaneRole::Control));
+        assert!(op_allowed("meta.exchange", LaneRole::Control));
+        assert!(op_allowed("clock.probe", LaneRole::Control));
+        assert!(op_allowed("objects.fetch", LaneRole::Bulk));
+        assert!(!op_allowed("meta.exchange", LaneRole::Bulk));
+        assert!(op_allowed("clock.probe", LaneRole::Probe));
+        assert!(!op_allowed("meta.exchange", LaneRole::Probe));
+    }
+
+    #[test]
+    fn protocol_is_version_4() {
+        assert_eq!(SUPPORTED_VERSIONS, &[4]);
+        assert_eq!(UPGRADE_V3, "4");
+        assert_eq!(UPGRADE_LOOPBACK, "4-loopback");
+        assert_eq!(IPC_VERSION, 4);
     }
 }

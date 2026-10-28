@@ -47,7 +47,7 @@ pub fn probe(endpoint: &str, code: &str) -> Result<Value> {
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     let reply = conn
         .call(
-            "folder.info",
+            "catalog.list",
             json!({}),
             Vec::new(),
             session::Priority::Control,
@@ -78,7 +78,7 @@ impl Catalog {
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         let reply = conn
             .call(
-                "folder.info",
+                "catalog.list",
                 json!({}),
                 Vec::new(),
                 session::Priority::Control,
@@ -236,7 +236,7 @@ pub struct PeerService {
 }
 impl Handler for PeerService {
     fn handle(&self, req: Incoming) {
-        if req.op == "folder.info" {
+        if req.op == "catalog.list" {
             // The session has already authenticated by pairing code or a
             // persisted peer key. This is not an unauthenticated discovery API.
             let label = self.catalog.get("label").ok().flatten();

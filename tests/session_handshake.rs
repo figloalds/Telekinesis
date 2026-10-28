@@ -196,12 +196,12 @@ fn read_frame(ws: &mut RawSocket) -> (u8, Value) {
 fn raw_v3(endpoint: &str) -> RawSocket {
     let (ws, response) = ws::connect_with(
         endpoint,
-        &[("X-Tkfs-Sync", "3")],
+        &[("X-Tkfs-Sync", "4")],
         None,
         Duration::from_secs(3),
     )
     .unwrap();
-    assert_eq!(response.headers()["X-Tkfs-Sync"], "3");
+    assert_eq!(response.headers()["X-Tkfs-Sync"], "4");
     bounded(&ws);
     ws
 }
@@ -372,7 +372,7 @@ fn right_code_authenticates_the_client_for_every_role() {
                 .unwrap_or_else(|error| panic!("{role:?}: {error}"));
         let (mut server_ws, peer) = server.join().unwrap().unwrap();
         assert_eq!(server_hello.protocol, PROTOCOL_NAME);
-        assert_eq!(server_hello.version, 3);
+        assert_eq!(server_hello.version, 4);
         assert_eq!(server_hello.installation, SERVER);
         assert_eq!((server_hello.role, server_hello.lane), (role, lane));
         assert_eq!(server_hello.verifier_generation, GENERATION);
@@ -499,7 +499,7 @@ fn lying_server(
         let mut ws = ws::accept_with(stream, 64 * 1024, |_, response| {
             response
                 .headers_mut()
-                .insert("X-Tkfs-Sync", "3".parse().unwrap());
+                .insert("X-Tkfs-Sync", "4".parse().unwrap());
         })
         .unwrap();
         let (kind, hello) = read_frame(&mut ws);
@@ -507,7 +507,7 @@ fn lying_server(
         let hello: ClientHello = serde_json::from_value(hello).unwrap();
         let mut server = ServerHello {
             protocol: PROTOCOL_NAME.into(),
-            version: 3,
+            version: 4,
             installation: SERVER.into(),
             role: hello.role,
             lane: hello.lane,
@@ -575,7 +575,7 @@ fn client_checks_the_server_hello_before_proving() {
             "answers another version",
             LaneRole::Control,
             None,
-            Box::new(|_, server| server.version = 4),
+            Box::new(|_, server| server.version = 3),
             "PEER_PROTOCOL_UNSUPPORTED",
         ),
     ];
@@ -717,7 +717,7 @@ fn refusals_before_auth_use_their_goaway_codes() {
         (
             "PEER_PROTOCOL_UNSUPPORTED",
             Policy::new(SERVER, Some((verifier, GENERATION))),
-            Some(vec![4]),
+            Some(vec![3]),
         ),
     ];
     for (code_expected, policy, versions) in cases {
@@ -741,7 +741,7 @@ fn refusals_before_auth_use_their_goaway_codes() {
             (DialError::Unsupported { offered, supported }, "PEER_PROTOCOL_UNSUPPORTED") => {
                 assert_eq!(
                     (offered.as_slice(), supported.as_slice()),
-                    (&[4][..], &[3][..])
+                    (&[3][..], &[4][..])
                 );
             }
             (DialError::Rejected(wire), _) => assert_eq!(wire.code, code_expected),
@@ -871,7 +871,7 @@ fn legacy_both_directions() {
     let (up, _) = relay.bytes();
     assert_absent(&up, &[&code], "v3 dialer → v2 server");
     assert!(
-        contains(&up.to_ascii_lowercase(), b"x-tkfs-sync: 3"),
+        contains(&up.to_ascii_lowercase(), b"x-tkfs-sync: 4"),
         "the upgrade request offered v3"
     );
 }
@@ -1028,7 +1028,7 @@ fn closing_server(code: CloseCode, reason: &'static str) -> (String, JoinHandle<
         let mut ws = ws::accept_with(stream, 64 * 1024, |_, response| {
             response
                 .headers_mut()
-                .insert("X-Tkfs-Sync", "3".parse().unwrap());
+                .insert("X-Tkfs-Sync", "4".parse().unwrap());
         })
         .unwrap();
         assert_eq!(read_frame(&mut ws).0, 1);
@@ -1240,7 +1240,7 @@ fn silent_and_trickling_peers_are_closed_at_5s() {
                 let mut ws = ws::accept_with(stream, 64 * 1024, |_, response| {
                     response
                         .headers_mut()
-                        .insert("X-Tkfs-Sync", "3".parse().unwrap());
+                        .insert("X-Tkfs-Sync", "4".parse().unwrap());
                 })
                 .unwrap();
                 bounded(&ws);
@@ -1376,7 +1376,7 @@ fn wss_handshake_authenticates_over_tls() {
                 assert_eq!(handshake::upgrade_kind(request), handshake::UpgradeKind::V3);
                 response
                     .headers_mut()
-                    .insert("X-Tkfs-Sync", "3".parse().unwrap());
+                    .insert("X-Tkfs-Sync", "4".parse().unwrap());
                 Ok(response)
             },
             None,

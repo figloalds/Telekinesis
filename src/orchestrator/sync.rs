@@ -985,7 +985,12 @@ mod tests {
         });
         let (client, _) = session::dial(
             &endpoint,
-            session::client_hello("batch-target", LaneRole::Control, None, 1),
+            session::client_hello(
+                "batch-target",
+                LaneRole::Bulk,
+                Some(crate::model::protocol::LaneSpec::new(0, 1)),
+                2,
+            ),
             &session::CodeAuth { code },
             None,
             options,

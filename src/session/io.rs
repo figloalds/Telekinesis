@@ -856,6 +856,15 @@ impl Io {
             self.answer(id, Ok(header));
             return;
         }
+        let role = shared.peer.role;
+        if !protocol::op_allowed(&request.op, role) {
+            let error = ErrorWire::coded(
+                "OP_NOT_ALLOWED",
+                format!("{} is not allowed on a {} lane", request.op, role.as_str()),
+            );
+            self.answer(id, Err(error));
+            return;
+        }
         let refusal = {
             let state = shared.lock();
             if let Some(goaway) = state.goaway_sent.as_ref().or(state.close_request.as_ref()) {

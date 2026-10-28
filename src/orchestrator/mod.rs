@@ -6,7 +6,7 @@ use crate::{
     content::working::lock,
     model::{
         content::{ContentKind, FileContentRef},
-        protocol::LaneRole,
+        protocol::{LaneRole, LaneSpec},
     },
     orchestrator::sync::{DigestFetch, FeedCursor, SessionSource},
     runtime::Engine,
@@ -145,26 +145,51 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                 }
                                 let device = lock(&engine.store).device.clone();
                                 let hello =
-                                    session::client_hello(&device, LaneRole::Control, None, 1);
+                                    session::client_hello(&device, LaneRole::Control, None, 2);
+                                let bulk_hello = session::client_hello(
+                                    &device,
+                                    LaneRole::Bulk,
+                                    Some(LaneSpec::new(0, 1)),
+                                    2,
+                                );
                                 let key = match peer.key() {
                                     Ok(key) => key,
                                     Err(_) => break,
                                 };
                                 lock(&engine.peer_status).insert(peer.endpoint.clone(),serde_json::json!({"state":"Connecting"}));
-                                match session::dial_expecting(
+                                // Metadata rides the control lane; object bytes only
+                                // ever ride the bulk lane (`op_allowed`).
+                                let dialed = session::dial_expecting(
                                     &peer.endpoint,
                                     hello,
                                     &session::auth::PeerAuth { key },
                                     Some(&peer.installation),
                                     None,
                                     ConnOptions::default(),
-                                ) {
-                                    Ok((conn, _)) => {
+                                )
+                                .and_then(|(conn, _)| {
+                                    match session::dial_expecting(
+                                        &peer.endpoint,
+                                        bulk_hello,
+                                        &session::auth::PeerAuth { key },
+                                        Some(&peer.installation),
+                                        None,
+                                        ConnOptions::default(),
+                                    ) {
+                                        Ok((bulk, _)) => Ok((conn, bulk)),
+                                        Err(error) => {
+                                            conn.close();
+                                            Err(error)
+                                        }
+                                    }
+                                });
+                                match dialed {
+                                    Ok((conn, bulk)) => {
                                         lock(&engine.peer_status).insert(peer.endpoint.clone(),serde_json::json!({"state":"Connected","health":conn.health()}));
                                         fetch.add(
                                             peer.endpoint.clone(),
                                             Arc::new(SessionSource {
-                                                conn: conn.clone(),
+                                                conn: bulk.clone(),
                                                 repo: lock(&engine.store).repo.clone(),
                                             }),
                                         );
@@ -172,6 +197,7 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                         while !engine.stopping.load(Ordering::Acquire)
                                             && catalog.contains(&peer.endpoint)
                                             && conn.closed().is_none()
+                                            && bulk.closed().is_none()
                                         {
                                             match sync::exchange(&engine, &conn, &mut cursor) {
                                                 Ok(more) => {
@@ -197,6 +223,7 @@ fn serve(engine: Arc<Engine>, listen: &str, advertise: Option<&str>) -> Result<(
                                             std::thread::sleep(Duration::from_millis(100));
                                         }
                                         conn.close();
+                                        bulk.close();
                                         fetch.remove(&peer.endpoint);
                                         let mut statuses=lock(&engine.peer_status);
                                         if statuses.get(&peer.endpoint).is_some_and(|status|status["state"]=="Connected") {

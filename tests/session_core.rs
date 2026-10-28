@@ -446,6 +446,37 @@ fn ping_is_answered_without_a_handler() {
 }
 
 #[test]
+fn server_refuses_ops_its_lane_role_does_not_allow() {
+    // (server-side role, refused op, allowed op)
+    let cases = [
+        (LaneRole::Control, "objects.fetch", "meta.exchange"),
+        (LaneRole::Bulk, "meta.exchange", "objects.fetch"),
+        (LaneRole::Probe, "meta.exchange", "clock.probe"),
+    ];
+    for (role, refused, allowed) in cases {
+        let pair = ws_pair(Transport::Plain);
+        let mut accepted = peer();
+        accepted.role = role;
+        let client =
+            Conn::from_established(pair.0, Side::Client, peer(), ConnOptions::default()).unwrap();
+        let server =
+            Conn::from_established(pair.1, Side::Server, accepted, ConnOptions::default()).unwrap();
+        server.serve(echo());
+        match call(&client, refused, json!({})).unwrap_err() {
+            CallError::Remote(wire) => {
+                assert_eq!(wire.code, "OP_NOT_ALLOWED", "{role:?} {refused}")
+            }
+            other => panic!("{role:?} {refused}: expected a remote error, got {other:?}"),
+        }
+        assert!(
+            call(&client, allowed, json!({})).is_ok(),
+            "{role:?} {allowed}"
+        );
+        assert!(client.closed().is_none() && server.closed().is_none());
+    }
+}
+
+#[test]
 fn full_handler_queue_answers_busy() {
     let options = ConnOptions {
         handlers: 1,
