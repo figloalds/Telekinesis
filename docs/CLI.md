@@ -42,6 +42,14 @@ They are accepted before or after the command.
 | `--runtime STATE/runtime.json` | The same, given as the `runtime.json` of a running worker: its directory is the state. |
 | `--request-id UUID`, `--generation NUMBER` | Accepted with folder mutations (`resolve`, `checkpoint`, `branch`, `checkout`, `mkdir`, `rename`, `delete`, `import`, `gc`) and passed to the worker in the request. The worker does not act on them yet, so they currently change nothing. |
 
+Compatibility (Windows): older builds read `orchestrator.toml` from the
+current directory. With neither `-f` nor `TKFS_CONFIG`, tkfs now reads the one
+next to `tkfs.exe`. When the current directory also holds an
+`orchestrator.toml` that is a different file, a command prints
+`CONFIG_LOCATION_CHANGED: using …; … is ignored (pass -f to use it)` on stderr
+and carries on with the file beside `tkfs.exe`; pass `-f orchestrator.toml` (or
+set `TKFS_CONFIG`) to keep using the one in the current directory.
+
 `--json` belongs to `manage` and goes before its subcommand
 (`tkfs manage --json status`).
 

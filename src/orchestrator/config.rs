@@ -87,6 +87,39 @@ pub fn resolve_path(
     }
 }
 
+/// The `CONFIG_LOCATION_CHANGED` notice for a command that found no `-f` and
+/// no `TKFS_CONFIG`: `Some(line)` when `cwd/orchestrator.toml` exists
+/// (`cwd_has_config`) but `resolved` (what [`resolve_path`] returned) is a
+/// different file, i.e. a Windows build that used to read the current
+/// directory's file now reads the one beside the executable. The command
+/// goes on with `resolved`; the line only says so.
+pub fn config_location_notice(
+    explicit: Option<&Path>,
+    env: Option<&std::ffi::OsStr>,
+    resolved: &Path,
+    cwd: &Path,
+    cwd_has_config: bool,
+) -> Option<String> {
+    if explicit.is_some() || env.is_some_and(|value| !value.is_empty()) || !cwd_has_config {
+        return None;
+    }
+    let ignored = cwd.join("orchestrator.toml");
+    let same = if cfg!(windows) {
+        ignored
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&resolved.to_string_lossy())
+    } else {
+        ignored == resolved
+    };
+    (!same).then(|| {
+        format!(
+            "CONFIG_LOCATION_CHANGED: using {}; {} is ignored (pass -f to use it)",
+            resolved.display(),
+            ignored.display()
+        )
+    })
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let path = std::path::absolute(path)?;
@@ -303,6 +336,32 @@ folders = []
         assert_eq!(loaded.default_mount_directory, dir.path().join("mounts"));
         let again = Config::load_or_init(&path).unwrap();
         assert_eq!(again.maximum_running, 8);
+    }
+
+    #[test]
+    fn a_different_cwd_config_is_announced_only_when_nothing_chose_the_file() {
+        use std::ffi::OsStr;
+        let cwd = Path::new(r"C:\work");
+        let beside_exe = Path::new(r"C:Tools	kfsorchestrator.toml");
+        let notice = |explicit, env, resolved: &Path, present| {
+            config_location_notice(explicit, env, resolved, cwd, present)
+        };
+        let line = notice(None, None, beside_exe, true).unwrap();
+        assert!(line.starts_with("CONFIG_LOCATION_CHANGED: using "), "{line}");
+        assert!(line.contains(&beside_exe.display().to_string()), "{line}");
+        assert!(
+            line.contains(&cwd.join("orchestrator.toml").display().to_string()),
+            "{line}"
+        );
+        assert!(line.contains("pass -f"), "{line}");
+        // An empty TKFS_CONFIG chooses nothing.
+        assert!(notice(None, Some(OsStr::new("")), beside_exe, true).is_some());
+        // Chosen by -f or TKFS_CONFIG, nothing in the current directory, or
+        // the same file: no notice.
+        assert!(notice(Some(Path::new("x.toml")), None, beside_exe, true).is_none());
+        assert!(notice(None, Some(OsStr::new("x.toml")), beside_exe, true).is_none());
+        assert!(notice(None, None, beside_exe, false).is_none());
+        assert!(notice(None, None, &cwd.join("orchestrator.toml"), true).is_none());
     }
 
     #[test]

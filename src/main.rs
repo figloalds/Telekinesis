@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use tkfs::{
     orchestrator::{
-        config::{CONFIG_ENV, Config, resolve_path},
+        config::{CONFIG_ENV, Config, config_location_notice, resolve_path},
         control, hub,
         manage::{self, ManagementCommand},
         settings::Settings,
@@ -166,12 +166,26 @@ fn report(error: &anyhow::Error) {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Gui);
+    let env_config = std::env::var_os(CONFIG_ENV);
+    let cwd = std::env::current_dir()?;
     let config_path = resolve_path(
         cli.config.as_deref(),
-        std::env::var_os(CONFIG_ENV).as_deref(),
+        env_config.as_deref(),
         &std::env::current_exe()?,
-        &std::env::current_dir()?,
+        &cwd,
     );
+    // The GUI has no console to tell.
+    if !matches!(command, Command::Gui)
+        && let Some(notice) = config_location_notice(
+            cli.config.as_deref(),
+            env_config.as_deref(),
+            &config_path,
+            &cwd,
+            cwd.join("orchestrator.toml").exists(),
+        )
+    {
+        eprintln!("{notice}");
+    }
     if matches!(command, Command::Gui) {
         #[cfg(windows)]
         return gui::run(config_path);
