@@ -10,6 +10,17 @@ Documentation and diagnosis do not close this demand. The fix below is
 implemented in this checkout ([note](notes/mount-lifecycle-fix.md)); the demand
 closes only when all acceptance checks, including the purge-cost decision, pass.
 
+On 2026-10-29 the user directed lifting the orchestrator's `MOUNT_UNSUPPORTED`
+refusal so that a folder with a mount point is started with `--mount`, for a
+practical mounted test on the user's own host to judge the performance targets.
+Both lifecycle deadlocks named here stay fixed below the orchestrator: the
+worker is the filesystem server, holds no handle to its served namespace
+(`src/mount.rs`, `native/mount.c`, unchanged since the qualified candidate) and
+refuses WinFsp older than 2.2.26286. The 44-case matrix ran against
+`tkfs daemon --mount` before that process was restructured into the
+orchestrator's worker (`src/orchestrator/worker.rs`); it has not been re-run on
+the worker or under the orchestrator's supervisor. This does not close P0.
+
 Read the [performance gate reassessment](notes/perf-gate-reassessment.md)
 before the next candidate lap. It records cache-policy and metadata-reference
 cost hypotheses, predicts counters for a proposed purge-off experiment, and

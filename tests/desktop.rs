@@ -387,18 +387,22 @@ fn the_client_creates_a_headless_folder_and_runs_folder_ops() -> Result<()> {
     guard.stop()
 }
 
+// Windows only: elsewhere an existing directory is a valid mount point.
+#[cfg(windows)]
 #[test]
-fn a_mount_request_reaches_the_orchestrator_and_is_refused() -> Result<()> {
+fn a_mount_request_reaches_the_orchestrator_and_an_occupied_point_is_refused() -> Result<()> {
     let (home, mut client, mut guard) = open_client()?;
-    let mount = home.path().join("m");
+    // An existing directory: refused before anything is created, so no
+    // worker starts and nothing mounts (mounted runs belong in the VM).
+    let occupied = home.path().join("m");
+    fs::create_dir(&occupied)?;
     let error = client
-        .act("create", json!({"label": "M", "mount": mount}))
+        .act("create", json!({"label": "M", "mount": occupied}))
         .unwrap_err();
     assert!(
-        error.to_string().starts_with("MOUNT_UNSUPPORTED"),
+        error.to_string().starts_with("MOUNT_POINT_EXISTS"),
         "{error:#}"
     );
-    assert!(!mount.exists(), "a mount path was created");
     let status = client.status()?;
     assert_eq!(status["folders"], json!([]), "{status}");
     drop(client);

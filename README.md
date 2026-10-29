@@ -92,7 +92,9 @@ The code tells what to do:
 | `FOLDER_REQUIRED` | A folder command has neither `--state` nor `--runtime`. | Give `--state DIR` or `--runtime STATE/runtime.json`. |
 | `FOLDER_NOT_FOUND`, `AMBIGUOUS_FOLDER` | The folder argument matches no folder, or more than one. | Use more of the id, or the exact label (`manage list`). |
 | `FOLDER_RUNNING`, `FOLDER_NOT_RUNNING` | The command needs the folder stopped (`configure-mount`), or running. | `manage stop` / `manage start` it first. |
-| `MOUNT_UNSUPPORTED` | `create`, `receive` or `configure-mount` was given `--mount`: orchestrator-managed folders run headless in this release. Nothing is created or changed. | Create the folder headless (`--headless`, or no `--mount`). |
+| `MOUNT_IN_USE` | `create`, `receive` or `configure-mount` names the mount point of another folder. Nothing is created or changed. | Choose another `--mount`, or clear that folder's mount. |
+| `MOUNT_POINT_EXISTS` | Something already occupies the mount point (Windows; WinFsp creates the directory itself), possibly an empty leftover. Nothing is created or changed. | Choose a path that does not exist yet, or remove the empty leftover. |
+| `MOUNT_FAILED`, `WINFSP_LOAD_FAILED` | The worker could not mount (it exits and the folder backs off). WinFsp older than 2.2.26286 (2026 Beta5) is refused before a volume exists. | Read `worker.log`; install WinFsp 2.2 Beta5 or newer. |
 | `FOLDER_INIT_FAILED` | A new folder's store could not be created. Nothing of the folder is kept. | Fix the cause it names (disk space, permissions) and run `create` / `receive` again. |
 | `WORKER_NOT_RUNNING` | The folder's worker is not running (`rpc`). | `manage start` the folder. |
 | `BUSY_VIEW` | The worker has files open and refuses to stop. | Close them, or `manage force-stop`. |

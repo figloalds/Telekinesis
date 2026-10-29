@@ -372,14 +372,12 @@ impl Controller {
                 return;
             }
         }
-        // Never a mount, whatever the record holds: a host mount under a
-        // supervisor that may kill the worker is barred until the W6-P0
-        // mount lifecycle blocker is closed (`AGENTS.md`); `record.mount`
-        // stays for the mounts plan.
+        // A killed worker cannot strand its mount: it holds no handle to,
+        // and does no I/O on, the namespace it serves (`src/mount.rs`).
         let spec = LaunchSpec {
             executable: self.executable.clone(),
             state: self.record.state.clone(),
-            mount: None,
+            mount: self.record.mount.clone(),
         };
         self.phase = self.starting(attempt, false);
         match self.launcher.spawn(&spec, sink) {
@@ -1136,11 +1134,12 @@ mod tests {
     }
 
     #[test]
-    fn a_record_with_a_mount_spawns_a_headless_worker() {
+    fn a_record_with_a_mount_spawns_a_mounting_worker() {
         let clock = Arc::new(ManualClock::new(1_800_000_000_000));
         let stub = Stub::new(vec![]);
         let mut record = folder();
-        record.mount = Some(std::env::temp_dir().join("tkfs-mount"));
+        let mount = std::env::temp_dir().join("tkfs-mount");
+        record.mount = Some(mount.clone());
         let mut controller = Controller::new(
             record.clone(),
             PathBuf::from("tkfs-test"),
@@ -1156,11 +1155,10 @@ mod tests {
             "--state".into(),
             record.state.clone().into(),
             "--supervised".into(),
+            "--mount".into(),
+            mount.into(),
         ];
         assert_eq!(commands, vec![expected]);
-        assert!(!commands[0].iter().any(|arg| arg == "--mount"));
-        // The stored mount itself is kept for the mounts plan.
-        assert_eq!(controller.record().mount, record.mount);
     }
 
     #[test]

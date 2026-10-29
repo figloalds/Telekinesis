@@ -352,6 +352,7 @@ fn watch_returns_immediately_when_seq_advanced_and_waits_otherwise() {
     assert_eq!(heartbeat["conflicts"], 0);
     assert_eq!(heartbeat["writable_handles"], 0);
     assert!(heartbeat["error"].is_null());
+    assert_eq!(heartbeat["mounts"], json!([]), "headless: {first}");
     assert_eq!(first["demand"], json!([]));
 
     // Park until the next heartbeat bump, so the following short watch starts

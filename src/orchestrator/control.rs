@@ -127,7 +127,8 @@ pub fn hello(engine: &Engine, instance: &str) -> Value {
     })
 }
 
-/// The worker's health summary carried by every `watch` reply.
+/// The worker's health summary carried by every `watch` reply; `mounts` is
+/// what it serves right now, so a stored mount that failed shows as such.
 pub fn heartbeat(engine: &Engine) -> Result<Value> {
     let writable = engine.writable_tokens().len();
     let error = lock(&engine.error).clone();
@@ -138,6 +139,7 @@ pub fn heartbeat(engine: &Engine) -> Result<Value> {
         "conflicts": store.conflicts(false)?.len(),
         "writable_handles": writable,
         "error": error,
+        "mounts": mounts(),
     }))
 }
 

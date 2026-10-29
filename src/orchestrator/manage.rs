@@ -25,24 +25,23 @@ pub enum ManagementCommand {
         #[arg(value_name = "STATE")]
         folder: String,
     },
-    /// Create a folder and start its worker (always headless for now).
+    /// Create a folder and start its worker.
     Create {
         label: String,
         #[arg(long)]
         repo: Option<String>,
-        /// Refused for now (`MOUNT_UNSUPPORTED`): mounts arrive with a later
-        /// release.
+        /// Mount the folder here: a directory that does not exist yet
+        /// (Windows: or a drive letter such as `X:`).
         #[arg(long, conflicts_with = "headless")]
         mount: Option<PathBuf>,
         #[arg(long)]
         headless: bool,
     },
-    /// Clear a stopped folder's stored mount (`--mount` is refused for now).
+    /// Set a stopped folder's mount (`--mount`), or clear it without one.
     ConfigureMount {
         #[arg(value_name = "STATE")]
         folder: String,
-        /// Refused for now (`MOUNT_UNSUPPORTED`): mounts arrive with a later
-        /// release.
+        /// The new mount point; omitted, the folder runs headless.
         #[arg(long)]
         mount: Option<PathBuf>,
     },
@@ -99,13 +98,13 @@ pub enum ManagementCommand {
     /// The folders a paired orchestrator publishes.
     RemoteList { endpoint: String },
     /// Create a folder of REPO, which the paired orchestrator at ENDPOINT
-    /// publishes, and start syncing it (always headless for now).
+    /// publishes, and start syncing it.
     Receive {
         endpoint: String,
         repo: String,
         label: String,
-        /// Refused for now (`MOUNT_UNSUPPORTED`): mounts arrive with a later
-        /// release.
+        /// Mount the folder here: a directory that does not exist yet
+        /// (Windows: or a drive letter such as `X:`).
         #[arg(long, conflicts_with = "headless")]
         mount: Option<PathBuf>,
         #[arg(long)]
@@ -159,7 +158,15 @@ pub fn run(config_path: &Path, command: ManagementCommand, json: bool) -> Result
 /// The action, payload and whether it is read-only (retried once).
 fn request(command: ManagementCommand) -> Result<(&'static str, Value, bool)> {
     use ManagementCommand as C;
-    let absolute = |path: Option<PathBuf>| path.map(std::path::absolute).transpose();
+    // A bare drive letter (`X:`) is a drive mount on Windows, not the
+    // current directory on that drive.
+    let absolute = |path: Option<PathBuf>| {
+        path.map(|path| match path.to_str().map(str::as_bytes) {
+            Some([letter, b':']) if cfg!(windows) && letter.is_ascii_alphabetic() => Ok(path),
+            _ => std::path::absolute(path),
+        })
+        .transpose()
+    };
     Ok(match command {
         C::Status | C::Watch => ("status", json!({}), true),
         C::List => ("list", json!({}), true),

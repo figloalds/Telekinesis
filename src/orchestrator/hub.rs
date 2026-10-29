@@ -820,9 +820,11 @@ impl Daemon {
         payload["label"]
             .as_str()
             .context("ARGUMENT_REQUIRED: label")?;
-        refuse_mount(payload)?;
-        // Checked again by `create` under the admission lock; this one
-        // spares the remote listing.
+        // Checked again by `create` under the admission lock; these spare
+        // the remote listing.
+        if let Some(mount) = mount_path(payload)? {
+            self.check_mount(None, &mount)?;
+        }
         self.refuse_held_repo(repo)?;
         let published = self.network()?.remote_list(endpoint)?;
         ensure!(
@@ -848,20 +850,45 @@ impl Daemon {
         Ok(())
     }
 
+    /// `MOUNT_IN_USE` when another folder than `folder` mounts at `mount`;
+    /// on Windows also `MOUNT_POINT_EXISTS` when something occupies it
+    /// (WinFsp creates the directory itself). The orchestrator serves no
+    /// filesystem, so looking at the path cannot wait on its own mount.
+    fn check_mount(&self, folder: Option<&str>, mount: &Path) -> Result<()> {
+        if let Some(other) = self.catalog.folders()?.into_iter().find(|record| {
+            Some(record.id.as_str()) != folder
+                && record
+                    .mount
+                    .as_deref()
+                    .is_some_and(|held| same_mount(held, mount))
+        }) {
+            bail!(
+                "MOUNT_IN_USE: folder {} already mounts at {}",
+                other.label,
+                mount.display()
+            );
+        }
+        #[cfg(windows)]
+        crate::mount::ensure_mount_point_free(mount)?;
+        Ok(())
+    }
+
     fn create(&self, payload: &Value) -> Result<Value> {
         let label = payload["label"]
             .as_str()
             .context("ARGUMENT_REQUIRED: label")?;
-        refuse_mount(payload)?;
         let repo = payload["repo"]
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(crate::core::id);
-        let mount = optional_path(payload, "mount")?;
+        let mount = mount_path(payload)?;
         let _admission = lock(&self.admission);
         // One folder per repo: sync jobs, `link_by_repo` and the peers'
         // view of this daemon all key folders by repo.
         self.refuse_held_repo(&repo)?;
+        if let Some(mount) = &mount {
+            self.check_mount(None, mount)?;
+        }
         self.admit(None)?;
         let record = self.catalog.create_folder(label, &repo, mount)?;
         if let Err(error) = (self.init_store)(&record.state, &repo) {
@@ -959,18 +986,23 @@ impl Daemon {
         Ok(view)
     }
 
-    /// Clears the stored mount of a stopped folder; setting one is refused
-    /// (`MOUNT_UNSUPPORTED`) until mounts return.
+    /// Sets (or, without `mount`, clears) the mount of a stopped folder; its
+    /// next start mounts there.
     fn configure_mount(&self, record: &FolderRecord, payload: &Value) -> Result<Value> {
-        refuse_mount(payload)?;
         let slot = self.slot(&record.id)?;
-        let mount = optional_path(payload, "mount")?;
+        let mount = mount_path(payload)?;
+        // Admission before the controller, as `start`: it also serializes
+        // the mount check with `create`.
+        let _admission = lock(&self.admission);
         let controller = slot.lock();
         ensure!(
             matches!(controller.phase(), Phase::Stopped | Phase::Failed { .. }),
             "FOLDER_RUNNING: stop {} before changing its mount",
             record.label
         );
+        if let Some(mount) = &mount {
+            self.check_mount(Some(&record.id), mount)?;
+        }
         self.catalog.set_mount(&record.id, mount)?;
         drop(controller);
         self.sync_record(&slot, &record.id)?;
@@ -1435,18 +1467,18 @@ fn folder_entry(mut view: Value) -> Value {
     view
 }
 
-/// `MOUNT_UNSUPPORTED` when `payload` names a mount. Orchestrator-managed
-/// folders run headless until the mounts plan: the W6-P0 mount lifecycle
-/// blocker (`AGENTS.md`) forbids host mounts under a supervisor that may kill
-/// the worker. The flags, the catalog column and `LaunchSpec::mount` stay for
-/// that plan.
-fn refuse_mount(payload: &Value) -> Result<()> {
-    ensure!(
-        payload["mount"].is_null(),
-        "MOUNT_UNSUPPORTED: mounts of orchestrator-managed folders arrive with a later \
-         release; create the folder headless"
-    );
-    Ok(())
+/// Whether two mount paths name the same place: ASCII case and trailing
+/// separators aside on Windows.
+fn same_mount(a: &Path, b: &Path) -> bool {
+    let text = |path: &Path| {
+        let text = path.to_string_lossy();
+        text.trim_end_matches(['\\', '/']).to_owned()
+    };
+    if cfg!(windows) {
+        text(a).eq_ignore_ascii_case(&text(b))
+    } else {
+        text(a) == text(b)
+    }
 }
 
 /// Creates the store of a new folder at `state`, then releases it
@@ -1483,6 +1515,19 @@ fn remove_state(state: &Path, bound: Duration) -> Result<()> {
 }
 
 /// `payload[key]` as an absolute path; `null`/absent is `None`.
+/// `payload.mount`: an absolute directory, or on Windows a drive letter
+/// (`X:`) too.
+fn mount_path(payload: &Value) -> Result<Option<PathBuf>> {
+    if cfg!(windows)
+        && let Some(text) = payload["mount"].as_str()
+        && let [letter, b':'] = text.as_bytes()
+        && letter.is_ascii_alphabetic()
+    {
+        return Ok(Some(PathBuf::from(text)));
+    }
+    optional_path(payload, "mount")
+}
+
 fn optional_path(payload: &Value, key: &str) -> Result<Option<PathBuf>> {
     match &payload[key] {
         Value::Null => Ok(None),
@@ -1757,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mount_is_refused_before_any_catalog_write() {
+    fn mounts_are_stored_and_a_taken_mount_is_refused_before_any_catalog_write() {
         let root = tempfile::tempdir().unwrap();
         let daemon = daemon(root.path());
         let held = daemon
@@ -1765,47 +1810,73 @@ mod tests {
             .create_folder("Project", "repo-1", None)
             .unwrap();
         daemon.register(held.clone());
+        let mount = root.path().join("mounts").join("Project");
+        let set = daemon
+            .execute(
+                "configure-mount",
+                &json!({"state": "Project", "mount": mount}),
+            )
+            .unwrap();
+        assert_eq!(set["mount"], json!(mount));
         let before = daemon.execute("list", &json!({})).unwrap();
-        let mount = std::env::temp_dir().join("tkfs-mount");
+        // Another folder may not take the same mount point, whatever the
+        // case or a trailing separator (Windows).
+        let same = if cfg!(windows) {
+            format!("{}\\", mount.display()).to_uppercase()
+        } else {
+            mount.display().to_string()
+        };
         let requests = [
-            ("create", json!({"label": "Mounted", "mount": mount})),
+            ("create", json!({"label": "Other", "mount": same})),
             (
                 "receive",
                 json!({
-                    "label": "Mounted",
+                    "label": "Other",
                     "repo": "repo-2",
                     "endpoint": "ws://127.0.0.1:9",
-                    "mount": mount,
+                    "mount": same,
                 }),
             ),
-            (
-                "configure-mount",
-                json!({"state": "Project", "mount": mount}),
-            ),
-            // Refused whatever the path, a relative one included.
-            ("create", json!({"label": "Mounted", "mount": "relative"})),
+            ("create", json!({"label": "Other", "mount": "relative"})),
         ];
         for (action, payload) in requests {
             let error = format!("{:#}", daemon.execute(action, &payload).unwrap_err());
             assert!(
-                error.starts_with(
-                    "MOUNT_UNSUPPORTED: mounts of orchestrator-managed folders arrive with a \
-                     later release; create the folder headless"
-                ),
+                error.starts_with("MOUNT_IN_USE: folder Project")
+                    || error.starts_with("INVALID_REQUEST: mount must be an absolute path"),
                 "{action}: {error}"
             );
         }
         assert_eq!(daemon.execute("list", &json!({})).unwrap(), before);
         assert_eq!(daemon.slots().len(), 1);
-        // Without `--mount`, configure-mount still clears a stored mount.
+        // Its own folder may set it again; clearing leaves it headless.
         daemon
-            .catalog
-            .set_mount(&held.id, Some(std::env::temp_dir().join("old")))
+            .execute(
+                "configure-mount",
+                &json!({"state": "Project", "mount": mount}),
+            )
             .unwrap();
         let cleared = daemon
             .execute("configure-mount", &json!({"state": "Project"}))
             .unwrap();
         assert_eq!(cleared["mount"], Value::Null);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_occupied_mount_point_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = daemon(root.path());
+        let occupied = root.path().join("occupied");
+        fs::create_dir(&occupied).unwrap();
+        let error = format!(
+            "{:#}",
+            daemon
+                .execute("create", &json!({"label": "P", "mount": occupied}))
+                .unwrap_err()
+        );
+        assert!(error.starts_with("MOUNT_POINT_EXISTS"), "{error}");
+        assert!(daemon.slots().is_empty());
     }
 
     #[test]
@@ -1866,6 +1937,14 @@ mod tests {
 
     #[test]
     fn mount_paths_must_be_absolute() {
+        assert_eq!(mount_path(&json!({})).unwrap(), None);
+        assert!(mount_path(&json!({"mount": "relative"})).is_err());
+        assert_eq!(
+            mount_path(&json!({"mount": "X:"})).is_ok(),
+            cfg!(windows),
+            "a drive letter is a mount on Windows only"
+        );
+        assert!(mount_path(&json!({"mount": "XY:"})).is_err());
         assert_eq!(optional_path(&json!({}), "mount").unwrap(), None);
         assert!(optional_path(&json!({"mount": "relative"}), "mount").is_err());
         assert!(optional_path(&json!({"mount": 3}), "mount").is_err());

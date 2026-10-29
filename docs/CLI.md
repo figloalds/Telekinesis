@@ -24,12 +24,11 @@ tkfs manage --help
 tkfs manage status --help
 ```
 
-Mounts are not part of this release of the orchestrator: every folder runs
-headless. `create`, `receive` and `configure-mount` keep their
-`--mount PATH` option for the mounts plan, but refuse it with
-`MOUNT_UNSUPPORTED` before anything is created or changed; `attach`,
-`detach`, `mount-now`, `-C DIRECTORY` and branch mounts arrive with the
-mounts plan.
+A folder mounts when it has a mount point: `create`, `receive` and
+`configure-mount` take `--mount PATH` (a directory that does not exist yet;
+on Windows also a drive letter such as `X:`), and the folder's worker serves
+it while it runs. Without one the folder runs headless. `attach`, `detach`,
+`mount-now`, `-C DIRECTORY` and branch mounts are not part of this release.
 
 ## Global options
 
@@ -157,9 +156,10 @@ peers: 1
 tkfs manage create Projects
 tkfs manage create Archive --headless
 tkfs manage create Projects --repo REPO_ID
-tkfs manage create Projects --mount /srv/tkfs/Projects   # refused: MOUNT_UNSUPPORTED
+tkfs manage create Projects --mount /srv/tkfs/Projects
 tkfs create Projects                     # the same as manage create
-tkfs manage configure-mount STATE        # no --mount: clear the stored mount
+tkfs manage configure-mount STATE --mount X:   # stopped folders only
+tkfs manage configure-mount STATE        # no --mount: run headless
 tkfs manage start STATE
 tkfs manage stop STATE
 tkfs manage stop STATE --no-wait
@@ -169,10 +169,10 @@ tkfs manage retry STATE
 
 - `create LABEL` makes a new folder (a new repository, or `--repo ID` for an
   existing repository id), creates its state directory under `DATA/` and
-  starts its worker. The label must be unique. Folders are headless:
-  `--mount PATH` fails with `MOUNT_UNSUPPORTED: mounts of
-  orchestrator-managed folders arrive with a later release; create the
-  folder headless`, and nothing is created.
+  starts its worker. The label must be unique. With `--mount PATH` the
+  worker mounts the folder there (its parent directory is created; the
+  mount point itself must not exist: `MOUNT_POINT_EXISTS`, nor be another
+  folder's: `MOUNT_IN_USE`; nothing is created then).
   If the folder's store cannot be created it fails with `FOLDER_INIT_FAILED`
   and nothing of it is kept, so the same label and repository can be tried
   again.
@@ -180,10 +180,9 @@ tkfs manage retry STATE
   `WORKER_LIMIT`. `tkfs create` is the same command. Creating a folder of a
   repository this orchestrator already holds fails with
   `REPO_ALREADY_PRESENT`.
-- `configure-mount` without `--mount` clears the stored mount of a
-  **stopped** folder (`FOLDER_RUNNING` otherwise); with `--mount` it is
-  refused (`MOUNT_UNSUPPORTED`). A worker is never started with a mount,
-  whatever the catalog holds.
+- `configure-mount` sets (`--mount PATH`) or clears (no `--mount`) the
+  mount of a **stopped** folder (`FOLDER_RUNNING` otherwise), checked as for
+  `create`. The next start mounts there.
 - `start` sets the folder to run (persisted) and starts its worker;
   `WORKER_LIMIT` if too many run.
 - `stop` records that the folder should stay stopped, then asks the worker
@@ -248,8 +247,7 @@ tkfs manage unpair INSTALLATION
   and `label`).
 - `receive ENDPOINT REPO LABEL` creates a local folder of that repository
   (it must be one the host publishes: `REPO_NOT_PUBLISHED` otherwise) and
-  starts syncing it; headless like `create` (`--mount` is refused with
-  `MOUNT_UNSUPPORTED`).
+  starts syncing it; `--mount` as for `create`.
 - `unpair INSTALLATION` (the id `peers` shows) asks the other host to forget
   this one (best effort), then forgets the peer and closes its connections.
   If the other host also dials this one, that pairing is its own: unpair it

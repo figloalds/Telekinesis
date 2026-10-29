@@ -188,6 +188,24 @@ pub fn ensure_mount_point_free(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// WinFsp creates only the last component of a directory mount: its parent
+/// (`default_mount_directory`, say) is created here, before any volume
+/// exists, so this is never I/O on the served namespace.
+fn create_mount_parent(path: &Path) -> Result<()> {
+    let text = path.as_os_str().to_string_lossy();
+    if text.len() == 2 && text.ends_with(':') {
+        return Ok(());
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("MOUNT_PARENT_UNAVAILABLE: {}", parent.display()))?;
+    }
+    Ok(())
+}
+
 pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
     let mut mount = lock(&MOUNT);
     ensure!(mount.is_none(), "MOUNT_ALREADY_ATTACHED");
@@ -198,6 +216,7 @@ pub fn attach(engine: Arc<Engine>, path: &Path) -> Result<()> {
     let backing_root = { lock(&engine.store).root.clone() };
     validate_backing_paths(&backing_root, path)?;
     ensure_mount_point_free(path)?;
+    create_mount_parent(path)?;
     // Explicit opt-in fault seam for VM lifecycle acceptance; never set during
     // normal operation. Every stage follows the real native unwind path.
     let fault = match std::env::var("TKFS_TEST_MOUNT_FAIL").as_deref() {
