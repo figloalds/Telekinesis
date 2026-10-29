@@ -72,6 +72,7 @@ The code tells what to do:
 | `CLOCK_INVALID` | The system clock reads before 2020-01-01 UTC (or a peer's does). The orchestrator, workers and `manage pair` refuse to run. | Fix the clock (NTP), then start again. |
 | `CATALOG_INCOMPATIBLE` | The data directory holds a catalog this build cannot read (another schema version, or a `folders.sqlite` of an earlier release). Nothing is migrated or written. | Move the data directory aside and start fresh (`reset-pairing-code`, `pair`, `receive`). |
 | `CONFIG_VERSION_2_REQUIRED`, `INVALID_CONFIG` | `orchestrator.toml` is not a format 2 file of this release, or has unknown fields. It is never overwritten. | Fix the file, or remove it to get a fresh one. |
+| `DESKTOP_CONFIG_UNSUPPORTED` | The configuration was written by an older desktop build (`format_version = 3` or a `folders` list). It is never overwritten or migrated. | Move it aside; tkfs creates a new `orchestrator.toml`. |
 | `LISTEN_FAILED` | The `[network] listen` address cannot be bound. | Free the port or change `listen`. |
 | `ALREADY_RUNNING` | Another orchestrator (or worker) holds this data directory (exit status 75). | Use that one, or stop it first. |
 | `ORCHESTRATOR_NOT_RUNNING`, `WS_CONNECT_FAILED` | No orchestrator answers for this configuration's data directory. | Start it (`tkfs -f FILE start`); run `manage` as its user. |

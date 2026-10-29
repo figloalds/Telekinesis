@@ -99,6 +99,15 @@ impl Config {
                 return Err(error).with_context(|| format!("reading {}", path.display()));
             }
         };
+        if let Ok(table) = text.parse::<toml::Table>()
+            && (table.contains_key("folders")
+                || table.get("format_version").and_then(toml::Value::as_integer) == Some(3))
+        {
+            bail!(
+                "DESKTOP_CONFIG_UNSUPPORTED: {} was written by an older desktop build (format_version 3 with folders); move it aside and tkfs creates a new orchestrator.toml",
+                path.display()
+            );
+        }
         let mut config: Self = toml::from_str(&text).map_err(|error| {
             anyhow::anyhow!(
                 "INVALID_CONFIG: this build requires the folder-first format_version=2 configuration: {error}"
@@ -238,6 +247,34 @@ mod tests {
     }
 
     #[test]
+    fn an_old_desktop_config_is_refused_by_name_and_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        for body in [
+            "format_version = 3
+data_directory = 'data'
+default_mount_directory = 'mounts'
+folders = []
+",
+            "format_version = 2
+data_directory = 'data'
+default_mount_directory = 'mounts'
+folders = []
+",
+        ] {
+            let path = write(dir.path(), body);
+            for result in [Config::load(&path), Config::load_or_init(&path)] {
+                let message = err(result);
+                assert!(
+                    message.starts_with("DESKTOP_CONFIG_UNSUPPORTED:"),
+                    "{message}"
+                );
+                assert!(message.contains(&path.display().to_string()), "{message}");
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        }
+    }
+
+    #[test]
     fn initialize_writes_defaults_and_refuses_to_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orchestrator.toml");
@@ -274,11 +311,11 @@ mod tests {
     }
 
     #[test]
-    fn format_3_is_refused() {
+    fn a_format_other_than_2_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(
             dir.path(),
-            "format_version = 3\ndata_directory = 'd'\ndefault_mount_directory = 'm'\n",
+            "format_version = 4\ndata_directory = 'd'\ndefault_mount_directory = 'm'\n",
         );
         assert!(err(Config::load(&path)).starts_with("CONFIG_VERSION_2_REQUIRED"));
     }
