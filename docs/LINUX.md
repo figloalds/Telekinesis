@@ -46,9 +46,9 @@ it closes its peer connections and stops every folder in parallel within a
 files open) is force-stopped, and one still alive at about 27 s is killed;
 each forced folder is logged as `FORCED_STOP`. Committed data is durable and
 unsealed scratch files are re-sealed at the next start. The orchestrator then
-exits 0. A worker started by hand (`tkfs daemon`) also stops on SIGINT and
-SIGTERM; with files open it refuses (`BUSY_VIEW`, logged), so send the signal
-again once they are closed.
+exits 0. A worker started by hand (`tkfs daemon`) does not handle signals:
+stop it with `tkfs --state DIR stop` (refused with `BUSY_VIEW` while files
+are open).
 
 Management commands read the orchestrator's token
 (`DATA/orchestrator.token`, owner-only), so run them as the orchestrator's
@@ -57,7 +57,8 @@ user (`sudo -u USER tkfs ...`).
 ## Adoption after a crash
 
 Workers are separate processes. If the orchestrator dies (a crash, `kill -9`,
-a service restart that leaves the group alone), its workers keep running.
+a service restart that leaves the group alone), its workers keep running (a supervised worker exits by itself after
+10 minutes without contact from an orchestrator).
 The next orchestrator on the same data directory reads each folder's
 `worker.json` and **adopts** a worker only when the process matches: same pid,
 same start time and same executable image. A worker that matches is
