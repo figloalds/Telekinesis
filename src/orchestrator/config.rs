@@ -342,7 +342,7 @@ folders = []
     fn a_different_cwd_config_is_announced_only_when_nothing_chose_the_file() {
         use std::ffi::OsStr;
         let cwd = Path::new(r"C:\work");
-        let beside_exe = Path::new(r"C:Tools	kfsorchestrator.toml");
+        let beside_exe = Path::new(r"C:\Tools\tkfs\orchestrator.toml");
         let notice = |explicit, env, resolved: &Path, present| {
             config_location_notice(explicit, env, resolved, cwd, present)
         };

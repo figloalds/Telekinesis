@@ -27,8 +27,10 @@ cargo fmt --check
 
 `tkfs` is one executable: the orchestrator (one per data directory), the
 worker it runs for each folder, and the `manage` client. Folders run headless
-for now; mounts, branches, remote conflict resolution and the desktop as an
-orchestrator client follow in later plans.
+for now; mounts, branches and remote conflict resolution follow in later
+plans. On Windows the desktop (`tkfs` with no command) is a client of the
+orchestrator: it attaches to the one running for its configuration or starts
+it in the background.
 
 ```sh
 # Terminal 1: creates orchestrator.toml and data/ beside it on first start.
@@ -73,6 +75,11 @@ The code tells what to do:
 | `CATALOG_INCOMPATIBLE` | The data directory holds a catalog this build cannot read (another schema version, or a `folders.sqlite` of an earlier release). Nothing is migrated or written. | Move the data directory aside and start fresh (`reset-pairing-code`, `pair`, `receive`). |
 | `CONFIG_VERSION_2_REQUIRED`, `INVALID_CONFIG` | `orchestrator.toml` is not a format 2 file of this release, or has unknown fields. It is never overwritten. | Fix the file, or remove it to get a fresh one. |
 | `DESKTOP_CONFIG_UNSUPPORTED` | The configuration was written by an older desktop build (`format_version = 3` or a `folders` list). It is never overwritten or migrated. | Move it aside; tkfs creates a new `orchestrator.toml`. |
+| `CONFIG_WRITE_FAILED` | A missing `orchestrator.toml` cannot be created at its location (read-only or missing directory, for example `Program Files`). | Pass `-f PATH` or set `TKFS_CONFIG` to a writable location. |
+| `CONFIG_LOCATION_CHANGED` | A Windows command found neither `-f` nor `TKFS_CONFIG` and an `orchestrator.toml` in the current directory, but uses the one next to `tkfs.exe` (printed as a notice; the command continues). | Pass `-f orchestrator.toml` to use the current directory's file. |
+| `ORCHESTRATOR_START_FAILED` | The desktop started an orchestrator that exited with an error (exit status other than 75), or could not be waited for. | Read `DATA/logs/orchestrator.log` for the reason. |
+| `ORCHESTRATOR_START_TIMEOUT` | No orchestrator answered within 30 s of the desktop starting one. A start that had to be killed and did not go also reports `STRANDED_PROCESS`. | Read `DATA/logs/orchestrator.log`; end the stranded process if one is named. |
+| `INVALID_FOLDER_NAME` | The desktop cannot use a folder's label as a mount directory name (path separators, `<>:"/\|?*` or control characters). | Rename the folder, or choose a mount directory. |
 | `LISTEN_FAILED` | The `[network] listen` address cannot be bound. | Free the port or change `listen`. |
 | `ALREADY_RUNNING` | Another orchestrator (or worker) holds this data directory (exit status 75). | Use that one, or stop it first. |
 | `ORCHESTRATOR_NOT_RUNNING`, `WS_CONNECT_FAILED` | No orchestrator answers for this configuration's data directory. | Start it (`tkfs -f FILE start`); run `manage` as its user. |
