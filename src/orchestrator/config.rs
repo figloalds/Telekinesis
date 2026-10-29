@@ -134,7 +134,10 @@ impl Config {
         };
         if let Ok(table) = text.parse::<toml::Table>()
             && (table.contains_key("folders")
-                || table.get("format_version").and_then(toml::Value::as_integer) == Some(3))
+                || table
+                    .get("format_version")
+                    .and_then(toml::Value::as_integer)
+                    == Some(3))
         {
             bail!(
                 "DESKTOP_CONFIG_UNSUPPORTED: {} was written by an older desktop build (format_version 3 with folders); move it aside and tkfs creates a new orchestrator.toml",
@@ -276,7 +279,10 @@ mod tests {
             resolve_path(Some(Path::new("a.toml")), env("b.toml"), exe, cwd),
             cwd.join("a.toml")
         );
-        assert_eq!(resolve_path(None, env("b.toml"), exe, cwd), cwd.join("b.toml"));
+        assert_eq!(
+            resolve_path(None, env("b.toml"), exe, cwd),
+            cwd.join("b.toml")
+        );
         assert_eq!(
             resolve_path(None, env(""), exe, cwd),
             resolve_path(None, None, exe, cwd)
@@ -287,7 +293,10 @@ mod tests {
             PathBuf::from(r"C:\Tools\tkfs\orchestrator.toml")
         );
         #[cfg(not(windows))]
-        assert_eq!(resolve_path(None, None, exe, cwd), cwd.join("orchestrator.toml"));
+        assert_eq!(
+            resolve_path(None, None, exe, cwd),
+            cwd.join("orchestrator.toml")
+        );
     }
 
     #[test]
@@ -347,7 +356,10 @@ folders = []
             config_location_notice(explicit, env, resolved, cwd, present)
         };
         let line = notice(None, None, beside_exe, true).unwrap();
-        assert!(line.starts_with("CONFIG_LOCATION_CHANGED: using "), "{line}");
+        assert!(
+            line.starts_with("CONFIG_LOCATION_CHANGED: using "),
+            "{line}"
+        );
         assert!(line.contains(&beside_exe.display().to_string()), "{line}");
         assert!(
             line.contains(&cwd.join("orchestrator.toml").display().to_string()),

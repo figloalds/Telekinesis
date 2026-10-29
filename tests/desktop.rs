@@ -177,7 +177,9 @@ fn spawns_then_attaches_then_starts_again_after_shutdown() -> Result<()> {
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<std::io::Result<_>>()?;
     assert!(
-        files.iter().all(|name| name.starts_with("orchestrator.log")),
+        files
+            .iter()
+            .all(|name| name.starts_with("orchestrator.log")),
         "{files:?}"
     );
 
@@ -341,10 +343,7 @@ fn an_unwritable_config_location_is_named_in_the_error() -> Result<()> {
         error.contains(&config_path.display().to_string()),
         "{error}"
     );
-    assert!(
-        error.contains("pass -f PATH or set TKFS_CONFIG"),
-        "{error}"
-    );
+    assert!(error.contains("pass -f PATH or set TKFS_CONFIG"), "{error}");
     let entries: Vec<_> = fs::read_dir(home.path())?
         .map(|entry| entry.map(|entry| entry.file_name()))
         .collect::<std::io::Result<_>>()?;
