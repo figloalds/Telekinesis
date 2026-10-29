@@ -1,0 +1,119 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Desktop GUI mockup (2026-10-29)</title><style>
+:root{color-scheme:dark;--background:#0f1115;--foreground:#e6e8ee;--muted-foreground:#8b93a7;--card:#161a21;--secondary:#1d222b;--border:#2a303b;--accent:#2b5cd6;--accent-foreground:#fff;--primary:#3b74f0;--primary-foreground:#fff;--success:#3ccf8e;--warning:#f0a43b;--code-background:#0b0d11;--radius:8px;--font-sans:Segoe UI,system-ui,sans-serif;--font-mono:Consolas,monospace}
+body{margin:16px;max-width:760px;font-family:var(--font-sans);font-size:12px;background:var(--background);color:var(--foreground)}
+h3{font-size:13px;margin:18px 0 6px}
+.note{color:var(--muted-foreground);font-size:11px;margin:0 0 8px}
+.win{border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;display:flex;background:var(--card)}
+.side{width:170px;background:var(--secondary);padding:10px;display:flex;flex-direction:column;gap:4px}
+.brand{font-weight:700;font-size:14px;margin-bottom:6px}
+.tab{padding:5px 8px;border-radius:5px}
+.tab.on{background:var(--accent);color:var(--accent-foreground)}
+.lbl{color:var(--muted-foreground);font-size:10px;text-transform:uppercase;letter-spacing:.05em;margin-top:8px}
+.peer{display:flex;gap:6px;align-items:center;padding:3px 8px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--success)}
+.dot.off{background:var(--muted-foreground)}
+.link{color:var(--primary);padding:3px 8px}
+.host{margin-top:auto;border-top:1px solid var(--border);padding-top:8px;font-size:11px;color:var(--muted-foreground);line-height:1.6}
+.host b{color:var(--foreground)}
+.main{flex:1;padding:12px;display:flex;flex-direction:column;gap:10px}
+.bar{display:flex;gap:6px;justify-content:flex-end}
+.btn{border:1px solid var(--border);border-radius:5px;padding:4px 10px;font-size:11px;white-space:nowrap}
+.btn.p{background:var(--primary);color:var(--primary-foreground);border-color:var(--primary)}
+.btn.s{padding:2px 7px;font-size:10px}
+.btn.new{border-color:var(--warning);box-shadow:0 0 0 1px var(--warning)}
+.stats{display:flex;gap:6px}
+.stat{flex:1;border:1px solid var(--border);border-radius:5px;padding:6px}
+.stat b{display:block;font-size:15px}
+table{width:100%;border-collapse:collapse}
+td,th{text-align:left;padding:6px 4px;border-bottom:1px solid var(--border)}
+th{color:var(--muted-foreground);font-weight:400;font-size:10px}
+.chip{border-radius:9px;padding:1px 7px;font-size:10px;background:var(--secondary)}
+.ok{color:var(--success)}.warn{color:var(--warning)}
+.dlgs{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.dlg{border:1px solid var(--border);border-radius:var(--radius);background:var(--card);padding:12px;display:flex;flex-direction:column;gap:6px}
+.dlg .t{font-weight:600;font-size:13px}
+.in{border:1px solid var(--border);border-radius:5px;padding:5px 7px}
+.in.ph{color:var(--muted-foreground);font-style:italic}
+.chk{display:flex;gap:6px;align-items:flex-start}
+.box{width:11px;height:11px;border:1px solid var(--muted-foreground);border-radius:2px;flex:none;margin-top:1px}
+.radio{display:flex;gap:6px;align-items:center}
+.rd{width:10px;height:10px;border-radius:50%;border:1px solid var(--muted-foreground)}
+.rd.on{background:var(--primary);border-color:var(--primary)}
+.row{display:flex;gap:6px;justify-content:flex-end;margin-top:4px}
+.code{font-family:var(--font-mono);font-size:11px;word-break:break-all;background:var(--code-background);padding:6px;border-radius:5px}
+.tag{font-size:10px;color:var(--warning)}
+.list{border:1px solid var(--border);border-radius:5px}
+.list div{padding:4px 7px;border-bottom:1px solid var(--border)}
+.list div:last-child{border:0}
+.list .sel{background:var(--accent);color:var(--accent-foreground)}
+</style></head><body>
+<p class="note">Approved in conversation on 2026-10-29. Companion to 2026-10-29-desktop-orchestrator-client-design.md. Layout from 1521d6b2; orange outline = new. Send to host lands after the two-way content prerequisite (design §7).</p>
+
+<h3>1 · Main window</h3>
+<div class="win">
+ <div class="side">
+  <div class="brand">Telekinesis</div>
+  <div class="tab on">Folders · 3</div>
+  <div class="tab">Activity</div>
+  <div class="lbl">Peers</div>
+  <div class="peer"><span class="dot"></span>office-pc</div>
+  <div class="peer"><span class="dot off"></span>laptop</div>
+  <div class="link">+ Pair with a host</div>
+  <div class="host"><b>Host · desk-01</b><br>Orchestrator <span class="ok">Running</span><br>Listening 0.0.0.0:43180<br><span class="btn s">Log</span> <span class="btn s">Settings</span></div>
+ </div>
+ <div class="main">
+  <div class="bar"><span class="btn">Pair with a host</span><span class="btn p">New folder</span></div>
+  <div class="stats">
+   <div class="stat">In sync<b>2 / 3</b></div><div class="stat">Mounted<b>1</b></div>
+   <div class="stat">Peers online<b>1 / 2</b></div><div class="stat">Transfer<b>1.2 MB/s</b></div>
+  </div>
+  <table>
+   <tr><th>Folder</th><th>Sync</th><th>Mount</th><th></th></tr>
+   <tr><td>Acme</td><td class="ok">In sync · office-pc</td><td>T:\Acme</td><td><span class="btn s new">Send to host</span> <span class="btn s">Details</span></td></tr>
+   <tr><td>Photos</td><td class="warn">Syncing 41%</td><td><span class="chip">Headless</span></td><td><span class="btn s new">Send to host</span> <span class="btn s">Details</span></td></tr>
+   <tr><td>Scratch</td><td>Local only</td><td>T:\Scratch</td><td><span class="btn s new">Send to host</span> <span class="btn s">Details</span></td></tr>
+  </table>
+ </div>
+</div>
+
+<h3>2 · Dialogs</h3>
+<div class="dlgs">
+ <div class="dlg">
+  <div class="t">New folder</div>
+  Folder name
+  <div class="in">Acme</div>
+  Mount point
+  <div class="in ph">T:\Telekinesis\Acme (default)</div>
+  <div class="chk"><span class="box"></span><span><b>Headless</b> <span class="tag">new</span><br><span class="note">Sync without a mount.</span></span></div>
+  <div class="row"><span class="btn">Cancel</span><span class="btn p">Create &amp; mount</span></div>
+ </div>
+ <div class="dlg">
+  <div class="t">Send “Acme” to a host <span class="tag">new</span></div>
+  Host
+  <div class="list"><div class="sel">office-pc · online</div><div>laptop · offline</div></div>
+  On that host
+  <div class="radio"><span class="rd on"></span>Mounted, in its default mount folder</div>
+  <div class="radio"><span class="rd"></span>Headless</div>
+  <div class="row"><span class="btn">Cancel</span><span class="btn p">Send</span></div>
+ </div>
+ <div class="dlg">
+  <div class="t">Pair with a host</div>
+  Host address
+  <div class="in">ws://office-pc:43180</div>
+  The host’s pairing code
+  <div class="in ph">paste the 64-character code shown on that host</div>
+  <div class="row"><span class="btn">Cancel</span><span class="btn p">Pair</span></div>
+  <span class="note">After pairing: Browse its folders → Receive (mounted / headless).</span>
+ </div>
+ <div class="dlg">
+  <div class="t">Settings · this host</div>
+  <span class="note">Config: C:\Tools\tkfs\orchestrator.toml</span>
+  Generate a code for another host to pair with this one. A new code revokes hosts paired with the old one.
+  <span class="btn" style="align-self:flex-start">Generate a new pairing code</span>
+  <div class="code">9f3c1a7e5b2d48c0e6a1f4b7d29c83e05a6b1d7f2e8c4a9b03d6e1f7a5c2b8d4</div>
+  <span class="btn s" style="align-self:flex-start">Copy</span>
+  <span class="note">Shown once. Closing the window leaves the orchestrator and folders running.</span>
+  <div class="row"><span class="btn">Stop orchestrator</span></div>
+ </div>
+</div>
+</body></html>
