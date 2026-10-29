@@ -391,7 +391,7 @@ export component AppWindow inherits Window {
     callback start-orchestrator();
     callback search-folders(string);
     callback create-folder(string /*name*/, string /*mount*/, bool /*headless*/);
-    callback configure-mount(string, string);
+    callback configure-mount(string /*state*/, string /*mount*/, bool /*headless*/);
     callback pair(string, string);
     callback remote-list(string);
     callback receive-folder(string /*endpoint*/, string /*repo*/, string /*label*/, string /*mount*/, bool /*headless*/);
@@ -798,16 +798,15 @@ export component AppWindow inherits Window {
                         Field { placeholder: "Project files"; text <=> root.folder-name; enabled: root.idle; }
                     }
                     Label { text: "Mount point"; }
-                    if root.dialog == "create": Field { placeholder: root.default-mount-directory + "\\" + root.folder-name + " (default)"; text <=> root.mount-path; enabled: root.idle && !root.headless; }
-                    if root.dialog == "mount": Field { placeholder: "e.g. C:\\Telekinesis\\projects"; text <=> root.mount-path; enabled: root.idle; }
-                    if root.dialog == "create": VerticalLayout { spacing: 2px;
+                    Field { placeholder: root.default-mount-directory + "\\" + (root.dialog == "create" ? root.folder-name : root.selected-label) + " (default)"; text <=> root.mount-path; enabled: root.idle && !root.headless; }
+                    VerticalLayout { spacing: 2px;
                         CheckBox { text: "Headless"; checked <=> root.headless; enabled: root.idle; }
                         Muted { text: "Sync without a mount."; }
                     }
-                    if root.dialog == "mount": Muted { text: "Leave empty to run without a filesystem mount. Start the folder after saving."; wrap: word-wrap; }
+                    Muted { text: "Leave empty for the default. A name alone goes under " + root.default-mount-directory + "." + (root.dialog == "mount" ? " Start the folder after saving." : ""); wrap: word-wrap; }
                     HorizontalLayout { alignment: end; spacing: 8px;
                         Button { text: "Cancel"; enabled: root.idle; clicked => { root.dismiss(); } }
-                        Button { text: root.dialog == "mount" ? "Save mount point" : root.headless ? "Create" : "Create & mount"; primary: true; enabled: root.idle && (root.dialog != "create" || root.folder-name != ""); clicked => { if root.dialog == "create" { root.create-folder(root.folder-name, root.mount-path, root.headless); } else { root.configure-mount(root.selected-state, root.mount-path); } } }
+                        Button { text: root.dialog == "mount" ? (root.headless ? "Save as headless" : "Save mount point") : root.headless ? "Create" : "Create & mount"; primary: true; enabled: root.idle && (root.dialog != "create" || root.folder-name != ""); clicked => { if root.dialog == "create" { root.create-folder(root.folder-name, root.mount-path, root.headless); } else { root.configure-mount(root.selected-state, root.mount-path, root.headless); } } }
                     }
                 }
                 if root.dialog == "stop-first": VerticalLayout { spacing: 16px;

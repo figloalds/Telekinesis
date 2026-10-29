@@ -96,7 +96,10 @@ pub fn default_mount(dir: &Path, label: &str) -> Result<PathBuf> {
 }
 
 /// Where a folder mounts: `None` when headless, the default under `dir` when
-/// `path_text` is blank, else the path as typed (trimmed).
+/// `path_text` is blank, an absolute path or drive letter (`X:`) as typed
+/// (trimmed), and a relative one (`Projects`, `work\Projects`) under `dir`.
+/// `INVALID_FOLDER_NAME` when a relative part is not a plain name (`..`,
+/// `C:name`, `\name`, reserved characters).
 pub fn mount_choice(
     dir: &Path,
     label: &str,
@@ -110,7 +113,17 @@ pub fn mount_choice(
     if path_text.is_empty() {
         return default_mount(dir, label).map(Some);
     }
-    Ok(Some(PathBuf::from(path_text)))
+    let typed = PathBuf::from(path_text);
+    let drive = matches!(path_text.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic());
+    if typed.is_absolute() || drive {
+        return Ok(Some(typed));
+    }
+    let mut mount = dir.to_path_buf();
+    for part in typed.components() {
+        // Anything but a plain name (`..`, a prefix, a root) is refused here.
+        mount = default_mount(&mount, &part.as_os_str().to_string_lossy())?;
+    }
+    Ok(Some(mount))
 }
 
 /// A pairing code as typed or pasted, without any whitespace.
@@ -142,6 +155,28 @@ mod tests {
             Some(PathBuf::from(r"D:\X"))
         );
         assert_eq!(mount_choice(root, "Acme", r"D:\X", true).unwrap(), None);
+        assert_eq!(
+            mount_choice(root, "Acme", "M:", false).unwrap(),
+            Some(PathBuf::from("M:"))
+        );
+    }
+    #[test]
+    fn a_relative_mount_goes_under_the_mount_root() {
+        let root = Path::new(r"C:\TK\mounts");
+        assert_eq!(
+            mount_choice(root, "Acme", " Projects ", false).unwrap(),
+            Some(root.join("Projects"))
+        );
+        assert_eq!(
+            mount_choice(root, "Acme", "work/Projects", false).unwrap(),
+            Some(root.join("work").join("Projects"))
+        );
+        for typed in ["..", r"..\x", "a/../b", "./a"] {
+            let e = mount_choice(root, "Acme", typed, false)
+                .unwrap_err()
+                .to_string();
+            assert!(e.starts_with("INVALID_FOLDER_NAME"), "{typed:?}: {e}");
+        }
     }
     #[test]
     fn default_mount_refuses_labels_that_are_not_one_path_segment() {

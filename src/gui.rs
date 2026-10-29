@@ -248,16 +248,17 @@ fn perform(
             done("Folder restarted")
         }
         "configure-mount" => {
-            let mount = a.trim();
-            let mount = if mount.is_empty() {
-                Value::Null
-            } else {
-                json!(mount)
-            };
+            // As in Create: blank is the default under the mount directory
+            // (by the folder's label), Headless clears the mount.
+            let mount = mount_choice(&mount_directory, b, a, headless)?;
             client.act("configure-mount", json!({"state": state, "mount": mount}))?;
             Done {
                 close: true,
-                ..done("Mount point saved")
+                ..done(if mount.is_some() {
+                    "Mount point saved; start the folder to mount it"
+                } else {
+                    "Folder set to sync headless"
+                })
             }
         }
         "resolve" => {
@@ -654,6 +655,18 @@ mod tests {
         assert_eq!(row.state, "a");
         assert_eq!(row.label, "Folder a");
         assert_eq!(row.mount_chip.text, "Headless");
+
+        // A configured mount shows as mounted only while the worker's
+        // heartbeat says it serves it.
+        let mut configured = entry("m", running(), false, Value::Null);
+        configured["record"]["mount"] = json!(r"C:\TK\mounts\M");
+        assert_eq!(folder_row(&configured).mount_chip.text, "Not mounted");
+        configured["heartbeat"]["mounts"] = json!([r"C:\TK\mounts\M"]);
+        let live = folder_row(&configured);
+        assert_eq!(live.mount_chip.text, "Mounted");
+        assert_eq!(live.mount_chip.action, "open");
+        configured["phase"] = json!({"phase": "Stopped"});
+        assert_eq!(folder_row(&configured).mount_chip.text, "Not mounted");
         assert!(row.running);
         assert_eq!(row.life.text, "Running");
         assert!(row.error_title.is_empty());

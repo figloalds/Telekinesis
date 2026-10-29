@@ -41,6 +41,14 @@ fn phase(entry: &Value) -> &str {
 fn active(entry: &Value) -> bool {
     matches!(phase(entry), "Running" | "Starting" | "Backoff")
 }
+/// Whether the folder's worker serves its mount right now (its heartbeat
+/// says so), not merely has one configured.
+fn mounted(entry: &Value) -> bool {
+    phase(entry) == "Running"
+        && entry["heartbeat"]["mounts"]
+            .as_array()
+            .is_some_and(|mounts| !mounts.is_empty())
+}
 /// One row of the folder table, from a `status.folders[i]` entry.
 fn folder_row(entry: &Value) -> FolderRow {
     let record = &entry["record"];
@@ -82,6 +90,10 @@ fn folder_row(entry: &Value) -> FolderRow {
         },
         mount_chip: if mount.is_empty() {
             chip("Headless", "muted", "", "")
+        } else if mounted(entry) {
+            chip("Mounted", "ok", "open", "Open")
+        } else if phase == "Starting" {
+            chip("Mounting", "progress", "", "")
         } else {
             chip("Not mounted", "muted", "configure-mount", "Change")
         },
@@ -460,15 +472,12 @@ fn render(ui: &AppWindow, value: Value) {
     ui.set_banner_action("".into());
     // Folders.
     let running_count = rows.iter().filter(|e| phase(e) == "Running").count();
-    let mounted = rows
-        .iter()
-        .filter(|e| e["record"]["mount"].is_string())
-        .count();
+    let mounted_count = rows.iter().filter(|e| mounted(e)).count();
     ui.set_folder_count(rows.len() as i32);
     ui.set_stat_folders(running_count.to_string().into());
     ui.set_stat_folders_detail(format!("of {}", plural(rows.len(), "folder", "folders")).into());
     ui.set_stat_folders_tone(if running_count > 0 { "ok" } else { "neutral" }.into());
-    ui.set_stat_mounted(mounted.to_string().into());
+    ui.set_stat_mounted(mounted_count.to_string().into());
     ui.set_stat_mounted_detail("Others sync headless".into());
     let search = ui.get_search().to_lowercase();
     ui.set_folders(model(
@@ -713,8 +722,16 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>, polls: mpsc::Sender<Poll>
         let _ = poller.send(Poll::Select(id.to_string()));
         if operation == "configure-mount" {
             if let Some(entry) = cached_entry(&id) {
-                ui.set_selected_label(text(&entry["record"], "label").into());
-                ui.set_mount_path(text(&entry["record"], "mount").into());
+                let label = text(&entry["record"], "label");
+                let mount = text(&entry["record"], "mount");
+                ui.set_selected_label(label.clone().into());
+                // Headless when it has no mount; the default mount shows as
+                // the blank field's placeholder rather than as typed text.
+                ui.set_headless(mount.is_empty());
+                let default = ui.get_default_mount_directory().to_string();
+                let is_default = tkfs::desktop::default_mount(Path::new(&default), &label)
+                    .is_ok_and(|path| path.as_os_str().eq_ignore_ascii_case(&mount));
+                ui.set_mount_path(if is_default { String::new() } else { mount }.into());
                 let stopped = matches!(phase(&entry), "Stopped" | "Failed");
                 ui.set_dialog(if stopped { "mount" } else { "stop-first" }.into());
             }
@@ -768,9 +785,17 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>, polls: mpsc::Sender<Poll>
     });
     let weak = ui.as_weak();
     let sender = tx.clone();
-    ui.on_configure_mount(move |id, mount| {
+    ui.on_configure_mount(move |id, mount, headless| {
         if let Some(ui) = weak.upgrade() {
-            send(&sender, &ui, "configure-mount", id.into(), args(mount));
+            ui.set_headless(headless);
+            let label = ui.get_selected_label().to_string();
+            send(
+                &sender,
+                &ui,
+                "configure-mount",
+                id.into(),
+                [mount.into(), label, String::new(), String::new()],
+            );
         }
     });
     let weak = ui.as_weak();
