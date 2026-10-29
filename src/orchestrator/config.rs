@@ -157,12 +157,24 @@ impl Config {
         Ok(config)
     }
 
+    /// Writes the default configuration to `path`, which must not exist
+    /// (`CONFIG_EXISTS` otherwise). A location that cannot be written is
+    /// `CONFIG_WRITE_FAILED: {path}: …; pass -f PATH or set TKFS_CONFIG`,
+    /// the same text for the GUI, `tkfs init` and every command that creates
+    /// a missing configuration.
     pub fn initialize(path: &Path) -> Result<Self> {
         let path = std::path::absolute(path)?;
+        let write_failed = |error: &dyn std::fmt::Display| {
+            anyhow::anyhow!(
+                "CONFIG_WRITE_FAILED: {}: {error}; pass -f PATH or set {CONFIG_ENV}",
+                path.display()
+            )
+        };
         fs::create_dir_all(
             path.parent()
                 .context("CONFIG_PARENT_REQUIRED: configuration path has no parent")?,
-        )?;
+        )
+        .map_err(|error| write_failed(&error))?;
         let config = Self {
             format_version: 2,
             data_directory: "data".into(),
@@ -176,11 +188,10 @@ impl Config {
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 bail!("CONFIG_EXISTS: {} already exists", path.display())
             }
-            Err(error) => {
-                return Err(error).with_context(|| format!("creating {}", path.display()));
-            }
+            Err(error) => return Err(write_failed(&error)),
         };
-        file.write_all(toml::to_string_pretty(&config)?.as_bytes())?;
+        file.write_all(toml::to_string_pretty(&config)?.as_bytes())
+            .map_err(|error| write_failed(&error))?;
         drop(file);
         Self::load(&path)
     }
@@ -301,6 +312,23 @@ folders = []
         assert!(err(Config::load(&path)).starts_with("CONFIG_NOT_FOUND"));
         Config::load_or_init(&path).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn an_unwritable_location_is_config_write_failed_with_the_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write(dir.path(), "not a directory");
+        let path = file.join("orchestrator.toml");
+        for result in [Config::load_or_init(&path), Config::initialize(&path)] {
+            let message = err(result);
+            assert!(message.starts_with("CONFIG_WRITE_FAILED:"), "{message}");
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(
+                message.ends_with("; pass -f PATH or set TKFS_CONFIG"),
+                "{message}"
+            );
+        }
+        assert!(err(Config::initialize(&file)).starts_with("CONFIG_EXISTS"));
     }
 
     #[test]

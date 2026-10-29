@@ -143,8 +143,24 @@ const MUTATIONS: &[&str] = &[
 ];
 fn main() {
     if let Err(error) = run() {
-        eprintln!("{error:#}");
+        report(&error);
         std::process::exit(1);
+    }
+}
+/// The error that ends the process. When stderr is captured into the
+/// process log (a spawned orchestrator), it is written as an event: a line
+/// printed now would still sit in the capture pipe when the process exits.
+fn report(error: &anyhow::Error) {
+    use tkfs::util::log;
+    if log::file_log().is_some_and(|installed| installed.captured_stderr) {
+        let code = tkfs::model::errors::code_of(error);
+        log::emit(
+            log::Level::Fatal,
+            &code,
+            &[log::field("message", &format!("{error:#}"))],
+        );
+    } else {
+        eprintln!("{error:#}");
     }
 }
 fn run() -> Result<()> {

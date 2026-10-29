@@ -133,6 +133,9 @@ directory, not inside it.
   are kept (`orchestrator.log`, then `.1` to `.4`, the oldest dropped);
   `TKFS_LOG_ROTATE_BYTES` and `TKFS_LOG_ROTATE_FILES` change that. When run
   from a terminal or a service manager it also prints its events on stderr.
+  The desktop starts its orchestrator with stdout and stderr appended to this
+  same file: the orchestrator captures them into it as `stdout`/`stderr`
+  events, so the file is rotated like any other and each event is written once.
   Notable events: `ORCHESTRATOR_STARTED`, `ORCHESTRATOR_STOPPING`,
   `FORCED_STOP` (a worker had to be forced or killed at shutdown),
   `PEER_LANES_SKIPPED` (the connections to a paired peer could not be set up), `CLOCK_OFFSET_LARGE` (a peer's clock differs by

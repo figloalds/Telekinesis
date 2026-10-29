@@ -18,7 +18,7 @@ use tkfs::orchestrator::{
     config::Config,
     endpoint::{ControlClient, DISCOVERY_FILE},
     hub::SHUTDOWN_BOUND,
-    launcher::{self, CONSOLE_LOG, START_BOUND, Started},
+    launcher::{self, START_BOUND, Started},
     process::ObservedProcess,
 };
 
@@ -166,6 +166,20 @@ fn spawns_then_attaches_then_starts_again_after_shutdown() -> Result<()> {
 
     first.stop()?;
     assert!(!config.data_directory.join(DISCOVERY_FILE).exists());
+    // The spawned orchestrator's streams are its log: each event is in
+    // `orchestrator.log` once, and no second log file exists.
+    let logs = config.data_directory.join("logs");
+    let log = fs::read_to_string(logs.join("orchestrator.log"))?;
+    for code in ["ORCHESTRATOR_STARTED", "ORCHESTRATOR_STOPPED"] {
+        assert_eq!(log.matches(code).count(), 1, "{code} in:\n{log}");
+    }
+    let files: Vec<_> = fs::read_dir(&logs)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    assert!(
+        files.iter().all(|name| name.starts_with("orchestrator.log")),
+        "{files:?}"
+    );
 
     let (config, client, started) = launcher::ensure_running(&config_path, exe(), START_BOUND)?;
     drop(client);
@@ -208,11 +222,11 @@ fn a_failing_orchestrator_is_reported_with_its_log() -> Result<()> {
         Err(error) => format!("{error:#}"),
     };
     assert!(error.starts_with("ORCHESTRATOR_START_FAILED"), "{error}");
-    assert!(error.contains(CONSOLE_LOG), "{error}");
+    assert!(error.contains("orchestrator.log"), "{error}");
     assert!(elapsed < START_BOUND, "reported after {elapsed:?}");
     let config = Config::load(&config_path)?;
-    let console = fs::read_to_string(config.data_directory.join("logs").join(CONSOLE_LOG))?;
-    assert!(console.contains("LISTEN_FAILED"), "console log:\n{console}");
+    let log = fs::read_to_string(config.data_directory.join("logs").join("orchestrator.log"))?;
+    assert!(log.contains("LISTEN_FAILED"), "orchestrator.log:\n{log}");
     Ok(())
 }
 
@@ -300,11 +314,8 @@ fn an_endpoint_that_never_replies_does_not_stretch_the_bound() -> Result<()> {
         elapsed < bound + Duration::from_secs(1),
         "reported after {elapsed:?}: {error}"
     );
-    let console = fs::read_to_string(data.join("logs").join(CONSOLE_LOG))?;
-    assert!(
-        console.contains("ALREADY_RUNNING"),
-        "console log:\n{console}"
-    );
+    let log = fs::read_to_string(data.join("logs").join("orchestrator.log"))?;
+    assert!(log.contains("ALREADY_RUNNING"), "orchestrator.log:\n{log}");
     drop(lock);
     Ok(())
 }
@@ -328,6 +339,10 @@ fn an_unwritable_config_location_is_named_in_the_error() -> Result<()> {
     assert!(error.starts_with("CONFIG_WRITE_FAILED"), "{error}");
     assert!(
         error.contains(&config_path.display().to_string()),
+        "{error}"
+    );
+    assert!(
+        error.contains("pass -f PATH or set TKFS_CONFIG"),
         "{error}"
     );
     let entries: Vec<_> = fs::read_dir(home.path())?
