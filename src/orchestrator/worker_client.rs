@@ -5,7 +5,7 @@
 //! lane's op policy; the link also refuses object ops on the control lane
 //! itself, before anything is sent.
 use super::{
-    sync::{OBJECT_BATCH, Object},
+    sync::{MissingPage, OBJECT_BATCH, Object},
     worker::Ready,
 };
 use crate::{
@@ -110,18 +110,21 @@ impl WorkerLink {
         parse("watch", &reply.body)
     }
 
-    /// `objects.missing {limit, exclude}` on the first bulk lane (object ops
-    /// are refused on the control lane): up to `limit` content objects the
-    /// worker's live entries need and its packs lack, `exclude` (at most
-    /// `sync::MAX_EXCLUDE`) left out.
+    /// `objects.missing {limit, exclude, after}` on the first bulk lane
+    /// (object ops are refused on the control lane): up to `limit` content
+    /// objects the worker's live entries need and its packs lack, `exclude`
+    /// (at most `sync::MAX_EXCLUDE`) left out, the scan resumed after the
+    /// cursor `after`. The page's `cursor` resumes after it (`None`: the scan
+    /// reached its end).
     pub fn missing(
         &self,
         limit: usize,
         exclude: &[Digest],
-    ) -> Result<Vec<(Digest, Kind)>, CallError> {
+        after: Option<&str>,
+    ) -> Result<MissingPage, CallError> {
         let reply = self.bulk[0].call(
             "objects.missing",
-            json!({"limit": limit, "exclude": exclude}),
+            json!({"limit": limit, "exclude": exclude, "after": after}),
             Vec::new(),
             Priority::Data,
             CALL_DEADLINE,

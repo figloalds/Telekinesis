@@ -7,8 +7,12 @@
 //! - `feed.outgoing {after}` → [`FeedPage`] of at most [`FEED_PAGE`] events.
 //! - `feed.apply {}`, body `Vec<Event>` → `{"applied": usize}`.
 //! - `meta.exchange {repo}`, body [`FeedRequest`] → [`FeedReply`].
-//! - `objects.missing {limit, exclude?}` → `Vec<(Digest, Kind)>`, `limit` ≤
-//!   [`BATCH`], skipping the digests of `exclude` (≤ [`MAX_EXCLUDE`]).
+//! - `objects.missing {limit, exclude?, after?}` → [`MissingPage`]
+//!   `{missing: Vec<(Digest, Kind)>, cursor}`: `limit` ≤ [`BATCH`], skipping
+//!   the digests of `exclude` (≤ [`MAX_EXCLUDE`]). The scan is resumable:
+//!   `after` is the `cursor` of the previous page, and `cursor` is `null`
+//!   once the scan reached its end (the next page without `after` starts
+//!   over).
 //! - `objects.fetch {repo}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`,
 //!   at most [`OBJECT_BATCH`] objects.
 //! - `objects.write {repo}`, body `Vec<Object>` → `{"stored": usize}`, at
@@ -67,6 +71,43 @@ pub struct FeedReply {
     pub events: Vec<Event>,
     pub more: bool,
 }
+/// One `objects.missing` page. `cursor` resumes the scan after this page
+/// (opaque; `None` when the scan reached its end).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct MissingPage {
+    pub missing: Vec<(Digest, Kind)>,
+    pub cursor: Option<String>,
+}
+/// Where a resumable `objects.missing` scan stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScanAt {
+    /// Roots after the entry with this key.
+    Roots(String),
+    /// Chunks of the manifest of the entry with this key, from this index.
+    Chunks(String, usize),
+}
+impl ScanAt {
+    fn encode(&self) -> String {
+        match self {
+            ScanAt::Roots(key) => format!("r/{key}"),
+            ScanAt::Chunks(key, index) => format!("c/{index}/{key}"),
+        }
+    }
+    fn decode(cursor: &str) -> Result<Self> {
+        let invalid = || anyhow::anyhow!("INVALID_REQUEST: malformed objects.missing cursor");
+        if let Some(key) = cursor.strip_prefix("r/") {
+            return Ok(ScanAt::Roots(key.to_owned()));
+        }
+        let (index, key) = cursor
+            .strip_prefix("c/")
+            .and_then(|rest| rest.split_once('/'))
+            .ok_or_else(invalid)?;
+        Ok(ScanAt::Chunks(
+            key.to_owned(),
+            index.parse().map_err(|_| invalid())?,
+        ))
+    }
+}
 /// One page of a worker's journal: the events after the requested sequence,
 /// `cursor` = the last one's sequence (or the request's when empty).
 #[derive(Serialize, Deserialize)]
@@ -121,23 +162,38 @@ impl Service {
         })
     }
     /// Content objects of live entries in the current projection that the
-    /// packs lack: every file's root first, then the chunks of manifests that
-    /// are present. At most `limit` (clamped to [`BATCH`]), without duplicates
-    /// and without the digests of `exclude`.
-    fn missing(&self, limit: usize, exclude: &BTreeSet<Digest>) -> Result<Vec<(Digest, Kind)>> {
+    /// packs lack, in a deterministic scan: every file's root first (by entry
+    /// key), then the chunks of manifests that are present. At most `limit`
+    /// (clamped to [`BATCH`]), without duplicates within the page and without
+    /// the digests of `exclude`, resuming after `after`. The cursor names the
+    /// last position scanned when the page filled up, `None` at the end.
+    fn missing(
+        &self,
+        limit: usize,
+        exclude: &BTreeSet<Digest>,
+        after: Option<&ScanAt>,
+    ) -> Result<MissingPage> {
         let limit = limit.min(BATCH);
         let mut wanted = Vec::new();
         if limit == 0 {
-            return Ok(wanted);
+            return Ok(MissingPage {
+                missing: wanted,
+                cursor: after.map(ScanAt::encode),
+            });
         }
         let entries = lock(&self.engine.store).projection().entries.clone();
         let content = self.engine.working.content();
+        // In key order (the projection is a BTreeMap).
         let references: Vec<_> = entries
-            .values()
-            .filter(|entry| !entry.deleted)
-            .filter_map(|entry| entry.content.as_ref())
-            .filter(|reference| reference.validate().is_ok())
+            .iter()
+            .filter(|(_, entry)| !entry.deleted)
+            .filter_map(|(key, entry)| Some((key.as_str(), entry.content.as_ref()?)))
+            .filter(|(_, reference)| reference.validate().is_ok())
             .collect();
+        let page = |wanted: Vec<(Digest, Kind)>, at: ScanAt| MissingPage {
+            missing: wanted,
+            cursor: Some(at.encode()),
+        };
         let mut seen = BTreeSet::new();
         // Adds an absent object; true once `limit` objects are listed.
         let mut full = |wanted: &mut Vec<_>, digest: Digest, kind: Kind| -> Result<bool> {
@@ -149,19 +205,29 @@ impl Service {
             }
             Ok(wanted.len() >= limit)
         };
-        for reference in &references {
+        let roots_from = match after {
+            None => 0,
+            Some(ScanAt::Roots(last)) => {
+                references.partition_point(|(key, _)| *key <= last.as_str())
+            }
+            Some(ScanAt::Chunks(..)) => references.len(),
+        };
+        for (key, reference) in &references[roots_from..] {
             let kind = match reference.kind {
                 ContentKind::Direct => Kind::Chunk,
                 ContentKind::Manifest => Kind::Manifest,
             };
             if full(&mut wanted, reference.digest, kind)? {
-                return Ok(wanted);
+                return Ok(page(wanted, ScanAt::Roots((*key).to_owned())));
             }
         }
-        for reference in references
-            .iter()
-            .filter(|reference| reference.kind == ContentKind::Manifest)
-        {
+        let resume = match after {
+            Some(ScanAt::Chunks(key, index)) => Some((key.as_str(), *index)),
+            _ => None,
+        };
+        for (key, reference) in references.iter().filter(|(key, reference)| {
+            reference.kind == ContentKind::Manifest && resume.is_none_or(|(from, _)| *key >= from)
+        }) {
             // Only a present manifest: `chunks` would otherwise block on the
             // fetcher, which is this worker's own demand.
             if !content.packs.contains(reference.digest)? {
@@ -170,13 +236,20 @@ impl Service {
             let Ok(chunks) = content.chunks(reference) else {
                 continue;
             };
-            for digest in chunks {
+            let start = match resume {
+                Some((from, index)) if from == *key => index,
+                _ => 0,
+            };
+            for (index, digest) in chunks.into_iter().enumerate().skip(start) {
                 if full(&mut wanted, digest, Kind::Chunk)? {
-                    return Ok(wanted);
+                    return Ok(page(wanted, ScanAt::Chunks((*key).to_owned(), index + 1)));
                 }
             }
         }
-        Ok(wanted)
+        Ok(MissingPage {
+            missing: wanted,
+            cursor: None,
+        })
     }
     fn fetch(&self, wanted: Vec<(Digest, Kind)>) -> Result<Vec<Object>> {
         ensure!(wanted.len() <= OBJECT_BATCH, "OBJECT_BATCH_TOO_LARGE");
@@ -247,9 +320,16 @@ impl Service {
             "objects.missing" => {
                 let limit = header["limit"].as_u64().unwrap_or(BATCH as u64);
                 let limit = usize::try_from(limit).unwrap_or(BATCH);
-                Ok(serde_json::to_vec(
-                    &self.missing(limit, &exclusions(header)?)?,
-                )?)
+                let after = match &header["after"] {
+                    Value::Null => None,
+                    Value::String(cursor) => Some(ScanAt::decode(cursor)?),
+                    _ => anyhow::bail!("INVALID_REQUEST: after must be a cursor string"),
+                };
+                Ok(serde_json::to_vec(&self.missing(
+                    limit,
+                    &exclusions(header)?,
+                    after.as_ref(),
+                )?)?)
             }
             FETCH_OP => Ok(serde_json::to_vec(
                 &self.fetch(serde_json::from_slice(body)?)?,
@@ -653,6 +733,11 @@ mod tests {
         service.handle_request(op, &header, body)
     }
 
+    /// The digests of an `objects.missing` reply.
+    fn listing(reply: &[u8]) -> Result<Vec<(Digest, Kind)>> {
+        Ok(serde_json::from_slice::<MissingPage>(reply)?.missing)
+    }
+
     fn code(error: &anyhow::Error) -> String {
         crate::orchestrator::control::error_wire(error).code
     }
@@ -832,12 +917,12 @@ mod tests {
             &serde_json::to_vec(&journal(&source)?)?,
         )?;
         let missing = |limit: u64| -> Result<Vec<(Digest, Kind)>> {
-            Ok(serde_json::from_slice(&call(
+            listing(&call(
                 &incoming,
                 "objects.missing",
                 json!({"limit":limit}),
                 &[],
-            )?)?)
+            )?)
         };
         // Roots only while the manifest is absent; a deleted entry's content
         // is not wanted.
@@ -849,12 +934,12 @@ mod tests {
         assert_eq!(missing(0)?.len(), 0);
         // Excluded digests are skipped: the next ones are listed instead.
         let skipping = |exclude: Vec<Digest>| -> Result<Vec<(Digest, Kind)>> {
-            Ok(serde_json::from_slice(&call(
+            listing(&call(
                 &incoming,
                 "objects.missing",
                 json!({"limit": 64, "exclude": exclude}),
                 &[],
-            )?)?)
+            )?)
         };
         assert_eq!(
             skipping(vec![manifest.digest])?,
@@ -867,7 +952,7 @@ mod tests {
             json!({"limit": 1, "exclude": [roots[0].0]}),
             &[],
         )?;
-        let one: Vec<(Digest, Kind)> = serde_json::from_slice(&one)?;
+        let one = listing(&one)?;
         assert_eq!(one, vec![roots[1]]);
         let error = call(
             &incoming,
@@ -1066,6 +1151,86 @@ mod tests {
         );
         engine.shutdown()?;
         Ok(())
+    }
+
+    #[test]
+    fn objects_missing_pages_resume_through_every_absent_root() -> Result<()> {
+        let source_home = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let source = Engine::open(source_home.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        for i in 0..300 {
+            let h = source.open_file(&format!("file-{i:03}"), true, false, true)?;
+            source.write(h, 0, format!("content {i}").as_bytes(), false, false)?;
+            source.close(h)?;
+        }
+        source.flush(None)?;
+        let incoming = service(&target);
+        for events in journal(&source)?.chunks(MAX_APPLY) {
+            call(
+                &incoming,
+                "feed.apply",
+                json!({}),
+                &serde_json::to_vec(events)?,
+            )?;
+        }
+        let mut cursor: Option<String> = None;
+        let mut seen = BTreeSet::new();
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            assert!(pages <= 10, "more than 10 pages for 300 roots");
+            let page: MissingPage = serde_json::from_slice(&call(
+                &incoming,
+                "objects.missing",
+                json!({"limit": 32, "after": cursor}),
+                &[],
+            )?)?;
+            for (digest, _) in &page.missing {
+                assert!(seen.insert(*digest), "{digest} listed twice");
+            }
+            match page.cursor {
+                Some(next) => {
+                    assert_eq!(page.missing.len(), 32, "a page with a cursor is full");
+                    cursor = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(pages, 10);
+        assert_eq!(seen.len(), 300);
+        // Without `after` the scan starts over; a bad cursor is refused.
+        let first: MissingPage = serde_json::from_slice(&call(
+            &incoming,
+            "objects.missing",
+            json!({"limit": 32}),
+            &[],
+        )?)?;
+        assert_eq!(first.missing.len(), 32);
+        assert!(first.cursor.is_some());
+        let error = call(
+            &incoming,
+            "objects.missing",
+            json!({"limit": 32, "after": "nonsense"}),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(code(&error), "INVALID_REQUEST", "{error:#}");
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_scan_cursor_round_trips() {
+        for at in [
+            ScanAt::Roots("entity/with/slashes".into()),
+            ScanAt::Chunks("c/3/x".into(), 7),
+        ] {
+            assert_eq!(ScanAt::decode(&at.encode()).unwrap(), at);
+        }
+        assert!(ScanAt::decode("c/x/key").is_err());
+        assert!(ScanAt::decode("z").is_err());
     }
 
     #[test]

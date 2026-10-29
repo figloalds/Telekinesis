@@ -17,14 +17,16 @@
 //! * **object pump** — one thread for every Running, unpaused folder. Each
 //!   round has two passes (spec §7.8: demand never waits behind background
 //!   traffic). Pass 1 supplies every folder's pending `watch` demand; pass 2
-//!   prefetches `objects.missing {limit: OBJECT_BATCH, exclude}` per folder
-//!   and is abandoned before its next call as soon as a demand wake-up (the
+//!   prefetches `objects.missing {limit: OBJECT_BATCH, exclude, after}` per
+//!   folder — a resumable scan: a page not wholly stored moves the folder's
+//!   cursor past it, so every missing object is eventually listed — and is
+//!   abandoned before its next call as soon as a demand wake-up (the
 //!   wake [`Seq`] the folders' watch threads bump) arrives, so the next
 //!   round's pass 1 waits at most for one call in flight (≤ 10 s). Objects
 //!   are asked of each peer in turn, per owning Ready bulk lane, in batches
 //!   of ≤ [`OBJECT_BATCH`], and written to the worker. A digest every asked
-//!   peer omitted is excluded for a backoff (5 s doubling to 5 min), so
-//!   later objects are not starved. A round that stored nothing sleeps
+//!   peer omitted is excluded for a backoff (5 s doubling to 5 min), which
+//!   spares re-asking it when the scan comes around again. A round that stored nothing sleeps
 //!   `sync_interval_ms` unless woken. A peer whose fetch failed sits out the
 //!   next round. The pump never blocks the scheduler.
 //! * **clock probes** — a short thread per probe, at most one per peer: at
@@ -164,8 +166,12 @@ struct PumpState {
     /// Per folder id: the digests no asked peer had, and until when they are
     /// excluded.
     unavailable: BTreeMap<String, BTreeMap<Digest, Unavailable>>,
-    /// Digests written lately (not fetched again for a stale demand).
-    supplied: BTreeMap<Digest, Instant>,
+    /// Per folder id: where its `objects.missing` scan resumes (`None`: from
+    /// the start).
+    scan: BTreeMap<String, Option<String>>,
+    /// (folder id, digest) written lately: not fetched again for a stale
+    /// demand.
+    supplied: BTreeMap<(String, Digest), Instant>,
 }
 
 struct Unavailable {
@@ -535,9 +541,9 @@ impl Driver {
         let turn = (round as usize) % endpoints.len();
         endpoints.rotate_left(turn);
         let folders = self.folders.syncing();
-        state
-            .unavailable
-            .retain(|id, _| folders.iter().any(|folder| folder.id == *id));
+        let syncing = |id: &String| folders.iter().any(|folder| folder.id == *id);
+        state.unavailable.retain(|id, _| syncing(id));
+        state.scan.retain(|id, _| syncing(id));
         let now = Instant::now();
         state
             .supplied
@@ -549,7 +555,7 @@ impl Driver {
             let demand: Vec<(Digest, Kind)> = folder
                 .demand
                 .iter()
-                .filter(|(digest, _)| !state.supplied.contains_key(digest))
+                .filter(|(digest, _)| !state.supplied.contains_key(&(folder.id.clone(), *digest)))
                 .copied()
                 .collect();
             if !demand.is_empty() && !self.cancel.is_cancelled() {
@@ -561,22 +567,37 @@ impl Driver {
             if self.cancel.is_cancelled() || self.wake.current() != seen {
                 break;
             }
-            let wanted = self.background(state, folder);
-            if wanted.is_empty() {
+            let Some((wanted, cursor)) = self.background(state, folder) else {
                 continue;
-            }
-            let supplied = self.supply(state, &endpoints, folder, wanted, Some(seen));
+            };
+            let supplied = if wanted.is_empty() {
+                Supplied::default()
+            } else {
+                self.supply(state, &endpoints, folder, wanted, Some(seen))
+            };
             stored += supplied.stored;
             if supplied.interrupted {
                 break;
+            }
+            // A page wholly stored is listed afresh from the same position
+            // (what was stored is no longer missing); any other moves on, and
+            // a scan at its end starts over.
+            if supplied.stored < OBJECT_BATCH {
+                state.scan.insert(folder.id.clone(), cursor);
             }
         }
         stored
     }
 
-    /// The folder's background work: `objects.missing` without the digests no
-    /// peer had lately (passed as `exclude`, and filtered here too).
-    fn background(&self, state: &mut PumpState, folder: &SyncFolder) -> Vec<(Digest, Kind)> {
+    /// The folder's background work: the next `objects.missing` page of its
+    /// scan without the digests no peer had lately (passed as `exclude`, and
+    /// filtered here too), with the cursor after that page. `None` when the
+    /// worker failed.
+    fn background(
+        &self,
+        state: &mut PumpState,
+        folder: &SyncFolder,
+    ) -> Option<(Wanted, Option<String>)> {
         let now = Instant::now();
         let unavailable = state.unavailable.entry(folder.id.clone()).or_default();
         let exclude: Vec<Digest> = unavailable
@@ -585,10 +606,14 @@ impl Driver {
             .map(|(digest, _)| *digest)
             .take(MAX_EXCLUDE)
             .collect();
-        let missing = match folder.link.missing(OBJECT_BATCH, &exclude) {
-            Ok(missing) => {
+        let after = state.scan.get(&folder.id).cloned().flatten();
+        let (missing, cursor) = match folder
+            .link
+            .missing(OBJECT_BATCH, &exclude, after.as_deref())
+        {
+            Ok(page) => {
                 state.logged.remove(&folder.id);
-                missing
+                (page.missing, page.cursor)
             }
             Err(error) => {
                 let error = format!("objects.missing: {error}");
@@ -599,21 +624,22 @@ impl Driver {
                     });
                     state.logged.insert(folder.id.clone(), error);
                 }
-                return Vec::new();
+                return None;
             }
         };
         // An expired backoff is kept while its object is still missing (the
         // next one doubles); one no longer missing is forgotten.
         let listed: BTreeSet<Digest> = missing.iter().map(|(digest, _)| *digest).collect();
         unavailable.retain(|digest, entry| entry.until > now || listed.contains(digest));
-        missing
+        let wanted = missing
             .into_iter()
             .filter(|(digest, _)| {
                 unavailable
                     .get(digest)
                     .is_none_or(|entry| entry.until <= now)
             })
-            .collect()
+            .collect();
+        Some((wanted, cursor))
     }
 
     /// Fetches `wanted` for `folder`: each endpoint in turn is asked, per
@@ -678,7 +704,7 @@ impl Driver {
                             state.logged.remove(endpoint);
                             let now = Instant::now();
                             for digest in &received {
-                                state.supplied.insert(*digest, now);
+                                state.supplied.insert((folder.id.clone(), *digest), now);
                             }
                             if let Some(unavailable) = state.unavailable.get_mut(&folder.id) {
                                 unavailable.retain(|digest, _| !received.contains(digest));
@@ -858,6 +884,7 @@ fn probe(catalog: &Catalog, installation: &str, conn: &Conn, cancel: &Cancel) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::sync::MissingPage;
     use crate::{
         model::{errors::ErrorWire, protocol::LaneRole},
         session::{ConnOptions, Handler, Incoming, PeerInfo, Side},
@@ -1042,15 +1069,21 @@ mod tests {
                     let exclude: BTreeSet<Digest> =
                         serde_json::from_value(req.header["exclude"].clone()).unwrap();
                     lock(&self.excludes).push(exclude.len());
+                    let start: usize = req.header["after"]
+                        .as_str()
+                        .map_or(0, |after| after.parse().unwrap());
                     let written = self.written();
-                    let listed: Vec<(Digest, Kind)> = self
-                        .missing
-                        .iter()
-                        .filter(|(d, _)| !exclude.contains(d) && !written.contains(d))
-                        .take(limit)
-                        .copied()
-                        .collect();
-                    serde_json::to_vec(&listed).unwrap()
+                    let mut page = MissingPage::default();
+                    for (index, object) in self.missing.iter().enumerate().skip(start) {
+                        if !exclude.contains(&object.0) && !written.contains(&object.0) {
+                            page.missing.push(*object);
+                        }
+                        if page.missing.len() == limit {
+                            page.cursor = Some((index + 1).to_string());
+                            break;
+                        }
+                    }
+                    serde_json::to_vec(&page).unwrap()
                 }
                 "objects.write" => {
                     let objects: Vec<Object> = serde_json::from_slice(&req.body).unwrap();
@@ -1227,6 +1260,38 @@ mod tests {
             state.unavailable["f1"]
                 .values()
                 .all(|u| u.backoff == UNAVAILABLE_FIRST * 2 && u.until > Instant::now())
+        );
+    }
+
+    #[test]
+    fn the_scan_pages_past_a_long_run_no_peer_has() {
+        // 300 head digests no peer has (more than MAX_EXCLUDE + one page),
+        // then one the peer has.
+        let all = objects("head", 301);
+        let folder = Arc::new(FakeFolder {
+            missing: wanted_of(&all),
+            ..FakeFolder::default()
+        });
+        let link = fake_worker(folder.clone());
+        let peer = Peer::new(&all[300..], &[], Duration::ZERO);
+        let folders = Arc::new(Folders(vec![("f1".into(), link, Mutex::new(Vec::new()))]));
+        let (driver, _root) = driver(OneLane(peer.lane()), folders, Seq::new());
+        let mut state = PumpState::default();
+        let seen = driver.wake.current();
+        let bound = 300_usize.div_ceil(OBJECT_BATCH) + 2;
+        let mut rounds = 0;
+        while folder.written().is_empty() {
+            rounds += 1;
+            assert!(
+                rounds <= bound,
+                "the 301st object not fetched in {bound} rounds"
+            );
+            driver.pump_round(&mut state, seen);
+        }
+        assert_eq!(folder.written(), vec![all[300].digest]);
+        assert!(
+            rounds <= 300_usize.div_ceil(OBJECT_BATCH) + 1,
+            "{rounds} rounds"
         );
     }
 
