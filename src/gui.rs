@@ -23,8 +23,12 @@ slint::include_modules!();
 const POLL: Duration = Duration::from_secs(1);
 /// Activity rows kept for the selected folder.
 const RECENT_EVENTS: usize = 128;
-/// How long `clip.exe` may take.
+/// How long `clip.exe` may take, and how long a killed one gets to go.
 const CLIPBOARD_BOUND: Duration = Duration::from_secs(5);
+/// How long the status thread waits for a reply: a hung orchestrator shows
+/// as lost within a poll or two, not after the actions' much longer wait
+/// (a status read is retried once).
+const STATUS_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 /// `CREATE_NO_WINDOW`: helper processes never flash a console.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// The error codes that mean the orchestrator is gone.
@@ -101,9 +105,26 @@ fn on_status_error(error: &anyhow::Error) -> (String, &'static str) {
     }
 }
 
+/// `name` under `%SystemRoot%\System32` (`C:\Windows` when `SystemRoot` is
+/// unset), or directly under `%SystemRoot%` where it lives there (`explorer.exe`
+/// is not in `System32`): a bare name would be searched for in the
+/// application's own directory first.
+fn system_tool(name: &str) -> PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .filter(|root| !root.is_empty())
+        .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+    let system32 = root.join("System32").join(name);
+    let beside = root.join(name);
+    if !system32.exists() && beside.exists() {
+        beside
+    } else {
+        system32
+    }
+}
+
 fn spawn_hidden(program: &str, path: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new(program)
+    std::process::Command::new(system_tool(program))
         .arg(path)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
@@ -112,10 +133,11 @@ fn spawn_hidden(program: &str, path: &Path) -> Result<()> {
 }
 
 /// Puts `text` on the clipboard through `clip.exe`, within
-/// [`CLIPBOARD_BOUND`].
+/// [`CLIPBOARD_BOUND`]; a `clip.exe` that does not go after its kill within
+/// [`CLIPBOARD_BOUND`] is reported as `STRANDED_PROCESS`.
 fn copy_to_clipboard(text: &str) -> Result<()> {
     use std::{io::Write, os::windows::process::CommandExt, process::Stdio};
-    let mut child = std::process::Command::new("clip.exe")
+    let mut child = std::process::Command::new(system_tool("clip.exe"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -129,14 +151,24 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
         .and_then(|mut stdin| Ok(stdin.write_all(text.as_bytes())?));
     let end = Instant::now() + CLIPBOARD_BOUND;
     loop {
-        if let Some(status) = child.try_wait()? {
+        // An error from `try_wait` is not an exit: it ends in the kill below.
+        if let Ok(Some(status)) = child.try_wait() {
             written?;
             ensure!(status.success(), "CLIPBOARD_FAILED: clip.exe {status}");
             return Ok(());
         }
         if Instant::now() >= end {
+            let pid = child.id();
             let _ = child.kill();
-            let _ = child.wait();
+            let gone_by = Instant::now() + CLIPBOARD_BOUND;
+            while !matches!(child.try_wait(), Ok(Some(_))) {
+                if Instant::now() >= gone_by {
+                    bail!(
+                        "CLIPBOARD_TIMEOUT: clip.exe did not finish; STRANDED_PROCESS: pid {pid}"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
             bail!("CLIPBOARD_TIMEOUT: clip.exe did not finish");
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -305,8 +337,9 @@ fn open_host_log(config_path: &Path) -> Result<Done> {
 /// from `open`, and a second one for the action thread.
 fn open_clients(config_path: &Path) -> Result<(Client, Client, Started)> {
     let exe = std::env::current_exe()?;
-    let (status, started) = Client::open(config_path, &exe)?;
+    let (mut status, started) = Client::open(config_path, &exe)?;
     let actions = status.connect_again()?;
+    status.set_reply_timeout(STATUS_REPLY_TIMEOUT);
     Ok((status, actions, started))
 }
 
@@ -583,6 +616,16 @@ include!("gui_adapter.rs");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_tools_are_absolute_paths_under_the_windows_directory() {
+        for name in ["clip.exe", "notepad.exe", "explorer.exe"] {
+            let path = system_tool(name);
+            assert!(path.is_absolute(), "{path:?}");
+            assert!(path.exists(), "{path:?}");
+            assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(name));
+        }
+    }
 
     /// A folder entry shaped like `hub::Daemon::snapshot`'s `folders[i]`.
     fn entry(id: &str, phase: Value, paused: bool, error: Value) -> Value {

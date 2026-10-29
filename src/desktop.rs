@@ -46,6 +46,12 @@ impl Client {
         })
     }
 
+    /// Replies wait at most `timeout` from now on (the default is the
+    /// control client's [`REPLY_TIMEOUT`](crate::orchestrator::endpoint::REPLY_TIMEOUT)).
+    pub fn set_reply_timeout(&mut self, timeout: std::time::Duration) {
+        self.client.set_reply_timeout(timeout);
+    }
+
     /// The orchestrator's `status` (a read: retried once on a new
     /// connection).
     pub fn status(&mut self) -> Result<Value> {
