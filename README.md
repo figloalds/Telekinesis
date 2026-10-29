@@ -21,17 +21,68 @@ cargo build --release
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-
-# Create and mount one folder.
-target/release/tkfs --state C:/tkfs/example init
-target/release/tkfs --state C:/tkfs/example daemon --mount X: --listen 127.0.0.1:43180
-
-# Use another terminal while the daemon serves the mount.
-target/release/tkfs --state C:/tkfs/example status
-target/release/tkfs --state C:/tkfs/example conflicts
-target/release/tkfs --state C:/tkfs/example gui
-target/release/tkfs --state C:/tkfs/example stop
 ```
+
+## Quick start
+
+`tkfs` is one executable: the orchestrator (one per data directory), the
+worker it runs for each folder, and the `manage` client. Folders run headless
+for now; mounts, branches, remote conflict resolution and the desktop as an
+orchestrator client follow in later plans.
+
+```sh
+# Terminal 1: creates orchestrator.toml and data/ beside it on first start.
+tkfs -f orchestrator.toml start
+
+# Terminal 2, as the same user.
+tkfs -f orchestrator.toml manage create Projects --headless
+tkfs -f orchestrator.toml manage status
+
+# Pair two hosts: host A prints a code, host B pairs with it and receives a folder.
+tkfs -f orchestrator.toml manage reset-pairing-code                     # host A
+echo "$CODE" | tkfs -f orchestrator.toml manage pair ws://hosta:43180   # host B
+tkfs -f orchestrator.toml manage remote-list ws://hosta:43180            # host B
+tkfs -f orchestrator.toml manage receive ws://hosta:43180 REPO_ID Projects   # host B
+
+tkfs -f orchestrator.toml manage shutdown
+```
+
+See the [command reference](docs/CLI.md), [configuration](docs/CONFIGURATION.md)
+and [Linux deployment](docs/LINUX.md) (signals, systemd, Docker).
+
+## Error classes and what to do
+
+A failed command prints `CODE: message` on stderr and exits with status 1.
+The code tells what to do:
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `CLOCK_INVALID` | The system clock reads before 2020-01-01 UTC (or a peer's does). The orchestrator, workers and `manage pair` refuse to run. | Fix the clock (NTP), then start again. |
+| `CATALOG_INCOMPATIBLE` | The data directory holds a catalog this build cannot read. Nothing is migrated. | Move the data directory aside and start fresh (`reset-pairing-code`, `pair`, `receive`). |
+| `CONFIG_VERSION_2_REQUIRED`, `INVALID_CONFIG` | `orchestrator.toml` is not a format 2 file of this release, or has unknown fields. It is never overwritten. | Fix the file, or remove it to get a fresh one. |
+| `LISTEN_FAILED` | The `[network] listen` address cannot be bound. | Free the port or change `listen`. |
+| `ADVERTISE_REQUIRED` | `manage pair` has no address to tell the peer. | Set `[network] advertise` or `listen`. |
+| `ALREADY_RUNNING` | Another orchestrator (or worker) holds this data directory (exit status 75). | Use that one, or stop it first. |
+| `ORCHESTRATOR_NOT_RUNNING`, `WS_CONNECT_FAILED` | No orchestrator answers for this configuration's data directory. | Start it (`tkfs -f FILE start`); run `manage` as its user. |
+| `ACCESS_DENIED` | The orchestrator's or worker's token cannot be read or does not match. | Run as the user the orchestrator runs as. |
+| `CONNECTION_LOST` | The connection dropped after a change was sent; it is never resent. | Check `manage status` to see whether it happened. |
+| `ORCHESTRATOR_STOPPING` | The orchestrator is shutting down. | Wait for it to exit and start it again. |
+| `FORCED_STOP` | Logged: a worker did not stop in time at shutdown and was forced or killed. Committed data is durable. | Nothing; look at `worker.log` if it repeats. |
+| `STRANDED_PROCESS` | A worker could not be shown gone or killed within its bound. | Find the process (`worker.json` names its pid) and end it. |
+| `WORKER_LIMIT` | `maximum_running` folders already have a worker. | Stop one, or raise `maximum_running` and restart. |
+| `FOLDER_REQUIRED` | A folder command has neither `--state` nor `--runtime`. | Give `--state DIR` or `--runtime STATE/runtime.json`. |
+| `FOLDER_NOT_FOUND`, `AMBIGUOUS_FOLDER` | The folder argument matches no folder, or more than one. | Use more of the id, or the exact label (`manage list`). |
+| `FOLDER_RUNNING`, `FOLDER_NOT_RUNNING` | The command needs the folder stopped (`configure-mount`), or running. | `manage stop` / `manage start` it first. |
+| `WORKER_NOT_RUNNING` | The folder's worker is not running (`rpc`). | `manage start` the folder. |
+| `BUSY_VIEW` | The worker has files open and refuses to stop. | Close them, or `manage force-stop`. |
+| `CRASH_LOOP` | The folder's worker failed 5 times within 10 minutes and is not restarted. | Read `worker.log`, fix the cause, `manage retry`. |
+| `OP_NOT_ALLOWED` | A peer or control request names an operation that lane or endpoint does not serve. | Use `manage` or the folder commands. |
+| `REPO_NOT_PUBLISHED` | The paired host publishes no running, unpaused folder of that repository. | `manage remote-list ENDPOINT`; start or resume the folder there. |
+| `REPO_ALREADY_PRESENT` | This orchestrator already has a folder of that repository. | Use that folder. |
+| `PAIRING_CODE_CHANGED`, `INVALID_PAIRING_CODE`, `PEER_REVOKED` | The peer's code was reset, the code is wrong, or the peer revoked this host. | Get the current code (`reset-pairing-code` there) and `manage pair` again. |
+| `PEER_LANES_SKIPPED` | Logged: the connections to a paired peer could not be set up (for example its credential is missing). | Restart the orchestrator; if it repeats, `manage unpair` and `manage pair` again. |
+| `CLOCK_OFFSET_LARGE` | Logged: a peer's clock differs from this one by more than 5 s. | Fix the clocks (NTP). |
+| `DESKTOP_REQUIRES_WINDOWS` | `gui` (or `tkfs` with no command) on a non-Windows host. | Use `manage`. |
 
 [Architecture](docs/ARCHITECTURE.md), [configuration](docs/CONFIGURATION.md),
 [validation](docs/VALIDATION.md), and [authority scope](docs/revamp/AUTHORITY_SCOPE.md).

@@ -41,11 +41,19 @@ index changes commit before old segments are removed.
 
 ## Sessions and ownership
 
-The folder daemon owns one metadata database and a pack index. Its pairing
-catalog lives in the metadata database. Existing authenticated session framing,
-TLS clients, pairing-code verification and enrolled credentials are retained.
-Events apply before objects arrive. Foreground hydration precedes background
-prefetch; digest requests use bounded batches and per-peer backoff.
+The orchestrator (one per data directory) owns the catalog (`folders.sqlite`:
+folders, intents, pairing verifier, peer credentials, clock offsets), runs one
+worker per folder and talks to paired peers; workers never listen for peers
+or dial. Each worker owns one folder's metadata database and pack index and
+serves a loopback multiplexed session (control lane 0, bulk lanes for
+objects) to its orchestrator and to the folder commands. Between
+orchestrators the same frame protocol runs over a pool of lanes per peer:
+lane 0 carries metadata and control, the other lanes object bytes. Existing
+authenticated session framing, TLS clients, pairing-code verification and
+enrolled credentials are retained. Events apply before objects arrive;
+foreground hydration precedes background prefetch, with digest requests in
+bounded batches and per-peer backoff. See
+[the restoration design](superpowers/specs/2026-10-28-orchestration-restoration-design.md).
 
 There is no private write database, overlay map, save pipeline, object admission
 outbox, per-reference grant, lease generation or pool-fencing engine.

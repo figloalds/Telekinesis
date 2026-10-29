@@ -1,7 +1,9 @@
 # Linux
 
-The daemon, the workers and the CLI run on Linux; the desktop is Windows
-only (on Linux, follow the status with `tkfs manage watch`).
+The orchestrator, the workers and the CLI run on Linux; the desktop is
+Windows only (on Linux, follow the status with `tkfs manage watch`). Folders
+run headless: FUSE mounts of orchestrator-managed folders arrive with a later
+plan, so containers and services need neither `/dev/fuse` nor `fuse3` yet.
 
 ## Building and runtime dependencies
 
@@ -11,55 +13,65 @@ cargo build --release --locked
 ```
 
 Outbound `wss://` uses OpenSSL and the distribution's CA bundle
-(`ca-certificates`). Mounts need FUSE 3 (`fuse3`, `fusermount3`) and
-`/dev/fuse`; headless folders need neither. TKFS does not install
-certificates or change trust stores. It creates its token files
-(`orchestrator.token`, each state's `runtime.token`) and the catalog
-(`folders.sqlite`, with its `-wal`/`-shm` files) with mode `0600`; the rest of
-the data directory follows your umask, so keep it `0700` if other users share
-the machine (see
+(`ca-certificates`). TKFS does not install certificates or change trust
+stores. It creates its token files (`orchestrator.token`, each state's
+`runtime.token`) and the catalog (`folders.sqlite`, with its `-wal`/`-shm`
+files) with mode `0600`; the rest of the data directory follows your umask,
+so keep it `0700` if other users share the machine (see
 [local access](CONFIGURATION.md#pairing-credentials-and-local-access)).
 
+## Quick start
+
 ```sh
-tkfs init -f ./orchestrator.toml
-tkfs -f ./orchestrator.toml orchestrator
-# In another terminal:
-tkfs -f ./orchestrator.toml manage create Project            # FUSE mount at mounts/Project
+tkfs -f ./orchestrator.toml start
+# In another terminal, as the same user:
+tkfs -f ./orchestrator.toml manage create Project --headless
 tkfs -f ./orchestrator.toml manage create Archive --headless
 tkfs -f ./orchestrator.toml manage watch
 ```
 
-## Mounts
+`start` creates `orchestrator.toml` (with the defaults of
+[CONFIGURATION](CONFIGURATION.md)) when it is missing and `data/` beside it.
+To sync with another host, set `[network] listen` (and `advertise` behind a
+proxy), then pair: `manage reset-pairing-code` on one host prints a code,
+`manage pair ENDPOINT` on the other reads it from stdin, and `manage
+receive` creates a folder from what the first host publishes
+([CLI](CLI.md#pairing-and-remote-folders)).
 
-- A mount path must not exist when the folder mounts: the worker creates the
-  directory and removes it after a clean unmount. An empty directory left at
-  the path (a killed container, a crash) makes the mount fail with
-  `MOUNT_PATH_MUST_NOT_EXIST`; the folder keeps syncing headless. Check the
-  directory is empty and not a mount (`mountpoint PATH`), remove it with
-  `rmdir PATH`, then `tkfs manage attach STATE`.
-- A stale mount of this folder's own previous worker (type `fuse.tkfs`, no
-  longer answering, proven by the previous `worker.json`) is unmounted and
-  removed automatically before the next attach. Any other mount at the path is
-  never touched.
-- FUSE's kernel permission checks and the mount helper's policy apply as the
-  system configures them. Portable permission bits and timestamps are
-  filesystem metadata; symlinks, hard links, devices, ownership and privileged
-  mode bits are not implemented. Names are case-insensitive, as on Windows.
+## Signals and shutdown
 
-## Signals and services
+The orchestrator handles SIGINT and SIGTERM exactly like `manage shutdown`:
+it closes its peer connections and stops every folder in parallel within a
+30 s bound. A worker that has not stopped by about 15 s (for example one with
+files open) is force-stopped, and one still alive at about 27 s is killed;
+each forced folder is logged as `FORCED_STOP`. Committed data is durable and
+unsealed scratch files are re-sealed at the next start. The orchestrator then
+exits 0. A worker started by hand (`tkfs daemon`) also stops on SIGINT and
+SIGTERM; with files open it refuses (`BUSY_VIEW`, logged), so send the signal
+again once they are closed.
 
-The daemon handles SIGINT and SIGTERM like `manage shutdown`: it closes its
-peer connections, stops every folder (graceful, up to 30 s; a folder with
-files open or a worker that does not answer is left running), and exits 0.
-A worker started by hand (`tkfs daemon`) also stops on SIGINT/SIGTERM; with
-files open it refuses (`BUSY_VIEW`, logged): send the signal again once they
-are closed.
+Management commands read the orchestrator's token
+(`DATA/orchestrator.token`, owner-only), so run them as the orchestrator's
+user (`sudo -u USER tkfs ...`).
 
-Management commands read the daemon's token (`DATA/orchestrator.token`,
-owner-only), so run them as the daemon's user (`sudo -u USER tkfs …`).
+## Adoption after a crash
 
-For a systemd service, adapt `deploy/tkfs-orchestrator.service.example`
-(`ExecStop` runs as the service's user, so it can read the token):
+Workers are separate processes. If the orchestrator dies (a crash, `kill -9`,
+a service restart that leaves the group alone), its workers keep running.
+The next orchestrator on the same data directory reads each folder's
+`worker.json` and **adopts** a worker only when the process matches: same pid,
+same start time and same executable image. A worker that matches is
+reused without restarting it; when nothing matches (a stale file, a recycled
+pid, a different binary) the folder starts a fresh worker. The
+supervisor of a folder that fails repeatedly backs off (up to 5 minutes)
+and, after 5 failures within 10 minutes, stops restarting it
+(`CRASH_LOOP`; `manage retry` clears it). `manage status` shows the phase of
+each folder.
+
+## systemd
+
+Adapt `deploy/tkfs-orchestrator.service.example` (`ExecStop` runs as the
+service's user, so it can read the token):
 
 ```ini
 ExecStart=/usr/local/bin/tkfs -f /etc/tkfs/orchestrator.toml orchestrator
@@ -67,43 +79,51 @@ ExecStop=/usr/local/bin/tkfs -f /etc/tkfs/orchestrator.toml manage shutdown
 TimeoutStopSec=60
 ```
 
-Workers are separate processes that may outlive the daemon, and a restarted
-daemon adopts the ones still running (see the
-[adoption runbook](../README.md#adoption-after-a-daemon-crash)). systemd's
-default `KillMode=control-group` ends every process of the unit when the
-service stops or its main process dies, workers included: they are then
-restarted with store recovery instead of adopted. `ExecStop` gives them a
-cooperative stop first, and committed data is durable, but a worker that is
-killed while files are open in its mount can lose changes not saved yet. If
-you want workers, and the files open in their mounts, to survive a daemon
-crash or a service restart, set `KillMode=process` (only the daemon is
-signalled; `mixed` still kills the rest of the group at the end of a stop)
-and keep `ExecStop`, which stops every quiet worker cooperatively.
+systemd's default `KillMode=control-group` ends every process of the unit
+when the service stops or its main process dies, workers included: they are
+then restarted with store recovery instead of adopted. `ExecStop` gives them
+a cooperative stop first, and committed data is durable, but a worker that is
+killed while files are open can lose changes not saved yet. If you want
+workers to survive an orchestrator crash or a service restart and be adopted,
+set `KillMode=process` (only the orchestrator is signalled; `mixed` still
+kills the rest of the group at the end of a stop) and keep `ExecStop`, which
+stops every quiet worker cooperatively.
 
 ## Containers
 
-`examples/docker-compose.yml` runs the daemon as the container's main process
-(`exec ./tkfs start`) with the binary, configuration and data in the
-bind-mounted directory, host networking, `/dev/fuse` and `SYS_ADMIN` for
-mounts. In a container every worker ends with the daemon, so there is no
-adoption: a restarted container restarts its folders.
+`examples/docker-compose.yml` runs the orchestrator as the container's main
+process (`exec ./tkfs -f orchestrator.toml start`), with the binary,
+configuration and data in the bind-mounted directory and host networking.
+Folders run headless; the mounting block (`/dev/fuse`, `SYS_ADMIN`,
+AppArmor) is commented out and unused until mounts return.
 
-- Stop or restart it with time for the daemon's own shutdown:
-  `docker compose stop -t 60` (Docker's default is 10 s, then SIGKILL).
-- Run management commands inside it, as the daemon's user (they read its
-  token): `docker compose exec tkfs-daemon ./tkfs manage status`.
-- Mounts live in the container's mount namespace; to see the files on the
-  host, use a headless folder plus another tool, or configure mount
-  propagation yourself.
-- Upgrading from the previous release: see the
-  [README](../README.md#step-by-step-a-desktop-and-a-server-behind-a-tls-proxy).
+- `exec` makes the orchestrator the container's PID 1, so `docker compose
+  stop` sends it SIGTERM and it shuts down by itself (the bounded 30 s sequence above,
+  with `FORCED_STOP` logged for any folder it had to force). The file asks
+  Docker to wait 60 s (`stop_grace_period`) before SIGKILL; there is no shell
+  trap.
+- In a container every worker ends with the orchestrator, so there is no
+  adoption: a restarted container restarts its folders.
+- Add and watch folders from inside the container, as the orchestrator's user
+  (they read its token):
+
+```sh
+docker compose exec tkfs-daemon ./tkfs manage create Project --headless
+docker compose exec tkfs-daemon ./tkfs manage status
+```
+
+- The peer listener defaults to `127.0.0.1:43180`. Set `[network] listen` to
+  `0.0.0.0:43180` in `orchestrator.toml` (and `advertise` to the address
+  peers should use, `wss://` behind your TLS proxy) to accept remote peers;
+  the container uses host networking.
+- Upgrading from the previous release: nothing is migrated. Start with a new
+  data directory and pair again (`reset-pairing-code`, `pair`, `receive`); a
+  catalog this build cannot read fails with `CATALOG_INCOMPATIBLE`.
 
 ## Tests on Linux
 
 ```sh
-CARGO_TARGET_DIR=$HOME/tkfs-target/linux cargo test --locked --test orchestrator --test session_core --test worker_lifecycle --test mount_lifecycle
-bash scripts/qualify.sh --wave 3
+CARGO_TARGET_DIR=$HOME/tkfs-target/linux cargo test --locked
 ```
 
-FUSE tests skip when `/dev/fuse` is missing. [Validation](VALIDATION.md)
-describes the qualification runs.
+[Validation](VALIDATION.md) describes the qualification runs.

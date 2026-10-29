@@ -4,13 +4,21 @@ After=network.target
 
 [Service]
 Type=simple
-# Set User, WorkingDirectory and paths for your installation.
+# Set User, WorkingDirectory and paths for your installation. Management
+# commands (and ExecStop) read DATA/orchestrator.token: run them as User.
 User=tkfs
 WorkingDirectory=/var/lib/tkfs
 ExecStart=/usr/local/bin/tkfs -f /etc/tkfs/orchestrator.toml orchestrator
+# `manage shutdown` is the cooperative stop; SIGTERM does the same. Either way
+# the orchestrator stops every folder within 30 s, forcing any it must.
 ExecStop=/usr/local/bin/tkfs -f /etc/tkfs/orchestrator.toml manage shutdown
 Restart=on-failure
 TimeoutStopSec=60
+# Workers are separate processes. With the default KillMode=control-group
+# they end with the service and are restarted (with store recovery) rather
+# than adopted. To let workers survive a crash or restart of the orchestrator
+# and be adopted by the next one, uncomment:
+# KillMode=process
 
 [Install]
 WantedBy=multi-user.target

@@ -7,6 +7,13 @@ replacement step notes. The
 [authority scope](AUTHORITY_SCOPE.md) (personal use, pairing is the admission
 boundary, TLS/WSS or VPN for the channel) is unchanged.
 
+Orchestration (2026-10-28): the orchestrator, per-folder workers, `manage`,
+peer lanes, pairing, clock checks, signal shutdown and the Linux/Docker/systemd
+deployment were restored on top of this runtime; see
+[the restoration design](../superpowers/specs/2026-10-28-orchestration-restoration-design.md).
+Mounts, branches, remote conflicts and the GUI as an orchestrator client follow
+in later plans.
+
 ## 0. Immediate blocking demand
 
 **W6-P0-MOUNT-LIFECYCLE remains OPEN.** The user's 2026-10-28 decision is to
