@@ -10,6 +10,7 @@ pub mod demand;
 pub mod endpoint;
 pub mod folder;
 pub mod hub;
+pub mod launcher;
 pub mod manage;
 pub mod network;
 pub mod process;

@@ -1,300 +1,228 @@
-//! Real executable/daemon checks. These create only native stores, never mounts.
-use anyhow::Result;
+//! The desktop's view of the orchestrator: `orchestrator::launcher` attaches
+//! to a running one or starts one in the background, bounded. Real
+//! orchestrators on temporary homes; headless only, never a mount. Every
+//! orchestrator a test starts is shut down by an [`Orchestrator`] guard and a
+//! process that outlives it is killed and reported as `STRANDED_PROCESS`.
+mod support;
+
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::{
-    path::Path,
+    fs,
+    path::{Path, PathBuf},
+    thread,
     time::{Duration, Instant},
 };
-use tkfs::desktop::Desktop;
+use tkfs::orchestrator::{
+    config::Config,
+    endpoint::{ControlClient, DISCOVERY_FILE},
+    hub::SHUTDOWN_BOUND,
+    launcher::{self, CONSOLE_LOG, START_BOUND, Started},
+    process::ObservedProcess,
+};
 
-struct Managed(Option<Desktop>);
-impl std::ops::Deref for Managed {
-    type Target = Desktop;
-    fn deref(&self) -> &Desktop {
-        self.0.as_ref().unwrap()
+/// How long a process gets to exit after its discovery file is gone (or
+/// after a kill) before it is reported stranded.
+const EXIT_BOUND: Duration = Duration::from_secs(10);
+
+fn exe() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_tkfs"))
+}
+
+/// A home whose `orchestrator.toml` listens on `listen`.
+fn home_listening(listen: &str) -> Result<(tempfile::TempDir, PathBuf)> {
+    let home = tempfile::tempdir()?;
+    let config = home.path().join("orchestrator.toml");
+    fs::write(
+        &config,
+        format!(
+            "format_version = 2\ndata_directory = \"data\"\n\
+             default_mount_directory = \"mounts\"\n\n[network]\n\
+             listen = \"{listen}\"\n"
+        ),
+    )?;
+    Ok((home, config))
+}
+
+/// Shuts an orchestrator down (on [`Self::stop`] or drop): `shutdown`
+/// through a fresh `ControlClient`, then at most `SHUTDOWN_BOUND` for
+/// `DATA/orchestrator.json` to be gone and `EXIT_BOUND` for the process.
+struct Orchestrator {
+    config: Config,
+    process: Option<ObservedProcess>,
+    stopped: bool,
+}
+
+impl Orchestrator {
+    fn new(config: &Config, pid: u32) -> Self {
+        Self {
+            config: config.clone(),
+            // Held from here, so the pid cannot be recycled before the kill.
+            process: ObservedProcess::open(pid).ok(),
+            stopped: false,
+        }
+    }
+
+    fn discovery(&self) -> PathBuf {
+        self.config.data_directory.join(DISCOVERY_FILE)
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.stopped = true;
+        let shutdown = ControlClient::connect(&self.config)
+            .and_then(|mut client| client.request("shutdown", json!({})));
+        let end = Instant::now() + SHUTDOWN_BOUND;
+        while self.discovery().exists() && Instant::now() < end {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let discovery_left = self.discovery().exists();
+        if let Some(process) = &self.process
+            && !process.wait(EXIT_BOUND)?
+        {
+            kill(process.pid);
+            let gone = process.wait(EXIT_BOUND)?;
+            bail!(
+                "STRANDED_PROCESS: orchestrator pid {} outlived its shutdown ({shutdown:?}; killed: {gone})",
+                process.pid
+            );
+        }
+        if discovery_left {
+            bail!("{DISCOVERY_FILE} left behind after shutdown ({shutdown:?})");
+        }
+        shutdown.map(drop)
     }
 }
-impl std::ops::DerefMut for Managed {
-    fn deref_mut(&mut self) -> &mut Desktop {
-        self.0.as_mut().unwrap()
-    }
-}
-impl Drop for Managed {
+
+impl Drop for Orchestrator {
     fn drop(&mut self) {
-        if let Some(desktop) = &mut self.0 {
-            let ids: Vec<_> = desktop
-                .config
-                .folders
-                .iter()
-                .filter(|f| f.autostart)
-                .map(|f| f.id.clone())
-                .collect();
-            for id in ids {
-                if let Err(error) = desktop.stop(&id) {
-                    eprintln!("desktop test cleanup: {error:#}");
-                }
+        if self.stopped {
+            return;
+        }
+        if let Err(error) = self.stop() {
+            if thread::panicking() {
+                eprintln!("orchestrator cleanup: {error:#}");
+            } else {
+                panic!("orchestrator cleanup: {error:#}");
             }
         }
     }
 }
-fn open(home: &Path, single: Option<&Path>) -> Result<Managed> {
-    let binary = std::env::var_os("TKFS_DESKTOP_TEST_BINARY")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_tkfs").into());
-    Ok(Managed(Some(Desktop::open(
-        &home.join("orchestrator.toml"),
-        single,
-        &binary,
-    )?)))
+
+/// Kills `pid` (held open by an `ObservedProcess`, so it is still ours).
+fn kill(pid: u32) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    #[cfg(unix)]
+    // SAFETY: kill(2) on a pid this test observes.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+fn status_pid(client: &mut ControlClient) -> Result<u64> {
+    let status = client.request_read("status", json!({}))?;
+    status["daemon"]["pid"]
+        .as_u64()
+        .with_context(|| format!("status has no daemon.pid: {status}"))
 }
 
 #[test]
-fn fresh_desktop_autoinits_reuses_a_daemon_and_preserves_an_explicit_stop() -> Result<()> {
-    let home = tempfile::tempdir()?;
-    let state = home.path().join("my-folder");
-    let mut first = open(home.path(), Some(&state))?;
-    first.autostart();
-    let id = first.config.folders[0].id.clone();
-    let status = first.request(&id, "status", json!({}))?;
-    let pid = status["pid"].clone();
-    assert!(state.join("metadata.sqlite").is_file());
-    assert!(home.path().join("orchestrator.toml").is_file());
-    let snapshot = first.snapshot(&id);
-    assert_eq!(snapshot["folders"][0]["online"], true);
-    assert!(snapshot["detail"]["branches"].as_array().unwrap().len() == 1);
-    // Closing the window leaves sync running. Reopen must reconnect, not spawn
-    // another owner or reinitialize the folder's identity.
-    drop(first.0.take());
-    let mut second = open(home.path(), None)?;
-    second.autostart();
-    assert_eq!(second.request(&id, "status", json!({}))?["pid"], pid);
-    second.stop(&id)?;
-    drop(second);
-    let mut third = open(home.path(), None)?;
-    third.autostart();
-    assert!(!third.config.folders[0].autostart);
-    assert_eq!(third.snapshot(&id)["folders"][0]["online"], false);
-    assert!(!state.join("control.json").exists());
-    Ok(())
+fn spawns_then_attaches_then_starts_again_after_shutdown() -> Result<()> {
+    let (_home, config_path) = home_listening("127.0.0.1:0")?;
+
+    let (config, client, started) = launcher::ensure_running(&config_path, exe(), START_BOUND)?;
+    drop(client);
+    let Started::Spawned { pid } = started else {
+        bail!("the first ensure_running was {started:?}");
+    };
+    let mut first = Orchestrator::new(&config, pid);
+
+    let (_, mut client, started) = launcher::ensure_running(&config_path, exe(), START_BOUND)?;
+    assert_eq!(started, Started::Attached);
+    assert_eq!(status_pid(&mut client)?, u64::from(pid));
+    drop(client);
+
+    first.stop()?;
+    assert!(!config.data_directory.join(DISCOVERY_FILE).exists());
+
+    let (config, client, started) = launcher::ensure_running(&config_path, exe(), START_BOUND)?;
+    drop(client);
+    let Started::Spawned { pid: pid2 } = started else {
+        bail!("the third ensure_running was {started:?}");
+    };
+    let mut second = Orchestrator::new(&config, pid2);
+    assert_ne!(pid2, pid);
+    second.stop()
 }
 
 #[test]
-fn desktop_recovers_stale_control_records_and_reports_real_startup_failures() -> Result<()> {
-    let home = tempfile::tempdir()?;
-    let state = home.path().join("folder");
-    std::fs::create_dir_all(&state)?;
-    std::fs::write(state.join("control.json"), "invalid stale control record")?;
-    let mut desktop = open(home.path(), Some(&state))?;
-    desktop.autostart();
-    let id = desktop.config.folders[0].id.clone();
-    desktop.request(&id, "status", json!({}))?;
-    desktop.stop(&id)?;
-    // A real worker startup failure after a successful `init`: a directory
-    // where the worker writes `runtime.token` (fatal RUNTIME_FILES_FAILED, 73).
-    std::fs::create_dir(state.join("runtime.token"))?;
-    let error = desktop.start(&id).unwrap_err();
-    assert!(
-        error.to_string().contains("DAEMON_START_FAILED"),
-        "{error:#}"
-    );
-    assert!(
-        error.to_string().contains("RUNTIME_FILES_FAILED"),
-        "{error:#}"
-    );
-    let value = desktop.snapshot(&id);
-    assert_eq!(value["folders"][0]["online"], false);
-    assert!(
-        value["detail"].is_null(),
-        "failed startup must not show empty loaded conflict data"
-    );
-    assert!(!state.join("control.json").exists());
-    Ok(())
-}
+fn attaches_to_an_orchestrator_started_elsewhere() -> Result<()> {
+    let (home, config_path) = home_listening("127.0.0.1:0")?;
+    let d = support::daemon::TestDaemon::start_in(home)?;
+    assert_eq!(d.config, config_path);
 
-/// Pairing-code discovery (`catalog.list` on a Probe lane). The worker-level
-/// catalog that provided it was removed; the orchestrator brings it back.
-fn probe(endpoint: &str, code: &str) -> Result<serde_json::Value> {
-    use tkfs::session;
-    let hello = session::client_hello(
-        "desktop-test-probe",
-        tkfs::model::protocol::LaneRole::Probe,
-        None,
-        1,
-    );
-    let (conn, _) = session::dial(
-        endpoint,
-        hello,
-        &session::CodeAuth { code: code.into() },
-        None,
-        session::ConnOptions::default(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let reply = conn
-        .call(
-            "catalog.list",
-            json!({}),
-            Vec::new(),
-            session::Priority::Control,
-            Duration::from_secs(10),
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"));
-    conn.close();
-    Ok(serde_json::from_slice(&reply?.body)?)
+    let (_, mut client, started) = launcher::ensure_running(&config_path, exe(), START_BOUND)?;
+    assert_eq!(started, Started::Attached);
+    assert_eq!(status_pid(&mut client)?, u64::from(d.pid()));
+    drop(client);
+    d.shutdown()
 }
 
 #[test]
-#[ignore = "worker peer listener removed by design; pairing/sync return at the orchestrator level (Task 11) and the desktop becomes an orchestrator client in the GUI plan"]
-fn desktop_can_receive_pair_and_manage_versions_over_the_current_protocol() -> Result<()> {
-    let home = tempfile::tempdir()?;
-    let mut desktop = open(home.path(), None)?;
-    let source = desktop.create("Source", None, None)?;
-    let status = desktop.request(&source, "status", json!({}))?;
-    let endpoint = status["endpoint"].as_str().unwrap();
-    let code = desktop.request(&source, "pairing-code", json!({}))?["code"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(probe(endpoint, "wrong-code").is_err());
-    let info = probe(endpoint, &code)?;
-    assert_eq!(info["label"], "Source");
-    let target = desktop.create("Received", Some(info["repo"].as_str().unwrap()), None)?;
-    desktop.request(&target, "pair", json!({"endpoint":endpoint,"code":code}))?;
-    let payload = home.path().join("import.bin");
-    std::fs::write(&payload, b"received using desktop startup")?;
-    desktop.request(&source, "import", json!({"path":"file","source":payload}))?;
-    let end = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Ok(reply) = desktop.request(&target, "cat", json!({"path":"file"})) {
-            let bytes: Vec<u8> = serde_json::from_value(reply["bytes"].clone())?;
-            if bytes == b"received using desktop startup" {
-                break;
+fn a_failing_orchestrator_is_reported_with_its_log() -> Result<()> {
+    // Config::load does not validate `listen`; the orchestrator itself
+    // fails with LISTEN_FAILED (exit 1, not 75).
+    let (_home, config_path) = home_listening("256.0.0.1:1")?;
+    let began = Instant::now();
+    let result = launcher::ensure_running(&config_path, exe(), START_BOUND);
+    let elapsed = began.elapsed();
+    let error = match result {
+        Ok((config, _client, started)) => {
+            if let Started::Spawned { pid } = started {
+                drop(Orchestrator::new(&config, pid));
             }
+            bail!("an orchestrator listening on 256.0.0.1:1 started: {started:?}");
         }
-        anyhow::ensure!(Instant::now() < end, "received file did not arrive");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    desktop.request(&target, "checkpoint", json!({}))?;
-    let branch = desktop.request(&target, "fork", json!({"name":"draft"}))?["branch"].clone();
-    desktop.request(&target, "checkout", json!({"branch":branch}))?;
-    let snapshot = desktop.request(&target, "desktop-snapshot", json!({}))?;
-    assert_eq!(snapshot["status"]["branch"], branch);
-    assert_eq!(snapshot["peers"].as_array().unwrap().len(), 1);
-    assert!(!snapshot.to_string().contains("credential"));
-    assert_eq!(
-        desktop.request(&target, "peer-info", json!({"endpoint":endpoint}))?["repo"],
-        info["repo"]
-    );
-    let version = snapshot["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row[1]["operation"] == "content")
-        .unwrap()[1]["id"]
-        .clone();
-    assert!(
-        desktop.request(&target, "preview-version", json!({"version":version}))?["preview"]
-            .as_str()
-            .unwrap()
-            .contains("received using desktop startup")
-    );
-    let installation = snapshot["peers"][0]["installation"].clone();
-    desktop.request(&target, "unpair", json!({"installation":installation}))?;
-    assert!(
-        desktop.request(&target, "desktop-snapshot", json!({}))?["peers"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.starts_with("ORCHESTRATOR_START_FAILED"), "{error}");
+    assert!(error.contains(CONSOLE_LOG), "{error}");
+    assert!(elapsed < START_BOUND, "reported after {elapsed:?}");
+    let config = Config::load(&config_path)?;
+    let console = fs::read_to_string(config.data_directory.join("logs").join(CONSOLE_LOG))?;
+    assert!(console.contains("LISTEN_FAILED"), "console log:\n{console}");
     Ok(())
 }
 
 #[test]
-fn cleanup_quarantine_survives_reopening_the_desktop() -> Result<()> {
+fn an_unwritable_config_location_is_named_in_the_error() -> Result<()> {
     let home = tempfile::tempdir()?;
-    let state = home.path().join("folder");
-    let first = open(home.path(), Some(&state))?;
-    let path = first.config_path.with_extension("blocked.json");
-    drop(first);
-    std::fs::write(
-        path,
-        r#"{"stranded":true,"reason":"retained cleanup failure"}"#,
-    )?;
-    let mut reopened = open(home.path(), None)?;
-    reopened.autostart();
-    let id = reopened.config.folders[0].id.clone();
-    assert!(reopened.start(&id).is_err());
-    assert!(!state.join("metadata.sqlite").exists());
-    assert_eq!(reopened.snapshot(&id)["blocked"], true);
-    reopened.config.folders[0].autostart = false; // no daemon exists for fixture cleanup
-    Ok(())
-}
+    let file = home.path().join("file");
+    fs::write(&file, "not a directory")?;
+    let config_path = file.join("orchestrator.toml");
 
-#[cfg(windows)]
-#[test]
-#[ignore = "isolated Windows VM only; validates real desktop-owned mount stop/start"]
-fn desktop_mounted_start_stop() -> Result<()> {
-    anyhow::ensure!(
-        std::env::var("TKFS_DESKTOP_ISOLATED_VM").as_deref() == Ok("1"),
-        "requires isolated Windows VM"
-    );
-    let root = std::path::PathBuf::from(
-        std::env::var_os("TKFS_DESKTOP_MOUNT_HOME")
-            .expect("persistent native evidence directory required"),
-    );
-    for kind in ["letter", "directory"] {
-        let home = root.join(kind);
-        std::fs::create_dir_all(&home)?;
-        let state = home.join("store");
-        let mut desktop = open(&home, Some(&state))?;
-        let id = desktop.config.folders[0].id.clone();
-        let mount = if kind == "letter" {
-            std::path::PathBuf::from("P:")
-        } else {
-            home.join("mount")
-        };
-        desktop.config.folders[0].mount = Some(mount.clone());
-        desktop.config.folders[0].mount_enabled = true;
-        desktop.start(&id)?;
-        assert_eq!(
-            desktop.request(&id, "status", json!({}))?["mount"],
-            json!(mount)
-        );
-        desktop.set_mount_enabled(&id, false)?;
-        assert!(desktop.request(&id, "status", json!({}))?["mount"].is_null());
-        desktop.set_mount_enabled(&id, true)?;
-        assert_eq!(
-            desktop.request(&id, "status", json!({}))?["mount"],
-            json!(mount)
-        );
-        desktop.stop(&id)?;
-        assert!(!state.join("control.json").exists());
-        println!("{kind}: mounted -> sync only -> mounted -> stopped; all bounded exits passed");
-    }
-    Ok(())
-}
-
-#[test]
-fn a_failed_desktop_shutdown_reports_error_and_keeps_recovery_bytes() -> Result<()> {
-    let home = tempfile::tempdir()?;
-    let mut desktop = open(home.path(), None)?;
-    let id = desktop.create("Fault", None, None)?;
-    let state = desktop.folder(&id)?.state;
-    desktop.request(&id, "inject-fault", json!({"name":"flush-persistent"}))?;
-    let payload = home.path().join("recover.bin");
-    std::fs::write(&payload, b"recover this local save")?;
+    let error = match launcher::ensure_running(&config_path, exe(), START_BOUND) {
+        Ok((config, _client, started)) => {
+            if let Started::Spawned { pid } = started {
+                drop(Orchestrator::new(&config, pid));
+            }
+            bail!("ensure_running under a regular file succeeded: {started:?}");
+        }
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.starts_with("CONFIG_WRITE_FAILED"), "{error}");
     assert!(
-        desktop
-            .request(&id, "import", json!({"path":"recover","source":payload}))
-            .is_err()
+        error.contains(&config_path.display().to_string()),
+        "{error}"
     );
-    assert!(desktop.stop(&id).is_err());
-    assert!(!state.join("control.json").exists());
-    assert!(!desktop.folder(&id)?.autostart);
-    // A failed flush cannot strand an owned daemon or prevent a later clean start.
-    desktop.start(&id)?;
-    let bytes: Vec<u8> = serde_json::from_value(
-        desktop.request(&id, "cat", json!({"path":"recover"}))?["bytes"].clone(),
-    )?;
-    assert_eq!(bytes, b"recover this local save");
+    let entries: Vec<_> = fs::read_dir(home.path())?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    assert_eq!(entries, vec![std::ffi::OsString::from("file")]);
+    assert_eq!(fs::read_to_string(&file)?, "not a directory");
     Ok(())
 }
