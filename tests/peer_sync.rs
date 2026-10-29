@@ -115,6 +115,46 @@ fn pair_opens_control_and_bulk_lanes_and_reset_code_revokes() -> Result<()> {
 }
 
 #[test]
+fn a_dial_only_host_pairs_and_its_peer_keeps_no_endpoint_for_it() -> Result<()> {
+    // A has no listener and no advertise address: it can only dial.
+    let a = TestDaemon::start_listening("", "")?;
+    let b = TestDaemon::start()?;
+    let discovery: Value = serde_json::from_slice(&fs::read(a.data().join("orchestrator.json"))?)?;
+    assert!(discovery["listen"].is_null(), "{discovery}");
+    let code = b.manage(&["reset-pairing-code"])?["code"]
+        .as_str()
+        .context("no code")?
+        .to_string();
+    let endpoint_b = b.listen_endpoint()?;
+    let paired = a.manage(&["pair", &endpoint_b, "--code", &code, "--connections", "2"])?;
+    assert_eq!(paired["installation"], installation(&b)?, "{paired}");
+    // A's lanes to B come up.
+    a.wait_lanes(&endpoint_b, 2, "Ready", LANES_READY)?;
+    // B keeps A paired inbound only, with no endpoint to dial.
+    let peers_b = b.manage(&["peers"])?;
+    let inbound = peers_b.as_array().context("peers is not a list")?;
+    assert_eq!(inbound.len(), 1, "{peers_b}");
+    assert_eq!(inbound[0]["installation"], installation(&a)?, "{peers_b}");
+    assert!(inbound[0]["endpoint"].is_null(), "{peers_b}");
+    assert_eq!(inbound[0]["direction"], "inbound", "{peers_b}");
+    assert_eq!(inbound[0]["paired"], true, "{peers_b}");
+    // B logged the enrollment with no endpoint.
+    let log = b.log_text();
+    let enrolled = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|line| line["code"] == "PEER_ENROLLED")
+        .with_context(|| format!("no PEER_ENROLLED in B's log:\n{log}"))?;
+    assert!(
+        enrolled.get("endpoint").is_some_and(Value::is_null),
+        "{enrolled}"
+    );
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn wrong_code_is_refused_and_nothing_is_saved() -> Result<()> {
     let a = TestDaemon::start()?;
     let b = TestDaemon::start()?;

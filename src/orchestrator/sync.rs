@@ -14,7 +14,9 @@
 //!   once the scan reached its end (the next page without `after` starts
 //!   over).
 //! - `objects.fetch {repo}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`,
-//!   at most [`OBJECT_BATCH`] objects.
+//!   at most [`OBJECT_BATCH`] objects, in request order, absent ones left
+//!   out. The reply is cut to fit the byte bounds, never refused for size
+//!   (see [`Fetched`]): its header is `{truncated_at, oversized}`.
 //! - `objects.write {repo}`, body `Vec<Object>` → `{"stored": usize}`, at
 //!   most [`OBJECT_BATCH`] objects.
 //!
@@ -46,6 +48,11 @@ pub const MAX_EXCLUDE: usize = 256;
 pub const OBJECT_BATCH: usize = BATCH / 2;
 /// Most raw object bytes one `objects.fetch` reply or `objects.write` carries.
 pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Most encoded bytes one `objects.fetch` reply gives its objects: the 16 MiB
+/// session body bound (`ConnOptions::max_body`) less room for the rest.
+pub const MAX_REPLY_JSON: usize = 15 * 1024 * 1024;
+/// The JSON of one object beyond its byte array (digest, kind, keys).
+const OBJECT_JSON_OVERHEAD: usize = 128;
 pub const FETCH_OP: &str = "objects.fetch";
 /// Events per `feed.outgoing` page and per `meta.exchange` request or reply.
 pub const FEED_PAGE: usize = 256;
@@ -57,6 +64,51 @@ pub struct Object {
     pub digest: Digest,
     pub kind: Kind,
     pub bytes: Vec<u8>,
+}
+/// One `objects.fetch` reply. The objects are taken in request order until
+/// the next present one would pass [`MAX_BATCH_BYTES`] raw or
+/// [`MAX_REPLY_JSON`] encoded; `truncated_at` is then the index (in the
+/// request) of the first digest not looked at, which the client asks again.
+/// An object whose encoding alone cannot fit a reply is never sent: it is
+/// listed in `oversized` and treated as absent.
+#[derive(Default)]
+pub struct Fetched {
+    pub objects: Vec<Object>,
+    pub truncated_at: Option<usize>,
+    pub oversized: Vec<Digest>,
+}
+impl Fetched {
+    /// The reply header carrying `truncated_at` and `oversized`.
+    pub fn header(&self) -> Value {
+        json!({"truncated_at": self.truncated_at, "oversized": self.oversized})
+    }
+    /// A reply from its `header` (absent fields: complete, none oversized)
+    /// and body.
+    pub fn from_reply(header: &Value, body: &[u8]) -> Result<Self> {
+        Ok(Self {
+            objects: serde_json::from_slice(body)?,
+            truncated_at: header
+                .get("truncated_at")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok()),
+            oversized: match header.get("oversized") {
+                None | Some(Value::Null) => Vec::new(),
+                Some(list) => serde_json::from_value(list.clone())?,
+            },
+        })
+    }
+}
+/// `bytes` as a JSON number array: up to 4 bytes per byte ("255,").
+fn encoded_len(bytes: &[u8]) -> usize {
+    let digits: usize = bytes
+        .iter()
+        .map(|byte| match byte {
+            0..=9 => 2,
+            10..=99 => 3,
+            _ => 4,
+        })
+        .sum();
+    digits + OBJECT_JSON_OVERHEAD
 }
 #[derive(Serialize, Deserialize)]
 pub struct FeedRequest {
@@ -251,24 +303,39 @@ impl Service {
             cursor: None,
         })
     }
-    fn fetch(&self, wanted: Vec<(Digest, Kind)>) -> Result<Vec<Object>> {
+    /// The present objects of `wanted`, cut to the reply bounds (see
+    /// [`Fetched`]); never an error for their size.
+    fn fetch(&self, wanted: Vec<(Digest, Kind)>) -> Result<Fetched> {
         ensure!(wanted.len() <= OBJECT_BATCH, "OBJECT_BATCH_TOO_LARGE");
         let content = self.engine.working.content();
         let _pins = content.packs.pin(wanted.iter().map(|(d, _)| *d));
-        let mut objects = Vec::new();
-        let mut size = 0;
-        for (digest, kind) in wanted {
-            if let Ok(bytes) = content.packs.get(digest) {
-                size += bytes.len();
-                ensure!(size <= MAX_BATCH_BYTES, "OBJECT_BATCH_TOO_LARGE");
-                objects.push(Object {
-                    digest,
-                    kind,
-                    bytes: (*bytes).clone(),
-                });
+        let mut fetched = Fetched::default();
+        let (mut raw, mut encoded) = (0, 0);
+        for (index, (digest, kind)) in wanted.into_iter().enumerate() {
+            let Ok(bytes) = content.packs.get(digest) else {
+                continue;
+            };
+            let size = encoded_len(&bytes);
+            if size > MAX_REPLY_JSON {
+                fetched.oversized.push(digest);
+                continue;
             }
+            // The first present object always goes, whatever its raw size.
+            if !fetched.objects.is_empty()
+                && (raw + bytes.len() > MAX_BATCH_BYTES || encoded + size > MAX_REPLY_JSON)
+            {
+                fetched.truncated_at = Some(index);
+                break;
+            }
+            raw += bytes.len();
+            encoded += size;
+            fetched.objects.push(Object {
+                digest,
+                kind,
+                bytes: (*bytes).clone(),
+            });
         }
-        Ok(objects)
+        Ok(fetched)
     }
     /// Verifies every object before storing any, makes them durable, then
     /// wakes the readers waiting for them.
@@ -296,6 +363,10 @@ impl Service {
     }
     /// Runs one op; the reply body on success.
     pub fn handle_request(&self, op: &str, header: &Value, body: &[u8]) -> Result<Vec<u8>> {
+        self.handle_reply(op, header, body).map(|(_, body)| body)
+    }
+    /// Runs one op; the reply header and body on success.
+    pub fn handle_reply(&self, op: &str, header: &Value, body: &[u8]) -> Result<(Value, Vec<u8>)> {
         if matches!(op, "meta.exchange" | FETCH_OP | "objects.write") {
             let repo = lock(&self.engine.store).repo.clone();
             ensure!(
@@ -303,7 +374,11 @@ impl Service {
                 "REPOSITORY_MISMATCH"
             );
         }
-        match op {
+        if op == FETCH_OP {
+            let fetched = self.fetch(serde_json::from_slice(body)?)?;
+            return Ok((fetched.header(), serde_json::to_vec(&fetched.objects)?));
+        }
+        let body: Result<Vec<u8>> = match op {
             "feed.outgoing" => Ok(serde_json::to_vec(
                 &self.page(header["after"].as_u64().unwrap_or(0))?,
             )?),
@@ -331,14 +406,12 @@ impl Service {
                     after.as_ref(),
                 )?)?)
             }
-            FETCH_OP => Ok(serde_json::to_vec(
-                &self.fetch(serde_json::from_slice(body)?)?,
-            )?),
             "objects.write" => Ok(serde_json::to_vec(
                 &json!({"stored":self.write(serde_json::from_slice(body)?)?}),
             )?),
             _ => anyhow::bail!("UNSUPPORTED_OPERATION"),
-        }
+        };
+        Ok((json!({}), body?))
     }
 }
 /// `objects.missing`'s `exclude`: absent or a list of at most
@@ -365,8 +438,8 @@ fn exclusions(header: &Value) -> Result<BTreeSet<Digest>> {
 
 impl Handler for Service {
     fn handle(&self, req: Incoming) {
-        match self.handle_request(&req.op, &req.header, &req.body) {
-            Ok(body) => req.responder.reply(json!({}), body),
+        match self.handle_reply(&req.op, &req.header, &req.body) {
+            Ok((header, body)) => req.responder.reply(header, body),
             Err(error) => req.responder.error(super::control::error_wire(&error)),
         }
     }
@@ -1047,6 +1120,96 @@ mod tests {
     /// The bound a session applies to `op`'s request and reply bodies.
     fn session_limit(op: &str) -> usize {
         crate::model::protocol::max_body(op).min(crate::session::ConnOptions::default().max_body)
+    }
+
+    /// Stores `count` distinct manifest-kind objects of `size` bytes of
+    /// `fill` and returns them as a fetch request.
+    fn stored_objects(
+        engine: &Engine,
+        count: usize,
+        size: usize,
+        fill: u8,
+    ) -> Result<Vec<(Digest, Kind)>> {
+        let packs = &engine.working.content().packs;
+        let mut wanted = Vec::new();
+        for n in 0..count {
+            let mut bytes = vec![fill; size];
+            bytes[0] = n as u8;
+            wanted.push((packs.put(Kind::Manifest, &bytes)?, Kind::Manifest));
+        }
+        packs.flush()?;
+        Ok(wanted)
+    }
+
+    fn fetch_reply(service: &Service, wanted: &[(Digest, Kind)]) -> Result<(Fetched, usize)> {
+        let (header, body) = service.handle_reply(
+            FETCH_OP,
+            &json!({"repo": "repo"}),
+            &serde_json::to_vec(wanted)?,
+        )?;
+        Ok((Fetched::from_reply(&header, &body)?, body.len()))
+    }
+
+    #[test]
+    fn a_fetch_beyond_the_byte_bounds_is_cut_never_refused() -> Result<()> {
+        const MIB: usize = 1024 * 1024;
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+        let digests = |fetched: &Fetched| -> Vec<Digest> {
+            fetched.objects.iter().map(|object| object.digest).collect()
+        };
+
+        // Raw bound: 4 × 3 MiB (12 MiB > MAX_BATCH_BYTES) of small bytes
+        // gives the first two and where it stopped; no error.
+        let wanted = stored_objects(&engine, 4, 3 * MIB, 0)?;
+        let (fetched, body) = fetch_reply(&service, &wanted)?;
+        assert_eq!(
+            digests(&fetched),
+            vec![wanted[0].0, wanted[1].0],
+            "a partial reply in request order"
+        );
+        assert_eq!(fetched.truncated_at, Some(2));
+        assert!(fetched.oversized.is_empty());
+        assert!(body <= session_limit(FETCH_OP), "{body} bytes");
+        // What was not looked at is served when asked again.
+        let (rest, _) = fetch_reply(&service, &wanted[2..])?;
+        assert_eq!(digests(&rest), vec![wanted[2].0, wanted[3].0]);
+        assert_eq!(rest.truncated_at, None);
+
+        // Encoded bound: 2 × 3 MiB of 0xFF (6 MiB raw, ~24 MiB as JSON).
+        let wide = stored_objects(&engine, 2, 3 * MIB, 0xFF)?;
+        let (fetched, body) = fetch_reply(&service, &wide)?;
+        assert_eq!(digests(&fetched), vec![wide[0].0]);
+        assert_eq!(fetched.truncated_at, Some(1));
+        assert!(body <= session_limit(FETCH_OP), "{body} bytes");
+
+        // An object that cannot fit any reply is never sent, nor does it
+        // fail the batch: it is named in `oversized`, the rest goes.
+        let huge = stored_objects(&engine, 1, 9 * MIB, 0)?;
+        let small = stored_objects(&engine, 1, 1024, 7)?;
+        let request = [huge[0], small[0]];
+        let (fetched, body) = fetch_reply(&service, &request)?;
+        assert_eq!(digests(&fetched), vec![small[0].0]);
+        assert_eq!(fetched.oversized, vec![huge[0].0]);
+        assert_eq!(fetched.truncated_at, None);
+        assert!(body <= session_limit(FETCH_OP), "{body} bytes");
+
+        // The header round-trips; a header without the fields is complete.
+        let header = Fetched {
+            objects: Vec::new(),
+            truncated_at: Some(3),
+            oversized: vec![huge[0].0],
+        }
+        .header();
+        let parsed = Fetched::from_reply(&header, b"[]")?;
+        assert_eq!(parsed.truncated_at, Some(3));
+        assert_eq!(parsed.oversized, vec![huge[0].0]);
+        let plain = Fetched::from_reply(&json!({}), b"[]")?;
+        assert_eq!(plain.truncated_at, None);
+        assert!(plain.oversized.is_empty());
+        engine.shutdown()?;
+        Ok(())
     }
 
     #[test]

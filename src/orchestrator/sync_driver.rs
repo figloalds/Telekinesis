@@ -22,9 +22,15 @@
 //!   cursor past it, so every missing object is eventually listed — and is
 //!   abandoned before its next call as soon as a demand wake-up (the
 //!   wake [`Seq`] the folders' watch threads bump) arrives, so the next
-//!   round's pass 1 waits at most for one call in flight (≤ 10 s). Objects
-//!   are asked of each peer in turn, per owning Ready bulk lane, in batches
-//!   of ≤ [`OBJECT_BATCH`], and written to the worker. A digest every asked
+//!   round's pass 1 waits at most for one call in flight (≤
+//!   [`FETCH_DEADLINE_MAX`]). Objects are asked of each peer in turn, per
+//!   owning Ready bulk lane: manifests (size unknown) in batches of ≤
+//!   [`MANIFEST_BATCH`], then chunks in batches of ≤ [`OBJECT_BATCH`], each
+//!   within a deadline that grows with what it asks ([`fetch_deadline`]),
+//!   and written to the worker. A fetch that timed out halves that folder's
+//!   batch for that peer (down to 1); each answered one grows it back by a
+//!   quarter. Of a reply the peer cut to its byte bounds (`truncated_at`),
+//!   the rest is asked again at once. A digest every asked
 //!   peer omitted is excluded for a backoff (5 s doubling to 5 min), which
 //!   spares re-asking it when the scan comes around again. A round that stored nothing sleeps
 //!   `sync_interval_ms` unless woken. A peer whose fetch failed sits out the
@@ -38,7 +44,7 @@ use super::{
     catalog::Catalog,
     demand::Seq,
     network::{Network, ReadyPeer},
-    sync::{FeedCursor, FeedPage, FeedReply, FeedRequest, MAX_EXCLUDE, Object},
+    sync::{FeedCursor, FeedPage, FeedReply, FeedRequest, Fetched, MAX_EXCLUDE},
     worker_client::{CALL_DEADLINE, WorkerLink},
 };
 use crate::{
@@ -51,7 +57,7 @@ use crate::{
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
@@ -67,8 +73,19 @@ pub const MAX_EXCHANGES: usize = 4;
 pub const OBJECT_BATCH: usize = super::sync::OBJECT_BATCH;
 /// A peer's clock is probed again every this many scheduler rounds.
 pub const CLOCK_PROBE_EVERY: u64 = 60;
-/// Deadline of one request on a peer lane.
+/// Deadline of one request on a peer lane (an `objects.fetch` gets more:
+/// [`fetch_deadline`]).
 pub const PEER_DEADLINE: Duration = Duration::from_secs(10);
+/// Objects of unknown size (manifests) per `objects.fetch`.
+pub const MANIFEST_BATCH: usize = 4;
+/// The longest `objects.fetch` deadline.
+pub const FETCH_DEADLINE_MAX: Duration = Duration::from_secs(120);
+/// What a fetch deadline counts for a requested chunk (a full one)…
+const CHUNK_GUESS: u64 = 64 * 1024;
+/// …and for an object of unknown size (a manifest).
+const UNKNOWN_GUESS: u64 = 1024 * 1024;
+/// A fetch deadline grows by 1 s per this many requested bytes.
+const DEADLINE_STEP_BYTES: u64 = 256 * 1024;
 /// A digest no asked peer had is excluded this long at first…
 pub const UNAVAILABLE_FIRST: Duration = Duration::from_secs(5);
 /// …doubling each time to at most this.
@@ -172,6 +189,45 @@ struct PumpState {
     /// (folder id, digest) written lately: not fetched again for a stale
     /// demand.
     supplied: BTreeMap<(String, Digest), Instant>,
+    /// (folder id, endpoint) → the objects asked per `objects.fetch`, while
+    /// below [`OBJECT_BATCH`]: halved by a timeout, grown back by replies.
+    batch: BTreeMap<(String, String), usize>,
+}
+
+impl PumpState {
+    /// The objects asked of `endpoint` per fetch for folder `id`.
+    fn batch_size(&self, id: &str, endpoint: &str) -> usize {
+        self.batch
+            .get(&(id.to_owned(), endpoint.to_owned()))
+            .copied()
+            .unwrap_or(OBJECT_BATCH)
+    }
+
+    /// A fetch of `asked` objects timed out: half that, at least 1.
+    fn shrink(&mut self, id: &str, endpoint: &str, asked: usize) {
+        let size = (self.batch_size(id, endpoint).min(asked) / 2).max(1);
+        self.batch
+            .insert((id.to_owned(), endpoint.to_owned()), size);
+        event!(info, SYNC_BATCH_SHRUNK, {
+            "peer": endpoint,
+            "folder": id,
+            "batch": size,
+        });
+    }
+
+    /// A fetch was answered: a quarter more (at least 1), up to
+    /// [`OBJECT_BATCH`].
+    fn grow(&mut self, id: &str, endpoint: &str) {
+        let key = (id.to_owned(), endpoint.to_owned());
+        if let Some(size) = self.batch.get(&key).copied() {
+            let size = size + (size / 4).max(1);
+            if size >= OBJECT_BATCH {
+                self.batch.remove(&key);
+            } else {
+                self.batch.insert(key, size);
+            }
+        }
+    }
 }
 
 struct Unavailable {
@@ -230,6 +286,9 @@ pub struct Driver {
     /// Shared with probe threads, which clear their `running` flag.
     probes: Arc<Mutex<BTreeMap<String, ProbeState>>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The deadline of an `objects.fetch` ([`fetch_deadline`]; tests
+    /// shorten it).
+    fetch_deadline: fn(&[(Digest, Kind)]) -> Duration,
 }
 
 /// Starts the scheduler, its exchange pool and the pump. `cancel` (a child
@@ -298,6 +357,7 @@ impl Driver {
             busy: AtomicUsize::new(0),
             probes: Arc::new(Mutex::new(BTreeMap::new())),
             threads: Mutex::new(Vec::new()),
+            fetch_deadline,
         })
     }
 
@@ -544,6 +604,7 @@ impl Driver {
         let syncing = |id: &String| folders.iter().any(|folder| folder.id == *id);
         state.unavailable.retain(|id, _| syncing(id));
         state.scan.retain(|id, _| syncing(id));
+        state.batch.retain(|(id, _), _| syncing(id));
         let now = Instant::now();
         state
             .supplied
@@ -668,17 +729,42 @@ impl Driver {
                 continue;
             }
             for (conn, batch) in self.lanes_for(endpoint, &remaining) {
-                for chunk in batch.chunks(OBJECT_BATCH) {
+                // Objects of unknown size (manifests) first, in their own
+                // small batches; then the chunks.
+                let mut queue: VecDeque<(Digest, Kind)> = batch
+                    .iter()
+                    .filter(|(_, kind)| *kind != Kind::Chunk)
+                    .chain(batch.iter().filter(|(_, kind)| *kind == Kind::Chunk))
+                    .copied()
+                    .collect();
+                while let Some(&(_, kind)) = queue.front() {
                     let woken = interrupt.is_some_and(|seen| self.wake.current() != seen);
                     if self.cancel.is_cancelled() || woken {
                         result.interrupted = true;
                         break 'peers;
                     }
-                    asked.extend(chunk.iter().map(|(digest, _)| *digest));
-                    let mut objects = match fetch(&conn, &folder.repo, chunk, &self.cancel) {
-                        Ok(objects) => objects,
-                        Err(failure) => {
+                    let chunks = kind == Kind::Chunk;
+                    let size = state.batch_size(&folder.id, endpoint);
+                    let limit = size.min(if chunks { OBJECT_BATCH } else { MANIFEST_BATCH });
+                    let mut chunk = Vec::with_capacity(limit);
+                    while chunk.len() < limit
+                        && queue
+                            .front()
+                            .is_some_and(|(_, next)| (*next == Kind::Chunk) == chunks)
+                    {
+                        chunk.extend(queue.pop_front());
+                    }
+                    let deadline = (self.fetch_deadline)(&chunk);
+                    let fetched = match fetch(&conn, &folder.repo, &chunk, deadline, &self.cancel) {
+                        Ok(fetched) => {
+                            state.grow(&folder.id, endpoint);
+                            fetched
+                        }
+                        Err(FetchFailure { failure, timed_out }) => {
                             failed.extend(chunk.iter().map(|(digest, _)| *digest));
+                            if timed_out {
+                                state.shrink(&folder.id, endpoint, chunk.len());
+                            }
                             state.resting.insert(endpoint.clone(), state.round + 2);
                             let error = failure.to_string();
                             if state.logged.get(endpoint) != Some(&error) {
@@ -686,13 +772,39 @@ impl Driver {
                                     "peer": endpoint.clone(),
                                     "repo": folder.repo.clone(),
                                     "error": error.clone(),
+                                    "batch": chunk.len(),
                                 });
                                 state.logged.insert(endpoint.clone(), error);
                             }
                             continue 'peers;
                         }
                     };
+                    // The peer cut its reply to its byte bounds: what it did
+                    // not look at is asked again next. It looked at one object
+                    // at least, so the queue always shrinks.
+                    let looked = fetched
+                        .truncated_at
+                        .map_or(chunk.len(), |at| at.clamp(1, chunk.len()));
+                    for object in chunk[looked..].iter().rev() {
+                        queue.push_front(*object);
+                    }
+                    let chunk = &chunk[..looked];
+                    asked.extend(chunk.iter().map(|(digest, _)| *digest));
+                    // Never sent (no reply can hold it): logged once, then
+                    // treated as absent like any object the peer lacks.
+                    for digest in &fetched.oversized {
+                        let key = format!("{}/{digest}", folder.id);
+                        state.logged.entry(key).or_insert_with(|| {
+                            event!(warn, SYNC_OBJECT_TOO_LARGE, {
+                                "peer": endpoint.clone(),
+                                "repo": folder.repo.clone(),
+                                "digest": digest.to_string(),
+                            });
+                            String::new()
+                        });
+                    }
                     // Only what was asked (the worker takes ≤ OBJECT_BATCH).
+                    let mut objects = fetched.objects;
                     objects.retain(|object| chunk.iter().any(|(d, _)| *d == object.digest));
                     if objects.is_empty() {
                         continue;
@@ -813,13 +925,45 @@ fn exchange(
     }
 }
 
-/// `objects.fetch` of ≤ [`OBJECT_BATCH`] objects on a peer bulk lane.
+/// Why a fetch failed, and whether its deadline passed.
+struct FetchFailure {
+    failure: Failure,
+    timed_out: bool,
+}
+
+impl From<Failure> for FetchFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            timed_out: false,
+        }
+    }
+}
+
+/// The deadline of an `objects.fetch` of `wanted`: [`PEER_DEADLINE`] plus
+/// 1 s per 256 KiB requested (a chunk counts 64 KiB, an object of unknown
+/// size such as a manifest 1 MiB), at most [`FETCH_DEADLINE_MAX`].
+pub fn fetch_deadline(wanted: &[(Digest, Kind)]) -> Duration {
+    let requested: u64 = wanted
+        .iter()
+        .map(|(_, kind)| match kind {
+            Kind::Chunk => CHUNK_GUESS,
+            _ => UNKNOWN_GUESS,
+        })
+        .sum();
+    let extra = Duration::from_millis(requested.saturating_mul(1000) / DEADLINE_STEP_BYTES);
+    (PEER_DEADLINE + extra).min(FETCH_DEADLINE_MAX)
+}
+
+/// `objects.fetch` of ≤ [`OBJECT_BATCH`] objects on a peer bulk lane, within
+/// `deadline`.
 fn fetch(
     conn: &Conn,
     repo: &str,
     wanted: &[(Digest, Kind)],
+    deadline: Duration,
     cancel: &Cancel,
-) -> Result<Vec<Object>, Failure> {
+) -> Result<Fetched, FetchFailure> {
     let body = serde_json::to_vec(wanted).map_err(|e| worker_failure("objects.fetch", e))?;
     let reply = conn
         .call_cancellable(
@@ -827,12 +971,16 @@ fn fetch(
             json!({"repo": repo}),
             body,
             Priority::Data,
-            PEER_DEADLINE,
+            deadline,
             &|| cancel.is_cancelled(),
         )
-        .map_err(|error| peer_failure("objects.fetch", error))?;
-    serde_json::from_slice(&reply.body)
-        .map_err(|error| Failure::Error(format!("objects.fetch: malformed reply: {error}")))
+        .map_err(|error| FetchFailure {
+            timed_out: matches!(error, CallError::Timeout { .. }),
+            failure: peer_failure("objects.fetch", error),
+        })?;
+    Fetched::from_reply(&reply.header, &reply.body).map_err(|error| {
+        Failure::Error(format!("objects.fetch: malformed reply: {error:#}")).into()
+    })
 }
 
 /// One clock probe on a control lane: stores the smoothed offset of
@@ -884,7 +1032,7 @@ fn probe(catalog: &Catalog, installation: &str, conn: &Conn, cancel: &Cancel) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestrator::sync::MissingPage;
+    use crate::orchestrator::sync::{MissingPage, Object};
     use crate::{
         model::{errors::ErrorWire, protocol::LaneRole},
         session::{ConnOptions, Handler, Incoming, PeerInfo, Side},
@@ -1136,22 +1284,35 @@ mod tests {
     }
 
     /// A peer bulk lane that holds `held`; a fetch naming one of `slow`
-    /// takes `delay`. Counts the fetches.
+    /// takes `delay`, and so does one of more than `stall_above` objects.
+    /// With `cut`, a reply carries at most that many objects and names the
+    /// first digest not looked at (`truncated_at`), as a peer at its byte
+    /// bounds does. Counts the fetches and records each request's kinds.
     struct Peer {
         held: BTreeMap<Digest, Object>,
         slow: BTreeSet<Digest>,
         delay: Duration,
+        stall_above: Option<usize>,
+        cut: Option<usize>,
         fetches: Mutex<u32>,
+        requests: Mutex<Vec<Vec<Kind>>>,
     }
 
     impl Peer {
         fn new(held: &[Object], slow: &[Object], delay: Duration) -> Arc<Self> {
-            Arc::new(Self {
+            Arc::new(Self::plain(held, slow, delay))
+        }
+
+        fn plain(held: &[Object], slow: &[Object], delay: Duration) -> Self {
+            Self {
                 held: held.iter().map(|o| (o.digest, o.clone())).collect(),
                 slow: slow.iter().map(|o| o.digest).collect(),
                 delay,
+                stall_above: None,
+                cut: None,
                 fetches: Mutex::new(0),
-            })
+                requests: Mutex::new(Vec::new()),
+            }
         }
 
         fn lane(self: &Arc<Self>) -> Conn {
@@ -1161,15 +1322,26 @@ mod tests {
                 Arc::new(FnHandler(move |req: Incoming| {
                     *lock(&peer.fetches) += 1;
                     let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
-                    if wanted.iter().any(|(d, _)| peer.slow.contains(d)) {
+                    lock(&peer.requests).push(wanted.iter().map(|(_, kind)| *kind).collect());
+                    if wanted.iter().any(|(d, _)| peer.slow.contains(d))
+                        || peer.stall_above.is_some_and(|most| wanted.len() > most)
+                    {
                         thread::sleep(peer.delay);
                     }
-                    let objects: Vec<&Object> = wanted
-                        .iter()
-                        .filter_map(|(d, _)| peer.held.get(d))
-                        .collect();
+                    let mut header = json!({});
+                    let mut objects: Vec<&Object> = Vec::new();
+                    for (index, (digest, _)) in wanted.iter().enumerate() {
+                        let Some(object) = peer.held.get(digest) else {
+                            continue;
+                        };
+                        if peer.cut.is_some_and(|most| objects.len() == most) {
+                            header = json!({"truncated_at": index});
+                            break;
+                        }
+                        objects.push(object);
+                    }
                     req.responder
-                        .reply(json!({}), serde_json::to_vec(&objects).unwrap());
+                        .reply(header, serde_json::to_vec(&objects).unwrap());
                 })),
             );
             std::mem::forget(server);
@@ -1377,5 +1549,200 @@ mod tests {
             served < first_third,
             "demand waited for folder 3's background batch"
         );
+    }
+
+    #[test]
+    fn the_fetch_deadline_grows_with_what_is_asked_and_is_capped() {
+        let chunk = |n: u8| (Digest([n; 32]), Kind::Chunk);
+        let manifest = |n: u8| (Digest([n; 32]), Kind::Manifest);
+        assert_eq!(fetch_deadline(&[]), PEER_DEADLINE);
+        // 1 s per 256 KiB: a 64 KiB chunk adds 250 ms…
+        assert_eq!(
+            fetch_deadline(&[chunk(1)]),
+            PEER_DEADLINE + Duration::from_millis(250)
+        );
+        // …a full chunk batch (2 MiB) 8 s…
+        let chunks: Vec<_> = (0..OBJECT_BATCH as u8).map(chunk).collect();
+        assert_eq!(
+            fetch_deadline(&chunks),
+            PEER_DEADLINE + Duration::from_secs(8)
+        );
+        // …a manifest (size unknown, taken as 1 MiB) 4 s.
+        let manifests: Vec<_> = (0..MANIFEST_BATCH as u8).map(manifest).collect();
+        assert_eq!(
+            fetch_deadline(&manifests),
+            PEER_DEADLINE + Duration::from_secs(16)
+        );
+        // At most FETCH_DEADLINE_MAX.
+        let many: Vec<_> = (0..=255).map(manifest).collect();
+        assert_eq!(fetch_deadline(&many), FETCH_DEADLINE_MAX);
+        assert_eq!(FETCH_DEADLINE_MAX, Duration::from_secs(120));
+    }
+
+    /// `count` distinct objects of kind Manifest.
+    fn manifests(tag: &str, count: usize) -> Vec<Object> {
+        objects(tag, count)
+            .into_iter()
+            .map(|object| Object {
+                kind: Kind::Manifest,
+                ..object
+            })
+            .collect()
+    }
+
+    /// Pump rounds until `folder` has `count` objects written, at most
+    /// `bound` of time.
+    fn pump_until(
+        driver: &Driver,
+        state: &mut PumpState,
+        folder: &FakeFolder,
+        count: usize,
+        bound: Duration,
+    ) -> u32 {
+        let end = Instant::now() + bound;
+        let seen = driver.wake.current();
+        let mut rounds = 0;
+        while folder.written().len() < count {
+            assert!(
+                Instant::now() < end,
+                "{} of {count} written after {rounds} rounds",
+                folder.written().len()
+            );
+            driver.pump_round(state, seen);
+            rounds += 1;
+        }
+        rounds
+    }
+
+    #[test]
+    fn a_timed_out_batch_is_halved_and_the_pump_completes() {
+        // A slow link: a fetch of more than 16 objects outlasts the deadline,
+        // one of 16 or fewer is answered at once.
+        let all = objects("slow-link", OBJECT_BATCH);
+        let folder = Arc::new(FakeFolder {
+            missing: wanted_of(&all),
+            ..FakeFolder::default()
+        });
+        let link = fake_worker(folder.clone());
+        let mut peer = Peer::plain(&all, &[], Duration::from_millis(900));
+        peer.stall_above = Some(16);
+        let peer = Arc::new(peer);
+        let folders = Arc::new(Folders(vec![("f1".into(), link, Mutex::new(Vec::new()))]));
+        let (mut driver, _root) = driver(OneLane(peer.lane()), folders, Seq::new());
+        Arc::get_mut(&mut driver).unwrap().fetch_deadline = |_| Duration::from_millis(300);
+        let mut state = PumpState::default();
+        let seen = driver.wake.current();
+        // The full batch times out: nothing stored, the batch halves, and
+        // the timed-out digests are not taken as missing on the peer.
+        assert_eq!(driver.pump_round(&mut state, seen), 0);
+        assert_eq!(state.batch_size("f1", "ws://peer"), OBJECT_BATCH / 2);
+        assert!(state.unavailable["f1"].is_empty());
+        assert_eq!(lock(&peer.requests)[0].len(), OBJECT_BATCH);
+        pump_until(
+            &driver,
+            &mut state,
+            &folder,
+            OBJECT_BATCH,
+            Duration::from_secs(30),
+        );
+        let mut written = folder.written();
+        written.sort();
+        let mut expected: Vec<Digest> = all.iter().map(|o| o.digest).collect();
+        expected.sort();
+        assert_eq!(written, expected);
+        // Every batch after the timeout was within the halved size, and the
+        // answered ones grew it back.
+        let requests = lock(&peer.requests).clone();
+        assert!(
+            requests[1..].iter().all(|kinds| kinds.len() <= 16),
+            "{:?}",
+            requests.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(state.batch_size("f1", "ws://peer") > OBJECT_BATCH / 2);
+    }
+
+    #[test]
+    fn a_batch_shrinks_to_one_and_grows_back_to_the_full_batch() {
+        let mut state = PumpState::default();
+        for expected in [16, 8, 4, 2, 1, 1] {
+            let asked = state.batch_size("f", "p");
+            state.shrink("f", "p", asked);
+            assert_eq!(state.batch_size("f", "p"), expected);
+        }
+        let mut sizes = Vec::new();
+        while state.batch_size("f", "p") < OBJECT_BATCH {
+            state.grow("f", "p");
+            sizes.push(state.batch_size("f", "p"));
+            assert!(sizes.len() < 32, "{sizes:?}");
+        }
+        assert_eq!(sizes[..4], [2, 3, 4, 5]);
+        assert!(state.batch.is_empty());
+        // Growing a full batch keeps it full.
+        state.grow("f", "p");
+        assert_eq!(state.batch_size("f", "p"), OBJECT_BATCH);
+    }
+
+    #[test]
+    fn manifests_are_asked_in_their_own_batches_of_four_before_chunks() {
+        let manifests = manifests("manifest", 6);
+        let chunks = objects("chunk", 10);
+        // Listed mixed, as an `objects.missing` page may be.
+        let all: Vec<Object> = chunks[..5]
+            .iter()
+            .chain(&manifests)
+            .chain(&chunks[5..])
+            .cloned()
+            .collect();
+        let folder = Arc::new(FakeFolder {
+            missing: wanted_of(&all),
+            ..FakeFolder::default()
+        });
+        let link = fake_worker(folder.clone());
+        let peer = Peer::new(&all, &[], Duration::ZERO);
+        let folders = Arc::new(Folders(vec![("f1".into(), link, Mutex::new(Vec::new()))]));
+        let (driver, _root) = driver(OneLane(peer.lane()), folders, Seq::new());
+        let mut state = PumpState::default();
+        assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 16);
+        let requests = lock(&peer.requests).clone();
+        assert_eq!(
+            requests,
+            vec![
+                vec![Kind::Manifest; 4],
+                vec![Kind::Manifest; 2],
+                vec![Kind::Chunk; 10],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reply_cut_to_the_byte_bounds_has_the_rest_asked_again() {
+        // The peer answers at most 3 objects per reply and says where it
+        // stopped; the 2 objects it does not hold are still found absent.
+        let all = objects("cut", 12);
+        let held: Vec<Object> = all[..10].to_vec();
+        let folder = Arc::new(FakeFolder {
+            missing: wanted_of(&all),
+            ..FakeFolder::default()
+        });
+        let link = fake_worker(folder.clone());
+        let mut peer = Peer::plain(&held, &[], Duration::ZERO);
+        peer.cut = Some(3);
+        let peer = Arc::new(peer);
+        let folders = Arc::new(Folders(vec![("f1".into(), link, Mutex::new(Vec::new()))]));
+        let (driver, _root) = driver(OneLane(peer.lane()), folders, Seq::new());
+        let mut state = PumpState::default();
+        // One round stores everything the peer holds.
+        assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 10);
+        let expected: Vec<Digest> = held.iter().map(|o| o.digest).collect();
+        assert_eq!(folder.written(), expected);
+        // 12, then what was not looked at: 9 (from the 4th), 6, 3 (two
+        // absent, held objects first).
+        let sizes: Vec<usize> = lock(&peer.requests).iter().map(Vec::len).collect();
+        assert_eq!(sizes, [12, 9, 6, 3]);
+        // Only the two the peer lacks are unavailable; nothing failed.
+        let unavailable: BTreeSet<Digest> = state.unavailable["f1"].keys().copied().collect();
+        let absent: BTreeSet<Digest> = all[10..].iter().map(|o| o.digest).collect();
+        assert_eq!(unavailable, absent);
+        assert!(state.resting.is_empty());
     }
 }

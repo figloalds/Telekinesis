@@ -70,7 +70,8 @@ pub const START_TOLERANCE_MS: u64 = 2000;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// What to launch: the worker's state directory (its log is
-/// `state/worker.log`) and an optional mount point.
+/// `state/worker.log`) and an optional mount point. The controller always
+/// leaves `mount` empty until the mounts plan (W6-P0, `AGENTS.md`).
 #[derive(Clone, Debug)]
 pub struct LaunchSpec {
     pub executable: PathBuf,
@@ -131,6 +132,22 @@ impl WorkerProcess {
     }
 }
 
+/// The worker's command line after the executable:
+/// `daemon --state S --supervised [--mount M]`.
+pub fn worker_args(spec: &LaunchSpec) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "daemon".into(),
+        "--state".into(),
+        spec.state.clone().into(),
+        "--supervised".into(),
+    ];
+    if let Some(mount) = &spec.mount {
+        args.push("--mount".into());
+        args.push(mount.clone().into());
+    }
+    args
+}
+
 /// Spawns a worker for `spec`; its events go to `sink`.
 pub fn spawn(spec: &LaunchSpec, sink: mpsc::Sender<ProcessEvent>) -> Result<WorkerProcess> {
     let executable = spec.executable.display().to_string();
@@ -150,14 +167,7 @@ pub fn spawn(spec: &LaunchSpec, sink: mpsc::Sender<ProcessEvent>) -> Result<Work
         .with_context(|| failed("open worker.log"))?;
     let mut command = Command::new(&spec.executable);
     command
-        .arg("daemon")
-        .arg("--state")
-        .arg(&spec.state)
-        .arg("--supervised");
-    if let Some(mount) = &spec.mount {
-        command.arg("--mount").arg(mount);
-    }
-    command
+        .args(worker_args(spec))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(stderr);

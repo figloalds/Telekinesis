@@ -23,7 +23,8 @@
 //! it `GOAWAY{PAIRING_CODE_CHANGED}` and shutdown can close it.
 //!
 //! **Pairing.** `pair` dials a probe lane with the code, enrolls a fresh
-//! secret (`peer.enroll`, header `{"endpoint": advertise}`), saves the peer
+//! secret (`peer.enroll`, header `{"endpoint": advertise}`, `null` on a
+//! dial-only host, whose peer then stores no endpoint for it), saves the peer
 //! and opens its lanes. A reset of this side's code revokes every inbound
 //! credential (`paired` is cleared), sends the GOAWAY above and closes every
 //! outbound lane; the `peers` rows stay (listed with `"paired": false`, no
@@ -347,10 +348,9 @@ impl Network {
                 "INVALID_REQUEST: connections must be 1..={MAX_POOL}"
             );
         }
-        let advertise = self.advertise.clone().context(
-            "ADVERTISE_REQUIRED: set [network] advertise (or listen) so the peer learns this \
-             orchestrator's endpoint",
-        )?;
+        // A dial-only host (no listener, no advertise) tells the peer no
+        // endpoint: the peer keeps the pairing inbound only.
+        let advertise = self.advertise.clone();
         register_secret(code);
         clock::check()?;
         let hello = session::client_hello(&self.installation, LaneRole::Probe, None, 1);
@@ -1131,8 +1131,9 @@ impl PeerService {
                 let link = self.link(header)?;
                 let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&body)
                     .map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))?;
-                let objects = link.fetch(&wanted).map_err(|error| error.to_wire())?;
-                Ok((json!({}), encode(&objects)?))
+                // The worker's cut (`truncated_at`, `oversized`) goes along.
+                let fetched = link.fetch_reply(&wanted).map_err(|error| error.to_wire())?;
+                Ok((fetched.header(), encode(&fetched.objects)?))
             }
             _ => Err(ErrorWire::coded(
                 "UNSUPPORTED_OPERATION",

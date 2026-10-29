@@ -107,6 +107,8 @@ pub const SYNC_SHUTDOWN: Duration = Duration::from_millis(500);
 const BRIEF_LOCK: Duration = Duration::from_millis(500);
 /// A background stop that left the worker running is retried after this.
 const STOP_RETRY: Duration = Duration::from_secs(30);
+/// How long a failed `create` waits for its state directory's removal.
+const STATE_REMOVAL: Duration = Duration::from_secs(5);
 pub const LOCK_FILE: &str = "orchestrator.lock";
 /// Exit code of a second orchestrator on a data directory (`EX_TEMPFAIL`).
 pub const EXIT_ALREADY_RUNNING: i32 = 75;
@@ -339,6 +341,8 @@ pub struct Daemon {
     latch: Latch,
     /// When the shutdown sequence began.
     shutdown_started: OnceLock<Instant>,
+    /// Creates a new folder's store (`create`); tests make it fail.
+    init_store: fn(&Path, &str) -> Result<()>,
     _lock: File,
 }
 
@@ -486,6 +490,7 @@ impl Daemon {
             requests: AtomicUsize::new(0),
             latch: Latch::default(),
             shutdown_started: OnceLock::new(),
+            init_store: initialize_store,
             _lock: lock,
             config,
         });
@@ -619,6 +624,10 @@ impl Daemon {
     /// One pass of the main loop over every folder.
     fn tick(self: &Arc<Self>) {
         for slot in self.slots() {
+            // A shutdown never waits behind the other folders' ticks.
+            if self.stopping.is_cancelled() {
+                return;
+            }
             let Some(mut controller) = slot.try_lock() else {
                 continue;
             };
@@ -807,6 +816,7 @@ impl Daemon {
         payload["label"]
             .as_str()
             .context("ARGUMENT_REQUIRED: label")?;
+        refuse_mount(payload)?;
         // Checked again by `create` under the admission lock; this one
         // spares the remote listing.
         self.refuse_held_repo(repo)?;
@@ -838,6 +848,7 @@ impl Daemon {
         let label = payload["label"]
             .as_str()
             .context("ARGUMENT_REQUIRED: label")?;
+        refuse_mount(payload)?;
         let repo = payload["repo"]
             .as_str()
             .map(str::to_owned)
@@ -849,16 +860,29 @@ impl Daemon {
         self.refuse_held_repo(&repo)?;
         self.admit(None)?;
         let record = self.catalog.create_folder(label, &repo, mount)?;
-        // Initialize the store, then release it (`owner.lock`) for the worker.
-        let initialized = Engine::open(&record.state, Some(&repo)).and_then(|engine| {
-            let result = engine.shutdown();
-            drop(engine);
-            result
-        });
-        if let Err(error) = initialized {
-            self.catalog.set_desired(&record.id, false)?;
-            self.register(self.catalog.resolve(&record.id)?);
-            return Err(error.context(format!("FOLDER_INIT_FAILED: {}", record.state.display())));
+        if let Err(error) = (self.init_store)(&record.state, &repo) {
+            // Nothing of the folder stays: the label and repo can be retried.
+            let kept = match self.catalog.remove_folder(&record.id) {
+                Ok(()) => String::new(),
+                Err(removal) => {
+                    // Kept stopped and registered, so it can still be managed.
+                    let _ = self.catalog.set_desired(&record.id, false);
+                    if let Ok(kept) = self.catalog.resolve(&record.id) {
+                        self.register(kept);
+                    }
+                    format!(" (its catalog row stays: {removal:#})")
+                }
+            };
+            if let Err(removal) = remove_state(&record.state, STATE_REMOVAL) {
+                event!(warn, FOLDER_STATE_LEFT, {
+                    "state": record.state.display().to_string(),
+                    "error": format!("{removal:#}"),
+                });
+            }
+            return Err(error.context(format!(
+                "FOLDER_INIT_FAILED: {}{kept}",
+                record.state.display()
+            )));
         }
         let slot = self.register(record.clone());
         let mut controller = slot.lock();
@@ -931,7 +955,10 @@ impl Daemon {
         Ok(view)
     }
 
+    /// Clears the stored mount of a stopped folder; setting one is refused
+    /// (`MOUNT_UNSUPPORTED`) until mounts return.
     fn configure_mount(&self, record: &FolderRecord, payload: &Value) -> Result<Value> {
+        refuse_mount(payload)?;
         let slot = self.slot(&record.id)?;
         let mount = optional_path(payload, "mount")?;
         let controller = slot.lock();
@@ -1404,6 +1431,53 @@ fn folder_entry(mut view: Value) -> Value {
     view
 }
 
+/// `MOUNT_UNSUPPORTED` when `payload` names a mount. Orchestrator-managed
+/// folders run headless until the mounts plan: the W6-P0 mount lifecycle
+/// blocker (`AGENTS.md`) forbids host mounts under a supervisor that may kill
+/// the worker. The flags, the catalog column and `LaunchSpec::mount` stay for
+/// that plan.
+fn refuse_mount(payload: &Value) -> Result<()> {
+    ensure!(
+        payload["mount"].is_null(),
+        "MOUNT_UNSUPPORTED: mounts of orchestrator-managed folders arrive with a later \
+         release; create the folder headless"
+    );
+    Ok(())
+}
+
+/// Creates the store of a new folder at `state`, then releases it
+/// (`owner.lock`) for the worker.
+fn initialize_store(state: &Path, repo: &str) -> Result<()> {
+    let engine = Engine::open(state, Some(repo))?;
+    let result = engine.shutdown();
+    drop(engine);
+    result
+}
+
+/// Removes a failed folder's state directory, waiting at most `bound` (the
+/// removal goes on in the background past it).
+fn remove_state(state: &Path, bound: Duration) -> Result<()> {
+    let (done, finished) = mpsc::channel();
+    let path = state.to_owned();
+    thread::Builder::new()
+        .name("tkfs-state-remove".into())
+        .spawn(move || {
+            let result = match fs::remove_dir_all(&path) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            };
+            let _ = done.send(result);
+        })?;
+    match finished.recv_timeout(bound) {
+        Ok(result) => result.with_context(|| format!("remove {}", state.display())),
+        Err(_) => bail!(
+            "STATE_REMOVE_TIMEOUT: {} not removed within {} ms",
+            state.display(),
+            bound.as_millis()
+        ),
+    }
+}
+
 /// `payload[key]` as an absolute path; `null`/absent is `None`.
 fn optional_path(payload: &Value, key: &str) -> Result<Option<PathBuf>> {
     match &payload[key] {
@@ -1676,6 +1750,92 @@ mod tests {
             );
         }
         assert_eq!(daemon.execute("list", &json!({})).unwrap(), before);
+    }
+
+    #[test]
+    fn a_mount_is_refused_before_any_catalog_write() {
+        let root = tempfile::tempdir().unwrap();
+        let daemon = daemon(root.path());
+        let held = daemon
+            .catalog
+            .create_folder("Project", "repo-1", None)
+            .unwrap();
+        daemon.register(held.clone());
+        let before = daemon.execute("list", &json!({})).unwrap();
+        let mount = std::env::temp_dir().join("tkfs-mount");
+        let requests = [
+            ("create", json!({"label": "Mounted", "mount": mount})),
+            (
+                "receive",
+                json!({
+                    "label": "Mounted",
+                    "repo": "repo-2",
+                    "endpoint": "ws://127.0.0.1:9",
+                    "mount": mount,
+                }),
+            ),
+            (
+                "configure-mount",
+                json!({"state": "Project", "mount": mount}),
+            ),
+            // Refused whatever the path, a relative one included.
+            ("create", json!({"label": "Mounted", "mount": "relative"})),
+        ];
+        for (action, payload) in requests {
+            let error = format!("{:#}", daemon.execute(action, &payload).unwrap_err());
+            assert!(
+                error.starts_with(
+                    "MOUNT_UNSUPPORTED: mounts of orchestrator-managed folders arrive with a \
+                     later release; create the folder headless"
+                ),
+                "{action}: {error}"
+            );
+        }
+        assert_eq!(daemon.execute("list", &json!({})).unwrap(), before);
+        assert_eq!(daemon.slots().len(), 1);
+        // Without `--mount`, configure-mount still clears a stored mount.
+        daemon
+            .catalog
+            .set_mount(&held.id, Some(std::env::temp_dir().join("old")))
+            .unwrap();
+        let cleared = daemon
+            .execute("configure-mount", &json!({"state": "Project"}))
+            .unwrap();
+        assert_eq!(cleared["mount"], Value::Null);
+    }
+
+    #[test]
+    fn a_create_whose_store_fails_leaves_no_folder_behind() {
+        fn failing(state: &Path, _: &str) -> Result<()> {
+            fs::create_dir_all(state.join("partial"))?;
+            bail!("STORE_BROKEN: injected")
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut daemon = daemon(root.path());
+        Arc::get_mut(&mut daemon).unwrap().init_store = failing;
+        let data = daemon.config.data_directory.clone();
+        let before = daemon.execute("list", &json!({})).unwrap();
+        let payload = json!({"label": "Project", "repo": "repo-1"});
+        let error = format!("{:#}", daemon.execute("create", &payload).unwrap_err());
+        assert!(error.starts_with("FOLDER_INIT_FAILED"), "{error}");
+        assert!(error.contains("STORE_BROKEN"), "{error}");
+        assert_eq!(daemon.execute("list", &json!({})).unwrap(), before);
+        assert!(daemon.slots().is_empty());
+        // No state directory is left in the data directory.
+        let left: Vec<_> = fs::read_dir(&data)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .map(|entry| entry.path())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        // The same label and repo can be created once the store works.
+        Arc::get_mut(&mut daemon).unwrap().init_store = |_, _| Ok(());
+        daemon.stopping.cancel();
+        let error = format!("{:#}", daemon.create(&payload).unwrap_err());
+        assert!(error.starts_with("ORCHESTRATOR_STOPPING"), "{error}");
+        let created = daemon.catalog.resolve("Project").unwrap();
+        assert_eq!(created.repo, "repo-1");
     }
 
     #[test]

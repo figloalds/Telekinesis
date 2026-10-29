@@ -42,6 +42,9 @@ pub const CONTROL_IDLE: Duration = Duration::from_secs(300);
 /// How long a client waits for one reply: the longest action (`stop` of a
 /// still-starting folder, `shutdown`) fits.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(180);
+/// After a failed accept, the accept loop waits this long (as the peer
+/// listener's does) instead of spinning on a persistent error.
+const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
 /// Binds `127.0.0.1:0`, writes the token and `orchestrator.json`, and serves
 /// control connections on background threads. Returns the endpoint's
@@ -82,7 +85,12 @@ pub fn serve(daemon: Arc<Daemon>) -> Result<String> {
         .name("tkfs-control-accept".into())
         .spawn(move || {
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
+                let Ok(stream) = stream else {
+                    // A persistent accept error (descriptors exhausted,
+                    // …) must not spin.
+                    thread::sleep(ACCEPT_RETRY);
+                    continue;
+                };
                 if active.load(Ordering::Acquire) >= IDLE_CONNECTIONS {
                     event!(warn, CONTROL_CONNECTIONS_EXHAUSTED, { "limit": IDLE_CONNECTIONS });
                     continue;

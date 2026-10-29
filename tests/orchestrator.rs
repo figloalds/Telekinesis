@@ -88,6 +88,18 @@ fn start_auto_inits_config_creates_headless_folders_and_shuts_down_cleanly() -> 
     assert_eq!(list.len(), 1);
     assert_eq!(list[0]["id"], created["id"]);
 
+    // `--mount` is refused before anything is written (no host mount under
+    // a force-kill supervisor until W6-P0 is closed).
+    let mount = d.home().join("never-mounted");
+    let mount = mount.to_str().context("mount path")?;
+    let refused = error_of(d.manage(&["create", "Mounted", "--mount", mount]));
+    assert!(refused.contains("MOUNT_UNSUPPORTED"), "{refused}");
+    let refused = error_of(d.manage(&["configure-mount", "Project", "--mount", mount]));
+    assert!(refused.contains("MOUNT_UNSUPPORTED"), "{refused}");
+    let unchanged = d.manage(&["list"])?;
+    assert_eq!(unchanged.as_array().map(Vec::len), Some(1), "{unchanged}");
+    assert!(!Path::new(mount).exists());
+
     let status = d.manage(&["status"])?;
     assert_eq!(status["folders"][0]["phase"]["phase"], "Running");
     assert_eq!(status["folders"][0]["record"]["label"], "Project");

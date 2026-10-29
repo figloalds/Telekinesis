@@ -35,7 +35,7 @@ open_wait_ms = 250
 | `default_mount_directory` | Reserved for the mounts plan (`<this>/<label>`). Validated and stored, not used yet: folders are headless. |
 | `maximum_running` | Folders that may have a worker at once, 1-64 (default 8). Beyond it, starting a folder fails with `WORKER_LIMIT`; `INVALID_WORKER_LIMIT` for a value outside the range. At start the orchestrator starts or adopts at most this many folders; the others log `WORKER_LIMIT` and stay stopped until one stops. |
 | `network.listen` | The peer listener, plain WebSocket. Default `127.0.0.1:43180` (this computer only, for a TLS proxy on the same host). `"0.0.0.0:43180"` listens on every IPv4 interface; `""` disables it (the orchestrator only dials). A port that cannot be bound fails the start with `LISTEN_FAILED`. |
-| `network.advertise` | The URL a peer should use to reach this orchestrator, for example the `wss://` address of your TLS proxy. `""` (default) derives `ws://` plus the listen address. With neither a listener nor an advertise address, `manage pair` fails with `ADVERTISE_REQUIRED`. |
+| `network.advertise` | The URL a peer should use to reach this orchestrator, for example the `wss://` address of your TLS proxy. `""` (default) derives `ws://` plus the listen address. With neither a listener nor an advertise address the host is dial-only: `manage pair` still works and tells the peer no address, so the peer keeps the pairing without an endpoint and never dials back. |
 | `network.connections` | The default pool per peer, 1-16 (default 4): lane 0 carries metadata, the other lanes file content, so the pool is at least 2. `manage pair --connections N` overrides it per peer (`INVALID_CONNECTION_COUNT` outside 1-16). |
 | `network.worker_lanes` | Loopback connections from the orchestrator to each worker, 1-8 (default 2): one control lane plus the rest for object transfer (`INVALID_WORKER_LANES`). |
 | `network.sync_interval_ms` | How often each folder exchanges metadata with each peer, 50-60,000 ms (default 500) (`INVALID_SYNC_INTERVAL`). The measured clock offset of each peer is refreshed every 60 intervals. |
@@ -49,7 +49,28 @@ paired peers and each peer's measured clock offset. A data directory whose
 catalog has a schema this build does not know fails with
 `CATALOG_INCOMPATIBLE`, and the message names the directory: move it aside
 (or restore a backup) and start again. Stores and catalogs of earlier
-releases are not read or migrated.
+releases are not read or migrated: a `folders.sqlite` of an earlier release
+(tables but no schema version) is refused the same way and never stamped as
+this release's.
+
+## Object transfer
+
+File content moves between orchestrators as objects (64 KiB chunks and, for
+larger files, a manifest listing their chunks) over the bulk lanes; there is
+nothing to configure. The receiving side asks for manifests in batches of at
+most 4 and for chunks in batches of at most 32. Each request may take
+10 s plus 1 s per 256 KiB asked (a chunk counts 64 KiB, a manifest 1 MiB),
+at most 120 s. A request that times out halves the batch that folder asks of
+that peer (down to one object; `SYNC_BATCH_SHRUNK` in the log); each answered
+request grows it back by a quarter. The sending side never fails a request for
+its size: it answers with what fits (8 MiB of object bytes, and a reply body
+within the 16 MiB session bound) and the rest is asked again at once.
+
+Limit of this release: an object whose encoding alone exceeds the reply bound
+is never sent (`SYNC_OBJECT_TOO_LARGE` on the receiving side). Object bytes
+travel as JSON number arrays (about 3.6 bytes per byte), so this is a
+manifest larger than about 4 MiB, that is a single file larger than about
+8 GiB: such a file cannot be replicated until binary bodies arrive.
 
 ## Environment variables
 

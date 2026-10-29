@@ -25,9 +25,11 @@ tkfs manage status --help
 ```
 
 Mounts are not part of this release of the orchestrator: every folder runs
-headless. `create` and `receive` accept `--mount PATH`, and the path is
-stored with the folder, but nothing mounts it yet; `attach`, `detach`,
-`mount-now`, `-C DIRECTORY` and branch mounts arrive with the mounts plan.
+headless. `create`, `receive` and `configure-mount` keep their
+`--mount PATH` option for the mounts plan, but refuse it with
+`MOUNT_UNSUPPORTED` before anything is created or changed; `attach`,
+`detach`, `mount-now`, `-C DIRECTORY` and branch mounts arrive with the
+mounts plan.
 
 ## Global options
 
@@ -145,9 +147,8 @@ peers: 1
 tkfs manage create Projects
 tkfs manage create Archive --headless
 tkfs manage create Projects --repo REPO_ID
-tkfs manage create Projects --mount /srv/tkfs/Projects
+tkfs manage create Projects --mount /srv/tkfs/Projects   # refused: MOUNT_UNSUPPORTED
 tkfs create Projects                     # the same as manage create
-tkfs manage configure-mount STATE --mount /srv/tkfs/Projects
 tkfs manage configure-mount STATE        # no --mount: clear the stored mount
 tkfs manage start STATE
 tkfs manage stop STATE
@@ -158,14 +159,21 @@ tkfs manage retry STATE
 
 - `create LABEL` makes a new folder (a new repository, or `--repo ID` for an
   existing repository id), creates its state directory under `DATA/` and
-  starts its worker. The label must be unique. Folders are headless: with
-  `--mount PATH` (a relative path is resolved against the current directory) the path is only stored for the mounts plan.
+  starts its worker. The label must be unique. Folders are headless:
+  `--mount PATH` fails with `MOUNT_UNSUPPORTED: mounts of
+  orchestrator-managed folders arrive with a later release; create the
+  folder headless`, and nothing is created.
+  If the folder's store cannot be created it fails with `FOLDER_INIT_FAILED`
+  and nothing of it is kept, so the same label and repository can be tried
+  again.
   Beyond `maximum_running` folders with a worker it fails with
   `WORKER_LIMIT`. `tkfs create` is the same command. Creating a folder of a
   repository this orchestrator already holds fails with
   `REPO_ALREADY_PRESENT`.
-- `configure-mount` sets or, without `--mount`, clears the stored mount of a
-  **stopped** folder (`FOLDER_RUNNING` otherwise).
+- `configure-mount` without `--mount` clears the stored mount of a
+  **stopped** folder (`FOLDER_RUNNING` otherwise); with `--mount` it is
+  refused (`MOUNT_UNSUPPORTED`). A worker is never started with a mount,
+  whatever the catalog holds.
 - `start` sets the folder to run (persisted) and starts its worker;
   `WORKER_LIMIT` if too many run.
 - `stop` records that the folder should stay stopped, then asks the worker
@@ -217,9 +225,11 @@ tkfs manage unpair INSTALLATION
   `--connections N` (1-16, default `[network] connections`) sets it, one
   control lane plus at least one bulk lane (`1` is raised to 2). `pair`
   tells the peer this host's address, taken from `[network] advertise` or,
-  when that is empty, from `listen`; with neither it fails with
-  `ADVERTISE_REQUIRED`. Pair on one side only: the dialing host drives the
-  exchange, which carries events both ways.
+  when that is empty, from `listen`. A dial-only host (`listen = ""` and no
+  `advertise`) tells it no address: the peer keeps the pairing without an
+  endpoint (`peers` shows it inbound, `endpoint` null) and never dials back.
+  Pair on one side only: the dialing host drives the exchange, which carries
+  events both ways.
 - `peers` prints the paired peers: endpoint, installation, direction, lanes
   and their state, inbound sessions and `clock` (the measured offset and
   round trip to that peer, `null` until the first measurement). It never
@@ -228,7 +238,8 @@ tkfs manage unpair INSTALLATION
   and `label`).
 - `receive ENDPOINT REPO LABEL` creates a local folder of that repository
   (it must be one the host publishes: `REPO_NOT_PUBLISHED` otherwise) and
-  starts syncing it; headless like `create`.
+  starts syncing it; headless like `create` (`--mount` is refused with
+  `MOUNT_UNSUPPORTED`).
 - `unpair INSTALLATION` (the id `peers` shows) asks the other host to forget
   this one (best effort), then forgets the peer and closes its connections.
   If the other host also dials this one, that pairing is its own: unpair it

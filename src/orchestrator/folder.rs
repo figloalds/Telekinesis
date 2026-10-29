@@ -372,10 +372,14 @@ impl Controller {
                 return;
             }
         }
+        // Never a mount, whatever the record holds: a host mount under a
+        // supervisor that may kill the worker is barred until the W6-P0
+        // mount lifecycle blocker is closed (`AGENTS.md`); `record.mount`
+        // stays for the mounts plan.
         let spec = LaunchSpec {
             executable: self.executable.clone(),
             state: self.record.state.clone(),
-            mount: self.record.mount.clone(),
+            mount: None,
         };
         self.phase = self.starting(attempt, false);
         match self.launcher.spawn(&spec, sink) {
@@ -992,6 +996,8 @@ mod tests {
         sink: Mutex<Option<Sender<ProcessEvent>>>,
         spawns: Mutex<u32>,
         kills: Mutex<Vec<u32>>,
+        /// The worker command line of every spawn.
+        commands: Mutex<Vec<Vec<std::ffi::OsString>>>,
     }
 
     impl Stub {
@@ -1019,6 +1025,7 @@ mod tests {
     impl Launcher for Stub {
         fn spawn(&self, spec: &LaunchSpec, sink: Sender<ProcessEvent>) -> Result<WorkerProcess> {
             assert_eq!(spec.executable, PathBuf::from("tkfs-test"));
+            lock(&self.commands).push(super::super::process::worker_args(spec));
             let mut spawns = lock(&self.spawns);
             *spawns += 1;
             for event in lock(&self.scripts).pop_front().unwrap_or_default() {
@@ -1126,6 +1133,34 @@ mod tests {
         assert!((2..=12).contains(&count), "{count} watches in 600 ms");
         drop(watch);
         link.close();
+    }
+
+    #[test]
+    fn a_record_with_a_mount_spawns_a_headless_worker() {
+        let clock = Arc::new(ManualClock::new(1_800_000_000_000));
+        let stub = Stub::new(vec![]);
+        let mut record = folder();
+        record.mount = Some(std::env::temp_dir().join("tkfs-mount"));
+        let mut controller = Controller::new(
+            record.clone(),
+            PathBuf::from("tkfs-test"),
+            1,
+            stub.clone(),
+            clock,
+        );
+        controller.start();
+        assert_eq!(stub.spawns(), 1);
+        let commands = lock(&stub.commands).clone();
+        let expected: Vec<std::ffi::OsString> = vec![
+            "daemon".into(),
+            "--state".into(),
+            record.state.clone().into(),
+            "--supervised".into(),
+        ];
+        assert_eq!(commands, vec![expected]);
+        assert!(!commands[0].iter().any(|arg| arg == "--mount"));
+        // The stored mount itself is kept for the mounts plan.
+        assert_eq!(controller.record().mount, record.mount);
     }
 
     #[test]

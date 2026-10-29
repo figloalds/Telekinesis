@@ -25,20 +25,24 @@ pub enum ManagementCommand {
         #[arg(value_name = "STATE")]
         folder: String,
     },
-    /// Create a folder and start its worker (headless unless `--mount`).
+    /// Create a folder and start its worker (always headless for now).
     Create {
         label: String,
         #[arg(long)]
         repo: Option<String>,
+        /// Refused for now (`MOUNT_UNSUPPORTED`): mounts arrive with a later
+        /// release.
         #[arg(long, conflicts_with = "headless")]
         mount: Option<PathBuf>,
         #[arg(long)]
         headless: bool,
     },
-    /// Set (or, without `--mount`, clear) a stopped folder's mount.
+    /// Clear a stopped folder's stored mount (`--mount` is refused for now).
     ConfigureMount {
         #[arg(value_name = "STATE")]
         folder: String,
+        /// Refused for now (`MOUNT_UNSUPPORTED`): mounts arrive with a later
+        /// release.
         #[arg(long)]
         mount: Option<PathBuf>,
     },
@@ -95,11 +99,13 @@ pub enum ManagementCommand {
     /// The folders a paired orchestrator publishes.
     RemoteList { endpoint: String },
     /// Create a folder of REPO, which the paired orchestrator at ENDPOINT
-    /// publishes, and start syncing it (headless unless `--mount`).
+    /// publishes, and start syncing it (always headless for now).
     Receive {
         endpoint: String,
         repo: String,
         label: String,
+        /// Refused for now (`MOUNT_UNSUPPORTED`): mounts arrive with a later
+        /// release.
         #[arg(long, conflicts_with = "headless")]
         mount: Option<PathBuf>,
         #[arg(long)]

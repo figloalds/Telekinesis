@@ -113,16 +113,33 @@ impl Catalog {
         .with_context(|| format!("CATALOG_UNAVAILABLE: {}", path.display()))?;
         let db = Connection::open(&path)
             .with_context(|| format!("CATALOG_UNAVAILABLE: {}", path.display()))?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS schema(version INTEGER NOT NULL);")?;
-        let version: Option<u32> = db
-            .query_cached("SELECT version FROM schema", [], |r| r.get(0))
-            .optional()?;
-        if let Some(version) = version {
-            ensure!(
+        let tables: Vec<String> = db
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let version: Option<u32> = if tables.iter().any(|name| name == "schema") {
+            db.query_cached("SELECT version FROM schema", [], |r| r.get(0))
+                .optional()?
+        } else {
+            None
+        };
+        match version {
+            Some(version) => ensure!(
                 version == SCHEMA_VERSION,
                 "CATALOG_INCOMPATIBLE: {} has schema version {version}, this build uses {SCHEMA_VERSION}",
                 path.display()
-            );
+            ),
+            // Fresh only when nothing but an empty `schema` table is there:
+            // a database of an earlier release (no `schema` row) is never
+            // stamped as this one's.
+            None => ensure!(
+                tables.iter().all(|name| name == "schema"),
+                "CATALOG_INCOMPATIBLE: {} is not a tkfs catalog of this release; move the data \
+                 directory aside",
+                path.display()
+            ),
         }
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
         let catalog = Arc::new(Self {
@@ -136,6 +153,7 @@ impl Catalog {
     fn initialize(&self, fresh: bool) -> Result<()> {
         let db = self.db()?;
         let tx = db.unchecked_transaction()?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS schema(version INTEGER NOT NULL);")?;
         tx.execute_batch(SCHEMA)?;
         if fresh {
             tx.execute_cached("INSERT INTO schema VALUES(?1)", [SCHEMA_VERSION])?;
@@ -300,6 +318,16 @@ impl Catalog {
 
     pub fn set_paused(&self, id: &str, paused: bool) -> Result<()> {
         self.update_folder(id, "UPDATE folders SET paused=?2 WHERE id=?1", paused)
+    }
+
+    /// Deletes the folder `id`'s row (a `create` whose store could not be
+    /// initialized).
+    pub fn remove_folder(&self, id: &str) -> Result<()> {
+        let changed = self
+            .db()?
+            .execute_cached("DELETE FROM folders WHERE id=?1", [id])?;
+        ensure!(changed == 1, "FOLDER_NOT_FOUND: no folder {id:?}");
+        Ok(())
     }
 
     pub fn set_mount(&self, id: &str, mount: Option<PathBuf>) -> Result<()> {
@@ -552,6 +580,78 @@ mod tests {
         drop(db);
         let error = Catalog::open(home.path()).err().expect("must be refused");
         assert_eq!(code(&error), "CATALOG_INCOMPATIBLE");
+        Ok(())
+    }
+
+    #[test]
+    fn a_catalog_of_an_earlier_release_is_refused_not_stamped() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("folders.sqlite");
+        let db = rusqlite::Connection::open(&path)?;
+        db.execute_batch(
+            "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT); \
+             CREATE TABLE peers(endpoint TEXT PRIMARY KEY, installation TEXT); \
+             INSERT INTO settings VALUES('installation', 'old');",
+        )?;
+        drop(db);
+        let error = Catalog::open(home.path()).err().expect("must be refused");
+        assert_eq!(code(&error), "CATALOG_INCOMPATIBLE");
+        let message = format!("{error:#}");
+        assert!(
+            message
+                .contains("is not a tkfs catalog of this release; move the data directory aside")
+                && message.contains(&path.display().to_string()),
+            "{message}"
+        );
+        // Nothing was written: no `schema` table, the old rows as they were.
+        let db = rusqlite::Connection::open(&path)?;
+        let schema: i64 = db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='schema'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(schema, 0);
+        let columns: i64 =
+            db.query_row("SELECT count(*) FROM pragma_table_info('peers')", [], |r| {
+                r.get(0)
+            })?;
+        assert_eq!(columns, 2);
+        // Refused again on the next start, never stamped.
+        assert_eq!(
+            code(&Catalog::open(home.path()).err().expect("still refused")),
+            "CATALOG_INCOMPATIBLE"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_database_and_a_bare_schema_table_are_fresh() -> Result<()> {
+        let empty = tempfile::tempdir()?;
+        rusqlite::Connection::open(empty.path().join("folders.sqlite"))?;
+        Catalog::open(empty.path())?.installation()?;
+        // An earlier open that stopped after creating `schema`.
+        let bare = tempfile::tempdir()?;
+        rusqlite::Connection::open(bare.path().join("folders.sqlite"))?
+            .execute_batch("CREATE TABLE schema(version INTEGER NOT NULL);")?;
+        let catalog = Catalog::open(bare.path())?;
+        catalog.installation()?;
+        drop(catalog);
+        Catalog::open(bare.path())?;
+        Ok(())
+    }
+
+    #[test]
+    fn remove_folder_frees_the_label() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = Catalog::open(home.path())?;
+        let record = catalog.create_folder("Project", "repo-a", None)?;
+        catalog.remove_folder(&record.id)?;
+        assert!(catalog.folders()?.is_empty());
+        assert_eq!(
+            code(&catalog.remove_folder(&record.id).unwrap_err()),
+            "FOLDER_NOT_FOUND"
+        );
+        catalog.create_folder("Project", "repo-a", None)?;
         Ok(())
     }
 

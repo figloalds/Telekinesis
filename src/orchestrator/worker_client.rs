@@ -5,7 +5,7 @@
 //! lane's op policy; the link also refuses object ops on the control lane
 //! itself, before anything is sent.
 use super::{
-    sync::{MissingPage, OBJECT_BATCH, Object},
+    sync::{Fetched, MissingPage, OBJECT_BATCH, Object},
     worker::Ready,
 };
 use crate::{
@@ -135,8 +135,14 @@ impl WorkerLink {
     /// Reads up to [`OBJECT_BATCH`] objects from the worker on the bulk lane
     /// of the first digest; absent ones are left out of the reply.
     pub fn fetch(&self, wanted: &[(Digest, Kind)]) -> Result<Vec<Object>, CallError> {
+        self.fetch_reply(wanted).map(|fetched| fetched.objects)
+    }
+
+    /// [`Self::fetch`] with where the worker cut the reply to its byte
+    /// bounds ([`Fetched`]).
+    pub fn fetch_reply(&self, wanted: &[(Digest, Kind)]) -> Result<Fetched, CallError> {
         let Some((first, _)) = wanted.first() else {
-            return Ok(Vec::new());
+            return Ok(Fetched::default());
         };
         check_batch(wanted.len())?;
         let body = encode("objects.fetch", &wanted)?;
@@ -147,7 +153,8 @@ impl WorkerLink {
             Priority::Data,
             CALL_DEADLINE,
         )?;
-        parse("objects.fetch", &reply.body)
+        Fetched::from_reply(&reply.header, &reply.body)
+            .map_err(|error| bad_reply("objects.fetch", &format!("{error:#}")))
     }
 
     /// Stores up to [`OBJECT_BATCH`] objects in the worker on the bulk lane of
