@@ -138,6 +138,10 @@ pub const FOLDER_OPS: &[&str] = &[
     "preview-version",
     "events",
     "tree",
+    "checkpoint",
+    "fork",
+    "checkout",
+    "gc",
 ];
 
 /// One folder: its controller and the view the last tick saw.

@@ -129,6 +129,24 @@ fn start_auto_inits_config_creates_headless_folders_and_shuts_down_cleanly() -> 
         json!({"state": "Project", "op": "tree", "payload": {}}),
     )?;
     assert!(tree.is_object(), "{tree}");
+    let checkpoint = client.request(
+        "folder",
+        json!({"state": "Project", "op": "checkpoint", "payload": {}}),
+    )?;
+    assert!(checkpoint["id"].is_string(), "{checkpoint}");
+    client.request(
+        "folder",
+        json!({"state": "Project", "op": "fork", "payload": {"name": "side"}}),
+    )?;
+    client.request(
+        "folder",
+        json!({"state": "Project", "op": "checkout", "payload": {"branch": "side"}}),
+    )?;
+    let collected = client.request(
+        "folder",
+        json!({"state": "Project", "op": "gc", "payload": {}}),
+    )?;
+    assert!(collected["removed"].is_number(), "{collected}");
     let refused = format!(
         "{:#}",
         client
