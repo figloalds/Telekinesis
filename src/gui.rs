@@ -310,33 +310,52 @@ fn open_clients(config_path: &Path) -> Result<(Client, Client, Started)> {
     Ok((status, actions, started))
 }
 
-/// The selected folder's recent events, read forward from `after`.
+/// The selected folder's recent events: seeded with the newest
+/// [`RECENT_EVENTS`] (`events {last}`), then read forward from `after`.
 #[derive(Default)]
 struct Feed {
     state: String,
+    seeded: bool,
     after: u64,
     events: Vec<Value>,
 }
 
 impl Feed {
-    fn poll(&mut self, client: &mut Client, state: &str) {
+    /// The `events` payload for folder `state` (a new folder starts over).
+    fn request(&mut self, state: &str) -> Value {
         if self.state != state {
             *self = Self {
                 state: state.into(),
                 ..Self::default()
             };
         }
-        let Ok(reply) = client.folder_op(state, "events", json!({"after": self.after})) else {
-            return;
-        };
+        if self.seeded {
+            json!({"after": self.after})
+        } else {
+            json!({"last": RECENT_EVENTS})
+        }
+    }
+
+    /// Takes in a reply to [`Self::request`].
+    fn absorb(&mut self, reply: &Value) {
+        self.seeded = true;
         for row in reply.as_array().into_iter().flatten() {
-            if let Some(seq) = row[0].as_u64() {
-                self.after = self.after.max(seq);
+            if let Some(seq) = row[0].as_u64()
+                && seq > self.after
+            {
+                self.after = seq;
                 self.events.push(row.clone());
             }
         }
         let excess = self.events.len().saturating_sub(RECENT_EVENTS);
         self.events.drain(..excess);
+    }
+
+    fn poll(&mut self, client: &mut Client, state: &str) {
+        let request = self.request(state);
+        if let Ok(reply) = client.folder_op(state, "events", request) {
+            self.absorb(&reply);
+        }
     }
 }
 
@@ -478,6 +497,15 @@ fn action_loop(
     }
 }
 
+/// Whether a folder list for `requested` belongs in the window: the pair
+/// dialog is open on that endpoint. Not the pairing generation: Browse in
+/// the peer dialog opens this dialog and lists in one handler, and the
+/// `changed dialog` bump runs after the request captured the generation.
+/// An edited endpoint changes `endpoint`, so a stale list never shows.
+fn remote_list_applies(dialog: &str, endpoint: &str, requested: &str) -> bool {
+    dialog == "connect" && endpoint == requested
+}
+
 /// Shows an action's outcome.
 fn finish(
     ui: &AppWindow,
@@ -505,9 +533,7 @@ fn finish(
                 ui.set_conflict_preview(preview.into());
             }
             if let Some(remote) = done.remote
-                && ui.get_dialog() == "connect"
-                && ui.get_endpoint() == args[0].as_str()
-                && current
+                && remote_list_applies(&ui.get_dialog(), &ui.get_endpoint(), &args[0])
             {
                 ui.set_remote_message(
                     if remote.is_empty() {
@@ -641,5 +667,57 @@ mod tests {
         let (banner, action) = on_status_error(&anyhow::anyhow!("INVALID_REPLY: x"));
         assert!(banner.contains("INVALID_REPLY"), "{banner}");
         assert_eq!(action, "");
+    }
+
+    #[test]
+    fn the_activity_feed_seeds_with_the_newest_events_then_follows_the_cursor() {
+        let event = |seq: u64| json!([seq, {"id": format!("e{seq}"), "operation": "Create"}]);
+        let mut feed = Feed::default();
+        // A newly selected folder asks for its newest events, not for seq 0.
+        assert_eq!(feed.request("a"), json!({"last": RECENT_EVENTS}));
+        feed.absorb(&json!(
+            (9_000..9_000 + RECENT_EVENTS as u64)
+                .map(event)
+                .collect::<Vec<_>>()
+        ));
+        let after = 9_000 + RECENT_EVENTS as u64 - 1;
+        assert_eq!(feed.request("a"), json!({"after": after}));
+        feed.absorb(&json!([event(after + 1)]));
+        assert_eq!(feed.events.len(), RECENT_EVENTS);
+        assert_eq!(feed.events.last().unwrap()[0], after + 1);
+        assert_eq!(feed.request("a"), json!({"after": after + 1}));
+        // A folder that has no events yet is seeded once; then it follows.
+        assert_eq!(feed.request("b"), json!({"last": RECENT_EVENTS}));
+        assert!(feed.events.is_empty());
+        feed.absorb(&json!([]));
+        assert_eq!(feed.request("b"), json!({"after": 0}));
+        // Switching back starts over from the newest again.
+        assert_eq!(feed.request("a"), json!({"last": RECENT_EVENTS}));
+    }
+
+    #[test]
+    fn a_folder_list_shows_while_the_pair_dialog_is_on_its_endpoint() {
+        // Browse from the peer dialog: the dialog change bumps the pairing
+        // generation after the request; the list still applies.
+        assert!(remote_list_applies(
+            "connect",
+            "ws://office:43180",
+            "ws://office:43180"
+        ));
+        assert!(!remote_list_applies(
+            "connect",
+            "ws://laptop:43180",
+            "ws://office:43180"
+        ));
+        assert!(!remote_list_applies(
+            "",
+            "ws://office:43180",
+            "ws://office:43180"
+        ));
+        assert!(!remote_list_applies(
+            "peer",
+            "ws://office:43180",
+            "ws://office:43180"
+        ));
     }
 }

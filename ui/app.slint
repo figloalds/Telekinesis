@@ -426,6 +426,12 @@ export component AppWindow inherits Window {
             root.pairing-code = "";
         }
         if root.dialog != "connect" { root.code = ""; }
+        // Create and Receive start mounted at the default unless Headless
+        // is ticked in that dialog: no choice carries over between them.
+        if root.dialog == "create" || root.dialog == "connect" {
+            root.headless = false;
+            root.remote-mount = "";
+        }
     }
     changed selected-state => {
         root.pairing-code="";root.pairing-generation+=1;

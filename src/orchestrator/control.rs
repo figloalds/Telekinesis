@@ -31,6 +31,8 @@ pub const LONG_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 /// Largest file `cat` returns. Its reply is a JSON number array (up to 4
 /// characters per byte), which must fit the 16 MiB `cat` body bound.
 pub const CAT_MAX_BYTES: u64 = 3 * 1024 * 1024;
+/// The most events `events {last}` returns.
+pub const EVENTS_LAST_MAX: u64 = 1024;
 
 /// The [`request`] deadline of `operation`.
 pub fn request_deadline(operation: &str) -> Duration {
@@ -248,9 +250,27 @@ pub fn execute(engine: &Engine, settings: &Settings, operation: &str, p: &Value)
                 .unwrap_or(0);
             Ok(json!({"entry":entry,"applied_ns":applied.to_string()}))
         }
-        "events" => Ok(serde_json::to_value(
-            lock(&engine.store).events_after(p["after"].as_u64().unwrap_or(0), 4096)?,
-        )?),
+        // `{after}`: at most 4096 events after `after`, oldest first.
+        // `{last: N}`: the newest `min(N, EVENTS_LAST_MAX)`, oldest first.
+        "events" => {
+            let store = lock(&engine.store);
+            let events = match &p["last"] {
+                Value::Null => store.events_after(p["after"].as_u64().unwrap_or(0), 4096)?,
+                last => {
+                    let count = last
+                        .as_u64()
+                        .context("INVALID_REQUEST: last must be a number")?
+                        .min(EVENTS_LAST_MAX);
+                    let newest: u64 = store.db.query_row(
+                        "SELECT coalesce(max(seq),0) FROM events",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    store.events_after(newest.saturating_sub(count), count as usize)?
+                }
+            };
+            Ok(serde_json::to_value(events)?)
+        }
         "conflicts" => Ok(serde_json::to_value(
             lock(&engine.store).conflicts(p["history"].as_bool().unwrap_or(false))?,
         )?),
@@ -452,6 +472,50 @@ mod tests {
         // Even the largest accepted file fits.
         assert!(CAT_MAX_BYTES * 4 + 64 <= crate::model::protocol::max_body("cat") as u64);
         assert!(engine.writable_tokens().is_empty());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn events_last_returns_the_newest_in_order_and_after_is_unchanged() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Engine::open(root.path(), None)?;
+        let settings = Settings {
+            engine: engine.clone(),
+        };
+        for name in ["a", "b", "c", "d"] {
+            execute(&engine, &settings, "mkdir", &json!({"path": name}))?;
+        }
+        let seqs = |reply: &Value| -> Vec<u64> {
+            reply
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row[0].as_u64().unwrap())
+                .collect()
+        };
+        let all = seqs(&execute(&engine, &settings, "events", &json!({}))?);
+        assert!(all.len() >= 4, "{all:?}");
+        assert!(all.windows(2).all(|w| w[0] < w[1]), "{all:?}");
+        let newest = &all[all.len() - 2..];
+        let last = execute(&engine, &settings, "events", &json!({"last": 2}))?;
+        assert_eq!(seqs(&last), newest);
+        assert_eq!(last.as_array().unwrap()[1][1]["state"]["name"], "d");
+        // `after` reads forward from a cursor as before.
+        let after = execute(&engine, &settings, "events", &json!({"after": all[1]}))?;
+        assert_eq!(seqs(&after), &all[2..]);
+        // A large `last` is bounded and returns everything there is.
+        let many = execute(&engine, &settings, "events", &json!({"last": 1_000_000}))?;
+        assert_eq!(seqs(&many), all);
+        assert_eq!(
+            seqs(&execute(&engine, &settings, "events", &json!({"last": 0}))?),
+            Vec::<u64>::new()
+        );
+        let error = execute(&engine, &settings, "events", &json!({"last": "x"})).unwrap_err();
+        assert!(
+            error.to_string().starts_with("INVALID_REQUEST"),
+            "{error:#}"
+        );
         engine.shutdown()?;
         Ok(())
     }
