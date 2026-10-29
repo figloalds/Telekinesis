@@ -1,6 +1,6 @@
-// Original WP3.4 desktop design, restored with a current-engine data adapter.
+// Original WP3.4 desktop design, rendered from the orchestrator's status.
 // Visual language: misc/prototype.html (dark palette).
-import { ScrollView, TextEdit, AboutSlint, Palette } from "std-widgets.slint";
+import { ScrollView, TextEdit, CheckBox, AboutSlint, Palette } from "std-widgets.slint";
 
 export struct Chip { text: string, tone: string, action: string, action-label: string }
 export struct FolderRow {
@@ -28,7 +28,6 @@ export struct MissingRow { path: string, state: string, progress: string, error:
 export struct ConflictRow { id: string, description: string, field: string, entity: string }
 export struct RevisionRow { id: string, description: string }
 export struct RemoteRow { repo: string, label: string }
-export struct BranchRow { id: string, name: string }
 
 global Theme {
     out property <color> background: #0e131b;
@@ -239,7 +238,7 @@ component FolderRowView inherits Rectangle {
                         Label { text: root.data.label; font-weight: 600; horizontal-stretch: 1; }
                         if root.data.conflicts > 0: Pill { text: root.data.conflicts + (root.data.conflicts == 1 ? " conflict" : " conflicts"); tone: "warn"; }
                     }
-                    Mono { text: root.data.mount == "" ? "No mount point" : root.data.mount; font-size: 11px; }
+                    Mono { text: root.data.mount == "" ? "Headless" : root.data.mount; font-size: 11px; }
                 }
             }
             VerticalLayout { spacing: 5px; horizontal-stretch: 1; alignment: center; min-width: 200px;
@@ -306,17 +305,13 @@ export component AppWindow inherits Window {
     in property <Chip> daemon-status: { text: "Connecting…", tone: "progress" };
     in property <string> daemon-installation;
     in property <string> daemon-network;
-    in property <string> daemon-control;
     in property <bool> connected;
     in property <bool> detail-loaded;
     in property <bool> resolution-enabled;
     in-out property <int> pairing-generation;
-    in property <[BranchRow]> branches;
-    in property <[string]> snapshots;
     in-out property <string> branch-name;
-    in-out property <string> listener;
-    in-out property <string> advertised;
-    in property <string> banner-text: "Connecting to the local daemon…";
+    in property <string> current-branch;
+    in property <string> banner-text: "Connecting to the orchestrator…";
     in property <string> banner-tone: "progress";
     in property <string> banner-action;
     in property <string> banner-action-label;
@@ -381,6 +376,8 @@ export component AppWindow inherits Window {
     in-out property <string> mount-path;
     in-out property <string> remote-mount;
     in-out property <string> code;
+    in property <string> default-mount-directory;
+    in-out property <bool> headless;
     in property <string> remote-message: "Pair with another host, then browse its folders.";
     in-out property <string> confirm-action;
     in-out property <string> confirm-text;
@@ -391,15 +388,16 @@ export component AppWindow inherits Window {
     callback detail-tab-changed(string);
     callback refresh-content();
     callback open-log();
-    callback banner-clicked(string);
+    callback start-orchestrator();
     callback search-folders(string);
-    callback create-folder(string, string);
+    callback create-folder(string /*name*/, string /*mount*/, bool /*headless*/);
     callback configure-mount(string, string);
     callback pair(string, string);
     callback remote-list(string);
-    callback receive-folder(string, string, string, string);
+    callback receive-folder(string /*endpoint*/, string /*repo*/, string /*label*/, string /*mount*/, bool /*headless*/);
     callback reset-code();
-    callback unpair(string);
+    callback copy-code();
+    callback unpair(string /*installation*/);
     callback shutdown();
     callback remote-changed();
     callback dialog-closed();
@@ -410,7 +408,6 @@ export component AppWindow inherits Window {
     callback recover-conflict(string);
     callback fork-branch(string);
     callback checkout-branch(string);
-    callback save-listener(string,string);
 
     private property <bool> idle: root.global-busy == "";
     private property <bool> interactive: root.dialog == "" && root.idle;
@@ -474,7 +471,7 @@ export component AppWindow inherits Window {
                 Card { height: 150px; background: #0c1426;
                     VerticalLayout { padding: 12px; spacing: 4px;
                         Label { text: "Host · " + root.host-name; font-size: 12px; font-weight: 600; }
-                        HorizontalLayout { spacing: 6px; Muted { text: "Daemon"; width: 74px; } Text { text: root.daemon-status.text; color: Theme.fg(root.daemon-status.tone); font-size: 12px; horizontal-alignment: right; overflow: elide; horizontal-stretch: 1; } }
+                        HorizontalLayout { spacing: 6px; Muted { text: "Orchestrator"; width: 74px; } Text { text: root.daemon-status.text; color: Theme.fg(root.daemon-status.tone); font-size: 12px; horizontal-alignment: right; overflow: elide; horizontal-stretch: 1; } }
                         HorizontalLayout { spacing: 6px; Muted { text: "Version"; width: 74px; } Muted { text: root.daemon-version; horizontal-alignment: right; horizontal-stretch: 1; } }
                         HorizontalLayout { spacing: 6px; Muted { text: "Listening"; width: 74px; } Muted { text: root.daemon-network; horizontal-alignment: right; horizontal-stretch: 1; } }
                         HorizontalLayout { spacing: 6px; Muted { text: "Installation"; width: 74px; } Muted { text: root.daemon-installation; horizontal-alignment: right; horizontal-stretch: 1; } }
@@ -505,7 +502,7 @@ export component AppWindow inherits Window {
                 HorizontalLayout { padding-left: 24px; padding-right: 24px; padding-top: 8px; padding-bottom: 8px; spacing: 10px;
                     if root.banner-tone == "progress": VerticalLayout { alignment: center; Spinner {} }
                     Text { text: root.banner-text; color: Theme.fg(root.banner-tone); font-size: 13px; wrap: word-wrap; horizontal-stretch: 1; vertical-alignment: center; }
-                    if root.banner-action != "": VerticalLayout { alignment: center; Button { small: true; text: root.banner-action-label; clicked => { root.banner-clicked(root.banner-action); } } }
+                    if root.banner-action == "start-orchestrator": VerticalLayout { alignment: center; Button { small: true; text: root.banner-action-label; enabled: root.idle; clicked => { root.start-orchestrator(); } } }
                 }
             }
             if root.daemon-errors.length > 0: Rectangle {
@@ -542,8 +539,8 @@ export component AppWindow inherits Window {
                             }
                         }
                         if root.folders.length == 0: VerticalLayout { padding: 40px; spacing: 12px; alignment: center; vertical-stretch: 1;
-                            Label { text: !root.connected ? "Waiting for the daemon" : root.search != "" ? "No folders match your search" : "Your folders, all in one place"; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
-                            Muted { text: !root.connected ? "Folders appear here once the local daemon answers." : root.search != "" ? "Try another name or mount path." : "Create a folder, or pair with a host and receive one of its folders."; horizontal-alignment: center; }
+                            Label { text: !root.connected ? "Waiting for the orchestrator" : root.search != "" ? "No folders match your search" : "Your folders, all in one place"; font-size: 18px; font-weight: 600; horizontal-alignment: center; }
+                            Muted { text: !root.connected ? "Folders appear here once the orchestrator answers." : root.search != "" ? "Try another name or mount path." : "Create a folder, or pair with a host and receive one of its folders."; horizontal-alignment: center; }
                             if root.connected: HorizontalLayout { alignment: center;
                                 Button { text: root.search != "" ? "Clear search" : "Create your first folder"; primary: true; enabled: root.interactive;
                                     clicked => { if root.search != "" { root.search = ""; root.search-folders(""); } else { root.folder-name = ""; root.mount-path = ""; root.dialog = "create"; } }
@@ -597,8 +594,8 @@ export component AppWindow inherits Window {
                             : root.dialog == "create" ? "New folder"
                             : root.dialog == "mount" || root.dialog == "stop-first" ? "Change mount point"
                             : root.dialog == "connect" ? "Pair with a host"
-                            : root.dialog == "host" ? "Settings"
-                            : root.dialog == "shutdown" ? "Shut down the daemon"
+                            : root.dialog == "host" ? "Settings · this host"
+                            : root.dialog == "shutdown" ? "Stop orchestrator"
                             : root.dialog == "confirm" ? "Are you sure?" : "Details";
                         font-size: 20px; font-weight: 600; horizontal-stretch: 1;
                     }
@@ -671,13 +668,12 @@ export component AppWindow inherits Window {
                     if root.detail-tab == "activation": ScrollView { vertical-stretch: 1;
                         VerticalLayout { spacing: 12px; alignment: start; padding-right: 12px;
                             KVList { rows: root.detail-activation; }
-                            HorizontalLayout { spacing:8px;
-                                Field { text <=> root.branch-name; placeholder:"New branch name"; enabled:root.idle; }
-                                Button { text:"Fork branch"; enabled:root.idle && root.detail-loaded && root.branch-name!="";clicked=>{root.fork-branch(root.branch-name);} }
+                            HorizontalLayout { spacing: 8px;
+                                Field { text <=> root.branch-name; placeholder: "Branch name"; enabled: root.idle; }
+                                Button { text: "Fork branch"; enabled: root.idle && root.detail-loaded && root.branch-name != ""; clicked => { root.fork-branch(root.branch-name); } }
+                                Button { text: "Check out"; enabled: root.idle && root.detail-loaded && root.branch-name != ""; clicked => { root.checkout-branch(root.branch-name); } }
                             }
-                            for branch in root.branches: Button { text:"Check out “"+branch.name+"”"; enabled:root.idle && root.detail-loaded;clicked=>{root.checkout-branch(branch.id);} }
-                            Label { text:"Recent checkpoints";font-weight:600; }
-                            for snapshot in root.snapshots: Mono {text:snapshot;}
+                            Muted { text: "Fork records a checkpoint and starts a branch from it. Check out takes a branch name or id."; wrap: word-wrap; }
                         }
                     }
                     if root.detail-tab == "content": ScrollView { vertical-stretch: 1;
@@ -785,7 +781,7 @@ export component AppWindow inherits Window {
                     HorizontalLayout { spacing: 8px; alignment: end;
                         if root.peer-detail.endpoint != "": Button { text: "Browse folders"; enabled: root.idle; clicked => { root.endpoint = root.peer-detail.endpoint; root.selected-repo = ""; root.dialog = "connect"; root.remote-list(root.peer-detail.endpoint); } }
                         if root.peer-detail.endpoint != "": Button { text: "Pair again"; enabled: root.idle; clicked => { root.endpoint = root.peer-detail.endpoint; root.code = ""; root.dialog = "connect"; } }
-                        if root.peer-detail.endpoint != "": Button { text: "Disconnect"; danger: true; enabled: root.idle; clicked => { root.unpair(root.peer-detail.endpoint); } }
+                        Button { text: "Disconnect"; danger: true; enabled: root.idle && root.peer-detail.installation != ""; clicked => { root.unpair(root.peer-detail.installation); } }
                     }
                 }
                 // ------------------------------------------ create / mount path
@@ -796,11 +792,16 @@ export component AppWindow inherits Window {
                         Field { placeholder: "Project files"; text <=> root.folder-name; enabled: root.idle; }
                     }
                     Label { text: "Mount point"; }
-                    Field { placeholder: "e.g. C:\\Telekinesis\\projects"; text <=> root.mount-path; enabled: root.idle; }
-                    Muted { text: root.dialog == "create" ? "Leave empty to start syncing without a filesystem mount." : "Leave empty to run without a filesystem mount. Start the folder after saving."; wrap: word-wrap; }
+                    if root.dialog == "create": Field { placeholder: root.default-mount-directory + "\\" + root.folder-name + " (default)"; text <=> root.mount-path; enabled: root.idle && !root.headless; }
+                    if root.dialog == "mount": Field { placeholder: "e.g. C:\\Telekinesis\\projects"; text <=> root.mount-path; enabled: root.idle; }
+                    if root.dialog == "create": VerticalLayout { spacing: 2px;
+                        CheckBox { text: "Headless"; checked <=> root.headless; enabled: root.idle; }
+                        Muted { text: "Sync without a mount."; }
+                    }
+                    if root.dialog == "mount": Muted { text: "Leave empty to run without a filesystem mount. Start the folder after saving."; wrap: word-wrap; }
                     HorizontalLayout { alignment: end; spacing: 8px;
                         Button { text: "Cancel"; enabled: root.idle; clicked => { root.dismiss(); } }
-                        Button { text: root.dialog == "create" ? "Create folder" : "Save mount point"; primary: true; enabled: root.idle && (root.dialog != "create" || root.folder-name != ""); clicked => { if root.dialog == "create" { root.create-folder(root.folder-name, root.mount-path); } else { root.configure-mount(root.selected-state, root.mount-path); } } }
+                        Button { text: root.dialog == "mount" ? "Save mount point" : root.headless ? "Create" : "Create & mount"; primary: true; enabled: root.idle && (root.dialog != "create" || root.folder-name != ""); clicked => { if root.dialog == "create" { root.create-folder(root.folder-name, root.mount-path, root.headless); } else { root.configure-mount(root.selected-state, root.mount-path); } } }
                     }
                 }
                 if root.dialog == "stop-first": VerticalLayout { spacing: 16px;
@@ -823,11 +824,10 @@ export component AppWindow inherits Window {
                     Label { text: "Host address"; }
                     Field { placeholder: "ws://host:43180 or wss://host"; text <=> root.endpoint; enabled: root.idle; edited(_) => { root.remote-changed(); } }
                     Label { text: "The host's pairing code"; }
-                    Field { placeholder: "Enter the code shown in the other host's Settings"; text <=> root.code; enabled: root.idle; }
+                    Field { placeholder: "Paste the 64-character code shown on that host"; text <=> root.code; enabled: root.idle; }
                     HorizontalLayout { spacing: 8px;
                         Button { text: "Pair"; primary: true; enabled: root.idle && root.endpoint != "" && root.code != ""; clicked => { root.pair(root.endpoint, root.code); } }
                         Button { text: "Browse folders"; enabled: root.idle && root.endpoint != ""; clicked => { root.remote-list(root.endpoint); } }
-                        Button { text: "Disconnect"; enabled: root.idle && root.endpoint != ""; clicked => { root.unpair(root.endpoint); } }
                     }
                     Muted { text: root.remote-message; wrap: word-wrap; }
                     ScrollView { height: 110px;
@@ -835,33 +835,38 @@ export component AppWindow inherits Window {
                             for remote in root.remote-folders: Button { small: true; min-width: 0px; text: (root.selected-repo == remote.repo ? "●  " : "○  ") + remote.label; enabled: root.idle; clicked => { root.selected-repo = remote.repo; root.selected-label = remote.label; } }
                         }
                     }
-                    Field { placeholder: "Local mount point (optional)"; text <=> root.remote-mount; enabled: root.idle; }
-                    Button { min-width: 0px; text: root.selected-repo == "" ? "Select a folder to receive" : "Receive “" + root.selected-label + "”"; primary: true; enabled: root.idle && root.selected-repo != "" && root.code!=""; clicked => { root.receive-folder(root.endpoint, root.selected-repo, root.selected-label, root.remote-mount); } }
+                    Label { text: "Mount point"; }
+                    Field { placeholder: root.default-mount-directory + "\\" + (root.selected-repo == "" ? "<folder name>" : root.selected-label) + " (default)"; text <=> root.remote-mount; enabled: root.idle && !root.headless; }
+                    VerticalLayout { spacing: 2px;
+                        CheckBox { text: "Headless"; checked <=> root.headless; enabled: root.idle; }
+                        Muted { text: "Sync without a mount."; }
+                    }
+                    Button { min-width: 0px; text: root.selected-repo == "" ? "Select a folder to receive" : (root.headless ? "Receive “" : "Receive & mount “") + root.selected-label + "”"; primary: true; enabled: root.idle && root.selected-repo != ""; clicked => { root.receive-folder(root.endpoint, root.selected-repo, root.selected-label, root.remote-mount, root.headless); } }
                 }
                 if root.dialog == "host": VerticalLayout { spacing: 10px;
-                    Muted { text: "Configuration"; }
-                    Mono { text: root.config-path; wrap: word-wrap; color: Theme.ink; }
-                    Muted { text: "Control endpoint: " + root.daemon-control; }
-                    Muted { text: "Pairing uses the selected folder's endpoint. Select and start a folder to generate its code. A new code replaces the previous code; existing paired credentials remain valid."; wrap: word-wrap; }
-                    Button { text: "Generate a new pairing code"; enabled: root.idle && root.detail-loaded; clicked => { root.reset-code(); } }
+                    Text { text: "Config: " + root.config-path; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
+                    Muted { text: "Listening " + root.daemon-network; }
+                    Text { text: "Generate a code for another host to pair with this one. A new code revokes hosts paired with the old one."; color: Theme.ink; font-size: 13px; wrap: word-wrap; }
+                    HorizontalLayout { alignment: start;
+                        Button { text: "Generate a new pairing code"; enabled: root.idle && root.connected; clicked => { root.reset-code(); } }
+                    }
                     if root.pairing-code != "": TextEdit { text: root.pairing-code; read-only: true; height: 56px; }
+                    if root.pairing-code != "": HorizontalLayout { alignment: start;
+                        Button { small: true; text: "Copy"; clicked => { root.copy-code(); } }
+                    }
                     if root.pairing-code != "": Muted { text: "Shown once: copy it now. It is cleared when this dialog closes."; wrap: word-wrap; }
-                    Muted { text: "Closing this window leaves the daemon and its mounts running."; wrap: word-wrap; }
-                    Label {text:"Selected folder listener";}
-                    Field {text<=>root.listener;placeholder:"0.0.0.0:43180";enabled:root.idle && !root.detail-row.running && root.selected-state!="";}
-                    Field {text<=>root.advertised;placeholder:"Advertised ws:// or wss:// endpoint (optional)";enabled:root.idle && !root.detail-row.running && root.selected-state!="";}
-                    Button {text:"Save listener";enabled:root.idle && !root.detail-row.running && root.selected-state!="";clicked=>{root.save-listener(root.listener,root.advertised);} }
-                    Muted {text:"Stop the selected folder before changing its listener. Use a reachable address to pair another computer.";}
+                    Muted { text: "Closing this window leaves the orchestrator and its folders running."; wrap: word-wrap; }
                     HorizontalLayout { spacing: 8px;
                         Button { text: "About Slint"; clicked => { about.show(); } }
-                        Button { text: "Shut down the daemon"; danger: true; enabled: root.idle && root.connected; clicked => { root.pairing-code = ""; root.dialog = "shutdown"; } }
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: "Stop orchestrator"; danger: true; enabled: root.idle && root.connected; clicked => { root.pairing-code = ""; root.dialog = "shutdown"; } }
                     }
                 }
                 if root.dialog == "shutdown": VerticalLayout { spacing: 16px;
-                    Label { text: "Shut down the daemon? Running folders stop and their mounts go away. It is not restarted until you start it again."; wrap: word-wrap; }
+                    Label { text: "Stop the orchestrator? Running folders stop and peers disconnect. It does not start again until you start it."; wrap: word-wrap; }
                     HorizontalLayout { alignment: end; spacing: 8px;
                         Button { text: "Cancel"; enabled: root.idle; clicked => { root.dismiss(); } }
-                        Button { text: "Shut down"; danger: true; enabled: root.idle; clicked => { root.shutdown(); } }
+                        Button { text: "Stop orchestrator"; danger: true; enabled: root.idle; clicked => { root.shutdown(); } }
                     }
                 }
                 if root.dialog != "folder" && root.dialog != "peer": Text { text: root.idle ? root.status : root.global-busy + "…"; color: root.status-error ? #ff9d96 : Theme.muted; font-size: 12px; wrap: word-wrap; }

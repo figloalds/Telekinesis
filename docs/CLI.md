@@ -73,14 +73,16 @@ tkfs -f orchestrator.toml start          # the same (alias); this is what contai
   `manage pair` fail with `CLOCK_INVALID` (exit status 78 for the two
   daemons). Fix the clock (NTP) and start again.
 - `gui` is the Windows desktop (elsewhere it fails with
-  `DESKTOP_REQUIRES_WINDOWS`; `tkfs` with no command runs it too). It is not
-  yet a client of the orchestrator: it keeps its own configuration, which it
-  rewrites in its own format, so give it a file of its own (`-f`), never the
-  `orchestrator.toml` of an orchestrator.
+  `DESKTOP_REQUIRES_WINDOWS`; `tkfs` with no command runs it too). It is a
+  client of the orchestrator and uses the same `orchestrator.toml` (`-f`, or
+  the usual resolution). It starts the orchestrator when none answers and
+  attaches to the running one otherwise; closing the window leaves the
+  orchestrator and its folders running. When the orchestrator stops, the
+  window says so and offers to start it again; it never restarts it by
+  itself.
 
 ```sh
 tkfs gui
-tkfs -f desktop.toml gui
 ```
 
 ## Managing folders: `tkfs manage …`

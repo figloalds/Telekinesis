@@ -158,7 +158,7 @@ fn run() -> Result<()> {
     );
     if matches!(command, Command::Gui) {
         #[cfg(windows)]
-        return gui::run(config_path, None);
+        return gui::run(config_path);
         #[cfg(not(windows))]
         anyhow::bail!("DESKTOP_REQUIRES_WINDOWS: use --help for headless commands");
     }

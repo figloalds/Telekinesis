@@ -1,4 +1,5 @@
-// Adapts the restored WP3.4 layout to the current per-folder daemon API.
+// Renders the orchestrator's `status` (hub::Daemon::snapshot) into the
+// WP3.4 layout, and wires the window's callbacks to the two threads.
 use std::cell::RefCell;
 thread_local! { static LAST:RefCell<Value>=const {RefCell::new(Value::Null)}; }
 fn chip(label: &str, tone: &str, action: &str, action_label: &str) -> Chip {
@@ -25,107 +26,214 @@ fn bytes(value: u64) -> String {
         format!("{value} B")
     }
 }
-fn folder_row(row: &Value) -> FolderRow {
-    let folder = &row["folder"];
-    let status = &row["status"];
-    let running = row["online"] == true;
-    let error = if running {
-        text(status, "error")
-    } else {
-        text(row, "error")
-    };
-    let mounted = status["mount"].is_string();
+/// The first 8 characters of an installation or folder id.
+fn short(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
+}
+/// A folder entry's phase name (`Running`, `Stopped`, …).
+fn phase(entry: &Value) -> &str {
+    entry["phase"]["phase"].as_str().unwrap_or_default()
+}
+/// Whether a folder has (or is getting) a worker: what Stop applies to.
+fn active(entry: &Value) -> bool {
+    matches!(phase(entry), "Running" | "Starting" | "Backoff")
+}
+/// One row of the folder table, from a `status.folders[i]` entry.
+fn folder_row(entry: &Value) -> FolderRow {
+    let record = &entry["record"];
+    let phase = phase(entry);
+    let running = phase == "Running";
+    let paused = record["paused"] == true;
+    let error = text(entry, "error");
+    let mount = text(record, "mount");
+    let peers = entry["sync"].as_object().map_or(0, |sync| sync.len());
     FolderRow {
-        state: text(folder, "id").into(),
-        label: text(folder, "label").into(),
-        mount: if mounted {
-            text(status, "mount")
-        } else {
-            text(folder, "mount")
-        }
-        .into(),
-        sync: if !running {
-            chip("Stopped", "muted", "start", "Start")
+        state: text(record, "id").into(),
+        label: text(record, "label").into(),
+        mount: mount.clone().into(),
+        sync: if paused {
+            chip("Paused", "warn", "resume", "Resume")
         } else if !error.is_empty() {
             chip("Needs attention", "error", "", "")
+        } else if running && peers == 0 {
+            chip("Local only", "muted", "", "")
+        } else if running {
+            chip(
+                &format!("Syncing with {}", plural(peers, "peer", "peers")),
+                "ok",
+                "",
+                "",
+            )
+        } else if phase == "Starting" {
+            chip("Starting", "progress", "", "")
         } else {
-            chip("Sync active", "ok", "", "")
+            chip("Not syncing", "muted", "", "")
         },
-        life: if running {
-            chip("Running", "ok", "stop", "Stop")
-        } else {
-            chip("Stopped", "muted", "start", "Start")
+        life: match phase {
+            "Running" => chip("Running", "ok", "stop", "Stop"),
+            "Starting" => chip("Starting", "progress", "", ""),
+            "Stopping" => chip("Stopping", "progress", "", ""),
+            "Backoff" => chip("Retrying", "warn", "stop", "Stop"),
+            "Failed" => chip("Failed", "error", "start", "Start"),
+            _ => chip("Stopped", "muted", "start", "Start"),
         },
-        mount_chip: if mounted {
-            chip("Mounted", "ok", "detach", "Unmount")
-        } else if folder["mount"].is_string() && running {
-            chip("Unmounted", "muted", "attach", "Mount")
+        mount_chip: if mount.is_empty() {
+            chip("Headless", "muted", "", "")
         } else {
-            chip("Sync only", "muted", "configure-mount", "Configure")
+            chip("Not mounted", "muted", "configure-mount", "Change")
         },
         detail: if running {
             format!(
-                "{} entries · branch {}",
-                status["entries"].as_u64().unwrap_or(1).saturating_sub(1),
-                text(status, "branch")
+                "{} entries",
+                entry["heartbeat"]["entries"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
             )
+        } else if error.is_empty() && phase == "Stopped" {
+            "Start to sync.".into()
         } else {
-            "Start to sync; configure a mount while stopped.".into()
+            String::new()
         }
         .into(),
-        conflicts: status["conflicts"].as_i64().unwrap_or(0) as i32,
+        conflicts: entry["conflicts"].as_i64().unwrap_or(0) as i32,
         error_title: error.clone().into(),
         error_hint: if error.is_empty() {
             ""
         } else {
-            "Open the daemon log for details; retry after correcting the problem."
+            "Open the folder's log for details; start it again after correcting the problem."
         }
         .into(),
         error_tone: "error".into(),
         attention: !error.is_empty(),
         running,
-        primary: if running { "stop" } else { "start" }.into(),
-        primary_label: if running { "Stop" } else { "Start" }.into(),
+        primary: if active(entry) {
+            "stop"
+        } else if phase == "Stopping" {
+            ""
+        } else {
+            "start"
+        }
+        .into(),
+        primary_label: if active(entry) { "Stop" } else { "Start" }.into(),
         ..Default::default()
     }
 }
-fn peer_row(peer: &Value, label: &str) -> PeerRow {
-    let runtime = &peer["runtime"];
-    let health = &runtime["health"];
-    let state = if runtime["state"].is_string() {
-        text(runtime, "state")
+/// The state of a lane as a chip (`network.peers()[i].lanes[j]`).
+fn lane_chip(lane: &Value) -> Chip {
+    match lane["state"].as_str().unwrap_or_default() {
+        "Ready" => chip("Ready", "ok", "", ""),
+        "Dialing" => chip("Connecting", "progress", "", ""),
+        "Backoff" => chip("Unreachable", "warn", "", ""),
+        "Unauthorized" => chip("Not authorized", "error", "", ""),
+        "Incompatible" => chip("Incompatible", "error", "", ""),
+        _ => chip("Idle", "muted", "", ""),
+    }
+}
+fn lane_bytes(lanes: &[Value]) -> (u64, u64) {
+    lanes.iter().fold((0, 0), |(up, down), lane| {
+        let health = &lane["health"];
+        (
+            up + health["bytes_up"].as_u64().unwrap_or(0),
+            down + health["bytes_down"].as_u64().unwrap_or(0),
+        )
+    })
+}
+/// One peer of the sidebar, from a `status.peers[i]` entry.
+fn peer_row(peer: &Value) -> PeerRow {
+    let lanes = peer["lanes"].as_array().cloned().unwrap_or_default();
+    let ready = lanes.iter().filter(|lane| lane["state"] == "Ready").count();
+    let inbound = peer["inbound"].as_u64().unwrap_or(0) as usize;
+    let inbound_only = peer["direction"] == "inbound";
+    let endpoint = text(peer, "endpoint");
+    let installation = text(peer, "installation");
+    let online = ready > 0 || inbound > 0;
+    let state = |name: &str| lanes.iter().any(|lane| lane["state"] == name);
+    let badge = if online {
+        chip("Connected", "ok", "", "")
+    } else if state("Unauthorized") {
+        chip("Not authorized", "error", "", "")
+    } else if state("Incompatible") {
+        chip("Incompatible", "error", "", "")
+    } else if state("Backoff") {
+        chip("Unreachable", "warn", "", "")
+    } else if state("Dialing") {
+        chip("Connecting", "progress", "", "")
+    } else if inbound_only {
+        chip("Paired", "muted", "", "")
     } else {
-        "Paired".into()
+        chip("Offline", "muted", "", "")
     };
-    let online = state == "Connected";
+    let error = lanes
+        .iter()
+        .find_map(|lane| lane["error"].as_str().or(lane["last_error"].as_str()))
+        .unwrap_or_default();
+    let rtt = peer["clock"]["rtt_ms"].as_u64().or_else(|| {
+        lanes
+            .iter()
+            .find_map(|lane| lane["health"]["rtt_ms"].as_u64())
+    });
+    let (up, down) = lane_bytes(&lanes);
+    let mut summary = format!("{} · {} ready", plural(lanes.len(), "lane", "lanes"), ready);
+    if inbound > 0 {
+        summary += &format!(
+            " · {}",
+            plural(inbound, "inbound session", "inbound sessions")
+        );
+    }
     PeerRow {
-        installation: text(peer, "installation").into(),
-        name: text(peer, "endpoint").into(),
-        endpoint: text(peer, "endpoint").into(),
-        badge: chip(
-            &state,
-            if online {
-                "ok"
-            } else if runtime["error"].is_string() {
-                "warn"
-            } else {
-                "muted"
-            },
-            "",
-            "",
-        ),
-        direction: "Two-way".into(),
-        protocol: "Current protocol".into(),
-        folders: label.into(),
+        installation: installation.clone().into(),
+        name: if endpoint.is_empty() {
+            format!("Inbound · {}", short(&installation))
+        } else {
+            endpoint.clone()
+        }
+        .into(),
+        endpoint: endpoint.into(),
+        badge,
+        direction: if inbound_only {
+            "Inbound only"
+        } else {
+            "Outbound"
+        }
+        .into(),
+        inbound_only,
         online,
-        rtt: health["rtt_ms"]
+        rtt: rtt.map(|ms| format!("{ms} ms")).unwrap_or_default().into(),
+        rates: if ready > 0 {
+            format!("↑ {} · ↓ {} total", bytes(up), bytes(down))
+        } else {
+            String::new()
+        }
+        .into(),
+        error_title: error.into(),
+        error_hint: if error.is_empty() {
+            ""
+        } else {
+            "Check the peer's endpoint, listener and network connection."
+        }
+        .into(),
+        lanes_summary: summary.into(),
+        ..Default::default()
+    }
+}
+fn lane_row(lane: &Value) -> LaneRow {
+    let health = &lane["health"];
+    LaneRow {
+        lane: lane["lane"].to_string().into(),
+        role: text(lane, "role").into(),
+        state: lane_chip(lane),
+        inflight: health["inflight"]
             .as_u64()
-            .map(|v| format!("{v} ms"))
+            .map(|n| n.to_string())
             .unwrap_or_default()
             .into(),
-        rates: if health.is_object() {
+        bytes: if health.is_object() {
             format!(
-                "↑ {} · ↓ {} total",
+                "↑ {} · ↓ {}",
                 bytes(health["bytes_up"].as_u64().unwrap_or(0)),
                 bytes(health["bytes_down"].as_u64().unwrap_or(0))
             )
@@ -133,9 +241,11 @@ fn peer_row(peer: &Value, label: &str) -> PeerRow {
             String::new()
         }
         .into(),
-        error_title: text(runtime, "error").into(),
-        error_hint: "Check the peer's endpoint, listener and network connection.".into(),
-        lanes_summary: "Metadata and immutable objects share the authenticated session.".into(),
+        error: lane["error"]
+            .as_str()
+            .or(lane["last_error"].as_str())
+            .unwrap_or_default()
+            .into(),
         ..Default::default()
     }
 }
@@ -199,88 +309,176 @@ fn revisions(ui: &AppWindow, detail: &Value) {
             }),
     );
 }
-fn render(ui: &AppWindow, value: Value, selected: &str) {
-    if (!ui.get_selected_state().is_empty() && ui.get_selected_state() != selected)
-        || value["selected"] != selected
-    {
-        return;
+/// The orchestrator is gone (or its status failed): the banner, and with
+/// `start-orchestrator` its button. Nothing is started from here.
+fn show_banner(ui: &AppWindow, banner: String, action: &str) {
+    if action == "start-orchestrator" {
+        LAST.with(|last| *last.borrow_mut() = Value::Null);
+        ui.set_connected(false);
+        ui.set_detail_loaded(false);
+        ui.set_daemon_status(chip("Stopped", "error", "", ""));
+        ui.set_folders(model(Vec::new()));
+        ui.set_folder_count(0);
+        ui.set_peers(model(Vec::new()));
+        ui.set_daemon_network("—".into());
+        for set in [
+            AppWindow::set_stat_folders,
+            AppWindow::set_stat_mounted,
+            AppWindow::set_stat_peers,
+            AppWindow::set_stat_transfer,
+        ] {
+            set(ui, "—".into());
+        }
+        for set in [
+            AppWindow::set_stat_folders_detail,
+            AppWindow::set_stat_mounted_detail,
+            AppWindow::set_stat_peers_detail,
+            AppWindow::set_stat_transfer_detail,
+        ] {
+            set(ui, "".into());
+        }
+        ui.set_stat_folders_tone("neutral".into());
     }
+    ui.set_banner_text(banner.into());
+    ui.set_banner_tone("error".into());
+    ui.set_banner_action(action.into());
+    ui.set_banner_action_label("Start orchestrator".into());
+}
+/// The sync tab: one row per peer of the folder's repo (`entry.sync`).
+fn sync_rows(entry: &Value, peers: &[Value]) -> Vec<PeerSyncRow> {
+    let now = tkfs::util::time::now_ms();
+    entry["sync"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(installation, job)| {
+            let peer = peers
+                .iter()
+                .find(|p| p["installation"] == installation.as_str());
+            let error = text(job, "error");
+            let last = job["last_exchange_ms"].as_u64().unwrap_or(0);
+            PeerSyncRow {
+                name: peer
+                    .map(|p| peer_row(p).name.to_string())
+                    .unwrap_or_else(|| short(installation))
+                    .into(),
+                direction: peer.map(|p| peer_row(p).direction).unwrap_or_default(),
+                state: if !error.is_empty() {
+                    chip("Error", "error", "", "")
+                } else if last > 0 {
+                    chip("Exchanging", "ok", "", "")
+                } else {
+                    chip("Waiting", "muted", "", "")
+                },
+                meta: "Events apply independently of content availability.".into(),
+                counts: format!(
+                    "{} sent · {} received",
+                    job["sent"].as_u64().unwrap_or(0),
+                    job["received"].as_u64().unwrap_or(0)
+                )
+                .into(),
+                progress: if last > 0 {
+                    format!("Last exchange {} s ago", now.saturating_sub(last) / 1000)
+                } else {
+                    "No exchange yet".into()
+                }
+                .into(),
+                error_title: error.into(),
+                error_tone: "error".into(),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+fn action(id: &str, label: &str, enabled: bool) -> ActionData {
+    ActionData {
+        id: id.into(),
+        label: label.into(),
+        enabled,
+        ..Default::default()
+    }
+}
+/// Renders one poll of the status thread (`{status, selected, detail, …}`).
+fn render(ui: &AppWindow, value: Value) {
     LAST.with(|last| *last.borrow_mut() = value.clone());
-    let rows = value["folders"].as_array().cloned().unwrap_or_default();
+    let status = &value["status"];
+    let daemon = &status["daemon"];
+    let selected = ui.get_selected_state();
+    let detail = if value["selected"] == selected.as_str() {
+        &value["detail"]
+    } else {
+        &Value::Null
+    };
+    let rows = status["folders"].as_array().cloned().unwrap_or_default();
+    let peers = status["peers"].as_array().cloned().unwrap_or_default();
     let current = rows
         .iter()
-        .find(|row| row["folder"]["id"] == selected)
+        .find(|entry| entry["record"]["id"] == selected.as_str())
         .cloned()
         .unwrap_or(Value::Null);
-    let detail = &value["detail"];
-    let online = current["online"] == true;
-    let active = rows.iter().filter(|row| row["online"] == true).count();
-    let mounted = rows
-        .iter()
-        .filter(|row| row["status"]["mount"].is_string())
-        .count();
-    let loaded = detail.is_object() && online;
-    ui.set_connected(value["blocked"] != true);
+    let record = &current["record"];
+    let running = phase(&current) == "Running";
+    let worker = &detail["inspect"]["worker"];
+    let loaded = running && worker.is_object();
+    let stopping = daemon["stopping"] == true;
+    // Host.
+    ui.set_connected(true);
     ui.set_detail_loaded(loaded);
-    ui.set_config_path(text(&value, "config_path").into());
+    ui.set_config_path(
+        daemon["config"]
+            .as_str()
+            .or(value["config_path"].as_str())
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_default_mount_directory(text(&value, "default_mount_directory").into());
     ui.set_host_name(
         std::env::var("COMPUTERNAME")
             .unwrap_or_else(|_| "This computer".into())
             .into(),
     );
-    ui.set_daemon_version(env!("CARGO_PKG_VERSION").into());
-    ui.set_daemon_status(chip(
-        if value["blocked"] == true {
-            "Cleanup blocked"
-        } else {
-            "Ready"
-        },
-        if value["blocked"] == true {
-            "error"
-        } else {
-            "ok"
-        },
-        "",
-        "",
-    ));
+    ui.set_daemon_version(text(daemon, "version").into());
+    ui.set_daemon_status(if stopping {
+        chip("Stopping", "warn", "", "")
+    } else {
+        chip("Running", "ok", "", "")
+    });
     ui.set_daemon_network(
-        if online {
-            text(&current["status"], "endpoint")
-        } else {
-            "—".into()
-        }
-        .into(),
-    );
-    ui.set_daemon_installation(
-        text(&current["status"], "device")
-            .chars()
-            .take(8)
-            .collect::<String>()
+        daemon["listen"]
+            .as_str()
+            .filter(|listen| !listen.is_empty())
+            .unwrap_or("not listening")
             .into(),
     );
-    ui.set_daemon_control("Local folder workers".into());
-    if value["blocked"] == true {
-        ui.set_banner_text("A process did not finish cleanup. Further starts are blocked; inspect desktop-exit-state.json and the saved configuration's blocked.json report.".into());
-        ui.set_banner_tone("error".into());
+    ui.set_daemon_installation(short(&text(daemon, "installation")).into());
+    if stopping {
+        ui.set_banner_text("The orchestrator is stopping…".into());
+        ui.set_banner_tone("progress".into());
     } else {
         ui.set_banner_text("".into());
-        ui.set_banner_action("".into());
     }
+    ui.set_banner_action("".into());
+    // Folders.
+    let running_count = rows.iter().filter(|e| phase(e) == "Running").count();
+    let mounted = rows
+        .iter()
+        .filter(|e| e["record"]["mount"].is_string())
+        .count();
     ui.set_folder_count(rows.len() as i32);
-    ui.set_stat_folders(active.to_string().into());
-    ui.set_stat_folders_detail(format!("of {} saved folders", rows.len()).into());
-    ui.set_stat_folders_tone(if active > 0 { "ok" } else { "neutral" }.into());
+    ui.set_stat_folders(running_count.to_string().into());
+    ui.set_stat_folders_detail(format!("of {}", plural(rows.len(), "folder", "folders")).into());
+    ui.set_stat_folders_tone(if running_count > 0 { "ok" } else { "neutral" }.into());
     ui.set_stat_mounted(mounted.to_string().into());
-    ui.set_stat_mounted_detail("Others run without a filesystem mount".into());
+    ui.set_stat_mounted_detail("Others sync headless".into());
     let search = ui.get_search().to_lowercase();
     ui.set_folders(model(
         rows.iter()
-            .filter(|row| {
+            .filter(|entry| {
                 search.is_empty()
                     || format!(
                         "{} {}",
-                        text(&row["folder"], "label"),
-                        text(&row["folder"], "mount")
+                        text(&entry["record"], "label"),
+                        text(&entry["record"], "mount")
                     )
                     .to_lowercase()
                     .contains(&search)
@@ -288,123 +486,92 @@ fn render(ui: &AppWindow, value: Value, selected: &str) {
             .map(folder_row)
             .collect(),
     ));
-    ui.set_selected_state(selected.into());
     if ui.get_dialog() != "connect" {
-        ui.set_selected_label(text(&current["folder"], "label").into());
+        ui.set_selected_label(text(record, "label").into());
     }
     ui.set_detail_row(folder_row(&current));
-    if ui.get_dialog() != "host" {
-        ui.set_listener(text(&current["folder"], "listen").into());
-        ui.set_advertised(text(&current["folder"], "advertise").into());
-    }
-    let peers = detail["peers"].as_array().cloned().unwrap_or_default();
-    let peer_rows: Vec<_> = peers
-        .iter()
-        .map(|p| peer_row(p, &text(&current["folder"], "label")))
-        .collect();
+    // Peers.
+    let peer_rows: Vec<_> = peers.iter().map(peer_row).collect();
+    let online = peer_rows.iter().filter(|p| p.online).count();
     ui.set_peers(model(peer_rows.clone()));
-    ui.set_stat_peers(
-        peer_rows
-            .iter()
-            .filter(|p| p.online)
-            .count()
-            .to_string()
-            .into(),
-    );
-    ui.set_stat_peers_detail(
-        if selected.is_empty() {
-            "Select a folder to view its peers".into()
-        } else {
-            text(&current["folder"], "label")
-        }
-        .into(),
-    );
-    let uploaded = peers
+    ui.set_stat_peers(format!("{online} / {}", peer_rows.len()).into());
+    ui.set_stat_peers_detail("Paired hosts".into());
+    let (up, down) = peers.iter().fold((0, 0), |(up, down), peer| {
+        let lanes = peer["lanes"].as_array().cloned().unwrap_or_default();
+        let (u, d) = lane_bytes(&lanes);
+        (up + u, down + d)
+    });
+    ui.set_stat_transfer(format!("↑ {} · ↓ {}", bytes(up), bytes(down)).into());
+    ui.set_stat_transfer_detail("Peer sessions · totals".into());
+    let selected_peer = ui.get_selected_peer();
+    match peers
         .iter()
-        .filter_map(|p| p["runtime"]["health"]["bytes_up"].as_u64())
-        .sum();
-    let downloaded = peers
-        .iter()
-        .filter_map(|p| p["runtime"]["health"]["bytes_down"].as_u64())
-        .sum();
-    ui.set_stat_transfer(format!("↑ {} · ↓ {}", bytes(uploaded), bytes(downloaded)).into());
-    ui.set_stat_transfer_detail("Selected folder · session totals".into());
-    if let Some(peer) = peer_rows
-        .iter()
-        .find(|p| p.installation == ui.get_selected_peer() || p.endpoint == ui.get_selected_peer())
+        .find(|p| p["installation"] == selected_peer.as_str())
     {
-        ui.set_peer_detail(peer.clone());
-        let data = peers
-            .iter()
-            .find(|p| p["installation"] == peer.installation.as_str())
-            .unwrap();
-        let health = &data["runtime"]["health"];
-        ui.set_peer_lanes(model(if health.is_object() {
-            vec![LaneRow {
-                lane: "1".into(),
-                role: "Session".into(),
-                state: peer.badge.clone(),
-                inflight: health["inflight"].to_string().into(),
-                bytes: peer.rates.clone(),
-                ..Default::default()
-            }]
-        } else {
-            Vec::new()
-        }));
-    } else {
-        ui.set_peer_detail(PeerRow::default());
-        ui.set_peer_lanes(model(Vec::new()));
+        Some(peer) => {
+            ui.set_peer_detail(peer_row(peer));
+            ui.set_peer_lanes(model(
+                peer["lanes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(lane_row)
+                    .collect(),
+            ));
+        }
+        None => {
+            ui.set_peer_detail(PeerRow::default());
+            ui.set_peer_lanes(model(Vec::new()));
+        }
     }
-    ui.set_detail_peers(model(
-        peers
-            .iter()
-            .map(|p| {
-                let row = peer_row(p, &text(&current["folder"], "label"));
-                PeerSyncRow {
-                    name: row.name,
-                    direction: row.direction,
-                    state: row.badge,
-                    meta: "Events apply independently of content availability.".into(),
-                    down: bytes(p["runtime"]["health"]["bytes_down"].as_u64().unwrap_or(0)).into(),
-                    up: bytes(p["runtime"]["health"]["bytes_up"].as_u64().unwrap_or(0)).into(),
-                    progress: "Missing content downloads on demand and in the background.".into(),
-                    error_title: row.error_title,
-                    error_tone: "error".into(),
-                    ..Default::default()
-                }
-            })
-            .collect(),
-    ));
+    // The selected folder.
+    ui.set_detail_peers(model(sync_rows(&current, &peers)));
     let mut overview = vec![
-        kv("Store", text(&current["folder"], "state")),
+        kv("Folder", text(record, "id")),
+        kv("Store", text(record, "state")),
+        kv("Repository", text(record, "repo")),
         kv(
-            "Configured mount",
-            if current["folder"]["mount"].is_string() {
-                text(&current["folder"], "mount")
+            "Mount",
+            if record["mount"].is_string() {
+                text(record, "mount")
             } else {
-                "Sync only".into()
+                "Headless".into()
+            },
+        ),
+        kv("Worker", phase(&current)),
+        kv(
+            "Sync",
+            if record["paused"] == true {
+                "Paused"
+            } else {
+                "Active"
             },
         ),
     ];
-    if online {
+    if loaded {
         overview.extend([
-            kv("Repository", text(&current["status"], "repo")),
-            kv("Current branch", text(&current["status"], "branch")),
-            kv("Peer endpoint", text(&current["status"], "endpoint")),
-            kv("Device", text(&current["status"], "device")),
+            kv("Current branch", text(worker, "branch")),
+            kv("Device", text(worker, "device")),
+            kv(
+                "Entries",
+                worker["entries"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .to_string(),
+            ),
         ]);
     }
     ui.set_detail_overview(model(overview));
-    ui.set_detail_activation(model(vec![
-        kv("Current branch", text(&current["status"], "branch")),
-        kv(
-            "Checkpoints",
-            detail["snapshots"]
-                .as_array()
-                .map_or(0, Vec::len)
-                .to_string(),
-        ),
-    ]));
+    ui.set_current_branch(text(worker, "branch").into());
+    ui.set_detail_activation(model(vec![kv(
+        "Current branch",
+        if loaded {
+            text(worker, "branch")
+        } else {
+            "Start the folder to see its branch.".into()
+        },
+    )]));
     ui.set_detail_content(model(vec![
         kv("Chunks", "64 KiB"),
         kv("Durability", "Flush/fsync commits locally before returning"),
@@ -414,18 +581,14 @@ fn render(ui: &AppWindow, value: Value, selected: &str) {
         ),
     ]));
     ui.set_detail_missing_note(
-        if online {
+        if running {
             "Open a file or preview a revision to fetch its missing content."
         } else {
             "Start this folder to load its current content state."
         }
         .into(),
     );
-    let error = if online {
-        text(&current["status"], "error")
-    } else {
-        text(&current, "error")
-    };
+    let error = text(&current, "error");
     ui.set_detail_errors(model(if error.is_empty() {
         Vec::new()
     } else {
@@ -438,25 +601,6 @@ fn render(ui: &AppWindow, value: Value, selected: &str) {
     }));
     ui.set_activity(model(activity(detail)));
     ui.set_detail_activity(model(activity(detail)));
-    ui.set_branches(model(
-        detail["branches"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|b| BranchRow {
-                id: text(b, "id").into(),
-                name: text(b, "name").into(),
-            })
-            .collect(),
-    ));
-    ui.set_snapshots(model(
-        detail["snapshots"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|s| s.as_str().map(Into::into))
-            .collect(),
-    ));
     let history = conflicts(detail);
     let unresolved = history.iter().filter(|c| !c.resolved).count();
     ui.set_conflict_count(history.len() as i32);
@@ -491,46 +635,27 @@ fn render(ui: &AppWindow, value: Value, selected: &str) {
             .collect(),
     ));
     revisions(ui, detail);
+    let paused = record["paused"] == true;
     let mut actions = vec![
-        ActionData {
-            id: if online { "stop" } else { "start" }.into(),
-            label: if online { "Stop" } else { "Start" }.into(),
-            enabled: true,
-            ..Default::default()
+        if active(&current) {
+            action("stop", "Stop", true)
+        } else {
+            action("start", "Start", phase(&current) != "Stopping")
         },
-        ActionData {
-            id: "configure-mount".into(),
-            label: "Change mount point".into(),
-            enabled: true,
-            ..Default::default()
+        if paused {
+            action("resume", "Resume sync", true)
+        } else {
+            action("pause", "Pause sync", true)
         },
+        action("configure-mount", "Change mount point", true),
+        action("open", "Open folder", record["mount"].is_string()),
+        action("log", "Open log", true),
     ];
-    if online {
+    if running {
         actions.extend([
-            ActionData {
-                id: "open".into(),
-                label: "Open folder".into(),
-                enabled: current["status"]["mount"].is_string(),
-                ..Default::default()
-            },
-            ActionData {
-                id: "flush".into(),
-                label: "Flush".into(),
-                enabled: true,
-                ..Default::default()
-            },
-            ActionData {
-                id: "checkpoint".into(),
-                label: "Checkpoint".into(),
-                enabled: true,
-                ..Default::default()
-            },
-            ActionData {
-                id: "restart".into(),
-                label: "Restart".into(),
-                enabled: true,
-                ..Default::default()
-            },
+            action("checkpoint", "Checkpoint", true),
+            action("gc", "Clean up storage", true),
+            action("restart", "Restart", true),
         ]);
     }
     ui.set_detail_actions(model(actions));
@@ -538,80 +663,74 @@ fn render(ui: &AppWindow, value: Value, selected: &str) {
 fn refresh_cached(ui: &AppWindow) {
     let cached = LAST.with(|last| last.borrow().clone());
     if !cached.is_null() {
-        render(ui, cached, ui.get_selected_state().as_str());
+        render(ui, cached);
     }
+}
+/// The cached `status.folders` entry of folder `id`.
+fn cached_entry(id: &str) -> Option<Value> {
+    LAST.with(|last| {
+        last.borrow()["status"]["folders"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|entry| entry["record"]["id"] == id)
+            .cloned()
+    })
 }
 fn send(
     tx: &mpsc::SyncSender<Message>,
     ui: &AppWindow,
-    folder: String,
     operation: &str,
-    args: [String; 3],
-    mount: String,
+    state: String,
+    args: [String; 4],
 ) {
-    if tx
-        .try_send(Message::Action {
-            folder,
-            operation: operation.into(),
-            args,
-            mount,
-            pairing_generation: ui.get_pairing_generation(),
-        })
-        .is_ok()
-    {
+    let message = Message::Action {
+        operation: operation.into(),
+        state,
+        args,
+        headless: ui.get_headless(),
+        pairing_generation: ui.get_pairing_generation(),
+    };
+    if tx.try_send(message).is_ok() {
         ui.set_global_busy(operation.into());
         ui.set_status("".into());
         ui.set_status_error(false);
     } else {
-        ui.set_status("Desktop is busy; please retry.".into());
+        ui.set_status("The desktop is busy; please retry.".into());
         ui.set_status_error(true);
     }
 }
-fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
+fn args(first: impl Into<String>) -> [String; 4] {
+    [first.into(), String::new(), String::new(), String::new()]
+}
+fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>, polls: mpsc::Sender<Poll>) {
     let weak = ui.as_weak();
     let sender = tx.clone();
-    ui.on_folder_action(move |id, action| {
-        if let Some(ui) = weak.upgrade() {
-            ui.set_selected_state(id.clone());
-            if action == "configure-mount" {
-                let cached = LAST.with(|last| last.borrow().clone());
-                if let Some(row) = cached["folders"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|row| row["folder"]["id"] == id.as_str())
-                {
-                    ui.set_selected_label(text(&row["folder"], "label").into());
-                    ui.set_mount_path(text(&row["folder"], "mount").into());
-                    ui.set_dialog(
-                        if row["online"] == true {
-                            "stop-first"
-                        } else {
-                            "mount"
-                        }
-                        .into(),
-                    );
-                }
-                let _ = sender.try_send(Message::Select(id.into()));
-                return;
+    let poller = polls.clone();
+    ui.on_folder_action(move |id, operation| {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.set_selected_state(id.clone());
+        let _ = poller.send(Poll::Select(id.to_string()));
+        if operation == "configure-mount" {
+            if let Some(entry) = cached_entry(&id) {
+                ui.set_selected_label(text(&entry["record"], "label").into());
+                ui.set_mount_path(text(&entry["record"], "mount").into());
+                let stopped = matches!(phase(&entry), "Stopped" | "Failed");
+                ui.set_dialog(if stopped { "mount" } else { "stop-first" }.into());
             }
-            send(
-                &sender,
-                &ui,
-                id.into(),
-                action.as_str(),
-                Default::default(),
-                String::new(),
-            );
+            return;
         }
+        send(
+            &sender,
+            &ui,
+            operation.as_str(),
+            id.into(),
+            Default::default(),
+        );
     });
-    let weak = ui.as_weak();
-    let sender = tx.clone();
+    let poller = polls.clone();
     ui.on_open_folder(move |id| {
-        if let Some(ui) = weak.upgrade() {
-            ui.set_selected_state(id.clone());
-            let _ = sender.try_send(Message::Select(id.into()));
-        }
+        let _ = poller.send(Poll::Select(id.into()));
     });
     let weak = ui.as_weak();
     ui.on_open_peer(move |_| {
@@ -625,31 +744,25 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
             refresh_cached(&ui);
         }
     });
-    let weak = ui.as_weak();
-    let sender = tx.clone();
+    let poller = polls.clone();
     ui.on_detail_tab_changed(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            let _ = sender.try_send(Message::Select(ui.get_selected_state().into()));
-        }
+        let _ = poller.send(Poll::Refresh);
     });
-    let weak = ui.as_weak();
-    let sender = tx.clone();
+    let poller = polls;
     ui.on_refresh_content(move || {
-        if let Some(ui) = weak.upgrade() {
-            let _ = sender.try_send(Message::Select(ui.get_selected_state().into()));
-        }
+        let _ = poller.send(Poll::Refresh);
     });
     let weak = ui.as_weak();
     let sender = tx.clone();
-    ui.on_create_folder(move |label, mount| {
+    ui.on_create_folder(move |label, mount, headless| {
         if let Some(ui) = weak.upgrade() {
+            ui.set_headless(headless);
             send(
                 &sender,
                 &ui,
-                ui.get_selected_state().into(),
                 "create",
-                [label.into(), mount.into(), String::new()],
                 String::new(),
+                [label.into(), mount.into(), String::new(), String::new()],
             );
         }
     });
@@ -657,26 +770,7 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
     let sender = tx.clone();
     ui.on_configure_mount(move |id, mount| {
         if let Some(ui) = weak.upgrade() {
-            let cached = LAST.with(|last| last.borrow().clone());
-            if let Some(row) = cached["folders"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|row| row["folder"]["id"] == id.as_str())
-            {
-                send(
-                    &sender,
-                    &ui,
-                    id.into(),
-                    "configure",
-                    [
-                        mount.into(),
-                        text(&row["folder"], "listen"),
-                        text(&row["folder"], "advertise"),
-                    ],
-                    String::new(),
-                );
-            }
+            send(&sender, &ui, "configure-mount", id.into(), args(mount));
         }
     });
     let weak = ui.as_weak();
@@ -686,10 +780,9 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
             send(
                 &sender,
                 &ui,
-                ui.get_selected_state().into(),
-                "probe",
-                [endpoint.into(), code.into(), String::new()],
+                "pair",
                 String::new(),
+                [endpoint.into(), code.into(), String::new(), String::new()],
             );
         }
     });
@@ -697,14 +790,7 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
     let sender = tx.clone();
     ui.on_remote_list(move |endpoint| {
         if let Some(ui) = weak.upgrade() {
-            send(
-                &sender,
-                &ui,
-                ui.get_selected_state().into(),
-                "probe",
-                [endpoint.into(), ui.get_code().into(), String::new()],
-                String::new(),
-            );
+            send(&sender, &ui, "remote-list", String::new(), args(endpoint));
         }
     });
     let weak = ui.as_weak();
@@ -717,15 +803,15 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
     });
     let weak = ui.as_weak();
     let sender = tx.clone();
-    ui.on_receive_folder(move |endpoint, _, label, mount| {
+    ui.on_receive_folder(move |endpoint, repo, label, mount, headless| {
         if let Some(ui) = weak.upgrade() {
+            ui.set_headless(headless);
             send(
                 &sender,
                 &ui,
-                ui.get_selected_state().into(),
                 "receive",
-                [label.into(), endpoint.into(), ui.get_code().into()],
-                mount.into(),
+                String::new(),
+                [endpoint.into(), repo.into(), label.into(), mount.into()],
             );
         }
     });
@@ -736,75 +822,70 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
             send(
                 &sender,
                 &ui,
-                ui.get_selected_state().into(),
-                "pairing-code",
-                Default::default(),
+                "reset-code",
                 String::new(),
+                Default::default(),
             );
         }
     });
     let weak = ui.as_weak();
+    ui.on_copy_code(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let code = ui.get_pairing_code().to_string();
+        let weak = ui.as_weak();
+        let copied = std::thread::Builder::new()
+            .name("tkfs-clipboard".into())
+            .spawn(move || {
+                let result = copy_to_clipboard(&code);
+                let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                    Ok(()) => {
+                        ui.set_status("Pairing code copied".into());
+                        ui.set_status_error(false);
+                    }
+                    Err(error) => {
+                        ui.set_status(explain(&error).into());
+                        ui.set_status_error(true);
+                    }
+                });
+            });
+        if let Err(error) = copied {
+            ui.set_status(format!("CLIPBOARD_UNAVAILABLE: {error}").into());
+            ui.set_status_error(true);
+        }
+    });
+    let weak = ui.as_weak();
     let sender = tx.clone();
-    ui.on_unpair(move |endpoint| {
+    ui.on_unpair(move |installation| {
         if let Some(ui) = weak.upgrade() {
-            let cached = LAST.with(|last| last.borrow().clone());
-            if let Some(peer) = cached["detail"]["peers"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|p| p["endpoint"] == endpoint.as_str())
-            {
-                send(
-                    &sender,
-                    &ui,
-                    ui.get_selected_state().into(),
-                    "unpair",
-                    [text(peer, "installation"), String::new(), String::new()],
-                    String::new(),
-                );
-            }
+            send(&sender, &ui, "unpair", String::new(), args(installation));
         }
     });
     let weak = ui.as_weak();
     let sender = tx.clone();
     ui.on_shutdown(move || {
         if let Some(ui) = weak.upgrade() {
-            send(
-                &sender,
-                &ui,
-                ui.get_selected_state().into(),
-                "shutdown-all",
-                Default::default(),
-                String::new(),
-            );
+            send(&sender, &ui, "shutdown", String::new(), Default::default());
         }
     });
     let weak = ui.as_weak();
     let sender = tx.clone();
     ui.on_open_log(move || {
         if let Some(ui) = weak.upgrade() {
-            send(
-                &sender,
-                &ui,
-                ui.get_selected_state().into(),
-                "log",
-                Default::default(),
-                String::new(),
-            );
+            send(&sender, &ui, "host-log", String::new(), Default::default());
         }
     });
     let weak = ui.as_weak();
     let sender = tx.clone();
-    ui.on_banner_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            send(
-                &sender,
-                &ui,
-                ui.get_selected_state().into(),
-                "retry",
-                Default::default(),
-                String::new(),
-            );
+    ui.on_start_orchestrator(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if sender.try_send(Message::StartOrchestrator).is_ok() {
+            ui.set_global_busy("Starting the orchestrator".into());
+            ui.set_banner_text("Connecting to the orchestrator…".into());
+            ui.set_banner_tone("progress".into());
+            ui.set_banner_action("".into());
+        } else {
+            ui.set_status("The desktop is busy; please retry.".into());
+            ui.set_status_error(true);
         }
     });
     let weak = ui.as_weak();
@@ -838,10 +919,9 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
             send(
                 &sender,
                 &ui,
-                ui.get_selected_state().into(),
                 "preview",
-                [version.into(), String::new(), String::new()],
-                String::new(),
+                ui.get_selected_state().into(),
+                args(version),
             );
         }
     });
@@ -852,14 +932,14 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
             send(
                 &sender,
                 &ui,
-                ui.get_selected_state().into(),
                 "resolve",
+                ui.get_selected_state().into(),
                 [
                     ui.get_selected_entity().into(),
                     ui.get_selected_revision().into(),
                     String::new(),
+                    String::new(),
                 ],
-                String::new(),
             );
         }
     });
@@ -870,136 +950,41 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>) {
             send(
                 &sender,
                 &ui,
-                ui.get_selected_state().into(),
                 "fork",
-                [name.into(), String::new(), String::new()],
-                String::new(),
-            );
-        }
-    });
-    let weak = ui.as_weak();
-    let sender = tx.clone();
-    ui.on_checkout_branch(move |branch| {
-        if let Some(ui) = weak.upgrade() {
-            send(
-                &sender,
-                &ui,
                 ui.get_selected_state().into(),
-                "checkout",
-                [branch.into(), String::new(), String::new()],
-                String::new(),
+                args(name),
             );
         }
     });
     let weak = ui.as_weak();
     let sender = tx;
-    ui.on_save_listener(move |listener, advertised| {
+    ui.on_checkout_branch(move |branch| {
         if let Some(ui) = weak.upgrade() {
-            let cached = LAST.with(|last| last.borrow().clone());
-            if let Some(row) = cached["folders"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find(|row| row["folder"]["id"] == ui.get_selected_state().as_str())
-            {
-                send(
-                    &sender,
-                    &ui,
-                    ui.get_selected_state().into(),
-                    "configure",
-                    [
-                        text(&row["folder"], "mount"),
-                        listener.into(),
-                        advertised.into(),
-                    ],
-                    String::new(),
-                );
-            }
+            send(
+                &sender,
+                &ui,
+                "checkout",
+                ui.get_selected_state().into(),
+                args(branch),
+            );
         }
     });
 }
-pub fn run(config: PathBuf, single: Option<PathBuf>) -> Result<()> {
+pub fn run(config: PathBuf) -> Result<()> {
     release_own_console();
     let app = AppWindow::new()?;
-    let (tx, rx) = mpsc::sync_channel(32);
-    wire(&app, tx);
+    let (tx, messages) = mpsc::sync_channel(32);
+    let (polls, poll_rx) = mpsc::channel();
+    wire(&app, tx, polls.clone());
+    app.set_global_busy("Connecting to the orchestrator".into());
     let weak = app.as_weak();
-    std::thread::Builder::new().name("tkfs-desktop".into()).spawn(move || {
-        let mut desktop:Option<Desktop>=None;
-        let mut selected=String::new();
-        loop {
-            if desktop.is_none() {
-                let opened=std::env::current_exe().map_err(Into::into).and_then(|exe|Desktop::open(&config,single.as_deref(),&exe));
-                match opened {
-                    Ok(mut value)=>{selected=value.config.folders.first().map(|f|f.id.clone()).unwrap_or_default();value.autostart();desktop=Some(value);let _=weak.upgrade_in_event_loop(|ui|{ui.set_global_busy("".into());ui.set_status("".into());ui.set_status_error(false);});}
-                    Err(error)=>{
-                        let message=format!("Desktop startup failed: {error:#}");
-                        if weak.upgrade_in_event_loop(move |ui|{ui.set_connected(false);ui.set_global_busy("".into());ui.set_banner_text(message.into());ui.set_banner_tone("error".into());ui.set_banner_action("retry".into());ui.set_banner_action_label("Retry startup".into());ui.set_daemon_status(chip("Startup failed","error","",""));}).is_err(){break;}
-                        match rx.recv(){Ok(Message::Action{operation,..}) if operation=="retry"=>continue,_=>break}
-                    }
-                }
-            }
-            let Some(value)=desktop.as_mut() else {continue};
-            let snapshot=value.snapshot(&selected);let selection=selected.clone();
-            if weak.upgrade_in_event_loop(move |ui|render(&ui,snapshot,&selection)).is_err(){break;}
-            match rx.recv_timeout(Duration::from_millis(750)) {
-                Ok(Message::Select(id))=>selected=id,
-                Ok(Message::Action{folder,operation,args,mount,pairing_generation})=>{
-                    selected=folder.clone();
-                    if operation=="probe" {
-                        let mut result=if args[1].is_empty(){value.request(&folder,"peer-info",json!({"endpoint":args[0]}))}else{probe(&args[0],&args[1])};
-                        if !folder.is_empty() && !args[1].is_empty() && let Ok(info)=&result {
-                            let remote_repo=info["repo"].clone();
-                            if let Ok(local)=value.request(&folder,"status",json!({})) && local["repo"]==remote_repo
-                                && let Err(error)=value.request(&folder,"pair",json!({"endpoint":args[0],"code":args[1]})) {
-                                result=Err(error);
-                            }
-                        }
-                        let endpoint=args[0].clone();
-                        let _=weak.upgrade_in_event_loop(move |ui|{
-                            ui.set_global_busy("".into());
-                            if ui.get_endpoint()!=endpoint || ui.get_dialog()!="connect" || ui.get_pairing_generation()!=pairing_generation{return;}
-                            match result {
-                                Ok(info)=>{ui.set_remote_folders(model(vec![RemoteRow{repo:text(&info,"repo").into(),label:info["label"].as_str().unwrap_or("Remote folder").into()}]));ui.set_remote_message("Authenticated. Select the folder to receive a new local copy. Enter its pairing code when receiving.".into());ui.set_status("Folder discovered".into());}
-                                Err(error)=>{ui.set_remote_message(format!("{error:#}").into());ui.set_status_error(true);}
-                            }
-                        });continue;
-                    }
-                    if operation=="pairing-code" || operation=="preview" {
-                        let preview=operation=="preview";
-                        let result=value.request(&folder,if preview{"preview-version"}else{"pairing-code"},if preview{json!({"version":args[0]})}else{json!({})});
-                        let _=weak.upgrade_in_event_loop(move |ui|{
-                            ui.set_global_busy("".into());
-                            match result {
-                                Ok(reply)=>{
-                                    if preview && ui.get_selected_revision()==args[0] {ui.set_conflict_preview(text(&reply,"preview").into());}
-                                    else if !preview && ui.get_dialog()=="host" && ui.get_selected_state()==folder && ui.get_pairing_generation()==pairing_generation {ui.set_pairing_code(text(&reply,"code").into());}
-                                }
-                                Err(error)=>{ui.set_status(format!("{error:#}").into());ui.set_status_error(true);}
-                            }
-                        });continue;
-                    }
-                    let result=perform(value,&folder,&operation,&args,&mount);
-                    if let Ok((Some(id),_))=&result {selected=id.clone();}
-                    let _=weak.upgrade_in_event_loop(move |ui|{
-                        ui.set_global_busy("".into());
-                        match result {
-                            Ok((new_selection,message))=>{
-                                if let Some(id)=new_selection {ui.set_selected_state(id.into());}
-                                ui.set_status(message.into());ui.set_status_error(false);
-                                if matches!(operation.as_str(),"create"|"receive"|"configure"|"shutdown-all"){ui.set_dialog("".into());}
-                                else if operation=="stop" && ui.get_dialog()=="stop-first"{ui.set_dialog("mount".into());}
-                                else if operation=="unpair" && ui.get_dialog()=="peer"{ui.set_dialog("".into());}
-                            }
-                            Err(error)=>{ui.set_status(format!("{error:#}").into());ui.set_status_error(true);}
-                        }
-                    });
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected)=>break,
-                Err(mpsc::RecvTimeoutError::Timeout)=>{}
-            }
-        }
-    })?;
+    std::thread::Builder::new()
+        .name("tkfs-status".into())
+        .spawn(move || status_loop(weak, poll_rx))?;
+    let weak = app.as_weak();
+    std::thread::Builder::new()
+        .name("tkfs-actions".into())
+        .spawn(move || action_loop(weak, messages, polls, config))?;
     app.run()?;
     Ok(())
 }
