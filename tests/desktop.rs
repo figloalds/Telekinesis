@@ -198,6 +198,99 @@ fn a_failing_orchestrator_is_reported_with_its_log() -> Result<()> {
     Ok(())
 }
 
+/// A loopback listener that accepts connections and never answers them,
+/// until dropped.
+struct Silent {
+    address: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Silent {
+    fn bind() -> Result<Self> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?.to_string();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => held.push(stream),
+                    Err(_) => thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for Silent {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[test]
+fn an_endpoint_that_never_replies_does_not_stretch_the_bound() -> Result<()> {
+    // DATA names an endpoint that accepts and never answers, and the
+    // orchestrator lock is held, so the spawned child exits 75 and every
+    // probe meets the silent endpoint until the bound.
+    let (_home, config_path) = home_listening("127.0.0.1:0")?;
+    let silent = Silent::bind()?;
+    let data = Config::load(&config_path)?.data_directory;
+    fs::create_dir_all(&data)?;
+    fs::write(
+        data.join(DISCOVERY_FILE),
+        json!({"control": silent.address, "pid": 1}).to_string(),
+    )?;
+    fs::write(data.join("orchestrator.token"), "silent-token")?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(data.join("orchestrator.lock"))?;
+    lock.try_lock()
+        .map_err(|error| anyhow::anyhow!("lock: {error}"))?;
+
+    let bound = Duration::from_secs(3);
+    let began = Instant::now();
+    let result = launcher::ensure_running(&config_path, exe(), bound);
+    let elapsed = began.elapsed();
+    let error = match result {
+        Ok((config, _client, started)) => {
+            if let Started::Spawned { pid } = started {
+                drop(Orchestrator::new(&config, pid));
+            }
+            bail!("ensure_running against a silent endpoint succeeded: {started:?}");
+        }
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.starts_with("ORCHESTRATOR_START_TIMEOUT"), "{error}");
+    assert!(!error.contains("STRANDED_PROCESS"), "{error}");
+    // No child to kill (it exited 75): the bound alone, plus scheduling.
+    assert!(
+        elapsed < bound + Duration::from_secs(1),
+        "reported after {elapsed:?}: {error}"
+    );
+    let console = fs::read_to_string(data.join("logs").join(CONSOLE_LOG))?;
+    assert!(
+        console.contains("ALREADY_RUNNING"),
+        "console log:\n{console}"
+    );
+    drop(lock);
+    Ok(())
+}
+
 #[test]
 fn an_unwritable_config_location_is_named_in_the_error() -> Result<()> {
     let home = tempfile::tempdir()?;

@@ -4,10 +4,17 @@
 //! [`ensure_running`] loads the configuration (creating it when missing),
 //! attaches when its orchestrator answers `status`, and otherwise spawns
 //! `EXE -f CONFIG orchestrator` in the background and polls its control
-//! endpoint until it answers or the bound elapses. The spawned orchestrator
-//! is not tied to this process: stdin is null, stdout and stderr go only to
-//! `DATA/logs/orchestrator-console.log`, and it outlives the caller.
-use super::{config::Config, endpoint::ControlClient, hub::EXIT_ALREADY_RUNNING};
+//! endpoint until it answers or the bound elapses. Every probe fits what is
+//! left of the bound, so an endpoint that accepts but never replies cannot
+//! stretch it. The spawned orchestrator is not tied to this process: stdin
+//! is null, stdout and stderr go only to
+//! `DATA/logs/orchestrator-console.log`, its working directory is the
+//! configuration's, and it outlives the caller.
+use super::{
+    config::Config,
+    endpoint::{ControlClient, REPLY_TIMEOUT},
+    hub::EXIT_ALREADY_RUNNING,
+};
 use crate::util::log::LOGS_DIRECTORY;
 use anyhow::{Context, Result, bail};
 use serde_json::json;
@@ -28,6 +35,9 @@ pub const KILL_BOUND: Duration = Duration::from_secs(5);
 pub const CONSOLE_LOG: &str = "orchestrator-console.log";
 /// Interval between control-endpoint polls.
 const POLL: Duration = Duration::from_millis(50);
+/// The longest one step of a probe (TCP connect, upgrade, `status` reply)
+/// waits; less when less of the bound is left.
+const PROBE_STEP: Duration = Duration::from_secs(2);
 /// `CREATE_NO_WINDOW`: the orchestrator gets no console window (and none of
 /// the caller's console's Ctrl+C).
 #[cfg(windows)]
@@ -44,7 +54,9 @@ pub enum Started {
 
 /// The configuration at `config_path` (created when missing), a client of
 /// its orchestrator, and whether that orchestrator was already running or
-/// spawned from `exe` here, within `bound`.
+/// spawned from `exe` here, within `bound` of the call (plus [`KILL_BOUND`]
+/// when a timed-out child has to be killed). The returned client waits the
+/// usual [`REPLY_TIMEOUT`] for replies.
 ///
 /// Errors: `CONFIG_WRITE_FAILED: {path}: …` when a missing configuration
 /// cannot be created (`Config::load` errors otherwise);
@@ -57,6 +69,7 @@ pub fn ensure_running(
     exe: &Path,
     bound: Duration,
 ) -> Result<(Config, ControlClient, Started)> {
+    let end = Instant::now() + bound;
     let config_path = std::path::absolute(config_path)?;
     let config = if config_path.exists() {
         Config::load(&config_path)?
@@ -64,13 +77,12 @@ pub fn ensure_running(
         Config::initialize(&config_path)
             .with_context(|| format!("CONFIG_WRITE_FAILED: {}", config_path.display()))?
     };
-    if let Some((client, _)) = answering(&config) {
+    if let Some((client, _)) = answering(&config, end) {
         return Ok((config, client, Started::Attached));
     }
     let console = config.data_directory.join(LOGS_DIRECTORY).join(CONSOLE_LOG);
     let mut child = Some(spawn(&config_path, exe, &console)?);
     let pid = child.as_ref().map_or(0, Child::id);
-    let end = Instant::now() + bound;
     loop {
         if let Some(running) = child.as_mut()
             && let Some(status) = running.try_wait()?
@@ -87,7 +99,7 @@ pub fn ensure_running(
             // Another orchestrator holds the data directory: attach to it.
             child = None;
         }
-        if let Some((client, serving)) = answering(&config) {
+        if let Some((client, serving)) = answering(&config, end) {
             // The child may have lost the lock race after the last check:
             // only its own pid in `status` makes it ours.
             let started = if child.is_some() && serving == Some(u64::from(pid)) {
@@ -111,15 +123,21 @@ pub fn ensure_running(
                 }
             );
         }
-        thread::sleep(POLL);
+        thread::sleep(POLL.min(end.saturating_duration_since(Instant::now())));
     }
 }
 
 /// A client of `config`'s orchestrator and the pid its `status` reports,
-/// when it answers.
-fn answering(config: &Config) -> Option<(ControlClient, Option<u64>)> {
-    let mut client = ControlClient::connect(config).ok()?;
-    let status = client.request_read("status", json!({})).ok()?;
+/// when it answers before `end`. Its three waits (TCP connect, upgrade,
+/// reply; no retry) share what is left until `end`.
+fn answering(config: &Config, end: Instant) -> Option<(ControlClient, Option<u64>)> {
+    let step = PROBE_STEP.min(end.saturating_duration_since(Instant::now()) / 3);
+    if step < Duration::from_millis(1) {
+        return None;
+    }
+    let mut client = ControlClient::connect_within(config, step).ok()?;
+    let status = client.request("status", json!({})).ok()?;
+    client.set_reply_timeout(REPLY_TIMEOUT);
     let pid = status["daemon"]["pid"].as_u64();
     Some((client, pid))
 }
@@ -136,6 +154,10 @@ fn spawn(config_path: &Path, exe: &Path, console: &Path) -> Result<Child> {
         .with_context(|| format!("CONSOLE_LOG_UNAVAILABLE: {}", console.display()))?;
     let stderr = stdout.try_clone()?;
     let mut command = Command::new(exe);
+    // Never the caller's: a live process pins its working directory.
+    if let Some(directory) = config_path.parent() {
+        command.current_dir(directory);
+    }
     command
         .arg("-f")
         .arg(config_path)

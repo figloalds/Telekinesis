@@ -110,10 +110,31 @@ pub fn connect_authorized(endpoint: &str, token: Option<&str>) -> Result<Socket>
     connect_with_connector(endpoint, None, token)
 }
 
+/// [`connect_authorized`] whose TCP connect and upgrade each wait at most
+/// `limit` (non-zero) instead of their usual bounds, and whose socket keeps
+/// `limit` as its read and write timeouts: for a probe that must fit a
+/// caller's deadline.
+pub fn connect_authorized_within(
+    endpoint: &str,
+    token: Option<&str>,
+    limit: Duration,
+) -> Result<Socket> {
+    connect_limited(endpoint, None, token, limit)
+}
+
 fn connect_with_connector(
     endpoint: &str,
     connector: Option<Connector>,
     token: Option<&str>,
+) -> Result<Socket> {
+    connect_limited(endpoint, connector, token, Duration::MAX)
+}
+
+fn connect_limited(
+    endpoint: &str,
+    connector: Option<Connector>,
+    token: Option<&str>,
+    limit: Duration,
 ) -> Result<Socket> {
     let uri = endpoint_uri(endpoint)?;
     let host = uri
@@ -129,9 +150,13 @@ fn connect_with_connector(
         });
     let mut last = None;
     for address in (host, port).to_socket_addrs()? {
-        match TcpStream::connect_timeout(&address, Duration::from_secs(3)) {
+        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT.min(limit)) {
             Ok(stream) => {
                 timeouts(&stream)?;
+                if limit < STREAM_TIMEOUT {
+                    stream.set_read_timeout(Some(limit))?;
+                    stream.set_write_timeout(Some(limit))?;
+                }
                 let mut request = endpoint.into_client_request()?;
                 request
                     .headers_mut()
@@ -178,12 +203,17 @@ fn refused(endpoint: &str, error: tungstenite::Error) -> anyhow::Error {
     }
 }
 
+/// How long a client's TCP connect waits per address.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// A socket's read and write timeouts (an upgrade included).
+const STREAM_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn timeouts(stream: &TcpStream) -> Result<()> {
     // Windows inherits the listener's nonblocking mode on accepted sockets.
     stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_read_timeout(Some(STREAM_TIMEOUT))?;
+    stream.set_write_timeout(Some(STREAM_TIMEOUT))?;
     Ok(())
 }
 

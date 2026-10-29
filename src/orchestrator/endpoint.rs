@@ -183,12 +183,22 @@ pub struct ControlClient {
     endpoint: String,
     token: String,
     socket: Option<Socket>,
+    /// How long a reply (and, when shorter than the dial's own bounds, each
+    /// step of a dial) may take.
+    reply_timeout: Duration,
 }
 
 impl ControlClient {
     /// `ORCHESTRATOR_NOT_RUNNING` without `orchestrator.json`; the dial's
     /// `WS_CONNECT_FAILED` or `ACCESS_DENIED` otherwise.
     pub fn connect(config: &Config) -> Result<Self> {
+        Self::connect_within(config, REPLY_TIMEOUT)
+    }
+
+    /// [`Self::connect`] whose TCP connect, upgrade and each reply wait at
+    /// most `timeout` (non-zero) instead of [`REPLY_TIMEOUT`]: for a probe
+    /// that must fit a deadline.
+    pub fn connect_within(config: &Config, timeout: Duration) -> Result<Self> {
         let data = &config.data_directory;
         let not_running = || {
             format!(
@@ -211,14 +221,23 @@ impl ControlClient {
             endpoint: format!("ws://{control}"),
             token,
             socket: None,
+            reply_timeout: timeout,
         };
         client.socket = Some(client.dial()?);
         Ok(client)
     }
 
+    /// Replies (and later dials) wait at most `timeout` from now on. Drops
+    /// the current connection: the next request dials again.
+    pub fn set_reply_timeout(&mut self, timeout: Duration) {
+        self.reply_timeout = timeout;
+        self.socket = None;
+    }
+
     fn dial(&self) -> Result<Socket> {
-        let socket = ws::connect_authorized(&self.endpoint, Some(&self.token))?;
-        set_read_timeout(&socket, REPLY_TIMEOUT)?;
+        let socket =
+            ws::connect_authorized_within(&self.endpoint, Some(&self.token), self.reply_timeout)?;
+        set_read_timeout(&socket, self.reply_timeout)?;
         Ok(socket)
     }
 
