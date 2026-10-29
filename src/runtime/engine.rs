@@ -911,6 +911,13 @@ impl Engine {
                 && lock(scratch).changed
             {
                 let _publication = lock(&self.publication);
+                // The target's own unsealed draft predates this replacement.
+                // Seal it first so it becomes the replacement's parent; a later
+                // write-back would fork the entity against its stale basis.
+                let branch = lock(scratch).record.basis.branch.clone();
+                let replaced = self.working.dirty_for_entity(&branch, &destination.id);
+                let stats = seal::seal_batch(&self.store, &self.working, &replaced)?;
+                self.queue_sealed(&replaced, stats.entities)?;
                 seal::replace_file(&self.store, &self.working, scratch, &destination.id)?;
                 self.working.track(scratch);
                 *lock(&h.entry) = lock(&self.store).entry(&destination.id)?;

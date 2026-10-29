@@ -1902,6 +1902,47 @@ fn metadata_changes_share_one_draft_and_atomic_replace_keeps_target_entity() -> 
 }
 
 #[test]
+fn replacing_a_target_with_an_unsealed_draft_keeps_one_local_history() -> Result<()> {
+    // git's config writes: the first lock file is renamed into place inside
+    // the write-back window, then each later lock file replaces it.
+    let root = tempfile::tempdir()?;
+    let engine = crate::runtime::Engine::open(root.path(), None)?;
+    let first = engine.open_file("config.lock", true, false, true)?;
+    engine.write(first, 0, b"[core]\n", false, false)?;
+    engine.cleanup(first, false)?;
+    engine.rename(first, "config", false)?;
+    engine.close(first)?;
+    let target = engine.lookup("config")?.id;
+    let second = engine.open_file("config.lock", true, false, true)?;
+    engine.write(second, 0, b"[core]\n\tbare = false\n", false, false)?;
+    engine.cleanup(second, false)?;
+    engine.rename(second, "config", true)?;
+    engine.close(second)?;
+    engine.flush(None)?;
+    assert!(lock(&engine.store).conflicts(true)?.is_empty());
+    let config = engine.lookup("config")?;
+    assert_eq!(config.id, target);
+    assert_eq!(
+        config.content.unwrap().digest,
+        crate::model::content::Digest::bytes(b"[core]\n\tbare = false\n")
+    );
+    // The replaced bytes stay in the entity's history.
+    let replaced = crate::model::content::Digest::bytes(b"[core]\n");
+    let store = lock(&engine.store);
+    let mut ancestors = vec![store.projection().visible[&target].clone()];
+    let mut retained = false;
+    while let Some(id) = ancestors.pop() {
+        let event = store.version(&id)?.unwrap();
+        retained |= event.state.content.is_some_and(|c| c.digest == replaced);
+        ancestors.extend(event.parents);
+    }
+    assert!(retained);
+    drop(store);
+    engine.shutdown()?;
+    Ok(())
+}
+
+#[test]
 fn local_metadata_after_remote_content_does_not_erase_the_edit_conflict() -> Result<()> {
     let root = tempfile::tempdir()?;
     let engine = crate::runtime::Engine::open(root.path(), None)?;
