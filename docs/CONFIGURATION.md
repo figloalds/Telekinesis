@@ -11,6 +11,12 @@ editing. Folders, their mount paths, pairings and intents are not in this
 file: they are changed with `tkfs manage …` and persist in the catalog at
 once.
 
+The file's path is `-f PATH` when given, else the `TKFS_CONFIG` environment
+variable when set and not empty, else `orchestrator.toml` next to `tkfs.exe`
+on Windows and in the current directory elsewhere. A relative `-f` or
+`TKFS_CONFIG` resolves against the current directory. The desktop app and
+every command use the same resolution.
+
 ```toml
 format_version = 2
 data_directory = "data"

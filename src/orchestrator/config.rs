@@ -61,6 +61,32 @@ impl Default for Freshness {
     }
 }
 
+/// Environment variable naming the orchestrator configuration.
+pub const CONFIG_ENV: &str = "TKFS_CONFIG";
+
+/// The one configuration path the GUI and every command share: `explicit`
+/// (`-f`), else `env` (`TKFS_CONFIG`, ignored when empty), else
+/// `orchestrator.toml` next to the executable on Windows and in `cwd`
+/// elsewhere. Relative inputs are joined to `cwd`.
+pub fn resolve_path(
+    explicit: Option<&Path>,
+    env: Option<&std::ffi::OsStr>,
+    exe: &Path,
+    cwd: &Path,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return cwd.join(path);
+    }
+    if let Some(path) = env.filter(|value| !value.is_empty()) {
+        return cwd.join(path);
+    }
+    if cfg!(windows) {
+        exe.with_file_name("orchestrator.toml")
+    } else {
+        cwd.join("orchestrator.toml")
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let path = std::path::absolute(path)?;
@@ -186,6 +212,30 @@ mod tests {
     }
 
     const BASE: &str = "format_version = 2\ndata_directory = 'd'\ndefault_mount_directory = 'm'\n";
+
+    #[test]
+    fn resolve_path_prefers_explicit_then_env_then_platform_default() {
+        use std::ffi::OsStr;
+        let cwd = Path::new(r"C:\work");
+        let exe = Path::new(r"C:\Tools\tkfs\tkfs.exe");
+        let env = |value| Some(OsStr::new(value));
+        assert_eq!(
+            resolve_path(Some(Path::new("a.toml")), env("b.toml"), exe, cwd),
+            cwd.join("a.toml")
+        );
+        assert_eq!(resolve_path(None, env("b.toml"), exe, cwd), cwd.join("b.toml"));
+        assert_eq!(
+            resolve_path(None, env(""), exe, cwd),
+            resolve_path(None, None, exe, cwd)
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            resolve_path(None, None, exe, cwd),
+            PathBuf::from(r"C:\Tools\tkfs\orchestrator.toml")
+        );
+        #[cfg(not(windows))]
+        assert_eq!(resolve_path(None, None, exe, cwd), cwd.join("orchestrator.toml"));
+    }
 
     #[test]
     fn initialize_writes_defaults_and_refuses_to_overwrite() {

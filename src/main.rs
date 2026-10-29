@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use tkfs::{
     orchestrator::{
-        config::Config,
+        config::{CONFIG_ENV, Config, resolve_path},
         control, hub,
         manage::{self, ManagementCommand},
         settings::Settings,
@@ -25,7 +25,8 @@ struct Cli {
     #[arg(long, global = true)]
     state: Option<PathBuf>,
     /// Orchestrator configuration (`orchestrator.toml`; created by `start`
-    /// when missing).
+    /// when missing). Default: `$TKFS_CONFIG`, else next to `tkfs.exe` on
+    /// Windows and in the current directory elsewhere.
     #[arg(short = 'f', long = "defaults-file", alias = "config", global = true)]
     config: Option<PathBuf>,
     /// A worker's `runtime.json`: its directory is the folder's state.
@@ -149,31 +150,21 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Gui);
+    let config_path = resolve_path(
+        cli.config.as_deref(),
+        std::env::var_os(CONFIG_ENV).as_deref(),
+        &std::env::current_exe()?,
+        &std::env::current_dir()?,
+    );
     if matches!(command, Command::Gui) {
         #[cfg(windows)]
-        {
-            let config = if let Some(config) = cli.config {
-                config
-            } else if let Some(state) = &cli.state {
-                state.join("desktop.toml")
-            } else {
-                std::env::current_exe()?.with_file_name("orchestrator.toml")
-            };
-            return gui::run(std::path::absolute(config)?, cli.state);
-        }
+        return gui::run(config_path, None);
         #[cfg(not(windows))]
         anyhow::bail!("DESKTOP_REQUIRES_WINDOWS: use --help for headless commands");
     }
-    let config_path = || {
-        std::path::absolute(
-            cli.config
-                .clone()
-                .unwrap_or_else(|| PathBuf::from("orchestrator.toml")),
-        )
-    };
     match command {
-        Command::Orchestrator => return hub::run(&config_path()?),
-        Command::Manage { json, command } => return manage::run(&config_path()?, command, json),
+        Command::Orchestrator => return hub::run(&config_path),
+        Command::Manage { json, command } => return manage::run(&config_path, command, json),
         Command::Create {
             label,
             repo,
@@ -181,7 +172,7 @@ fn run() -> Result<()> {
             headless,
         } => {
             return manage::run(
-                &config_path()?,
+                &config_path,
                 ManagementCommand::Create {
                     label,
                     repo,
@@ -196,11 +187,10 @@ fn run() -> Result<()> {
                 repo.is_none(),
                 "FOLDER_REQUIRED: --repo initializes a folder store: use --state DIR"
             );
-            let path = config_path()?;
-            let config = Config::initialize(&path)?;
+            let config = Config::initialize(&config_path)?;
             println!(
                 "{}",
-                json!({"config": path, "data_directory": config.data_directory})
+                json!({"config": config_path, "data_directory": config.data_directory})
             );
             return Ok(());
         }

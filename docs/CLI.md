@@ -37,7 +37,7 @@ They are accepted before or after the command.
 
 | Option | Meaning |
 |---|---|
-| `-f, --defaults-file CONFIG` | The orchestrator configuration ([CONFIGURATION](CONFIGURATION.md)); default `orchestrator.toml` in the current directory. `orchestrator` creates it when missing. Every `manage` command finds the running orchestrator through the `data_directory` of this file. |
+| `-f, --defaults-file CONFIG` | The orchestrator configuration ([CONFIGURATION](CONFIGURATION.md)); default `TKFS_CONFIG` when set, else `orchestrator.toml` next to `tkfs.exe` on Windows and in the current directory elsewhere. `orchestrator` creates it when missing. Every `manage` command finds the running orchestrator through the `data_directory` of this file. |
 | `--state DIRECTORY` | A folder's state directory (`DATA/<folder id>`, shown by `manage list`): the folder commands, `daemon` and `init --state` use it. |
 | `--runtime STATE/runtime.json` | The same, given as the `runtime.json` of a running worker: its directory is the state. |
 | `--request-id UUID`, `--generation NUMBER` | Accepted with folder mutations (`resolve`, `checkpoint`, `branch`, `checkout`, `mkdir`, `rename`, `delete`, `import`, `gc`) and passed to the worker in the request. The worker does not act on them yet, so they currently change nothing. |
