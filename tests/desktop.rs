@@ -13,6 +13,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use tkfs::desktop::Client;
 use tkfs::orchestrator::{
     config::Config,
     endpoint::{ControlClient, DISCOVERY_FILE},
@@ -65,6 +66,23 @@ impl Orchestrator {
 
     fn discovery(&self) -> PathBuf {
         self.config.data_directory.join(DISCOVERY_FILE)
+    }
+
+    /// After a `shutdown` the test itself sent: waits (bounded) for the
+    /// process to go, killing and reporting it as stranded otherwise.
+    fn exited(&mut self) -> Result<()> {
+        self.stopped = true;
+        if let Some(process) = &self.process
+            && !process.wait(EXIT_BOUND)?
+        {
+            kill(process.pid);
+            let gone = process.wait(EXIT_BOUND)?;
+            bail!(
+                "STRANDED_PROCESS: orchestrator pid {} outlived its shutdown (killed: {gone})",
+                process.pid
+            );
+        }
+        Ok(())
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -317,5 +335,87 @@ fn an_unwritable_config_location_is_named_in_the_error() -> Result<()> {
         .collect::<std::io::Result<_>>()?;
     assert_eq!(entries, vec![std::ffi::OsString::from("file")]);
     assert_eq!(fs::read_to_string(&file)?, "not a directory");
+    Ok(())
+}
+
+/// A client on a fresh home, with the orchestrator it spawned guarded.
+fn open_client() -> Result<(tempfile::TempDir, Client, Orchestrator)> {
+    let (home, config_path) = home_listening("127.0.0.1:0")?;
+    let (client, started) = Client::open(&config_path, exe())?;
+    let Started::Spawned { pid } = started else {
+        bail!("Client::open on a fresh home was {started:?}");
+    };
+    let guard = Orchestrator::new(&client.config, pid);
+    Ok((home, client, guard))
+}
+
+#[test]
+fn the_client_creates_a_headless_folder_and_runs_folder_ops() -> Result<()> {
+    let (_home, mut client, mut guard) = open_client()?;
+    let created = client.act("create", json!({"label": "Project", "mount": null}))?;
+    let state = created["id"].as_str().context("created.id")?.to_owned();
+
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = client.status()?;
+        if status["folders"][0]["phase"]["phase"] == "Running" {
+            break;
+        }
+        if Instant::now() >= end {
+            bail!("the folder was not Running within 30 s: {status}");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let checkpoint = client.folder_op(&state, "checkpoint", json!({}))?;
+    assert!(checkpoint["id"].is_string(), "{checkpoint}");
+    drop(client);
+    guard.stop()
+}
+
+#[test]
+fn a_mount_request_reaches_the_orchestrator_and_is_refused() -> Result<()> {
+    let (home, mut client, mut guard) = open_client()?;
+    let mount = home.path().join("m");
+    let error = client
+        .act("create", json!({"label": "M", "mount": mount}))
+        .unwrap_err();
+    assert!(
+        error.to_string().starts_with("MOUNT_UNSUPPORTED"),
+        "{error:#}"
+    );
+    assert!(!mount.exists(), "a mount path was created");
+    let status = client.status()?;
+    assert_eq!(status["folders"], json!([]), "{status}");
+    drop(client);
+    guard.stop()
+}
+
+#[test]
+fn status_after_shutdown_reports_not_running() -> Result<()> {
+    let (_home, mut client, mut guard) = open_client()?;
+    let discovery = guard.discovery();
+    // A second client, taken while the orchestrator is up, works.
+    let mut second = client.connect_again()?;
+    assert!(second.status()?["daemon"]["pid"].is_u64());
+    drop(second);
+
+    client.act("shutdown", json!({}))?;
+    let end = Instant::now() + SHUTDOWN_BOUND;
+    while discovery.exists() && Instant::now() < end {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!discovery.exists(), "{DISCOVERY_FILE} left behind");
+    guard.exited()?;
+
+    let error = client
+        .connect_again()
+        .err()
+        .context("connect_again succeeded")?;
+    assert!(
+        error.to_string().contains("ORCHESTRATOR_NOT_RUNNING"),
+        "{error:#}"
+    );
+    assert!(client.status().is_err());
     Ok(())
 }

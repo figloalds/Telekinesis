@@ -227,11 +227,16 @@ impl ControlClient {
         Ok(client)
     }
 
-    /// Replies (and later dials) wait at most `timeout` from now on. Drops
-    /// the current connection: the next request dials again.
+    /// Replies (and later dials) wait at most `timeout` from now on. The
+    /// live connection stays and takes the new read timeout; one that
+    /// cannot is dropped (the next request dials again).
     pub fn set_reply_timeout(&mut self, timeout: Duration) {
         self.reply_timeout = timeout;
-        self.socket = None;
+        if let Some(socket) = &self.socket
+            && set_read_timeout(socket, timeout).is_err()
+        {
+            self.socket = None;
+        }
     }
 
     fn dial(&self) -> Result<Socket> {
@@ -299,6 +304,33 @@ fn parse_reply(reply: Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that serves exactly one connection, then stops listening.
+    #[test]
+    fn changing_the_reply_timeout_keeps_the_live_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            drop(listener);
+            let mut socket = ws::accept_authorized(stream, Some("t")).unwrap();
+            let _: Value = ws::receive(&mut socket).unwrap();
+            ws::send(&mut socket, &json!({"ok": true, "result": {"n": 1}})).unwrap();
+        });
+        let mut client = ControlClient {
+            endpoint: format!("ws://{address}"),
+            token: "t".into(),
+            socket: None,
+            reply_timeout: Duration::from_secs(5),
+        };
+        client.socket = Some(client.dial().unwrap());
+        client.set_reply_timeout(Duration::from_secs(7));
+        assert_eq!(client.reply_timeout, Duration::from_secs(7));
+        // A re-dial would be refused: nothing listens any more.
+        let reply = client.request("status", json!({})).unwrap();
+        assert_eq!(reply, json!({"n": 1}));
+        server.join().unwrap();
+    }
 
     #[test]
     fn error_codes_come_from_the_message() {
