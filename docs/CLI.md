@@ -159,7 +159,7 @@ tkfs manage retry STATE
 - `create LABEL` makes a new folder (a new repository, or `--repo ID` for an
   existing repository id), creates its state directory under `DATA/` and
   starts its worker. The label must be unique. Folders are headless: with
-  `--mount PATH` (absolute) the path is only stored for the mounts plan.
+  `--mount PATH` (a relative path is resolved against the current directory) the path is only stored for the mounts plan.
   Beyond `maximum_running` folders with a worker it fails with
   `WORKER_LIMIT`. `tkfs create` is the same command. Creating a folder of a
   repository this orchestrator already holds fails with
@@ -249,7 +249,7 @@ tkfs manage shutdown
 `shutdown` stops the orchestrator. New requests get `ORCHESTRATOR_STOPPING`;
 the peer connections close; every folder is stopped in parallel within a
 30 s bound. A worker that has not stopped by about 15 s is force-stopped and
-one that is still alive at about 27 s is killed; each folder that needed it
+one that is still alive at about 25 s is killed (the sequence ends by 30 s); each folder that needed it
 is logged as `FORCED_STOP`. The reply lists each folder's outcome:
 `stopped`, `not_running`, `killed` or `stranded` (it could not be shown gone
 or killed; the reason is in `error`). It never changes whether a folder

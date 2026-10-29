@@ -58,7 +58,7 @@ optional.
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `TKFS_UNSUPERVISED_EXIT_S` | worker | A worker started with `--supervised` stops itself after this many seconds without contact from an orchestrator; default 600, `0` disables it. |
+| `TKFS_UNSUPERVISED_EXIT_S` | worker | A worker started with `--supervised` stops itself after this many seconds without contact from an orchestrator; default 600. |
 | `TKFS_LOG_ROTATE_BYTES`, `TKFS_LOG_ROTATE_FILES` | orchestrator | The size at which `DATA/logs/orchestrator.log` is rotated (bytes, at least 256; default 10 MiB) and how many files are kept (1-100, default 5). |
 | `TKFS_FAULT_POINT`, `TKFS_FAULT_ACTION`, `TKFS_FAULT_SCOPE`, `TKFS_FAULT_MS`, `TKFS_FAULT_COUNT` | both | Fault injection for the qualification scenarios (`hang`, `fail`, `exit`, `panic` at a named point). Never set them in production. |
 

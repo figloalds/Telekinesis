@@ -43,7 +43,7 @@ receive` creates a folder from what the first host publishes
 The orchestrator handles SIGINT and SIGTERM exactly like `manage shutdown`:
 it closes its peer connections and stops every folder in parallel within a
 30 s bound. A worker that has not stopped by about 15 s (for example one with
-files open) is force-stopped, and one still alive at about 27 s is killed;
+files open) is force-stopped, and one still alive at about 25 s is killed (the sequence ends by 30 s);
 each forced folder is logged as `FORCED_STOP`. Committed data is durable and
 unsealed scratch files are re-sealed at the next start. The orchestrator then
 exits 0. A worker started by hand (`tkfs daemon`) does not handle signals:

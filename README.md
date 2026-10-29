@@ -47,6 +47,11 @@ tkfs -f orchestrator.toml manage receive ws://hosta:43180 REPO_ID Projects   # h
 tkfs -f orchestrator.toml manage shutdown
 ```
 
+The default listener is `127.0.0.1:43180`, reachable from the same computer
+only: before host B can pair, host A must set `[network] listen =
+"0.0.0.0:43180"` (or a specific interface) in its `orchestrator.toml` and
+restart (see [Linux deployment](docs/LINUX.md#quick-start)).
+
 See the [command reference](docs/CLI.md), [configuration](docs/CONFIGURATION.md)
 and [Linux deployment](docs/LINUX.md) (signals, systemd, Docker).
 
