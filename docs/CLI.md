@@ -294,8 +294,8 @@ tkfs daemon --state /srv/tkfs/standalone --supervised
   session (`runtime.json`, `runtime.token`, `worker.json` and `worker.log` in
   the state directory) for the folder commands below and for an
   orchestrator. A worker never listens for peers and never dials: peers talk
-  to the orchestrator. `--mount PATH` is accepted for tests and the mounts
-  plan; the orchestrator does not pass it.
+  to the orchestrator. `--mount PATH` mounts the folder there; the
+  orchestrator passes it for a folder that has a mount point.
 - `--supervised` is what the orchestrator uses: the worker exits quietly
   after a period without contact (`TKFS_UNSUPERVISED_EXIT_S`, default
   600 s). A worker started by hand does not.
