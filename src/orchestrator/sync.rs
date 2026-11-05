@@ -13,6 +13,10 @@
 //!   `after` is the `cursor` of the previous page, and `cursor` is `null`
 //!   once the scan reached its end (the next page without `after` starts
 //!   over).
+//! - `objects.wanted {repo, limit, exclude?, after?}` → [`WantedPage`]
+//!   `{demand, missing, cursor}`: what this worker's readers are blocked on
+//!   (at most [`BATCH`], whatever `limit` is) and an `objects.missing` page
+//!   (`limit` 0: none).
 //! - `objects.fetch {repo}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`,
 //!   at most [`OBJECT_BATCH`] objects, in request order, absent ones left
 //!   out. The reply is cut to fit the byte bounds, never refused for size
@@ -130,6 +134,16 @@ pub struct MissingPage {
     pub missing: Vec<(Digest, Kind)>,
     pub cursor: Option<String>,
 }
+/// One `objects.wanted` reply: what the worker's readers are blocked on now
+/// (`demand`, at most [`BATCH`], whatever `limit` is) and a page of the
+/// `objects.missing` scan (`missing`, `cursor`).
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct WantedPage {
+    pub demand: Vec<(Digest, Kind)>,
+    pub missing: Vec<(Digest, Kind)>,
+    pub cursor: Option<String>,
+}
+
 /// Where a resumable `objects.missing` scan stands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ScanAt {
@@ -379,7 +393,10 @@ impl Service {
     }
     /// Runs one op; the reply header and body on success.
     pub fn handle_reply(&self, op: &str, header: &Value, body: &[u8]) -> Result<(Value, Vec<u8>)> {
-        if matches!(op, "meta.exchange" | FETCH_OP | "objects.write") {
+        if matches!(
+            op,
+            "meta.exchange" | FETCH_OP | "objects.write" | "objects.wanted"
+        ) {
             let repo = lock(&self.engine.store).repo.clone();
             ensure!(
                 header.get("repo").and_then(Value::as_str) == Some(repo.as_str()),
@@ -405,18 +422,23 @@ impl Service {
                 Ok(serde_json::to_vec(&self.feed_reply(request)?)?)
             }
             "objects.missing" => {
-                let limit = header["limit"].as_u64().unwrap_or(BATCH as u64);
-                let limit = usize::try_from(limit).unwrap_or(BATCH);
-                let after = match &header["after"] {
-                    Value::Null => None,
-                    Value::String(cursor) => Some(ScanAt::decode(cursor)?),
-                    _ => anyhow::bail!("INVALID_REQUEST: after must be a cursor string"),
-                };
+                let (limit, after) = scan_arguments(header)?;
                 Ok(serde_json::to_vec(&self.missing(
                     limit,
                     &exclusions(header)?,
                     after.as_ref(),
                 )?)?)
+            }
+            "objects.wanted" => {
+                let (limit, after) = scan_arguments(header)?;
+                let mut demand = self.demand.pending();
+                demand.truncate(BATCH);
+                let page = self.missing(limit, &exclusions(header)?, after.as_ref())?;
+                Ok(serde_json::to_vec(&WantedPage {
+                    demand,
+                    missing: page.missing,
+                    cursor: page.cursor,
+                })?)
             }
             "objects.write" => Ok(serde_json::to_vec(
                 &json!({"stored":self.write(serde_json::from_slice(body)?)?}),
@@ -425,6 +447,17 @@ impl Service {
         };
         Ok((json!({}), body?))
     }
+}
+/// The `limit` and `after` of `objects.missing` and `objects.wanted`.
+fn scan_arguments(header: &Value) -> Result<(usize, Option<ScanAt>)> {
+    let limit = header["limit"].as_u64().unwrap_or(BATCH as u64);
+    let limit = usize::try_from(limit).unwrap_or(BATCH);
+    let after = match &header["after"] {
+        Value::Null => None,
+        Value::String(cursor) => Some(ScanAt::decode(cursor)?),
+        _ => anyhow::bail!("INVALID_REQUEST: after must be a cursor string"),
+    };
+    Ok((limit, after))
 }
 /// `objects.missing`'s `exclude`: absent or a list of at most
 /// [`MAX_EXCLUDE`] digests.

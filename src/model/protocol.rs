@@ -106,7 +106,7 @@ pub fn op_allowed(op: &str, role: LaneRole) -> bool {
     }
 }
 pub fn max_body(op: &str) -> usize {
-    if matches!(op, "objects.fetch" | "objects.write") {
+    if matches!(op, "objects.fetch" | "objects.write" | "objects.store") {
         32 * 1024 * 1024
     } else if matches!(
         op,
@@ -439,6 +439,7 @@ mod tests {
     #[test]
     fn worker_sync_ops_get_bodies_that_fit_their_batches() {
         assert_eq!(max_body("objects.fetch"), 32 * 1024 * 1024);
+        assert_eq!(max_body("objects.store"), 32 * 1024 * 1024);
         assert_eq!(max_body("objects.write"), 32 * 1024 * 1024);
         assert_eq!(max_body("feed.apply"), 16 * 1024 * 1024);
         assert_eq!(max_body("feed.outgoing"), 16 * 1024 * 1024);

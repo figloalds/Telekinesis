@@ -5,7 +5,7 @@
 //! lane's op policy; the link also refuses object ops on the control lane
 //! itself, before anything is sent.
 use super::{
-    sync::{Fetched, MissingPage, OBJECT_BATCH, Object},
+    sync::{Fetched, MissingPage, OBJECT_BATCH, Object, WantedPage},
     worker::Ready,
 };
 use crate::{
@@ -130,6 +130,25 @@ impl WorkerLink {
             CALL_DEADLINE,
         )?;
         parse("objects.missing", &reply.body)
+    }
+
+    /// `objects.wanted {repo, limit, exclude, after}` on the first bulk lane:
+    /// the objects the worker's readers are blocked on, and (`limit` > 0) a
+    /// page of its `objects.missing` scan, resumed after `after`.
+    pub fn wanted(
+        &self,
+        limit: usize,
+        exclude: &[Digest],
+        after: Option<&str>,
+    ) -> Result<WantedPage, CallError> {
+        let reply = self.bulk[0].call(
+            "objects.wanted",
+            json!({"repo": self.ready.repo, "limit": limit, "exclude": exclude, "after": after}),
+            Vec::new(),
+            Priority::Data,
+            CALL_DEADLINE,
+        )?;
+        parse("objects.wanted", &reply.body)
     }
 
     /// Reads up to [`OBJECT_BATCH`] objects from the worker on the bulk lane

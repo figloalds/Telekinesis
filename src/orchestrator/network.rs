@@ -33,6 +33,7 @@ use super::{
     catalog::Catalog,
     catalog::Peer,
     config::{Config, SyncProfile},
+    sync::{MAX_BATCH_BYTES, OBJECT_BATCH, Object},
     worker_client::WorkerLink,
 };
 use crate::{
@@ -55,6 +56,7 @@ use crate::{
     },
     util::{
         cancel::Cancel,
+        fault,
         lock::lock,
         log::{event, register_secret},
         time::now_ms,
@@ -62,10 +64,10 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, ensure};
 use rand::Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex, Weak,
@@ -84,6 +86,11 @@ pub const PRE_AUTH_CAP: usize = 32;
 pub const SESSION_CAP: usize = 128;
 /// Largest pool `[network] connections` / `pair --connections` allows.
 pub const MAX_POOL: usize = 16;
+/// Most digests listed to one peer for one repository at a time. Listing is
+/// what admits an `objects.store`, so this bounds what a paired peer may make
+/// this host store without having been asked; an evicted digest is just
+/// listed again by the next `objects.wanted`.
+const MAX_LISTED: usize = 4096;
 /// Deadline of one request this side originates (`catalog.list`, …).
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// How often a Ready lane checks whether its session ended.
@@ -284,6 +291,39 @@ impl PeerLanes {
     }
 }
 
+/// The digests this listener told one peer it wants, oldest first: the
+/// admission set of `objects.store`.
+#[derive(Default)]
+struct ListedDigests {
+    order: VecDeque<Digest>,
+    set: BTreeSet<Digest>,
+}
+
+impl ListedDigests {
+    /// Lists `digest`; past [`MAX_LISTED`] the oldest listed one is dropped.
+    fn insert(&mut self, digest: Digest) {
+        if !self.set.insert(digest) {
+            return;
+        }
+        self.order.push_back(digest);
+        while self.order.len() > MAX_LISTED {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+    }
+
+    fn contains(&self, digest: &Digest) -> bool {
+        self.set.contains(digest)
+    }
+
+    fn remove(&mut self, digest: &Digest) {
+        if self.set.remove(digest) {
+            self.order.retain(|listed| listed != digest);
+        }
+    }
+}
+
 /// A peer with a Ready control lane.
 pub struct ReadyPeer {
     pub endpoint: String,
@@ -305,6 +345,10 @@ pub struct Network {
     peers: Mutex<BTreeMap<String, PeerLanes>>,
     /// Admitted inbound sessions (closed ones are pruned on use).
     inbound: Mutex<Vec<Conn>>,
+    /// What `objects.wanted` listed, per (installation, repo): not per
+    /// session, because a digest may be listed on one bulk lane and stored on
+    /// another. In memory only.
+    listed: Mutex<BTreeMap<(String, String), ListedDigests>>,
     pre_auth: AtomicUsize,
     stopping: Cancel,
 }
@@ -337,6 +381,7 @@ pub fn start(
         folders,
         peers: Mutex::new(BTreeMap::new()),
         inbound: Mutex::new(Vec::new()),
+        listed: Mutex::new(BTreeMap::new()),
         pre_auth: AtomicUsize::new(0),
         stopping: stopping.child(),
     });
@@ -526,6 +571,7 @@ impl Network {
     /// Closes the lanes to `installation` and sends its inbound sessions a
     /// `GOAWAY{code}`.
     fn forget(&self, installation: &str, code: &str) {
+        self.forget_listed(installation);
         let removed: Vec<PeerLanes> = {
             let mut peers = lock(&self.peers);
             let endpoints: Vec<String> = peers
@@ -546,12 +592,30 @@ impl Network {
         }
     }
 
+    /// Forgets the digests listed to `installation`: a peer that is revoked
+    /// and paired again must be told what is wanted afresh.
+    pub fn forget_listed(&self, installation: &str) {
+        lock(&self.listed).retain(|(listed_to, _), _| listed_to != installation);
+    }
+
+    /// Lists `digests` to `installation` for `repo`: `objects.store` accepts
+    /// them from it.
+    fn record_listed(&self, installation: &str, repo: &str, digests: &[Digest]) {
+        let mut listed = lock(&self.listed);
+        let set = listed
+            .entry((installation.to_owned(), repo.to_owned()))
+            .or_default();
+        digests.iter().for_each(|digest| set.insert(*digest));
+    }
+
     /// A new pairing code: every inbound credential is revoked, every inbound
     /// session gets `GOAWAY{PAIRING_CODE_CHANGED}` and every outbound lane is
     /// closed (the `peers` rows stay for a re-pair).
     pub fn reset_pairing_code(&self) -> Result<String> {
         let code = self.catalog.reset_code()?;
         register_secret(&code);
+        // Every inbound credential is revoked: nothing stays listed.
+        lock(&self.listed).clear();
         {
             let mut inbound = lock(&self.inbound);
             inbound.retain(|conn| conn.closed().is_none());
@@ -1032,7 +1096,8 @@ fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
 }
 
 /// Serves one inbound session. Ops by the session's role: `objects.*` on
-/// bulk lanes only, `meta.exchange` on the control lane only, `catalog.list`,
+/// bulk lanes only (`objects.store` accepts only digests that `objects.wanted`
+/// listed to that peer for that repo), `meta.exchange` on the control lane only, `catalog.list`,
 /// `peer.enroll`, `peer.revoke`, `ping` and `clock.probe` on probe and
 /// control lanes; anything else is refused with `OP_NOT_ALLOWED`. The
 /// session layer enforces the same policy (`protocol::op_allowed`).
@@ -1085,6 +1150,63 @@ impl PeerService {
                 format!("no running, unpaused folder of repo {repo}"),
             )
         })
+    }
+
+    /// `objects.store`: refuses, per object, a digest that does not match its
+    /// bytes (`INVALID_PEER_OBJECT`) and one this host did not list to the
+    /// peer (`OBJECT_NOT_WANTED`); the rest are written and fsynced by the
+    /// worker before the reply names them. A batch over the worker's bounds
+    /// is a dialer bug and is refused whole.
+    fn store(
+        &self,
+        link: &WorkerLink,
+        repo: &str,
+        objects: Vec<Object>,
+    ) -> Result<StoreReply, ErrorWire> {
+        if objects.len() > OBJECT_BATCH
+            || objects.iter().map(|o| o.bytes.len()).sum::<usize>() > MAX_BATCH_BYTES
+        {
+            return Err(ErrorWire::coded(
+                "OBJECT_BATCH_TOO_LARGE",
+                format!("{} objects exceed the batch bounds", objects.len()),
+            ));
+        }
+        let key = (self.peer.installation.clone(), repo.to_owned());
+        let mut refused = Vec::new();
+        let mut accepted: Vec<Object> = Vec::new();
+        {
+            let listed = lock(&self.network.listed);
+            let listed = listed.get(&key);
+            for object in objects {
+                let refusal = if Digest::bytes(&object.bytes) != object.digest {
+                    Some("INVALID_PEER_OBJECT")
+                } else if !listed.is_some_and(|set| set.contains(&object.digest)) {
+                    Some("OBJECT_NOT_WANTED")
+                } else {
+                    None
+                };
+                match refusal {
+                    Some(code) => refused.push(Refused {
+                        digest: object.digest,
+                        code: code.into(),
+                    }),
+                    None if accepted.iter().all(|o| o.digest != object.digest) => {
+                        accepted.push(object)
+                    }
+                    None => {}
+                }
+            }
+        }
+        let stored: Vec<Digest> = accepted.iter().map(|o| o.digest).collect();
+        if !accepted.is_empty() {
+            fault::fail("objects.store.write").map_err(|error| ErrorWire::from_error(&error))?;
+            link.write(accepted).map_err(|error| error.to_wire())?;
+            // Durable now: no longer wanted.
+            if let Some(set) = lock(&self.network.listed).get_mut(&key) {
+                stored.iter().for_each(|digest| set.remove(digest));
+            }
+        }
+        Ok(StoreReply { stored, refused })
     }
 
     fn serve(
@@ -1155,12 +1277,67 @@ impl PeerService {
                 let fetched = link.fetch_reply(&wanted).map_err(|error| error.to_wire())?;
                 Ok((fetched.header(), encode(&fetched.objects)?))
             }
+            "objects.wanted" => {
+                self.require_paired()?;
+                let link = self.link(header)?;
+                let invalid = |error: serde_json::Error| ErrorWire::coded("INVALID_REQUEST", error);
+                let limit = match &header["limit"] {
+                    Value::Null => crate::orchestrator::sync::BATCH,
+                    limit => serde_json::from_value(limit.clone()).map_err(invalid)?,
+                };
+                let exclude: Vec<Digest> = match &header["exclude"] {
+                    Value::Null => Vec::new(),
+                    list => serde_json::from_value(list.clone()).map_err(invalid)?,
+                };
+                let after: Option<String> =
+                    serde_json::from_value(header["after"].clone()).map_err(invalid)?;
+                let page = link
+                    .wanted(limit, &exclude, after.as_deref())
+                    .map_err(|error| error.to_wire())?;
+                // Listing is the admission: store only what was told here.
+                let digests: Vec<Digest> = page
+                    .demand
+                    .iter()
+                    .chain(&page.missing)
+                    .map(|(digest, _)| *digest)
+                    .collect();
+                self.network.record_listed(
+                    &self.peer.installation,
+                    header["repo"].as_str().unwrap_or_default(),
+                    &digests,
+                );
+                Ok((json!({}), encode(&page)?))
+            }
+            "objects.store" => {
+                self.require_paired()?;
+                let link = self.link(header)?;
+                let objects: Vec<Object> = serde_json::from_slice(&body)
+                    .map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))?;
+                let repo = header["repo"].as_str().unwrap_or_default();
+                let reply = self.store(&link, repo, objects)?;
+                Ok((json!({}), encode(&reply)?))
+            }
             _ => Err(ErrorWire::coded(
                 "UNSUPPORTED_OPERATION",
                 format!("{op} is not served to peers"),
             )),
         }
     }
+}
+
+/// One object `objects.store` refused; the session stays usable.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Refused {
+    pub digest: Digest,
+    pub code: String,
+}
+
+/// The reply to `objects.store`: `stored` digests are durable on the
+/// listener, `refused` ones were not stored.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StoreReply {
+    pub stored: Vec<Digest>,
+    pub refused: Vec<Refused>,
 }
 
 /// A reply body as JSON.
@@ -1369,6 +1546,430 @@ mod tests {
         assert_eq!(code(&bulk, "objects.fetch", wanted), "REPO_NOT_PUBLISHED");
         control.close();
         bulk.close();
+    }
+
+    /// A real worker service of repo `r1` behind loopback lanes, a `Network`
+    /// publishing it, and a second engine whose content the first lacks.
+    struct Listener {
+        network: Arc<Network>,
+        service: Arc<crate::orchestrator::sync::Service>,
+        /// The objects the listener's feed references but its packs lack.
+        objects: Vec<crate::orchestrator::sync::Object>,
+        _engines: [Arc<crate::runtime::Engine>; 2],
+        _link: Arc<WorkerLink>,
+        _home: tempfile::TempDir,
+    }
+
+    struct Published(Arc<WorkerLink>);
+
+    impl FolderDirectory for Published {
+        fn link_by_repo(&self, repo: &str) -> Option<Arc<WorkerLink>> {
+            (repo == "r1").then(|| self.0.clone())
+        }
+        fn published(&self) -> Vec<Value> {
+            Vec::new()
+        }
+    }
+
+    const TOKEN: &str = "network-test-token";
+
+    fn listener() -> Listener {
+        use crate::orchestrator::{
+            demand::{Demand, Seq},
+            sync::{Object, Service},
+        };
+        let home = tempfile::tempdir().unwrap();
+        let open =
+            |name: &str| crate::runtime::Engine::open(&home.path().join(name), Some("r1")).unwrap();
+        let (source, target) = (open("source"), open("target"));
+        for (path, bytes) in [("one", "first"), ("two", "second"), ("three", "third")] {
+            let h = source.open_file(path, true, false, true).unwrap();
+            source.write(h, 0, bytes.as_bytes(), false, false).unwrap();
+            source.flush(Some(h)).unwrap();
+            source.close(h).unwrap();
+        }
+        let events: Vec<_> = crate::content::working::lock(&source.store)
+            .events_after(0, 4096)
+            .unwrap()
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect();
+        let service = Arc::new(Service {
+            engine: target.clone(),
+            demand: Demand::new(Seq::new(), target.working.content().packs.clone()),
+        });
+        service
+            .handle_request(
+                "feed.apply",
+                &json!({}),
+                &serde_json::to_vec(&events).unwrap(),
+            )
+            .unwrap();
+        let objects = ["one", "two", "three"]
+            .map(|path| {
+                let digest = source.lookup(path).unwrap().content.unwrap().digest;
+                Object {
+                    digest,
+                    kind: Kind::Chunk,
+                    bytes: (*source.working.content().packs.get(digest).unwrap()).clone(),
+                }
+            })
+            .to_vec();
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", socket.local_addr().unwrap());
+        let handler: Arc<dyn Handler> = service.clone();
+        thread::spawn(move || {
+            let mut conns = Vec::new();
+            for stream in socket.incoming() {
+                let Ok(stream) = stream else { break };
+                if let Ok(conn) = session::accept_loopback(
+                    stream,
+                    Some(TOKEN),
+                    ConnOptions::for_role(LaneRole::Control),
+                ) {
+                    conn.serve(handler.clone());
+                    conns.push(conn);
+                }
+            }
+        });
+        let link = WorkerLink::connect(
+            &crate::orchestrator::worker::Ready {
+                ready: true,
+                repo: "r1".into(),
+                device: "device".into(),
+                instance: "instance".into(),
+                pid: 1,
+                address,
+                token: TOKEN.into(),
+                version: "test".into(),
+                ipc: 1,
+                mounts: Vec::new(),
+            },
+            2,
+        )
+        .unwrap();
+        let mut config = Config::initialize(&home.path().join("orchestrator.toml")).unwrap();
+        config.network.listen = String::new();
+        let catalog = Catalog::open(&config.data_directory).unwrap();
+        catalog.save_paired("peer-a", [7; 32]).unwrap();
+        let network = start(
+            &config,
+            catalog,
+            Arc::new(Published(link.clone())),
+            Cancel::new(),
+            None,
+        )
+        .unwrap();
+        Listener {
+            network,
+            service,
+            objects,
+            _engines: [source, target],
+            _link: link,
+            _home: home,
+        }
+    }
+
+    fn bulk(listener: &Listener) -> Conn {
+        serve(&listener.network, LaneRole::Bulk, LaneRole::Bulk).0
+    }
+
+    /// One call with `header`; the reply body, or the error code.
+    fn ask(
+        client: &Conn,
+        op: &str,
+        header: Value,
+        body: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, String> {
+        match client.call(op, header, body, Priority::Data, Duration::from_secs(10)) {
+            Ok(reply) => Ok(reply.body),
+            Err(CallError::Remote(error)) => Err(error.code),
+            Err(other) => panic!("{op}: {other}"),
+        }
+    }
+
+    fn wanted(
+        client: &Conn,
+        limit: usize,
+        after: Option<&str>,
+    ) -> std::result::Result<crate::orchestrator::sync::WantedPage, String> {
+        ask(
+            client,
+            "objects.wanted",
+            json!({"repo": "r1", "limit": limit, "exclude": [], "after": after}),
+            Vec::new(),
+        )
+        .map(|body| serde_json::from_slice(&body).unwrap())
+    }
+
+    struct Stored {
+        stored: Vec<Digest>,
+        refused: Vec<(Digest, String)>,
+    }
+
+    impl Stored {
+        fn refused_only(&self, digest: Digest, code: &str) -> bool {
+            self.stored.is_empty() && self.refused == vec![(digest, code.to_owned())]
+        }
+    }
+
+    fn store(
+        client: &Conn,
+        objects: &[crate::orchestrator::sync::Object],
+    ) -> std::result::Result<Stored, String> {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            stored: Vec<Digest>,
+            refused: Vec<Refused>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Refused {
+            digest: Digest,
+            code: String,
+        }
+        ask(
+            client,
+            "objects.store",
+            json!({"repo": "r1"}),
+            serde_json::to_vec(objects).unwrap(),
+        )
+        .map(|body| {
+            let wire: Wire = serde_json::from_slice(&body).unwrap();
+            Stored {
+                stored: wire.stored,
+                refused: wire
+                    .refused
+                    .into_iter()
+                    .map(|r| (r.digest, r.code))
+                    .collect(),
+            }
+        })
+    }
+
+    fn held(listener: &Listener, digest: Digest) -> bool {
+        listener
+            .service
+            .engine
+            .working
+            .content()
+            .packs
+            .contains(digest)
+            .unwrap()
+    }
+
+    #[test]
+    fn wanted_lists_demand_first_and_a_page_of_missing() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let demanded = Digest::bytes(b"demanded");
+        let reader = {
+            let demand = listener.service.demand.clone();
+            thread::spawn(move || {
+                crate::content::ObjectFetcher::fetch(&*demand, &[(demanded, Kind::Chunk)])
+            })
+        };
+        let started = Instant::now();
+        while listener.service.demand.pending().is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(5), "no demand");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let first = wanted(&client, 2, None).unwrap();
+        assert_eq!(first.demand, vec![(demanded, Kind::Chunk)]);
+        assert_eq!(first.missing.len(), 2);
+        assert!(first.cursor.is_some());
+        let last = wanted(&client, 2, first.cursor.as_deref()).unwrap();
+        assert_eq!(last.missing.len(), 1);
+        assert_eq!(last.cursor, None);
+        let only_demand = wanted(&client, 0, None).unwrap();
+        assert_eq!(only_demand.demand, first.demand);
+        assert!(only_demand.missing.is_empty());
+        // The demanded object is admitted because it was listed; storing it
+        // wakes the reader.
+        let object = crate::orchestrator::sync::Object {
+            digest: demanded,
+            kind: Kind::Chunk,
+            bytes: b"demanded".to_vec(),
+        };
+        assert_eq!(store(&client, &[object]).unwrap().stored, vec![demanded]);
+        reader.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn store_accepts_a_listed_object_and_names_it_stored() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let object = listener.objects[0].clone();
+        assert!(!held(&listener, object.digest));
+        wanted(&client, 64, None).unwrap();
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert_eq!(reply.stored, vec![object.digest]);
+        assert!(reply.refused.is_empty());
+        assert!(held(&listener, object.digest));
+        // Stored: no longer admitted.
+        let again = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert!(again.refused_only(object.digest, "OBJECT_NOT_WANTED"));
+    }
+
+    #[test]
+    fn store_refuses_an_unlisted_digest_with_object_not_wanted() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let object = listener.objects[0].clone();
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert!(reply.refused_only(object.digest, "OBJECT_NOT_WANTED"));
+        assert!(!held(&listener, object.digest));
+        // The session is still usable.
+        assert!(wanted(&client, 1, None).is_ok());
+    }
+
+    #[test]
+    fn store_refuses_a_mismatched_digest_with_invalid_peer_object() {
+        let listener = listener();
+        let client = bulk(&listener);
+        wanted(&client, 64, None).unwrap();
+        let mut forged = listener.objects[0].clone();
+        forged.bytes = b"not the bytes".to_vec();
+        let reply = store(&client, &[forged.clone()]).unwrap();
+        assert!(reply.refused_only(forged.digest, "INVALID_PEER_OBJECT"));
+        assert!(!held(&listener, forged.digest));
+        // Still listed: the right bytes are accepted.
+        let good = store(&client, &[listener.objects[0].clone()]).unwrap();
+        assert_eq!(good.stored, vec![forged.digest]);
+    }
+
+    #[test]
+    fn a_mixed_batch_stores_the_good_objects_and_refuses_the_rest() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let page = wanted(&client, 2, None).unwrap();
+        let listed: Vec<Digest> = page.missing.iter().map(|(d, _)| *d).collect();
+        let (unlisted, listed_objects): (Vec<_>, Vec<_>) = listener
+            .objects
+            .iter()
+            .cloned()
+            .partition(|o| !listed.contains(&o.digest));
+        assert_eq!((unlisted.len(), listed_objects.len()), (1, 2));
+        let mut forged = listed_objects[1].clone();
+        forged.bytes = b"forged".to_vec();
+        let batch = vec![
+            listed_objects[0].clone(),
+            unlisted[0].clone(),
+            forged.clone(),
+        ];
+        let reply = store(&client, &batch).unwrap();
+        assert_eq!(reply.stored, vec![listed_objects[0].digest]);
+        assert_eq!(
+            reply.refused,
+            vec![
+                (unlisted[0].digest, "OBJECT_NOT_WANTED".to_owned()),
+                (forged.digest, "INVALID_PEER_OBJECT".to_owned()),
+            ]
+        );
+        assert!(held(&listener, listed_objects[0].digest));
+        assert!(!held(&listener, unlisted[0].digest));
+        assert!(!held(&listener, forged.digest));
+    }
+
+    #[test]
+    fn a_batch_over_the_object_limit_is_refused_whole() {
+        let listener = listener();
+        let client = bulk(&listener);
+        wanted(&client, 64, None).unwrap();
+        let too_many =
+            vec![listener.objects[0].clone(); crate::orchestrator::sync::OBJECT_BATCH + 1];
+        assert_eq!(
+            store(&client, &too_many).err().unwrap(),
+            "OBJECT_BATCH_TOO_LARGE"
+        );
+        assert!(!held(&listener, listener.objects[0].digest));
+    }
+
+    #[test]
+    fn a_digest_listed_on_one_bulk_lane_is_accepted_on_another() {
+        let listener = listener();
+        let (listing, storing) = (bulk(&listener), bulk(&listener));
+        wanted(&listing, 64, None).unwrap();
+        let object = listener.objects[1].clone();
+        let reply = store(&storing, std::slice::from_ref(&object)).unwrap();
+        assert_eq!(reply.stored, vec![object.digest]);
+    }
+
+    #[test]
+    fn the_listed_set_is_bounded_and_an_evicted_digest_can_be_listed_again() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let object = listener.objects[0].clone();
+        let fillers: Vec<Digest> = (0..MAX_LISTED)
+            .map(|n| Digest::bytes(format!("filler {n}").as_bytes()))
+            .collect();
+        listener
+            .network
+            .record_listed("peer-a", "r1", &[object.digest]);
+        listener.network.record_listed("peer-a", "r1", &fillers);
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert!(reply.refused_only(object.digest, "OBJECT_NOT_WANTED"));
+        listener
+            .network
+            .record_listed("peer-a", "r1", &[object.digest]);
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert_eq!(reply.stored, vec![object.digest]);
+    }
+
+    #[test]
+    fn the_listed_set_belongs_to_one_installation_and_repo() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let object = listener.objects[0].clone();
+        listener
+            .network
+            .record_listed("peer-b", "r1", &[object.digest]);
+        listener
+            .network
+            .record_listed("peer-a", "r2", &[object.digest]);
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert!(reply.refused_only(object.digest, "OBJECT_NOT_WANTED"));
+    }
+
+    #[test]
+    fn unpaired_and_unpublished_store_are_refused() {
+        let listener = listener();
+        let body = serde_json::to_vec(&[listener.objects[0].clone()]).unwrap();
+        let client = bulk(&listener);
+        for op in ["objects.store", "objects.wanted"] {
+            let header = json!({"repo": "nope", "limit": 1});
+            let refused = ask(&client, op, header, body.clone());
+            assert_eq!(refused.err().unwrap(), "REPO_NOT_PUBLISHED", "{op}");
+        }
+        listener.network.catalog.unpair("peer-a").unwrap();
+        for op in ["objects.store", "objects.wanted"] {
+            let header = json!({"repo": "r1", "limit": 1});
+            let refused = ask(&client, op, header, body.clone());
+            assert_eq!(refused.err().unwrap(), "PEER_REVOKED", "{op}");
+        }
+    }
+
+    #[test]
+    fn revoking_a_peer_clears_its_listed_digests() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let object = listener.objects[0].clone();
+        let catalog = &listener.network.catalog;
+        // An unpair (what `peer.revoke` ends in).
+        wanted(&client, 64, None).unwrap();
+        listener.network.unpair("peer-a").unwrap();
+        catalog.save_paired("peer-a", [7; 32]).unwrap();
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert!(reply.refused_only(object.digest, "OBJECT_NOT_WANTED"));
+        // A pairing-code reset.
+        wanted(&client, 64, None).unwrap();
+        listener.network.reset_pairing_code().unwrap();
+        catalog.save_paired("peer-a", [7; 32]).unwrap();
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert!(reply.refused_only(object.digest, "OBJECT_NOT_WANTED"));
+        // Listed again, it is accepted.
+        wanted(&client, 64, None).unwrap();
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert_eq!(reply.stored, vec![object.digest]);
     }
 
     #[test]
