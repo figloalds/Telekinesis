@@ -805,10 +805,15 @@ impl Network {
     }
 
     /// `[{"endpoint","installation","direction","paired","connections",
-    /// "lanes":[…],"inbound","clock","requests_served","notifies_sent"}]`:
-    /// every outbound peer row, then every paired installation with no row (an
-    /// inbound pairing, `endpoint` null). The two counters are that peer's, as
-    /// this side's listener saw it since this process started.
+    /// "lanes":[…],"inbound","clock","requests_served","notifies_sent",
+    /// "features","profile","two_way_content"}]`: every outbound peer row, then
+    /// every paired installation with no row (an inbound pairing, `endpoint`
+    /// null). The two counters are that peer's, as this side's listener saw it
+    /// since this process started. `features` joins what its listener lane
+    /// advertised and what its inbound sessions advertised as a dialer;
+    /// `profile` is `"active"` or `"passive"` as that dialer declared, `null`
+    /// with no inbound session; `two_way_content` is whether content moves both
+    /// ways: it takes our pushes, or it is a current dialer that pushes.
     pub fn peers(&self) -> Value {
         let outbound = self.catalog.peers().unwrap_or_default();
         let paired: BTreeSet<String> = self
@@ -818,11 +823,38 @@ impl Network {
             .into_iter()
             .collect();
         let mut sessions: BTreeMap<String, usize> = BTreeMap::new();
+        let mut dialed: BTreeMap<String, Vec<Vec<String>>> = BTreeMap::new();
         for conn in self.sessions() {
-            *sessions
-                .entry(conn.peer().installation.clone())
-                .or_default() += 1;
+            let peer = conn.peer();
+            *sessions.entry(peer.installation.clone()).or_default() += 1;
+            dialed
+                .entry(peer.installation.clone())
+                .or_default()
+                .push(peer.features.clone());
         }
+        // What a peer's inbound sessions say of it: the features it advertised
+        // as a dialer, its profile, and whether it is a current dialer (an
+        // older one advertises nothing and pushes nothing). `null` profile:
+        // it has no session open to this side.
+        let inbound_of = |installation: &str| -> (Vec<String>, Value, bool) {
+            let Some(all) = dialed.get(installation) else {
+                return (Vec::new(), Value::Null, false);
+            };
+            let profile = if all
+                .iter()
+                .any(|f| f.iter().any(|f| f == features::PROFILE_PASSIVE))
+            {
+                "passive"
+            } else {
+                "active"
+            };
+            let merged: BTreeSet<String> = all.iter().flatten().cloned().collect();
+            (
+                merged.into_iter().collect(),
+                json!(profile),
+                all.iter().any(|f| !f.is_empty()),
+            )
+        };
         let clock = |installation: &str| match self.catalog.clock(installation) {
             Ok(Some((offset, measured_at))) => json!({
                 "offset_ms": offset.offset_ms,
@@ -841,6 +873,15 @@ impl Network {
                     .get(&peer.endpoint)
                     .map(|lanes| lanes.lanes.iter().map(|lane| lane.view()).collect())
                     .unwrap_or_default();
+                // The listener's features, read off the control lane.
+                let listener = lanes
+                    .get(&peer.endpoint)
+                    .and_then(|lanes| lanes.lanes.first()?.ready())
+                    .map(|control| control.peer().features.clone())
+                    .unwrap_or_default();
+                let (dialer, profile, dialer_new) = inbound_of(&peer.installation);
+                let two_way = listener.iter().any(|f| f == features::CONTENT_PUSH) || dialer_new;
+                let merged: BTreeSet<String> = listener.into_iter().chain(dialer).collect();
                 json!({
                     "endpoint": peer.endpoint,
                     "installation": peer.installation,
@@ -852,6 +893,9 @@ impl Network {
                     "clock": clock(&peer.installation),
                     "requests_served": counted(&peer.installation).requests_served,
                     "notifies_sent": counted(&peer.installation).notifies_sent,
+                    "features": merged,
+                    "profile": profile,
+                    "two_way_content": two_way,
                 })
             })
             .collect();
@@ -861,6 +905,7 @@ impl Network {
             .map(|peer| peer.installation.as_str())
             .collect();
         for installation in paired.iter().filter(|i| !known.contains(i.as_str())) {
+            let (dialer, profile, dialer_new) = inbound_of(installation);
             list.push(json!({
                 "endpoint": Value::Null,
                 "installation": installation,
@@ -872,6 +917,9 @@ impl Network {
                 "clock": clock(installation),
                 "requests_served": counted(installation).requests_served,
                 "notifies_sent": counted(installation).notifies_sent,
+                "features": dialer,
+                "profile": profile,
+                "two_way_content": dialer_new,
             }));
         }
         Value::Array(list)

@@ -1670,3 +1670,101 @@ fn peer_with_invalid_clock_is_refused() -> Result<()> {
     );
     Ok(())
 }
+
+const OLDER: (&str, &str) = ("TKFS_FAULT_POINT", "session.features.none");
+
+#[test]
+fn an_older_listener_still_syncs_pull_only_and_peers_says_so() -> Result<()> {
+    let seed = text(1000, 211);
+    let Shared {
+        a,
+        b,
+        endpoint_b,
+        state_a,
+        state_b,
+    } = shared_pair_of(
+        TestDaemon::start()?,
+        TestDaemon::start_env("", &[OLDER])?,
+        &[("seed.txt", &seed)],
+    )?;
+    arrives_within(&state_a, "seed.txt", &seed, REPLICATED)?;
+    let held = pack_bytes(&state_b);
+    import(&a, &state_a, "from-a.txt", &text(1000, 213))?;
+    std::thread::sleep(Duration::from_secs(5));
+    ensure!(
+        pack_bytes(&state_b) == held,
+        "the older listener took bytes it cannot accept"
+    );
+    let row = row_of(&a, &b)?;
+    ensure!(row["two_way_content"] == false, "{row}");
+    ensure!(row["features"] == serde_json::json!([]), "{row}");
+    ensure!(row["endpoint"] == endpoint_b.as_str(), "{row}");
+    let failed = a
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["code"] == "SYNC_PUSH_FAILED")
+        .count();
+    ensure!(failed == 0, "{failed} SYNC_PUSH_FAILED in A's log");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn an_older_dialer_keeps_the_short_poll() -> Result<()> {
+    const SHORT: &str = "sync_interval_ms = 1000\nbackup_poll_ms = 60000\n";
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(
+        TestDaemon::start_env(SHORT, &[OLDER])?,
+        TestDaemon::start_with(SHORT)?,
+        &[],
+    )?;
+    let from_b = text(1000, 217);
+    import(&b, &state_b, "from-b.txt", &from_b)?;
+    arrives_within(&state_a, "from-b.txt", &from_b, Duration::from_secs(15))?;
+    let row = row_of(&b, &a)?;
+    ensure!(row["notifies_sent"] == 0, "{row}");
+    ensure!(row["two_way_content"] == false, "{row}");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn peers_and_sync_views_report_features_profile_and_pushes() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        endpoint_b,
+        state_a,
+        state_b,
+    } = passive_pair(&[("seed.txt", "seed")])?;
+    let from_a = text(1000, 219);
+    import(&a, &state_a, "from-a.txt", &from_a)?;
+    sync_now_clean(&a)?;
+    arrives_within(&state_b, "from-a.txt", &from_a, NOTIFIED)?;
+    let seen_by_b = row_of(&b, &a)?;
+    ensure!(seen_by_b["profile"] == "passive", "{seen_by_b}");
+    ensure!(
+        seen_by_b["features"] == serde_json::json!(["profile-passive"]),
+        "{seen_by_b}"
+    );
+    ensure!(seen_by_b["two_way_content"] == true, "{seen_by_b}");
+    let seen_by_a = row_of(&a, &b)?;
+    ensure!(seen_by_a["two_way_content"] == true, "{seen_by_a}");
+    let features = seen_by_a["features"].as_array().context("no features")?;
+    ensure!(features.iter().any(|f| f == "content-push"), "{seen_by_a}");
+    let view = a.manage(&["inspect", "Shared"])?;
+    let sync = &view["sync"][endpoint_b.as_str()];
+    ensure!(sync["pushed"].as_u64() > Some(0), "{view}");
+    ensure!(sync["last_push_error"].is_null(), "{view}");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}

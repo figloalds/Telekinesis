@@ -55,5 +55,26 @@ foreground hydration precedes background prefetch, with digest requests in
 bounded batches and per-peer backoff. See
 [the restoration design](superpowers/specs/2026-10-28-orchestration-restoration-design.md).
 
+### Content moves both ways
+
+Only the dialer originates requests, but content moves in both directions. A
+dialer pulls what it lacks with `objects.fetch` and pushes what its listener
+lacks: it asks `objects.wanted` for the digests the listener lists as missing,
+then sends them with `objects.store`. The listener takes only objects it listed
+and verifies each digest (`OBJECT_NOT_WANTED`, `INVALID_PEER_OBJECT`), so a
+pair made by `pair` then `receive` is two-way. A listener hints at a change
+with a `notify` frame; this is the only message it originates, and it carries
+no data. Both sides negotiate features in the handshake: `content-push`
+(listener), `notify` (active dialer) and `profile-passive` (passive dialer). A
+peer that advertises none is an older one: it is pulled from, never pushed to,
+and polled every `sync_interval_ms`.
+
+A host notices its own changes within about a second. Profiles set how it
+keeps up with the rest: an active host exchanges on notify, with a slow
+`backup_poll_ms` poll as a safety net, and pushes in the background; a passive
+host, for a battery or a metered link, keeps its connections open and
+serves its readers but exchanges and pushes only during `manage sync-now`. See
+[the two-way content design](superpowers/specs/2026-11-04-two-way-content-design.md).
+
 There is no private write database, overlay map, save pipeline, object admission
 outbox, per-reference grant, lease generation or pool-fencing engine.

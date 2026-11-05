@@ -322,6 +322,8 @@ The desktop app shows the same codes. The code tells you what to do:
 | `PAIRING_CODE_CHANGED`, `INVALID_PAIRING_CODE`, `PEER_REVOKED` | The peer's code was reset, the code is wrong, or the peer revoked this host. | Get the current code (`reset-pairing-code` there) and `manage pair` again. |
 | `PEER_LANES_SKIPPED` | Logged: the connections to a paired peer could not be set up (for example its credential is missing). | Restart the orchestrator; if it repeats, `manage unpair` and `manage pair` again. |
 | `CLOCK_OFFSET_LARGE` | Logged: a peer's clock differs from this one by more than 5 s. | Fix the clocks (NTP). |
+| `SYNC_PUSH_FAILED` | Logged once per distinct error: pushing objects to a peer failed or timed out. That peer rests briefly and is tried again. | Nothing if it clears. |
+| `SYNC_PUSH_REFUSED` | Logged: a peer refused a pushed object (for example `OBJECT_NOT_WANTED`). Only that object is dropped; it is listed again if still wanted. | None. |
 | `SYNC_FETCH_FAILED` | Logged: fetching objects from a peer failed or timed out. On a timeout the folder asks that peer for smaller batches and grows them back as replies arrive. | Nothing if it clears. |
 | `SYNC_OBJECT_TOO_LARGE` | Logged: a peer holds an object too large for any reply, the content list (manifest) of a file larger than about 8 GiB. It is not replicated in this release. | Keep such files out of synced folders for now. |
 | `DESKTOP_REQUIRES_WINDOWS` | `gui` (or `tkfs` with no command) on a non-Windows host. | Use `manage`. |

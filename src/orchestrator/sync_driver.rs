@@ -575,6 +575,8 @@ pub struct Driver {
     policy: SyncPolicy,
     cancel: Cancel,
     jobs: Mutex<BTreeMap<(String, String), Slot>>,
+    /// What the pump's pushes counted, per (endpoint, repo), for [`Driver::view`].
+    pushes: Mutex<BTreeMap<Pair, (u64, Option<String>)>>,
     busy: AtomicUsize,
     /// Shared with probe threads, which clear their `running` flag.
     probes: Arc<Mutex<BTreeMap<String, ProbeState>>>,
@@ -667,6 +669,7 @@ impl Driver {
             policy,
             cancel,
             jobs: Mutex::new(BTreeMap::new()),
+            pushes: Mutex::new(BTreeMap::new()),
             busy: AtomicUsize::new(0),
             probes: Arc::new(Mutex::new(BTreeMap::new())),
             threads: Mutex::new(Vec::new()),
@@ -690,14 +693,20 @@ impl Driver {
         event!(info, SYNC_DRIVER_STOPPED, { "threads_left": left });
     }
 
-    /// `{endpoint: {sent, received, last_exchange_ms, error}}` of `repo`.
+    /// `{endpoint: {sent, received, last_exchange_ms, error, pushed,
+    /// last_push_error}}` of `repo`.
     pub fn view(&self, repo: &str) -> Value {
         let jobs = lock(&self.jobs);
+        let pushes = lock(&self.pushes);
         let map: serde_json::Map<String, Value> = jobs
             .values()
             .filter(|slot| slot.job.repo == repo)
             .map(|slot| {
                 let job = &slot.job;
+                let (pushed, push_error) = pushes
+                    .get(&(job.peer.clone(), repo.to_owned()))
+                    .cloned()
+                    .unwrap_or_default();
                 (
                     job.peer.clone(),
                     json!({
@@ -705,6 +714,8 @@ impl Driver {
                         "received": job.cursor.received,
                         "last_exchange_ms": job.last_exchange_ms,
                         "error": job.error,
+                        "pushed": pushed,
+                        "last_push_error": push_error,
                     }),
                 )
             })
@@ -1487,7 +1498,7 @@ impl Driver {
         mode: PushMode,
         interrupt: Option<u64>,
     ) -> push::PushOutcome {
-        push::run(
+        let outcome = push::run(
             self.lanes.as_ref(),
             &mut state.push,
             std::slice::from_ref(endpoint),
@@ -1495,7 +1506,14 @@ impl Driver {
             mode,
             interrupt.map(|seen| (self.wake.as_ref(), seen)),
             &self.cancel,
-        )
+        );
+        if let Some(counters) = state.push.counters(&folder.id, endpoint) {
+            lock(&self.pushes).insert(
+                (endpoint.clone(), folder.repo.clone()),
+                (counters.pushed, counters.last_error.clone()),
+            );
+        }
+        outcome
     }
 
     /// The folder's background work: the next `objects.missing` page of its

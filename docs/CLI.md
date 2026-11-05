@@ -244,12 +244,20 @@ tkfs manage unpair INSTALLATION
   round trip to that peer, `null` until the first measurement), and
   `requests_served` and `notifies_sent` (what this host answered for that peer
   and hinted to it since this orchestrator started; heartbeats count for
-  neither). It never shows a code or a credential.
+  neither), `features` (what the peer advertised, so `[]` for an older one),
+  `profile` (`"active"` or `"passive"`, as that peer declared when it dialed
+  this host; `null` with no inbound session) and `two_way_content` (whether
+  content moves both ways with that peer: `false` for an older one, which is
+  only pulled from). It never shows a code or a credential. Per-folder
+  `inspect` gains `pushed` and `last_push_error` for each peer.
 - `remote-list ENDPOINT` lists the folders a paired host publishes (`repo`
   and `label`).
 - `receive ENDPOINT REPO LABEL` creates a local folder of that repository
   (it must be one the host publishes: `REPO_NOT_PUBLISHED` otherwise) and
-  starts syncing it; `--mount` as for `create`.
+  starts syncing it; `--mount` as for `create`. Pair then receive is two-way:
+  local changes are noticed within about a second and reach the host as well.
+  On a passive host (`network.sync_profile = "passive"`) nothing arrives until
+  `sync-now`.
 - `unpair INSTALLATION` (the id `peers` shows) asks the other host to forget
   this one (best effort), then forgets the peer and closes its connections.
   If the other host also dials this one, that pairing is its own: unpair it

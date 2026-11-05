@@ -1268,6 +1268,7 @@ The table test (WP0.4) greps `src/` for `"[A-Z][A-Z_]{3,}` code literals and ass
 4. **Dialer-driven exchanges in both directions on each request.** Only clients originate requests.
    - **Why:** one-way pairing must still sync both directions (`tests/orchestrator.rs:327`: the acceptor has no Peers). All scheduling lives in the PeerSupervisor, and the server stays passive and bounded.
    - **Rejected:** symmetric requests with an acceptor-side scheduler.
+   - **Note (2026-11-04):** dialers still originate every request, and now also push content to their listeners (`objects.wanted`, `objects.store`); a listener only hints with `notify`. See [the two-way content design](../superpowers/specs/2026-11-04-two-way-content-design.md).
 5. **Metadata as a cursor feed with acks from per-id evidence.** Grafted from throughput-first, adapted to dialer-driven exchanges.
    - **Why:**
      - steady state is O(delta) and idle exchanges are O(1);
