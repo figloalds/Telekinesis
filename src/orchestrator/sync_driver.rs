@@ -41,7 +41,11 @@
 //!   next round. The pump never blocks the scheduler. After each pass it also
 //!   pushes ([`push`]), so a round runs: this side's demand, the listeners'
 //!   demand, background pull, background push. The background push stops
-//!   before its next call on a demand wake-up, as pass 2 does. The push steps
+//!   before its next call on a demand wake-up, as pass 2 does. Only a reader
+//!   waiting is such a wake-up: its own side's demand, or a demand notify for a
+//!   repo synced here. What marks work for later (a local change, an exchange
+//!   that moved events) only rouses a sleeping pump ([`Seq::nudge`]), so it does
+//!   not stop background work to do nothing new. The push steps
 //!   run only for a pair that is due, so an idle pair asks its listener nothing:
 //!   the demand step on a peer's demand notify, the background step on a local
 //!   change or an exchange that moved events, and both on the pair's poll. A
@@ -163,10 +167,9 @@ struct Due {
     background: BTreeSet<Pair>,
 }
 
-fn mark(marks: &mut BTreeSet<Pair>, pair: Pair) {
-    if marks.len() < MAX_MARKS {
-        marks.insert(pair);
-    }
+/// Whether it is a new mark. A full set keeps none.
+fn mark(marks: &mut BTreeSet<Pair>, pair: Pair) -> bool {
+    marks.len() < MAX_MARKS && marks.insert(pair)
 }
 
 /// The peer lanes the driver uses: the [`Network`] (tests stub it).
@@ -371,8 +374,9 @@ pub struct Driver {
     lanes: Arc<dyn Lanes>,
     catalog: Arc<Catalog>,
     folders: Arc<dyn SyncFolders>,
-    /// Bumped by folder watch threads when demand changes, and by whatever
-    /// marks a push step due; wakes the pump.
+    /// Bumped when a reader waits: by folder watch threads when demand changes
+    /// or lasts, and by a demand notify for a repo synced here. A bump stops the
+    /// background passes. What only marks work for later nudges it instead.
     wake: Arc<Seq>,
     /// Bumped by what marks an exchange due; wakes the scheduler.
     poke: Arc<Seq>,
@@ -529,7 +533,7 @@ impl Driver {
             }
         }
         self.poke.bump();
-        self.wake.bump();
+        self.wake.nudge();
     }
 
     // ---- scheduler -------------------------------------------------------
@@ -665,7 +669,7 @@ impl Driver {
         // Events moved: the objects they name may now be wanted, either way.
         if cursor != task.cursor {
             mark(&mut lock(&self.due).background, task.key.clone());
-            self.wake.bump();
+            self.wake.nudge();
         }
         // What this exchange carried is not across yet: no waiting for the
         // backup poll.
@@ -738,14 +742,14 @@ impl Driver {
     fn pump(&self) {
         let mut state = PumpState::default();
         while !self.cancel.is_cancelled() {
-            let seen = self.wake.current();
-            let stored = self.pump_round(&mut state, seen);
+            let since = self.wake.mark();
+            let stored = self.pump_round(&mut state, since.value);
             if self.cancel.is_cancelled() {
                 break;
             }
             if stored == 0 {
-                // Returns at once when a demand wake-up came meanwhile.
-                self.wake.wait_past(seen, self.pump_wait());
+                // Returns at once when something came up meanwhile.
+                self.wake.wait_moved(since, self.pump_wait());
             }
         }
     }
@@ -1176,7 +1180,9 @@ impl Driver {
 }
 
 impl NotifySink for Driver {
-    /// Runs on the lane's I/O thread: only marks and bumps.
+    /// Runs on the lane's I/O thread: only marks and bumps. A demand notify
+    /// repeats while its reader waits, whether or not the repo is synced here,
+    /// and a peer picks the name: only a new mark looks any further.
     fn notified(&self, endpoint: &str, notify: &Notify) {
         let pair = (endpoint.to_owned(), notify.repo.clone());
         match notify.reason {
@@ -1185,8 +1191,17 @@ impl NotifySink for Driver {
                 self.poke.bump();
             }
             NotifyReason::Demand => {
-                mark(&mut lock(&self.due).demand, pair);
-                self.wake.bump();
+                if !mark(&mut lock(&self.due).demand, pair) {
+                    return;
+                }
+                let here = self.folders.syncing();
+                if here.iter().any(|folder| folder.repo == notify.repo) {
+                    self.wake.bump();
+                } else {
+                    // Not syncing now, which may be a slot that is only busy:
+                    // the pump looks again, and nothing is interrupted.
+                    self.wake.nudge();
+                }
             }
         }
     }
@@ -1381,7 +1396,10 @@ mod tests {
         },
         session::{ConnOptions, Handler, Incoming, PeerInfo, Side},
     };
-    use std::net::{TcpListener, TcpStream};
+    use std::{
+        net::{TcpListener, TcpStream},
+        sync::OnceLock,
+    };
     use tungstenite::stream::MaybeTlsStream;
 
     #[test]
@@ -1551,7 +1569,12 @@ mod tests {
         /// Bumped by every `objects.fetch`, as a reader's demand arriving
         /// during the read.
         wake_on_read: Option<Arc<Seq>>,
+        /// Runs during every `objects.fetch`.
+        during_read: Option<Hook>,
     }
+
+    /// Something that happens while a request is being served.
+    type Hook = Box<dyn Fn() + Send + Sync>;
 
     impl FakeFolder {
         fn written(&self) -> Vec<Digest> {
@@ -1600,6 +1623,9 @@ mod tests {
                 "objects.fetch" => {
                     if let Some(wake) = &self.wake_on_read {
                         wake.bump();
+                    }
+                    if let Some(hook) = &self.during_read {
+                        hook();
                     }
                     let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
                     let mut fetched = Fetched::default();
@@ -2150,6 +2176,8 @@ mod tests {
         unpublished: Option<String>,
         /// Bumped by every store, as a reader's demand arriving meanwhile.
         wake_on_store: Option<Arc<Seq>>,
+        /// Runs during every `objects.fetch`.
+        during_fetch: Option<Hook>,
         stored: Mutex<Vec<(Digest, Kind)>>,
         calls: Mutex<Vec<String>>,
         store_sizes: Mutex<Vec<usize>>,
@@ -2180,6 +2208,9 @@ mod tests {
                 "objects.store" => self.store(req),
                 "objects.fetch" => {
                     lock(&self.calls).push("fetch".into());
+                    if let Some(hook) = &self.during_fetch {
+                        hook();
+                    }
                     if self.stall_fetch {
                         thread::sleep(Duration::from_millis(900));
                         return;
@@ -3223,10 +3254,12 @@ mod tests {
         let peers = lanes.ready_peers();
         let (driver, _root) = policy_driver(lanes, &["repo-1", "repo-2"], active(HOUR, HOUR));
         assert_eq!(dispatched(&driver, &peers).len(), 4);
-        let (poke, wake) = (driver.poke.current(), driver.wake.current());
+        let (poke, wake) = (driver.poke.current(), driver.wake.mark());
         driver.local_change("repo-1");
         assert!(driver.poke.current() > poke);
-        assert!(driver.wake.current() > wake);
+        // It rouses the pump and stops no background work.
+        assert_ne!(driver.wake.mark(), wake);
+        assert_eq!(driver.wake.current(), wake.value);
         let expected = [pair("ws://one", "repo-1"), pair("ws://two", "repo-1")];
         assert_eq!(dispatched(&driver, &peers), expected);
         assert_eq!(
@@ -3296,13 +3329,14 @@ mod tests {
         lock(&driver.due).exchange.insert(pair(ENDPOINT, "repo-1"));
         driver.dispatch(1, &peers, &tasks);
         let task = queue.try_recv().unwrap();
-        let wake = driver.wake.current();
+        let wake = driver.wake.mark();
         let moved = FeedCursor {
             sent: task.cursor.sent + 1,
             ..task.cursor
         };
         driver.finish(&task, moved, Ok(()));
-        assert!(driver.wake.current() > wake);
+        assert_ne!(driver.wake.mark(), wake);
+        assert_eq!(driver.wake.current(), wake.value);
         assert_eq!(
             calls_of_round(&driver, &mut state, &listener),
             ["wanted/32"]
@@ -3477,10 +3511,203 @@ mod tests {
     fn a_mark_of_a_repo_not_here_does_not_keep_the_pump_awake() {
         let listener = Arc::new(Listener::default());
         let (driver, _root) = pushing_driver(&listener, true, active(HOUR, HOUR));
+        let wake = driver.wake.mark();
         driver.notified(ENDPOINT, &demand_of("repo-elsewhere"));
         assert_eq!(driver.pump_wait(), HOUR);
+        // It rouses the pump once and interrupts nothing, and its repeats, which
+        // last as long as a reader there waits, do neither.
+        assert_ne!(driver.wake.mark(), wake);
+        assert_eq!(driver.wake.current(), wake.value);
+        let once = driver.wake.mark();
+        driver.notified(ENDPOINT, &demand_of("repo-elsewhere"));
+        assert_eq!(driver.wake.mark(), once);
         driver.notified(ENDPOINT, &demand_of("repo-1"));
         assert_eq!(driver.pump_wait(), DUE_CHECK);
+        assert!(driver.wake.current() > wake.value);
+    }
+
+    /// The driver a hook acts on, set once the driver exists.
+    type LateDriver = Arc<OnceLock<Weak<Driver>>>;
+
+    fn on_driver(late: &LateDriver, act: impl Fn(&Driver) + Send + Sync + 'static) -> Hook {
+        let late = late.clone();
+        Box::new(move || {
+            if let Some(driver) = late.get().and_then(Weak::upgrade) {
+                act(&driver);
+            }
+        })
+    }
+
+    /// Exchanges that moved events finish, for every pair the dispatch starts.
+    fn exchanges_move_events(driver: &Driver) {
+        lock(&driver.due).exchange.insert(pair(ENDPOINT, "repo-1"));
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &driver.lanes.ready_peers(), &tasks);
+        for task in queue.try_iter() {
+            let moved = FeedCursor {
+                sent: task.cursor.sent + 1,
+                ..task.cursor
+            };
+            driver.finish(&task, moved, Ok(()));
+        }
+    }
+
+    /// Two folders that each have a page to pull from a listener, which also
+    /// wants a page pushed; `during_fetch` runs during every pull.
+    struct PullAndPush {
+        listener: Arc<Listener>,
+        driver: Arc<Driver>,
+        _root: tempfile::TempDir,
+    }
+
+    fn pull_and_push(act: impl Fn(&Driver) + Send + Sync + 'static) -> PullAndPush {
+        let (first, second, there) = (objects("first", 1), objects("second", 1), objects("x", 1));
+        let late = LateDriver::default();
+        let listener = Arc::new(Listener {
+            held: [first.clone(), second.clone()].concat(),
+            missing: wanted_of(&there),
+            during_fetch: Some(on_driver(&late, act)),
+            ..Listener::default()
+        });
+        let folder = |missing: &[Object], repo: &str| {
+            let fake = Arc::new(FakeFolder {
+                missing: wanted_of(missing),
+                held: there.clone(),
+                ..FakeFolder::default()
+            });
+            (repo.to_owned(), fake_worker(fake), Vec::new())
+        };
+        let root = tempfile::tempdir().unwrap();
+        let driver = Driver::with_policy(
+            Arc::new(ReadyLanes::one(
+                true,
+                listener.lane_with("session", &[features::CONTENT_PUSH]),
+            )),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![
+                folder(&first, "repo-1"),
+                folder(&second, "repo-2"),
+            ])),
+            Seq::new(),
+            active(HOUR, HOUR),
+            Cancel::new(),
+        );
+        late.set(Arc::downgrade(&driver)).unwrap();
+        PullAndPush {
+            listener,
+            driver,
+            _root: root,
+        }
+    }
+
+    fn calls_named(calls: &[String], name: &str) -> usize {
+        calls.iter().filter(|call| *call == name).count()
+    }
+
+    #[test]
+    fn a_local_change_during_a_background_page_does_not_interrupt_the_pass() {
+        let PullAndPush {
+            listener, driver, ..
+        } = pull_and_push(|driver| driver.local_change("repo-1"));
+        let mut state = PumpState::default();
+        let calls = calls_of_round(&driver, &mut state, &listener);
+        assert_eq!(calls_named(&calls, "fetch"), 2, "{calls:?}");
+        assert_eq!(calls_named(&calls, "store"), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn an_exchange_that_moved_events_during_a_background_page_does_not_interrupt_the_pass() {
+        let PullAndPush {
+            listener, driver, ..
+        } = pull_and_push(exchanges_move_events);
+        let mut state = PumpState::default();
+        let calls = calls_of_round(&driver, &mut state, &listener);
+        assert_eq!(calls_named(&calls, "fetch"), 2, "{calls:?}");
+        assert_eq!(calls_named(&calls, "store"), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn a_demand_notify_for_a_repo_not_here_does_not_interrupt_the_pass() {
+        let PullAndPush {
+            listener, driver, ..
+        } = pull_and_push(|driver| driver.notified(ENDPOINT, &demand_of("repo-elsewhere")));
+        let mut state = PumpState::default();
+        let calls = calls_of_round(&driver, &mut state, &listener);
+        assert_eq!(calls_named(&calls, "fetch"), 2, "{calls:?}");
+        assert_eq!(calls_named(&calls, "store"), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn a_demand_notify_for_a_repo_here_does_interrupt_the_pass() {
+        let PullAndPush {
+            listener, driver, ..
+        } = pull_and_push(|driver| driver.notified(ENDPOINT, &demand_of("repo-2")));
+        let mut state = PumpState::default();
+        let calls = calls_of_round(&driver, &mut state, &listener);
+        // The page in flight finishes, and nothing after it starts.
+        assert_eq!(calls_named(&calls, "fetch"), 1, "{calls:?}");
+        assert_eq!(calls_named(&calls, "store"), 0, "{calls:?}");
+        // The next round begins with what the reader waits for.
+        let calls = calls_of_round(&driver, &mut state, &listener);
+        assert_eq!(calls[0], "wanted/0", "{calls:?}");
+    }
+
+    #[test]
+    fn a_local_change_during_a_read_does_not_discard_it_before_its_store() {
+        let all = objects("object", 1);
+        let late = LateDriver::default();
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let fake = FakeFolder {
+            held: all,
+            during_read: Some(on_driver(&late, |driver| driver.local_change("repo-1"))),
+            ..FakeFolder::default()
+        };
+        let (driver, _root) = holding_driver(&listener, fake, Seq::new());
+        late.set(Arc::downgrade(&driver)).unwrap();
+        let mut state = PumpState::default();
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/0", "wanted/32", "store"]
+        );
+    }
+
+    #[test]
+    fn a_local_change_rouses_a_sleeping_pump() {
+        let listener = Arc::new(Listener::default());
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let fake = Arc::new(FakeFolder::default());
+        let root = tempfile::tempdir().unwrap();
+        let driver = start(
+            Arc::new(ReadyLanes::one(true, bulk)),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".into(),
+                fake_worker(fake),
+                Vec::new(),
+            )])),
+            Seq::new(),
+            active(HOUR, HOUR),
+            Cancel::new(),
+        )
+        .unwrap();
+        let backgrounds = || calls_named(&listener.calls(), "wanted/32");
+        let wait_for = |count: usize| {
+            let end = Instant::now() + Duration::from_secs(5);
+            while backgrounds() < count {
+                assert!(Instant::now() < end, "{:?}", listener.calls());
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // Its first poll, then nothing is due for an hour.
+        wait_for(1);
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(backgrounds(), 1);
+        driver.local_change("repo-1");
+        wait_for(2);
+        driver.stop(Duration::from_secs(2));
     }
 
     #[test]

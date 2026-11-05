@@ -16,38 +16,69 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// A monotonically increasing wake-up counter.
+/// A monotonically increasing wake-up counter. Whoever compares [`Seq::current`]
+/// sees only bumps. A [`Seq::nudge`] rouses a [`Seq::wait_moved`] sleeper and
+/// leaves the counter as it is.
 pub struct Seq {
-    value: Mutex<u64>,
+    state: Mutex<SeqMark>,
     changed: Condvar,
+}
+
+/// Where a [`Seq`] stood, for [`Seq::wait_moved`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeqMark {
+    /// What [`Seq::current`] returned.
+    pub value: u64,
+    nudges: u64,
 }
 
 impl Seq {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            value: Mutex::new(0),
+            state: Mutex::new(SeqMark::default()),
             changed: Condvar::new(),
         })
     }
 
     /// Advances the counter, wakes every waiter and returns the new value.
     pub fn bump(&self) -> u64 {
-        let mut value = lock(&self.value);
-        *value += 1;
+        let mut state = lock(&self.state);
+        state.value += 1;
         self.changed.notify_all();
-        *value
+        state.value
+    }
+
+    /// Rouses a [`Self::wait_moved`] sleeper. The counter does not move, so
+    /// nothing that compares it takes this for a bump.
+    pub fn nudge(&self) {
+        lock(&self.state).nudges += 1;
+        self.changed.notify_all();
     }
 
     pub fn current(&self) -> u64 {
-        *lock(&self.value)
+        lock(&self.state).value
+    }
+
+    /// Where it stands now.
+    pub fn mark(&self) -> SeqMark {
+        *lock(&self.state)
     }
 
     /// Waits at most `timeout` for the counter to pass `after`; returns its
     /// value then (which equals `after` on timeout when nothing moved).
     pub fn wait_past(&self, after: u64, timeout: Duration) -> u64 {
+        self.wait_until(timeout, |state| state.value > after).value
+    }
+
+    /// Waits at most `timeout` for a bump or a nudge since `since`.
+    pub fn wait_moved(&self, since: SeqMark, timeout: Duration) {
+        self.wait_until(timeout, |state| *state != since);
+    }
+
+    fn wait_until(&self, timeout: Duration, done: impl Fn(&SeqMark) -> bool) -> SeqMark {
         let end = Instant::now().checked_add(timeout);
-        let mut value = lock(&self.value);
-        while *value <= after {
+        let mut state = lock(&self.state);
+        while !done(&state) {
             let left = match end {
                 Some(end) => end.saturating_duration_since(Instant::now()),
                 None => Duration::from_secs(3600),
@@ -55,13 +86,13 @@ impl Seq {
             if left.is_zero() {
                 break;
             }
-            value = self
+            state = self
                 .changed
-                .wait_timeout(value, left)
+                .wait_timeout(state, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
         }
-        *value
+        *state
     }
 }
 
@@ -196,6 +227,48 @@ mod tests {
         };
         assert_eq!(seq.wait_past(1, Duration::from_secs(5)), 2);
         bumper.join().unwrap();
+    }
+
+    #[test]
+    fn a_nudge_rouses_a_moved_wait_and_leaves_the_counter_alone() {
+        let seq = Seq::new();
+        seq.bump();
+        let since = seq.mark();
+        // Nothing since: it times out.
+        let started = Instant::now();
+        seq.wait_moved(since, Duration::from_millis(50));
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        // A nudge from before the wait is not lost, whichever came first.
+        seq.nudge();
+        assert_eq!(seq.current(), since.value);
+        let started = Instant::now();
+        seq.wait_moved(since, Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // One during the wait rouses it.
+        let since = seq.mark();
+        let nudger = {
+            let seq = seq.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                seq.nudge();
+            })
+        };
+        let started = Instant::now();
+        seq.wait_moved(since, Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        nudger.join().unwrap();
+        // A bump does too.
+        let since = seq.mark();
+        seq.bump();
+        let started = Instant::now();
+        seq.wait_moved(since, Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // `wait_past` does not take a nudge for what it waits for.
+        let at = seq.current();
+        seq.nudge();
+        let started = Instant::now();
+        assert_eq!(seq.wait_past(at, Duration::from_millis(50)), at);
+        assert!(started.elapsed() >= Duration::from_millis(40));
     }
 
     #[test]
