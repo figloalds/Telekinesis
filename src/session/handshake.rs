@@ -162,16 +162,6 @@ pub fn client_hello(
     }
 }
 
-/// `features`, or nothing under the `session.features.none` fault (an older
-/// peer).
-fn negotiated(features: Vec<String>) -> Vec<String> {
-    if fault::hit(features::FAULT_NONE).is_some() {
-        Vec::new()
-    } else {
-        features
-    }
-}
-
 /// Dials `endpoint`, runs the v3 handshake and returns the authenticated
 /// connection and the server's hello. The caller checks
 /// `ServerHello.installation` against its catalog, or uses
@@ -265,6 +255,13 @@ fn dial_with(
     let role = hello.role;
     let lane = hello.lane;
     let session = hello.session.clone();
+    // Once per handshake: under the `session.features.none` fault this side
+    // behaves as an older peer, sending and recording no features.
+    let mut hello = hello;
+    let older = fault::hit(features::FAULT_NONE).is_some();
+    if older {
+        hello.features.clear();
+    }
     let (ws, server) = connect_v3_with(
         endpoint,
         hello,
@@ -279,7 +276,11 @@ fn dial_with(
         lane,
         session,
         verifier_generation: server.verifier_generation,
-        features: negotiated(server.features.clone()),
+        features: if older {
+            Vec::new()
+        } else {
+            server.features.clone()
+        },
     };
     let conn = into_conn(ws, Side::Client, peer, o)
         .map_err(|error| DialError::Connect(format!("session I/O did not start: {error}")))?;
@@ -668,14 +669,6 @@ fn client_steps(
     hello: &ClientHello,
     auth: &dyn ClientAuth,
 ) -> Result<ServerHello, DialError> {
-    let mut sent;
-    let hello = if fault::hit(features::FAULT_NONE).is_some() {
-        sent = hello.clone();
-        sent.features.clear();
-        &sent
-    } else {
-        hello
-    };
     guarded
         .write_frame(FrameKind::Hello, hello)
         .map_err(StepError::into_dial)?;
@@ -943,6 +936,9 @@ fn server_auth(
         )));
     };
     policy.admit(&hello).map_err(Failure::Goaway)?;
+    // Once per handshake: under the `session.features.none` fault this side
+    // behaves as an older peer, advertising and recording no features.
+    let older = fault::hit(features::FAULT_NONE).is_some();
     let server = ServerHello {
         protocol: PROTOCOL_NAME.to_owned(),
         version: PROTOCOL_VERSION,
@@ -951,7 +947,11 @@ fn server_auth(
         lane: hello.lane,
         salt: verifier.salt.clone(),
         verifier_generation: generation,
-        features: negotiated(vec![features::CONTENT_PUSH.into(), features::NOTIFY.into()]),
+        features: if older {
+            Vec::new()
+        } else {
+            vec![features::CONTENT_PUSH.into(), features::NOTIFY.into()]
+        },
         limits,
     };
     guarded.write_frame(FrameKind::HelloAck, &server)?;
@@ -1011,7 +1011,7 @@ fn server_auth(
         lane: hello.lane,
         session: hello.session,
         verifier_generation: generation,
-        features: negotiated(hello.features),
+        features: if older { Vec::new() } else { hello.features },
     })
 }
 
