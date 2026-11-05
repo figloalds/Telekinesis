@@ -27,7 +27,7 @@ use tkfs::{
             LaneRole,
             frame::{
                 CancelHeader, ChunkHeader, FLAG_LAST, FLAG_MORE, FrameKind, Goaway, Heartbeat,
-                MAX_CHUNK, MAX_HEADER, RequestHeader, ResponseHeader,
+                MAX_CHUNK, MAX_HEADER, Notify, NotifyReason, RequestHeader, ResponseHeader,
             },
         },
     },
@@ -3285,6 +3285,179 @@ fn stream_chunks_do_not_pin_received_messages() {
 }
 
 // ---------------------------------------------------------------------------
+// NOTIFY: a one-way hint from a listener to its dialer
+
+fn notify(repo: &str, reason: NotifyReason) -> Notify {
+    Notify {
+        repo: repo.into(),
+        reason,
+    }
+}
+
+fn notify_inbox(client: &Conn) -> mpsc::Receiver<Notify> {
+    let (tx, rx) = mpsc::channel();
+    client.on_notify(Arc::new(move |hint| {
+        let _ = tx.send(hint.clone());
+    }));
+    rx
+}
+
+#[test]
+fn a_server_notify_reaches_the_client_handler() {
+    let (client, server) = session(Transport::Plain);
+    let inbox = notify_inbox(&client);
+    for hint in [
+        notify("repo-a", NotifyReason::Metadata),
+        notify("repo-b", NotifyReason::Demand),
+    ] {
+        server.notify(&hint);
+        let got = inbox
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the hint arrived");
+        assert_eq!(got, hint);
+    }
+    assert!(client.closed().is_none() && server.closed().is_none());
+}
+
+#[test]
+fn notify_is_refused_as_a_violation_on_the_server_side() {
+    let hint = serde_json::to_vec(&notify("repo-a", NotifyReason::Demand)).unwrap();
+    server_rejects(raw_frame(12, 0, 0, &hint, b""), "notify to a server");
+}
+
+#[test]
+fn a_notify_with_no_handler_set_is_ignored() {
+    let (client, server) = session(Transport::Plain);
+    server.serve(echo());
+    server.notify(&notify("repo-a", NotifyReason::Metadata));
+    // Frames are handled in order: once this reply is back, the hint has been.
+    call(&client, "echo", json!({})).unwrap();
+    assert!(client.closed().is_none(), "{:?}", client.closed());
+    // A handler set later sees only later hints.
+    let inbox = notify_inbox(&client);
+    server.notify(&notify("repo-b", NotifyReason::Demand));
+    let got = inbox.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(got.repo, "repo-b");
+    assert!(inbox.recv_timeout(Duration::from_millis(200)).is_err());
+}
+
+#[test]
+fn a_notify_on_a_closed_conn_is_a_no_op() {
+    let (client, server) = session(Transport::Plain);
+    let inbox = notify_inbox(&client);
+    server.close();
+    server
+        .wait_closed(Duration::from_secs(5))
+        .expect("the server closed");
+    server.notify(&notify("repo-a", NotifyReason::Metadata));
+    assert!(inbox.recv_timeout(Duration::from_millis(300)).is_err());
+}
+
+#[test]
+fn notify_is_dropped_not_blocking_when_the_control_queue_is_full() {
+    // A raw peer that floods `ping` and never reads fills the server's control
+    // queue past its bound; the server then holds its reads.
+    let options = ConnOptions {
+        control_queue_bytes: MIB,
+        dead_after: Duration::from_secs(30),
+        ..ConnOptions::default()
+    };
+    let cap = options.sanitized().control_queue_bytes as u64;
+    let (mut raw, server_ws) = ws_pair(Transport::Plain);
+    let server = Conn::from_established(server_ws, Side::Server, peer(), options).unwrap();
+    if let MaybeTlsStream::Plain(stream) = raw.get_mut() {
+        stream
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+    }
+    let started = Instant::now();
+    let mut sent = 0u64;
+    'flood: while started.elapsed() < Duration::from_secs(30) {
+        for _ in 0..256 {
+            sent += 1;
+            let request = raw_frame(5, 0, 0, &request_header(sent, "ping", None), b"");
+            if raw.write(request).is_err() {
+                break 'flood;
+            }
+        }
+        if raw.flush().is_err() {
+            break;
+        }
+    }
+    wait_until("the control queue to pass its bound", Duration::from_secs(10), || {
+        server.health().queued_bytes > cap
+    });
+    let queued = server.health().queued_bytes;
+
+    let began = Instant::now();
+    server.notify(&notify("repo-a", NotifyReason::Demand));
+    let took = began.elapsed();
+    assert!(
+        took < latency_bound(100),
+        "notify blocked for {took:?} on a full queue"
+    );
+    assert!(
+        server.health().queued_bytes <= queued,
+        "the hint was queued past the bound"
+    );
+
+    // The connection is still usable: drain what the server owes, ask once
+    // more, and get that answer. No NOTIFY may be among the frames.
+    if let MaybeTlsStream::Plain(stream) = raw.get_mut() {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+    }
+    let mut notifies = 0;
+    let mut answered = false;
+    let mut asked = false;
+    let mut quiet_since = Instant::now();
+    let drain = Instant::now();
+    while !answered {
+        assert!(
+            drain.elapsed() < Duration::from_secs(20),
+            "no answer after the drain ({sent} requests)"
+        );
+        let _ = raw.flush();
+        match raw.read() {
+            Ok(Message::Binary(bytes)) => {
+                quiet_since = Instant::now();
+                let frame = decode(&bytes, FrameLimits::SESSION).unwrap();
+                match frame.kind {
+                    FrameKind::Notify => notifies += 1,
+                    FrameKind::Response if asked => {
+                        answered =
+                            frame.header_as::<ResponseHeader>().unwrap().id == sent + 1;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if !asked && quiet_since.elapsed() > Duration::from_millis(600) {
+                    asked = true;
+                    let _ = raw.send(raw_frame(
+                        5,
+                        0,
+                        0,
+                        &request_header(sent + 1, "ping", None),
+                        b"",
+                    ));
+                }
+            }
+            Err(error) => panic!("the connection broke: {error}"),
+        }
+    }
+    assert_eq!(notifies, 0, "a dropped hint was sent after all");
+    assert!(server.closed().is_none(), "{:?}", server.closed());
+}
+
+// ---------------------------------------------------------------------------
 // Protocol violations close the connection (invariant 22)
 
 /// Sends `message` from a raw client to a `Conn` server, which must close with
@@ -3352,7 +3525,7 @@ fn request_header(id: u64, op: &str, total: Option<u64>) -> Vec<u8> {
 fn protocol_violations_close_the_connection() {
     let request = request_header(1, "echo", None);
     let heartbeat = serde_json::to_vec(&Heartbeat::default()).unwrap();
-    server_rejects(raw_frame(12, 0, 0, b"{}", b""), "unknown kind");
+    server_rejects(raw_frame(13, 0, 0, b"{}", b""), "unknown kind");
     server_rejects(raw_frame(0, 0, 0, b"{}", b""), "kind zero");
     server_rejects(raw_frame(5, 0, 1, &request, b""), "non-zero reserved");
     server_rejects(raw_frame(5, 0b100, 0, &request, b""), "unknown flag");

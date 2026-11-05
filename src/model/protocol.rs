@@ -192,10 +192,12 @@ pub mod frame {
         Cancel = 9,
         Heartbeat = 10,
         Goaway = 11,
+        /// A listener's one-way hint to its dialer; never a request.
+        Notify = 12,
     }
 
     impl FrameKind {
-        pub const ALL: [FrameKind; 11] = [
+        pub const ALL: [FrameKind; 12] = [
             FrameKind::Hello,
             FrameKind::HelloAck,
             FrameKind::Auth,
@@ -207,6 +209,7 @@ pub mod frame {
             FrameKind::Cancel,
             FrameKind::Heartbeat,
             FrameKind::Goaway,
+            FrameKind::Notify,
         ];
 
         pub fn from_u8(byte: u8) -> Option<FrameKind> {

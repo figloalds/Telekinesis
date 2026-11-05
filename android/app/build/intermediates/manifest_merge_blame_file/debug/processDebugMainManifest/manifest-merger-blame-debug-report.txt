@@ -1,0 +1,66 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="dev.tkfs.spike"
+4    android:versionCode="1"
+5    android:versionName="0.0.1-spike" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="26"
+9        android:targetSdkVersion="35" />
+10
+11    <uses-permission android:name="android.permission.INTERNET" />
+11-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:4:5-67
+11-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:4:22-64
+12
+13    <application
+13-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:6:5-31:19
+14        android:allowBackup="false"
+14-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:7:9-36
+15        android:debuggable="true"
+16        android:extractNativeLibs="false"
+17        android:icon="@drawable/ic_folder"
+17-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:8:9-43
+18        android:label="Telekinesis Spike"
+18-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:9:9-42
+19        android:theme="@android:style/Theme.Material.Light" >
+19-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:10:9-60
+20        <activity
+20-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:12:9-19:20
+21            android:name="dev.tkfs.spike.MainActivity"
+21-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:13:13-41
+22            android:exported="true" >
+22-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:14:13-36
+23            <intent-filter>
+23-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:15:13-18:29
+24                <action android:name="android.intent.action.MAIN" />
+24-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:16:17-69
+24-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:16:25-66
+25
+26                <category android:name="android.intent.category.LAUNCHER" />
+26-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:17:17-77
+26-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:17:27-74
+27            </intent-filter>
+28        </activity>
+29
+30        <provider
+30-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:21:9-30:20
+31            android:name="dev.tkfs.spike.TkfsProvider"
+31-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:22:13-41
+32            android:authorities="dev.tkfs.spike.documents"
+32-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:23:13-59
+33            android:exported="true"
+33-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:24:13-36
+34            android:grantUriPermissions="true"
+34-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:25:13-47
+35            android:permission="android.permission.MANAGE_DOCUMENTS" >
+35-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:26:13-69
+36            <intent-filter>
+36-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:27:13-29:29
+37                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+37-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:28:17-84
+37-->C:\Users\felyp\Desktop\Projetos\Telekinesis\android\app\src\main\AndroidManifest.xml:28:25-81
+38            </intent-filter>
+39        </provider>
+40    </application>
+41
+42</manifest>

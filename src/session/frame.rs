@@ -420,10 +420,17 @@ mod tests {
             Err(FrameError::UnknownKind(0))
         );
         let mut bad = good.clone();
-        bad[0] = 12;
+        bad[0] = 13;
         assert_eq!(
             decode(&bad, FrameLimits::SESSION),
-            Err(FrameError::UnknownKind(12))
+            Err(FrameError::UnknownKind(13))
+        );
+        // 12 is NOTIFY, a header-only frame.
+        let mut notify = good.clone();
+        notify[0] = 12;
+        assert_eq!(
+            decode(&notify, FrameLimits::SESSION),
+            Err(FrameError::TrailingBytes)
         );
         let mut bad = good.clone();
         bad[1] = 0b100;
