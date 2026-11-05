@@ -54,7 +54,7 @@ use super::{
     network::{self, FolderDirectory, Network},
     process::{self, READY_TIMEOUT},
     signals,
-    sync_driver::{self, Driver, SyncFolder, SyncFolders, SyncPolicy},
+    sync_driver::{self, Driver, SYNC_NOW_BOUND, SyncFolder, SyncFolders, SyncPolicy},
     worker::{EXIT_CONFIG, RECORD_FILE, WorkerRecord},
     worker_client::{CALL_DEADLINE, WorkerLink},
 };
@@ -133,6 +133,7 @@ const MUTATIONS: &[&str] = &[
     "pair",
     "unpair",
     "receive",
+    "sync-now",
 ];
 /// Worker ops the `folder` action forwards.
 pub const FOLDER_OPS: &[&str] = &[
@@ -791,6 +792,17 @@ impl Daemon {
                 Ok(json!({}))
             }
             "peers" => Ok(self.network()?.peers()),
+            "sync-now" => {
+                let folders = match &payload["state"] {
+                    Value::Null => self.catalog.folders()?.into_iter().map(|f| f.id).collect(),
+                    _ => vec![selector()?.id],
+                };
+                let driver = self
+                    .sync
+                    .get()
+                    .context("NETWORK_UNAVAILABLE: the peer network is not running")?;
+                Ok(driver.sync_now(&folders, SYNC_NOW_BOUND))
+            }
             "receive" => self.receive(payload),
             "remote-list" => {
                 let endpoint = payload["endpoint"]

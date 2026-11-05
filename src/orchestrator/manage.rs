@@ -110,6 +110,13 @@ pub enum ManagementCommand {
         #[arg(long)]
         headless: bool,
     },
+    /// Sync now: redial peers waiting in backoff, exchange metadata and push
+    /// what they want, for one folder or every folder. The way a passive
+    /// orchestrator syncs. Prints what it did for each folder.
+    SyncNow {
+        #[arg(value_name = "STATE")]
+        folder: Option<String>,
+    },
     /// Stop every folder and the orchestrator.
     Shutdown,
 }
@@ -224,6 +231,7 @@ fn request(command: ManagementCommand) -> Result<(&'static str, Value, bool)> {
             }),
             false,
         ),
+        C::SyncNow { folder } => ("sync-now", json!({"state": folder}), false),
         C::Shutdown => ("shutdown", json!({}), false),
     })
 }

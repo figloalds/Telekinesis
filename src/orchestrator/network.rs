@@ -9,8 +9,10 @@
 //! machine of [`LaneState`]: `Dialing` (a dial is bounded by the session
 //! layer: [`DIAL_TIMEOUT`] per TCP connect, 5 s per handshake step) →
 //! `Ready`; a failed dial or a lost session → `Backoff` (1 s doubling to
-//! [`LANE_BACKOFF_MAX`], ±20 %), the attempt count reset by a session that
-//! stayed Ready for [`READY_RESET`] (it redials at once); a version mismatch
+//! [`LANE_BACKOFF_MAX`], or [`PASSIVE_LANE_BACKOFF_MAX`] on a passive
+//! orchestrator, ±20 %), the attempt count reset by a session that stayed Ready
+//! for [`READY_RESET`] (it redials at once) or by [`Network::nudge_lanes`],
+//! which also ends the wait; a version mismatch
 //! → `Incompatible` for [`INCOMPATIBLE_HOLD`]; a refused credential
 //! (`ACCESS_DENIED`, `PEER_REVOKED`, `PAIRING_CODE_CHANGED`,
 //! `INVALID_PAIRING_CODE`) → `Unauthorized` for [`UNAUTHORIZED_HOLD`].
@@ -39,6 +41,7 @@ use super::{
     catalog::Catalog,
     catalog::Peer,
     config::{Config, SyncProfile},
+    demand::{Seq, SeqMark},
     sync::{MAX_BATCH_BYTES, OBJECT_BATCH, Object},
     worker_client::WorkerLink,
 };
@@ -85,6 +88,9 @@ use std::{
 
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 pub const LANE_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// A passive dialer redials less often: nothing of its own waits for the peer,
+/// and `sync-now` clears the backoff when something does.
+pub const PASSIVE_LANE_BACKOFF_MAX: Duration = Duration::from_secs(300);
 pub const READY_RESET: Duration = Duration::from_secs(5);
 pub const INCOMPATIBLE_HOLD: Duration = Duration::from_secs(600);
 pub const UNAUTHORIZED_HOLD: Duration = Duration::from_secs(60);
@@ -157,12 +163,20 @@ pub trait NotifySink: Send + Sync {
     fn notified(&self, endpoint: &str, notify: &Notify);
 }
 
+/// The longest a lane of this `profile` waits between dials.
+fn backoff_cap(profile: SyncProfile) -> Duration {
+    match profile {
+        SyncProfile::Active => LANE_BACKOFF_MAX,
+        SyncProfile::Passive => PASSIVE_LANE_BACKOFF_MAX,
+    }
+}
+
 /// The backoff after `attempt` failures in a row: `1 s · 2^(attempt−1)`
-/// capped at [`LANE_BACKOFF_MAX`], then `× (1 + jitter)` with `jitter`
-/// clamped to ±0.2 (NaN → 0).
-pub fn lane_backoff(attempt: u32, jitter: f64) -> Duration {
+/// capped at `cap`, then `× (1 + jitter)` with `jitter` clamped to ±0.2
+/// (NaN → 0).
+pub fn lane_backoff(attempt: u32, jitter: f64, cap: Duration) -> Duration {
     let exponent = attempt.saturating_sub(1).min(31);
-    let nominal_ms = (1000u64 << exponent).min(LANE_BACKOFF_MAX.as_millis() as u64);
+    let nominal_ms = (1000u64 << exponent).min(cap.as_millis() as u64);
     let jitter = if jitter.is_finite() {
         jitter.clamp(-JITTER, JITTER)
     } else {
@@ -195,6 +209,8 @@ struct Lane {
     role: LaneRole,
     spec: Option<LaneSpec>,
     slot: Mutex<LaneSlot>,
+    /// Bumped by [`Network::nudge_lanes`]: a transient backoff ends.
+    nudge: Arc<Seq>,
 }
 
 struct LaneSlot {
@@ -222,7 +238,25 @@ impl Lane {
                 conn: None,
                 last_error: None,
             }),
+            nudge: Seq::new(),
         })
+    }
+
+    /// Waits out a transient backoff of `hold`, unless cancelled. Whether a
+    /// nudge since `since` ended it.
+    fn backoff(&self, since: SeqMark, hold: Duration, cancel: &Cancel) -> bool {
+        let end = Instant::now() + hold;
+        while !cancel.is_cancelled() {
+            if self.nudge.mark() != since {
+                return true;
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            self.nudge.wait_moved(since, left.min(LANE_POLL));
+        }
+        false
     }
 
     fn set(&self, state: LaneState) {
@@ -280,6 +314,8 @@ struct Target {
     pool: usize,
     /// Advertised in `HELLO.features` (`protocol::features`).
     features: Vec<String>,
+    /// The longest a backoff of these lanes lasts.
+    backoff_max: Duration,
     /// Hears the listener's hints, once one is registered.
     sink: NotifySlot,
 }
@@ -287,7 +323,7 @@ struct Target {
 type NotifySlot = Arc<OnceLock<Arc<dyn NotifySink>>>;
 
 /// What a dialer asks of its listeners: an active one wants notifications, a
-/// passive one says so and polls instead.
+/// passive one says so and syncs only when it is asked to.
 fn dialer_features(profile: SyncProfile) -> Vec<String> {
     match profile {
         SyncProfile::Active => vec![features::NOTIFY.into()],
@@ -354,6 +390,17 @@ struct NotifyGap {
     held: bool,
 }
 
+/// What was asked of and hinted to one paired installation, since this process
+/// started. Heartbeats are neither.
+#[derive(Clone, Copy, Debug, Default)]
+struct PeerCounts {
+    requests_served: u64,
+    notifies_sent: u64,
+}
+
+/// Per paired installation, so a peer's name cannot grow it.
+type Counts = Arc<Mutex<BTreeMap<String, PeerCounts>>>;
+
 /// (session, repo, reason) of what [`Network::notify`] sends.
 type NotifyKey = (String, String, NotifyReason);
 type NotifyGaps = Arc<Mutex<BTreeMap<NotifyKey, NotifyGap>>>;
@@ -386,6 +433,7 @@ pub struct Network {
     /// another. In memory only.
     listed: Mutex<BTreeMap<(String, String), ListedDigests>>,
     notify_gaps: NotifyGaps,
+    counts: Counts,
     /// Registered after the lanes start; lanes read it per hint.
     notify_sink: NotifySlot,
     pre_auth: AtomicUsize,
@@ -422,6 +470,7 @@ pub fn start(
         inbound: Mutex::new(Vec::new()),
         listed: Mutex::new(BTreeMap::new()),
         notify_gaps: Arc::new(Mutex::new(BTreeMap::new())),
+        counts: Arc::new(Mutex::new(BTreeMap::new())),
         notify_sink: Arc::new(OnceLock::new()),
         pre_auth: AtomicUsize::new(0),
         stopping: stopping.child(),
@@ -613,6 +662,7 @@ impl Network {
     /// `GOAWAY{code}`.
     fn forget(&self, installation: &str, code: &str) {
         self.forget_listed(installation);
+        lock(&self.counts).remove(installation);
         let removed: Vec<PeerLanes> = {
             let mut peers = lock(&self.peers);
             let endpoints: Vec<String> = peers
@@ -668,7 +718,7 @@ impl Network {
                     repo: repo.to_owned(),
                     reason,
                 };
-                notify_coalesced(&self.notify_gaps, conn, notify);
+                notify_coalesced(&self.notify_gaps, &self.counts, conn, notify);
             }
         }
     }
@@ -687,6 +737,7 @@ impl Network {
         register_secret(&code);
         // Every inbound credential is revoked: nothing stays listed.
         lock(&self.listed).clear();
+        lock(&self.counts).clear();
         {
             let mut inbound = lock(&self.inbound);
             inbound.retain(|conn| conn.closed().is_none());
@@ -754,8 +805,10 @@ impl Network {
     }
 
     /// `[{"endpoint","installation","direction","paired","connections",
-    /// "lanes":[…],"inbound","clock"}]`: every outbound peer row, then every
-    /// paired installation with no row (an inbound pairing, `endpoint` null).
+    /// "lanes":[…],"inbound","clock","requests_served","notifies_sent"}]`:
+    /// every outbound peer row, then every paired installation with no row (an
+    /// inbound pairing, `endpoint` null). The two counters are that peer's, as
+    /// this side's listener saw it since this process started.
     pub fn peers(&self) -> Value {
         let outbound = self.catalog.peers().unwrap_or_default();
         let paired: BTreeSet<String> = self
@@ -778,6 +831,8 @@ impl Network {
             }),
             _ => Value::Null,
         };
+        let counts = lock(&self.counts).clone();
+        let counted = |installation: &str| counts.get(installation).copied().unwrap_or_default();
         let lanes = lock(&self.peers);
         let mut list: Vec<Value> = outbound
             .iter()
@@ -795,6 +850,8 @@ impl Network {
                     "lanes": views,
                     "inbound": sessions.get(&peer.installation).copied().unwrap_or(0),
                     "clock": clock(&peer.installation),
+                    "requests_served": counted(&peer.installation).requests_served,
+                    "notifies_sent": counted(&peer.installation).notifies_sent,
                 })
             })
             .collect();
@@ -813,6 +870,8 @@ impl Network {
                 "lanes": [],
                 "inbound": sessions.get(installation).copied().unwrap_or(0),
                 "clock": clock(installation),
+                "requests_served": counted(installation).requests_served,
+                "notifies_sent": counted(installation).notifies_sent,
             }));
         }
         Value::Array(list)
@@ -878,6 +937,29 @@ impl Network {
             .find_map(|lane| lane.ready())
     }
 
+    /// Every endpoint this side keeps lanes to, whatever state they are in.
+    pub fn dialed_endpoints(&self) -> Vec<String> {
+        lock(&self.peers).keys().cloned().collect()
+    }
+
+    /// Why the control lane to `endpoint` last failed.
+    pub fn lane_error(&self, endpoint: &str) -> Option<String> {
+        let peers = lock(&self.peers);
+        let control = peers.get(endpoint)?.lanes.first()?;
+        lock(&control.slot).last_error.clone()
+    }
+
+    /// Lanes waiting out a transient backoff redial at once, with their attempt
+    /// count reset. `Unauthorized` and `Incompatible` holds are not affected:
+    /// redialing does not change what those lanes were told.
+    pub fn nudge_lanes(&self) {
+        for lanes in lock(&self.peers).values() {
+            for lane in &lanes.lanes {
+                lane.nudge.bump();
+            }
+        }
+    }
+
     /// Closes every lane and inbound session, waiting at most `budget` for
     /// lane threads to end and sessions to close.
     pub fn shutdown(&self, budget: Duration) {
@@ -916,6 +998,7 @@ impl Network {
             local: self.installation.clone(),
             pool,
             features: dialer_features(self.sync_profile),
+            backoff_max: backoff_cap(self.sync_profile),
             sink: self.notify_sink.clone(),
         });
         let cancel = self.stopping.child();
@@ -947,6 +1030,16 @@ impl Network {
             previous.stop();
         }
         Ok(())
+    }
+
+    /// A paired peer asked this side for something.
+    fn count_request(&self, installation: &str) {
+        if self.catalog.paired_key(installation).is_ok() {
+            lock(&self.counts)
+                .entry(installation.to_owned())
+                .or_default()
+                .requests_served += 1;
+        }
     }
 
     /// Open inbound sessions (closed ones are pruned).
@@ -1012,7 +1105,7 @@ impl Network {
 /// [`NOTIFY_MIN_GAP`]. The last of such a burst is sent when the gap ends, not
 /// dropped: the frame before it may have started an exchange that already
 /// passed what this one is about.
-fn notify_coalesced(gaps: &NotifyGaps, conn: &Conn, notify: Notify) {
+fn notify_coalesced(gaps: &NotifyGaps, counts: &Counts, conn: &Conn, notify: Notify) {
     let key = (
         conn.peer().session.clone(),
         notify.repo.clone(),
@@ -1039,10 +1132,11 @@ fn notify_coalesced(gaps: &NotifyGaps, conn: &Conn, notify: Notify) {
         }
     };
     let Some(wait) = wait else {
-        send_notify(conn, &notify);
+        send_notify(counts, conn, &notify);
         return;
     };
     let (held_gaps, held_key, conn) = (gaps.clone(), key.clone(), conn.clone());
+    let counts = counts.clone();
     let spawned = thread::Builder::new()
         .name("tkfs-notify-held".into())
         .spawn(move || {
@@ -1051,7 +1145,7 @@ fn notify_coalesced(gaps: &NotifyGaps, conn: &Conn, notify: Notify) {
                 gap.sent = Instant::now();
                 gap.held = false;
             }
-            send_notify(&conn, &notify);
+            send_notify(&counts, &conn, &notify);
         });
     if spawned.is_err()
         && let Some(gap) = lock(gaps).get_mut(&key)
@@ -1061,7 +1155,7 @@ fn notify_coalesced(gaps: &NotifyGaps, conn: &Conn, notify: Notify) {
     }
 }
 
-fn send_notify(conn: &Conn, notify: &Notify) {
+fn send_notify(counts: &Counts, conn: &Conn, notify: &Notify) {
     let dropped = fault::hit(FAULT_NOTIFY_DROP).is_some()
         || (notify.reason == NotifyReason::Demand
             && fault::hit(FAULT_NOTIFY_DROP_DEMAND).is_some());
@@ -1073,6 +1167,10 @@ fn send_notify(conn: &Conn, notify: &Notify) {
         return;
     }
     conn.notify(notify);
+    lock(counts)
+        .entry(conn.peer().installation.clone())
+        .or_default()
+        .notifies_sent += 1;
 }
 
 /// Accepts peer connections until the network is gone; each handshake runs
@@ -1152,6 +1250,8 @@ impl AcceptPolicy for Admission {
 fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
     let mut attempt: u32 = 0;
     while !cancel.is_cancelled() {
+        // Taken before the dial: a nudge during it still ends what follows.
+        let since = lane.nudge.mark();
         lane.set(LaneState::Dialing { since_ms: now_ms() });
         let dialed = (target.check_clock)()
             .map_err(|error| ErrorWire::new("CLOCK_INVALID", format!("{error:#}")))
@@ -1215,7 +1315,8 @@ fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
             }
             Err(error) => error,
         };
-        let hold = match refusal(&error) {
+        let refused = refusal(&error);
+        let hold = match refused {
             Refusal::Unauthorized => {
                 lane.fail(
                     LaneState::Unauthorized {
@@ -1236,7 +1337,11 @@ fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
             }
             Refusal::Transient => {
                 attempt = attempt.saturating_add(1);
-                let delay = lane_backoff(attempt, rand::thread_rng().gen_range(-JITTER..=JITTER));
+                let delay = lane_backoff(
+                    attempt,
+                    rand::thread_rng().gen_range(-JITTER..=JITTER),
+                    target.backoff_max,
+                );
                 lane.fail(
                     LaneState::Backoff {
                         until_ms: now_ms() + delay.as_millis() as u64,
@@ -1248,8 +1353,12 @@ fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
                 delay
             }
         };
-        if cancel.sleep(hold) {
-            break;
+        if refused != Refusal::Transient {
+            if cancel.sleep(hold) {
+                break;
+            }
+        } else if lane.backoff(since, hold, cancel) {
+            attempt = 0;
         }
     }
     lane.set(LaneState::Idle);
@@ -1516,6 +1625,7 @@ impl Handler for PeerService {
             responder,
             ..
         } = req;
+        self.network.count_request(&self.peer.installation);
         let result = self
             .allowed(&op)
             .and_then(|()| self.serve(&op, &header, body, deadline));
@@ -2199,14 +2309,127 @@ mod tests {
 
     #[test]
     fn lane_backoff_doubles_to_a_minute_with_bounded_jitter() {
-        assert_eq!(lane_backoff(1, 0.0), Duration::from_secs(1));
-        assert_eq!(lane_backoff(2, 0.0), Duration::from_secs(2));
-        assert_eq!(lane_backoff(7, 0.0), LANE_BACKOFF_MAX);
-        assert_eq!(lane_backoff(40, 0.0), LANE_BACKOFF_MAX);
-        assert_eq!(lane_backoff(1, 0.5), Duration::from_millis(1200));
-        assert_eq!(lane_backoff(1, -0.5), Duration::from_millis(800));
-        assert_eq!(lane_backoff(1, f64::NAN), Duration::from_secs(1));
+        let backoff = |attempt, jitter| lane_backoff(attempt, jitter, LANE_BACKOFF_MAX);
+        assert_eq!(backoff(1, 0.0), Duration::from_secs(1));
+        assert_eq!(backoff(2, 0.0), Duration::from_secs(2));
+        assert_eq!(backoff(7, 0.0), LANE_BACKOFF_MAX);
+        assert_eq!(backoff(40, 0.0), LANE_BACKOFF_MAX);
+        assert_eq!(backoff(1, 0.5), Duration::from_millis(1200));
+        assert_eq!(backoff(1, -0.5), Duration::from_millis(800));
+        assert_eq!(backoff(1, f64::NAN), Duration::from_secs(1));
         assert_eq!(DIAL_TIMEOUT, crate::model::protocol::frame::DIAL_ATTEMPT);
+    }
+
+    #[test]
+    fn a_passive_lane_backs_off_up_to_its_longer_cap() {
+        let cap = backoff_cap(SyncProfile::Passive);
+        assert_eq!(cap, PASSIVE_LANE_BACKOFF_MAX);
+        assert_eq!(backoff_cap(SyncProfile::Active), LANE_BACKOFF_MAX);
+        assert_eq!(lane_backoff(1, 0.0, cap), Duration::from_secs(1));
+        assert_eq!(lane_backoff(7, 0.0, cap), Duration::from_secs(64));
+        assert_eq!(lane_backoff(10, 0.0, cap), PASSIVE_LANE_BACKOFF_MAX);
+        assert_eq!(lane_backoff(40, 0.0, cap), PASSIVE_LANE_BACKOFF_MAX);
+    }
+
+    /// Nothing listens on port 9: a dial fails with `WS_CONNECT_FAILED`. The
+    /// clock is not checked, and a backoff outlasts any test.
+    fn unreachable_target() -> Arc<Target> {
+        Arc::new(Target {
+            check_clock: || Ok(()),
+            endpoint: "ws://127.0.0.1:9".into(),
+            remote: "peer-b".into(),
+            key: [7; 32],
+            local: "peer-a".into(),
+            pool: 2,
+            features: Vec::new(),
+            backoff_max: Duration::from_secs(3600),
+            sink: Arc::new(OnceLock::new()),
+        })
+    }
+
+    fn wait_view(lane: &Lane, what: &str, check: impl Fn(&Value) -> bool) -> Value {
+        let end = Instant::now() + Duration::from_secs(20);
+        loop {
+            let view = lane.view();
+            if check(&view) {
+                return view;
+            }
+            assert!(Instant::now() < end, "no {what}: {view}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A lane that ends only on `cancel`, running.
+    fn dialing_lane(cancel: &Cancel) -> (Arc<Lane>, JoinHandle<()>) {
+        let lane = Lane::new(0, 2);
+        let thread = {
+            let (lane, target, cancel) = (lane.clone(), unreachable_target(), cancel.clone());
+            thread::spawn(move || run_lane(&lane, &target, &cancel))
+        };
+        (lane, thread)
+    }
+
+    #[test]
+    fn a_nudge_ends_a_transient_backoff_and_resets_its_attempts() {
+        let cancel = Cancel::new();
+        let (lane, thread) = dialing_lane(&cancel);
+        // Climb to where a wait is long enough to tell a nudge from its end.
+        let view = wait_view(&lane, "a long backoff", |view| {
+            view["attempt"].as_u64() >= Some(3)
+        });
+        let attempt = view["attempt"].as_u64().unwrap();
+        lane.nudge.bump();
+        let view = wait_view(&lane, "a reset count", |view| {
+            view["state"] == "Backoff" && view["attempt"].as_u64() < Some(attempt)
+        });
+        assert_eq!(view["attempt"], 1, "{view}");
+        cancel.cancel();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn a_lane_stopped_in_its_backoff_ends_at_once() {
+        let cancel = Cancel::new();
+        let (lane, thread) = dialing_lane(&cancel);
+        wait_view(&lane, "a long backoff", |view| {
+            view["attempt"].as_u64() >= Some(2)
+        });
+        let began = Instant::now();
+        cancel.cancel();
+        thread.join().unwrap();
+        assert!(began.elapsed() < Duration::from_secs(1));
+        assert_eq!(lane.view()["state"], "Idle");
+    }
+
+    #[test]
+    fn the_peers_row_counts_what_a_paired_peer_asked_and_was_told() {
+        let root = tempfile::tempdir().unwrap();
+        let network = network(root.path());
+        // Not paired yet: served, not counted, so a stranger's name is not kept.
+        let (client, _server) = serve(&network, LaneRole::Control, LaneRole::Control);
+        code(&client, "catalog.list", b"");
+        assert!(lock(&network.counts).is_empty());
+        network.catalog.save_paired("peer-a", [7; 32]).unwrap();
+        code(&client, "catalog.list", b"");
+        code(&client, "clock.probe", b"");
+        let (_silent, _) = notified_session(&network, "peer-a", LaneRole::Control, &[]);
+        let (_told, heard) =
+            notified_session(&network, "peer-a", LaneRole::Control, &[features::NOTIFY]);
+        network.notify("repo-1", NotifyReason::Metadata);
+        wait_heard(&heard, 1);
+        let peers = network.peers();
+        let row = peers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["installation"] == "peer-a")
+            .unwrap();
+        assert_eq!(row["requests_served"], 2, "{row}");
+        assert_eq!(row["notifies_sent"], 1, "{row}");
+        // Forgotten with the pairing.
+        network.forget("peer-a", "PEER_REVOKED");
+        assert!(lock(&network.counts).is_empty());
+        client.close();
     }
 
     #[test]
@@ -2341,6 +2564,7 @@ mod tests {
             local: "peer-a".into(),
             pool: 2,
             features: Vec::new(),
+            backoff_max: LANE_BACKOFF_MAX,
             sink: Arc::new(OnceLock::new()),
         };
         let lanes: Vec<Arc<Lane>> = (0..2).map(|index| Lane::new(index, 2)).collect();

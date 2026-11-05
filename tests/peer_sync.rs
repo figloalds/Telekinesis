@@ -16,6 +16,7 @@ use tkfs::{
     model::protocol::LaneRole,
     orchestrator::sync::MissingPage,
     session::{ConnOptions, Priority},
+    util::time::now_ms,
 };
 
 const LANES_READY: Duration = Duration::from_secs(30);
@@ -1215,6 +1216,243 @@ fn an_edit_made_while_lanes_are_down_arrives_when_they_return() -> Result<()> {
     arrives_within(&state_b, "offline.txt", &offline, Duration::from_secs(20))?;
     a.shutdown()?;
     b.shutdown()?;
+    Ok(())
+}
+
+// ---- passive dialers and sync-now -----------------------------------------
+
+const PASSIVE: &str = "sync_profile = \"passive\"\n";
+/// `sync_driver::SYNC_NOW_BOUND`: `endpoint::REPLY_TIMEOUT` less 5 s.
+const SYNC_NOW_BOUND: Duration = Duration::from_secs(175);
+/// How long a passive dialer is watched doing nothing.
+const IDLE_WINDOW: Duration = Duration::from_secs(15);
+
+/// [`shared_pair`] with a passive A.
+fn passive_pair(files: &[(&str, &str)]) -> Result<Shared> {
+    shared_pair_of(
+        TestDaemon::start_with(PASSIVE)?,
+        TestDaemon::start()?,
+        files,
+    )
+}
+
+/// `manage sync-now`, within its bound: the reply's one folder, and how long
+/// it took.
+fn sync_now(daemon: &TestDaemon) -> Result<(Value, Duration)> {
+    let began = Instant::now();
+    let reply = daemon.manage(&["sync-now"])?;
+    let took = began.elapsed();
+    ensure!(took < SYNC_NOW_BOUND, "sync-now took {took:?}");
+    let folders = reply["folders"].as_array().context("no folders")?;
+    ensure!(folders.len() == 1, "{reply}");
+    Ok((folders[0].clone(), took))
+}
+
+/// [`sync_now`] that reports no error.
+fn sync_now_clean(daemon: &TestDaemon) -> Result<Value> {
+    let (folder, _) = sync_now(daemon)?;
+    ensure!(
+        folder["error"].is_null(),
+        "{folder}\nlog:\n{}",
+        daemon.log_text()
+    );
+    Ok(folder)
+}
+
+/// `daemon`'s `peers` row for the installation of `peer`.
+fn row_of(daemon: &TestDaemon, peer: &TestDaemon) -> Result<Value> {
+    let installation = installation(peer)?;
+    let peers = daemon.manage(&["peers"])?;
+    peers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|row| row["installation"] == installation.as_str())
+        .cloned()
+        .with_context(|| format!("no row for {installation} in {peers}"))
+}
+
+#[test]
+fn a_passive_dialer_makes_no_sync_requests_while_idle() -> Result<()> {
+    let Shared { a, b, state_b, .. } = passive_pair(&[("seed.txt", "seed")])?;
+    sync_now_clean(&a)?;
+    let before = row_of(&b, &a)?;
+    let served = before["requests_served"]
+        .as_u64()
+        .context("no requests_served")?;
+    ensure!(served > 0, "the burst served nothing: {before}");
+    // A change on the listener's side is no reason for it to reach A either.
+    import(&b, &state_b, "while-idle.txt", "idle")?;
+    std::thread::sleep(IDLE_WINDOW);
+    let after = row_of(&b, &a)?;
+    ensure!(after["requests_served"] == served, "{before} -> {after}");
+    ensure!(after["notifies_sent"] == 0, "{after}");
+    // The lanes stayed open meanwhile.
+    ensure!(
+        before["inbound"] == after["inbound"] && after["inbound"].as_u64() > Some(0),
+        "{before} -> {after}"
+    );
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn sync_now_moves_metadata_and_pushes_but_does_not_download_unread_files() -> Result<()> {
+    // Both unread on A. `cat` stops at 3 MiB, so the read is of the smaller one.
+    let big = text(8 * 1024 * 1024, 107);
+    let small = text(2 * 1024 * 1024, 113);
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = passive_pair(&[("big.bin", &big), ("small.bin", &small)])?;
+    let new = text(1000, 109);
+    import(&a, &state_a, "new.txt", &new)?;
+    let reply = sync_now_clean(&a)?;
+    ensure!(reply["remaining"] == 0, "{reply}");
+    ensure!(reply["exchanged"].as_u64() > Some(0), "{reply}");
+    ensure!(reply["pushed"].as_u64() > Some(0), "{reply}");
+    // B cannot ask A for anything, so the burst must have put the bytes there.
+    arrives_within(&state_b, "new.txt", &new, NOTIFIED)?;
+    // A knows of both files and fetched neither.
+    let tree = folder(&state_a, &["tree"])?;
+    ensure!(
+        tree.contains("big.bin") && tree.contains("small.bin"),
+        "{tree}"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let held = pack_bytes(&state_a);
+    ensure!(
+        held < small.len() as u64 / 4,
+        "A holds {held} bytes of packs against small.bin's {}",
+        small.len()
+    );
+    // Its reader still gets one, and only that one comes.
+    let bytes = folder(&state_a, &["cat", "small.bin"])?;
+    ensure!(bytes == small, "small.bin differs on A");
+    std::thread::sleep(Duration::from_secs(2));
+    let held = pack_bytes(&state_a);
+    ensure!(
+        held < big.len() as u64 / 2,
+        "A holds {held} bytes of packs against big.bin's {}",
+        big.len()
+    );
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_passive_dialer_learns_of_a_remote_change_only_when_asked() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = passive_pair(&[])?;
+    import(&b, &state_b, "from-b.txt", "from b")?;
+    std::thread::sleep(Duration::from_secs(5));
+    let tree = folder(&state_a, &["tree"])?;
+    ensure!(!tree.contains("from-b.txt"), "unasked: {tree}");
+    // By its selector: the one folder.
+    let reply = a.manage(&["sync-now", "Shared"])?;
+    ensure!(reply["folders"][0]["error"].is_null(), "{reply}");
+    let tree = folder(&state_a, &["tree"])?;
+    ensure!(tree.contains("from-b.txt"), "asked: {tree}");
+    let unknown = error_of(a.manage(&["sync-now", "no-such-folder"]));
+    ensure!(unknown.contains("FOLDER_NOT_FOUND"), "{unknown}");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+/// Once every lane to `endpoint` is in Backoff with its end over `away` off:
+/// the soonest of those ends.
+fn all_in_backoff(daemon: &TestDaemon, endpoint: &str, away: Duration) -> Result<u64> {
+    let mut until = 0;
+    wait_until(
+        Duration::from_secs(120),
+        "a long backoff on every lane",
+        || {
+            let peers = daemon.manage(&["peers"])?;
+            let lanes = peer_at(&peers, endpoint)?["lanes"]
+                .as_array()
+                .context("no lanes")?
+                .clone();
+            until = lanes
+                .iter()
+                .map(|lane| lane["until_ms"].as_u64().unwrap_or(0))
+                .min()
+                .context("no lane")?;
+            Ok(all_lanes(&peers, "Backoff") && until > now_ms() + away.as_millis() as u64)
+        },
+    )?;
+    Ok(until)
+}
+
+#[test]
+fn sync_now_redials_a_lane_waiting_in_backoff() -> Result<()> {
+    let a = TestDaemon::start_with(PASSIVE)?;
+    let b = TestDaemon::start_listening(&free_address()?, "")?;
+    let Shared {
+        a, b, endpoint_b, ..
+    } = shared_pair_of(a, b, &[])?;
+    let home_b = b.shutdown_keep_home()?;
+    let until = all_in_backoff(&a, &endpoint_b, Duration::from_secs(20))?;
+    let b = TestDaemon::start_in(home_b)?;
+    b.wait_phase("Shared", "Running", REPLICATED)?;
+    sync_now_clean(&a)?;
+    a.wait_lanes(&endpoint_b, 4, "Ready", LANES_READY)?;
+    let now = now_ms();
+    ensure!(
+        now < until,
+        "the lanes came back at {now}, not before their backoff ended at {until}"
+    );
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn sync_now_leaves_a_refused_credential_on_hold() -> Result<()> {
+    let Shared {
+        a, b, endpoint_b, ..
+    } = passive_pair(&[])?;
+    b.manage(&["reset-pairing-code"])?;
+    let held = |daemon: &TestDaemon| -> Result<Option<Vec<Value>>> {
+        let peers = daemon.manage(&["peers"])?;
+        let lanes = peer_at(&peers, &endpoint_b)?["lanes"]
+            .as_array()
+            .context("no lanes")?;
+        let ends = lanes.iter().map(|lane| lane["until_ms"].clone()).collect();
+        Ok(all_lanes(&peers, "Unauthorized").then_some(ends))
+    };
+    wait_until(LANES_REVOKED, "lanes on hold", || Ok(held(&a)?.is_some()))?;
+    let ends = held(&a)?.context("the hold ended")?;
+    let (reply, took) = sync_now(&a)?;
+    ensure!(reply["error"].is_string(), "{reply}");
+    ensure!(took < Duration::from_secs(30), "it took {took:?}: {reply}");
+    // The same holds: no lane redialed.
+    ensure!(held(&a)? == Some(ends), "{}", a.manage(&["peers"])?);
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn sync_now_reports_an_unreachable_peer_within_its_bound() -> Result<()> {
+    let Shared { a, b, .. } = passive_pair(&[])?;
+    b.shutdown()?;
+    let (reply, took) = sync_now(&a)?;
+    ensure!(reply["error"].is_string(), "{reply}");
+    ensure!(reply.get("remaining").is_some(), "{reply}");
+    // The lane wait, not the whole bound.
+    ensure!(took < Duration::from_secs(30), "it took {took:?}: {reply}");
+    a.shutdown()?;
     Ok(())
 }
 

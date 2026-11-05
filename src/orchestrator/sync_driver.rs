@@ -56,10 +56,20 @@
 //!   however often the scheduler is poked. The smoothed offset goes to the
 //!   catalog (`Catalog::set_clock`); one past `WARN_OFFSET_MS` logs
 //!   `CLOCK_OFFSET_LARGE`.
+//!
+//! **Passive.** A passive driver asks peers nothing on its own: no exchange, no
+//! clock probe, no push and no background pull, and a notify changes nothing.
+//! Pass 1 still runs, so a local reader gets what it waits for from a peer whose
+//! lanes are up, and that needs no poll: a folder's watch bumps the wake. Only a
+//! burst ([`Driver::sync_now`], which works in either profile) opens the rest,
+//! for the pairs it selected: an exchange until neither side has more, then
+//! pushes until the listener's scan comes back empty. A passive burst still does
+//! no background pull.
 use super::{
     catalog::Catalog,
     config::SyncProfile,
     demand::Seq,
+    endpoint::REPLY_TIMEOUT,
     network::{Network, NotifySink, ReadyPeer},
     push::{self, PushMode, PushState},
     sync::{FeedCursor, FeedPage, FeedReply, FeedRequest, Fetched, MAX_EXCLUDE},
@@ -119,6 +129,19 @@ const DUE_CHECK: Duration = Duration::from_millis(500);
 /// Most marks kept per kind. A mark names a repo a paired peer chose, so it is
 /// bounded; past this one is not kept, and the pair's poll covers that.
 const MAX_MARKS: usize = 4096;
+/// How long [`Driver::sync_now`] may take: its reply beats the control client's
+/// timeout, so the client never takes a slow burst for a lost connection.
+pub const SYNC_NOW_BOUND: Duration = Duration::from_secs(REPLY_TIMEOUT.as_secs() - 5);
+/// How long a burst waits for a peer's lanes before it reports that peer.
+const LANE_WAIT: Duration = Duration::from_secs(10);
+/// How long a burst waits for a selected folder to be Running and unpaused. A
+/// folder whose controller is only busy is back well within this.
+const FOLDER_WAIT: Duration = Duration::from_secs(2);
+/// How often a burst looks at how it is doing.
+const BURST_LOOK: Duration = Duration::from_millis(50);
+/// How long a passive driver's threads sleep with no burst open. Only a safety
+/// net: a burst and a waiting reader wake them.
+const PASSIVE_IDLE: Duration = Duration::from_secs(60);
 /// Fault point: the background push steps do not run, so a test can hold bytes
 /// on this side until a reader on the other side asks for them.
 pub const FAULT_BACKGROUND_SKIP: &str = "sync.push.background.skip";
@@ -165,6 +188,94 @@ struct Due {
     demand: BTreeSet<Pair>,
     /// The background push step.
     background: BTreeSet<Pair>,
+    /// The open `sync-now`s. In here because what they count and what is marked
+    /// have to change together.
+    bursts: BTreeMap<u64, Burst>,
+    next_burst: u64,
+}
+
+impl Due {
+    /// Whether an open burst still wants `pair` synced.
+    fn in_burst(&self, pair: &Pair) -> bool {
+        in_burst(&self.bursts, pair)
+    }
+
+    /// What every open burst counts for `pair`.
+    fn burst_pairs<'a>(&'a mut self, pair: &'a Pair) -> impl Iterator<Item = &'a mut BurstPair> {
+        self.bursts
+            .values_mut()
+            .filter_map(move |burst| burst.pairs.get_mut(pair))
+    }
+
+    /// `pair` joins `burst`, with everything due. Past [`MAX_MARKS`] too: that
+    /// bound is for names a peer chose, and these are this side's.
+    fn join_burst(&mut self, burst: u64, pair: Pair, error: Option<String>) {
+        if let Some(burst) = self.bursts.get_mut(&burst) {
+            let state = BurstPair {
+                rescan: true,
+                error,
+                ..BurstPair::default()
+            };
+            burst.pairs.insert(pair.clone(), state);
+            self.exchange.insert(pair.clone());
+            self.demand.insert(pair.clone());
+            self.background.insert(pair);
+        }
+    }
+}
+
+fn in_burst(bursts: &BTreeMap<u64, Burst>, pair: &Pair) -> bool {
+    let now = Instant::now();
+    bursts.values().any(|burst| {
+        burst.until > now
+            && burst
+                .pairs
+                .get(pair)
+                .is_some_and(|state| state.error.is_none())
+    })
+}
+
+/// One open `sync-now`.
+struct Burst {
+    until: Instant,
+    pairs: BTreeMap<Pair, BurstPair>,
+}
+
+/// What one `sync-now` counted for one pair.
+#[derive(Default)]
+struct BurstPair {
+    /// Exchanges that finished.
+    exchanged: u64,
+    /// Objects the listener named durable.
+    pushed: u64,
+    /// What the last page listed and its pass did not store: an estimate of the
+    /// work left. `None` until a page came back.
+    remaining: Option<usize>,
+    /// A background push ran to its end since its mark was last taken.
+    swept: bool,
+    /// The listener's scan must start over: what the exchange just told it may
+    /// lie behind where the scan stood.
+    rescan: bool,
+    /// It failed in a way waiting will not cure, so this pair is finished.
+    error: Option<String>,
+}
+
+/// A folder `sync-now` was asked about.
+struct BurstFolder {
+    id: String,
+    /// Known once the folder was seen syncing.
+    repo: Option<String>,
+    /// When it was last seen syncing.
+    seen: Instant,
+    error: Option<String>,
+}
+
+/// A peer a `sync-now` is waiting on.
+struct BurstPeer {
+    /// When its control lane was last seen Ready.
+    seen: Instant,
+    /// Why it was given up on.
+    error: Option<String>,
 }
 
 /// Whether it is a new mark. A full set keeps none.
@@ -182,6 +293,19 @@ pub trait Lanes: Send + Sync {
     fn bulk_lane(&self, endpoint: &str, digest: &Digest) -> Option<Conn>;
     /// Any Ready bulk lane to `endpoint`.
     fn any_bulk_lane(&self, endpoint: &str) -> Option<Conn>;
+    /// Every endpoint lanes are kept to, whatever state they are in.
+    fn dialed_endpoints(&self) -> Vec<String> {
+        self.ready_peers()
+            .into_iter()
+            .map(|peer| peer.endpoint)
+            .collect()
+    }
+    /// Why the control lane to `endpoint` last failed.
+    fn lane_error(&self, _endpoint: &str) -> Option<String> {
+        None
+    }
+    /// Lanes waiting out a transient backoff redial at once.
+    fn nudge_lanes(&self) {}
 }
 
 impl Lanes for Network {
@@ -196,6 +320,15 @@ impl Lanes for Network {
     }
     fn any_bulk_lane(&self, endpoint: &str) -> Option<Conn> {
         Network::any_bulk_lane(self, endpoint)
+    }
+    fn dialed_endpoints(&self) -> Vec<String> {
+        Network::dialed_endpoints(self)
+    }
+    fn lane_error(&self, endpoint: &str) -> Option<String> {
+        Network::lane_error(self, endpoint)
+    }
+    fn nudge_lanes(&self) {
+        Network::nudge_lanes(self)
     }
 }
 
@@ -521,8 +654,21 @@ impl Driver {
         Value::Object(map)
     }
 
-    /// `repo` changed on this side: every peer's pair of it is due.
+    fn passive(&self) -> bool {
+        matches!(self.policy.profile, SyncProfile::Passive)
+    }
+
+    /// Whether a passive driver has nothing to do but serve readers.
+    fn at_rest(&self) -> bool {
+        self.passive() && lock(&self.due).bursts.is_empty()
+    }
+
+    /// `repo` changed on this side: every peer's pair of it is due. A passive
+    /// driver tells nobody until it is asked, and a burst marks what it needs.
     pub fn local_change(&self, repo: &str) {
+        if self.at_rest() {
+            return;
+        }
         let peers = self.lanes.ready_peers();
         {
             let mut due = lock(&self.due);
@@ -534,6 +680,156 @@ impl Driver {
         }
         self.poke.bump();
         self.wake.nudge();
+    }
+
+    // ---- sync-now --------------------------------------------------------
+
+    /// Syncs `folders` (ids) with every peer now, in either profile, and reports
+    /// `{"folders": [{"id", "exchanged", "pushed", "remaining", "error"}]}`.
+    /// Lanes in a transient backoff redial at once. It returns when every pair
+    /// is done or given up on, and within `budget` either way. `remaining` is an
+    /// estimate from the last `objects.wanted` page, `null` when none came back.
+    /// A peer with no Ready control lane or no Ready bulk lane for [`LANE_WAIT`]
+    /// is reported with the control lane's failure, so it costs that wait and not
+    /// the budget, and a daemon that is stopping ends this at once.
+    pub fn sync_now(&self, folders: &[String], budget: Duration) -> Value {
+        let began = Instant::now();
+        let end = began + budget;
+        self.lanes.nudge_lanes();
+        let mut peers: BTreeMap<String, BurstPeer> = self
+            .lanes
+            .dialed_endpoints()
+            .into_iter()
+            .map(|endpoint| {
+                let peer = BurstPeer {
+                    seen: began,
+                    error: None,
+                };
+                (endpoint, peer)
+            })
+            .collect();
+        let mut folders: Vec<BurstFolder> = folders
+            .iter()
+            .map(|id| BurstFolder {
+                id: id.clone(),
+                repo: None,
+                seen: began,
+                error: None,
+            })
+            .collect();
+        let burst = {
+            let mut due = lock(&self.due);
+            let burst = due.next_burst;
+            due.next_burst += 1;
+            let pairs = BTreeMap::new();
+            due.bursts.insert(burst, Burst { until: end, pairs });
+            burst
+        };
+        let failure = loop {
+            self.burst_look(burst, &mut folders, &mut peers);
+            if self.cancel.is_cancelled() {
+                break Some("ORCHESTRATOR_STOPPING: the orchestrator is shutting down".to_owned());
+            }
+            let probing = lock(&self.probes).values().any(|probe| probe.running);
+            let settled = {
+                let jobs = lock(&self.jobs);
+                let due = lock(&self.due);
+                folders
+                    .iter()
+                    .all(|folder| burst_folder_settled(&jobs, &due, burst, folder))
+            };
+            if settled && !probing {
+                break None;
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Some(format!("SYNC_NOW_TIMEOUT: not finished within {budget:?}"));
+            }
+            self.cancel.sleep(BURST_LOOK.min(left));
+        };
+        self.close_burst(burst, &folders, failure)
+    }
+
+    /// Takes in the folders that became known and gives up on the folders and
+    /// peers gone for too long.
+    fn burst_look(
+        &self,
+        burst: u64,
+        folders: &mut [BurstFolder],
+        peers: &mut BTreeMap<String, BurstPeer>,
+    ) {
+        let now = Instant::now();
+        let syncing = self.folders.syncing();
+        let ready = self.lanes.ready_peers();
+        let bulk = self.lanes.bulk_endpoints();
+        let mut failed = Vec::new();
+        for (endpoint, peer) in peers.iter_mut() {
+            // A push needs a bulk lane as an exchange needs the control lane.
+            if bulk.contains(endpoint) && ready.iter().any(|ready| ready.endpoint == *endpoint) {
+                peer.seen = now;
+            } else if peer.error.is_none() && now.duration_since(peer.seen) >= LANE_WAIT {
+                let error = self.lanes.lane_error(endpoint).unwrap_or_else(|| {
+                    format!("SYNC_NOW_TIMEOUT: no Ready lane within {LANE_WAIT:?}")
+                });
+                peer.error = Some(error.clone());
+                failed.push((endpoint.clone(), error));
+            }
+        }
+        let mut joined = false;
+        let mut due = lock(&self.due);
+        for folder in folders.iter_mut().filter(|folder| folder.error.is_none()) {
+            match syncing.iter().find(|syncing| syncing.id == folder.id) {
+                Some(syncing) => {
+                    folder.seen = now;
+                    if folder.repo.is_none() {
+                        folder.repo = Some(syncing.repo.clone());
+                        for (endpoint, peer) in peers.iter() {
+                            let pair = (endpoint.clone(), syncing.repo.clone());
+                            due.join_burst(burst, pair, peer.error.clone());
+                            joined = true;
+                        }
+                    }
+                }
+                None if now.duration_since(folder.seen) >= FOLDER_WAIT => {
+                    folder.error = Some(format!(
+                        "WORKER_NOT_RUNNING: folder {} is not running, or is paused",
+                        folder.id
+                    ));
+                }
+                None => {}
+            }
+        }
+        if let Some(burst) = due.bursts.get_mut(&burst) {
+            for (endpoint, error) in failed {
+                for ((peer, _), state) in &mut burst.pairs {
+                    if *peer == endpoint {
+                        state.error.get_or_insert_with(|| error.clone());
+                    }
+                }
+            }
+        }
+        drop(due);
+        if joined {
+            self.poke.bump();
+            self.wake.nudge();
+        }
+    }
+
+    /// Ends `burst` and reports it. `failure` is why it stopped, for the folders
+    /// it did not finish.
+    fn close_burst(&self, burst: u64, folders: &[BurstFolder], failure: Option<String>) -> Value {
+        let jobs = lock(&self.jobs);
+        let mut due = lock(&self.due);
+        let reports: Vec<Value> = folders
+            .iter()
+            .map(|folder| {
+                let settled = burst_folder_settled(&jobs, &due, burst, folder);
+                let unfinished = failure.clone().filter(|_| !settled);
+                burst_report(due.bursts.get(&burst), folder, unfinished)
+            })
+            .collect();
+        due.bursts.remove(&burst);
+        json!({ "folders": reports })
     }
 
     // ---- scheduler -------------------------------------------------------
@@ -550,6 +846,10 @@ impl Driver {
                 next_round = now + self.policy.interval;
             }
             turn += 1;
+            if self.at_rest() {
+                self.poke.wait_past(seen, PASSIVE_IDLE);
+                continue;
+            }
             let peers = self.lanes.ready_peers();
             self.probe_clocks(round, &peers);
             self.dispatch(turn, &peers, &tasks);
@@ -578,6 +878,9 @@ impl Driver {
                 return;
             }
             let key = (peer.endpoint.clone(), folder.repo.clone());
+            if self.passive() && !lock(&self.due).in_burst(&key) {
+                continue;
+            }
             let slot = jobs.entry(key.clone()).or_insert_with(|| Slot {
                 job: SyncJob {
                     peer: peer.endpoint.clone(),
@@ -602,7 +905,8 @@ impl Driver {
                 slot.session = peer.session.clone();
                 slot.job.cursor = FeedCursor::default();
             }
-            let polled = slot.next_poll.is_none_or(|at| at <= now);
+            // No clock moves a passive driver, even during a burst.
+            let polled = !self.passive() && slot.next_poll.is_none_or(|at| at <= now);
             let marked = lock(&self.due).exchange.remove(&key);
             if !(new || polled || marked) {
                 continue;
@@ -667,10 +971,12 @@ impl Driver {
         // Pages the peer and the worker both took stay taken.
         slot.job.cursor = cursor;
         // Events moved: the objects they name may now be wanted, either way.
-        if cursor != task.cursor {
+        let moved = cursor != task.cursor;
+        if moved {
             mark(&mut lock(&self.due).background, task.key.clone());
             self.wake.nudge();
         }
+        self.burst_exchanged(&task.key, moved, &result);
         // What this exchange carried is not across yet: no waiting for the
         // backup poll.
         if result.is_err() {
@@ -693,6 +999,27 @@ impl Driver {
                 }
                 slot.job.error = Some(error);
             }
+        }
+    }
+
+    /// Tells the open bursts of `key` how its exchange went. A lost lane is
+    /// asked again, by the next session if it takes that. Any other failure
+    /// would only repeat itself, so it ends the pair.
+    fn burst_exchanged(&self, key: &Pair, moved: bool, result: &Result<(), Failure>) {
+        let mut due = lock(&self.due);
+        let wanted = due.in_burst(key);
+        for state in due.burst_pairs(key) {
+            state.rescan |= moved;
+            match result {
+                Ok(()) => state.exchanged += 1,
+                Err(Failure::LaneLost) => {}
+                Err(Failure::Error(error)) => {
+                    state.error.get_or_insert_with(|| error.clone());
+                }
+            }
+        }
+        if wanted && matches!(result, Err(Failure::LaneLost)) {
+            due.exchange.insert(key.clone());
         }
     }
 
@@ -756,8 +1083,12 @@ impl Driver {
 
     /// How long a round that stored nothing rests: until a poll may come due,
     /// or [`DUE_CHECK`] while a push step of a syncing folder stays due. Marks
-    /// of a repo not synced here wait for it and do not keep the pump awake.
+    /// of a repo not synced here wait for it and do not keep the pump awake,
+    /// and nothing comes due by time on a passive driver.
     fn pump_wait(&self) -> Duration {
+        if self.at_rest() {
+            return PASSIVE_IDLE;
+        }
         let repos: BTreeSet<String> = self
             .folders
             .syncing()
@@ -769,7 +1100,7 @@ impl Driver {
             .demand
             .iter()
             .chain(&due.background)
-            .any(|(_, repo)| repos.contains(repo));
+            .any(|pair| repos.contains(&pair.1) && (!self.passive() || due.in_burst(pair)));
         if pending {
             self.policy.shortest().min(DUE_CHECK)
         } else {
@@ -779,7 +1110,8 @@ impl Driver {
 
     /// Marks both push steps due for the pairs whose poll came up, and drops
     /// the marks of a peer with no Ready lane left. When it returns, its new
-    /// control session starts an exchange that moves events again.
+    /// control session starts an exchange that moves events again. What a burst
+    /// marked stays, since it waits for that peer. A passive driver has no polls.
     fn mark_polls(
         &self,
         state: &mut PumpState,
@@ -800,8 +1132,20 @@ impl Driver {
         let lanes = |endpoint: &String| {
             endpoints.contains(endpoint) || peers.iter().any(|peer| peer.endpoint == *endpoint)
         };
-        due.demand.retain(|(endpoint, _)| lanes(endpoint));
-        due.background.retain(|(endpoint, _)| lanes(endpoint));
+        {
+            let Due {
+                demand,
+                background,
+                bursts,
+                ..
+            } = &mut *due;
+            let keep = |pair: &Pair| lanes(&pair.0) || in_burst(bursts, pair);
+            demand.retain(keep);
+            background.retain(keep);
+        }
+        if self.passive() {
+            return;
+        }
         for folder in folders {
             for endpoint in endpoints {
                 let pair = (endpoint.clone(), folder.repo.clone());
@@ -819,7 +1163,8 @@ impl Driver {
     }
 
     /// Whether `folder` to `endpoint` has its step in `marks` due and can run
-    /// it now. A pair at rest keeps its mark.
+    /// it now. A pair at rest keeps its mark, and on a passive driver so does a
+    /// pair no burst wants.
     fn take_due(
         &self,
         state: &PumpState,
@@ -827,8 +1172,65 @@ impl Driver {
         endpoint: &str,
         marks: impl Fn(&mut Due) -> &mut BTreeSet<Pair>,
     ) -> bool {
-        !state.push.rests(&folder.id, endpoint, Instant::now())
-            && marks(&mut lock(&self.due)).remove(&(endpoint.to_owned(), folder.repo.clone()))
+        let pair = (endpoint.to_owned(), folder.repo.clone());
+        if state.push.rests(&folder.id, endpoint, Instant::now()) {
+            return false;
+        }
+        let mut due = lock(&self.due);
+        (!self.passive() || due.in_burst(&pair)) && marks(&mut due).remove(&pair)
+    }
+
+    /// [`Self::take_due`] of the background step. For a burst it also says the
+    /// last sweep no longer counts, in the same breath so the burst never sees
+    /// neither a mark nor a sweep under way, and starts the scan over if an
+    /// exchange moved events since.
+    fn take_background(&self, state: &mut PumpState, folder: &SyncFolder, endpoint: &str) -> bool {
+        let pair = (endpoint.to_owned(), folder.repo.clone());
+        if state.push.rests(&folder.id, endpoint, Instant::now()) {
+            return false;
+        }
+        let mut due = lock(&self.due);
+        if (self.passive() && !due.in_burst(&pair)) || !due.background.remove(&pair) {
+            return false;
+        }
+        let mut rescan = false;
+        for burst in due.burst_pairs(&pair) {
+            burst.swept = false;
+            rescan |= std::mem::take(&mut burst.rescan);
+        }
+        drop(due);
+        if rescan {
+            state.push.restart_scan(&folder.id, endpoint);
+        }
+        true
+    }
+
+    /// A background step ended: what stays due, and what the bursts learn of it.
+    /// A page that listed something is not done. A listing that failed lists
+    /// nothing: it waits for the pair's next trigger, so a hung listener does not
+    /// hold this pump again at once. In a burst a lost lane is such a trigger,
+    /// and any other failure ends the pair.
+    fn background_done(&self, pair: &Pair, outcome: &push::PushOutcome) {
+        let lost = outcome.error == Some(Failure::LaneLost.to_string());
+        let mut due = lock(&self.due);
+        if outcome.interrupted
+            || outcome.pushed + outcome.remaining > 0
+            || (lost && due.in_burst(pair))
+        {
+            mark(&mut due.background, pair.clone());
+        }
+        for state in due.burst_pairs(pair) {
+            state.pushed += outcome.pushed as u64;
+            state.swept = true;
+            // A pass that listed nothing because it failed or stopped says
+            // nothing of what is left.
+            if outcome.remaining > 0 || (outcome.error.is_none() && !outcome.interrupted) {
+                state.remaining = Some(outcome.remaining);
+            }
+            if let Some(error) = outcome.error.as_ref().filter(|_| !lost) {
+                state.error.get_or_insert_with(|| error.clone());
+            }
+        }
     }
 
     /// One round, in a fixed order. Pass 1 supplies every folder's pending
@@ -886,16 +1288,25 @@ impl Driver {
                     break;
                 }
                 if self.take_due(state, folder, endpoint, |due| &mut due.demand) {
-                    stored += self
+                    let pushed = self
                         .push(state, endpoint, folder, PushMode::Demand, None)
                         .pushed;
+                    stored += pushed;
+                    let pair = (endpoint.clone(), folder.repo.clone());
+                    for burst in lock(&self.due).burst_pairs(&pair) {
+                        burst.pushed += pushed as u64;
+                    }
                 }
             }
         }
         // Pass 2: background prefetch. With every endpoint resting a page would
-        // be passed over unasked.
+        // be passed over unasked. A passive driver downloads only what is read.
         for folder in &folders {
-            if self.cancel.is_cancelled() || self.wake.current() != seen || endpoints.is_empty() {
+            if self.passive()
+                || self.cancel.is_cancelled()
+                || self.wake.current() != seen
+                || endpoints.is_empty()
+            {
                 break;
             }
             let Some((wanted, cursor)) = self.background(state, folder) else {
@@ -926,18 +1337,12 @@ impl Driver {
                 if self.cancel.is_cancelled() || self.wake.current() != seen {
                     return stored;
                 }
-                if !self.take_due(state, folder, endpoint, |due| &mut due.background) {
+                if !self.take_background(state, folder, endpoint) {
                     continue;
                 }
                 let outcome = self.push(state, endpoint, folder, PushMode::Background, Some(seen));
                 stored += outcome.pushed;
-                // A page that listed something is not done. A listing that
-                // failed lists nothing: it waits for the pair's next trigger, so
-                // a hung listener does not hold this pump again at once.
-                if outcome.interrupted || outcome.pushed + outcome.remaining > 0 {
-                    let pair = (endpoint.clone(), folder.repo.clone());
-                    mark(&mut lock(&self.due).background, pair);
-                }
+                self.background_done(&(endpoint.clone(), folder.repo.clone()), &outcome);
                 if outcome.interrupted {
                     return stored;
                 }
@@ -1182,8 +1587,12 @@ impl Driver {
 impl NotifySink for Driver {
     /// Runs on the lane's I/O thread: only marks and bumps. A demand notify
     /// repeats while its reader waits, whether or not the repo is synced here,
-    /// and a peer picks the name: only a new mark looks any further.
+    /// and a peer picks the name: only a new mark looks any further. A passive
+    /// driver did not ask for hints, and the other side does not get to wake it.
     fn notified(&self, endpoint: &str, notify: &Notify) {
+        if self.passive() {
+            return;
+        }
         let pair = (endpoint.to_owned(), notify.repo.clone());
         match notify.reason {
             NotifyReason::Metadata => {
@@ -1205,6 +1614,69 @@ impl NotifySink for Driver {
             }
         }
     }
+}
+
+/// Whether nothing more will happen for `folder` in `burst`: it is given up on,
+/// or each of its pairs is, or each has no exchange running or due and its last
+/// page listed nothing left. Take `jobs` before `due`, as `dispatch` does, so a
+/// job that just took its mark shows as running.
+fn burst_folder_settled(
+    jobs: &BTreeMap<Pair, Slot>,
+    due: &Due,
+    burst: u64,
+    folder: &BurstFolder,
+) -> bool {
+    if folder.error.is_some() {
+        return true;
+    }
+    let (Some(repo), Some(burst)) = (&folder.repo, due.bursts.get(&burst)) else {
+        return false;
+    };
+    burst
+        .pairs
+        .iter()
+        .filter(|((_, of), _)| of == repo)
+        .all(|(pair, state)| {
+            state.error.is_some()
+                || (state.swept
+                    && state.remaining == Some(0)
+                    && !due.exchange.contains(pair)
+                    && !due.demand.contains(pair)
+                    && !due.background.contains(pair)
+                    && !jobs.get(pair).is_some_and(|slot| slot.running))
+        })
+}
+
+/// `{id, exchanged, pushed, remaining, error}` of `folder`, over its pairs in
+/// `burst`. `unfinished` is the error of a burst stopped before it was done.
+fn burst_report(burst: Option<&Burst>, folder: &BurstFolder, unfinished: Option<String>) -> Value {
+    let pairs: Vec<(&Pair, &BurstPair)> = burst
+        .iter()
+        .flat_map(|burst| &burst.pairs)
+        .filter(|((_, repo), _)| Some(repo) == folder.repo.as_ref())
+        .collect();
+    let error = folder.error.clone().or_else(|| {
+        pairs
+            .iter()
+            .find_map(|((endpoint, _), state)| {
+                let error = state.error.as_ref()?;
+                Some(format!("{error} (peer {endpoint})"))
+            })
+            .or(unfinished)
+    });
+    // Unknown only if some peer was asked and none answered.
+    let remaining = pairs
+        .iter()
+        .filter_map(|(_, state)| state.remaining)
+        .reduce(|sum, left| sum + left)
+        .or(pairs.is_empty().then_some(0));
+    json!({
+        "id": folder.id,
+        "exchanged": pairs.iter().map(|(_, state)| state.exchanged).sum::<u64>(),
+        "pushed": pairs.iter().map(|(_, state)| state.pushed).sum::<u64>(),
+        "remaining": remaining,
+        "error": error,
+    })
 }
 
 /// `wanted` grouped by the Ready bulk lane of `endpoint` that owns each
@@ -3270,6 +3742,418 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+    }
+
+    // ---- passive and sync-now ---------------------------------------------
+
+    fn passive(interval: Duration) -> SyncPolicy {
+        SyncPolicy {
+            profile: SyncProfile::Passive,
+            interval,
+            backup_poll: interval,
+        }
+    }
+
+    /// Opens a burst of `pairs`, the way `sync_now` does, ending far off.
+    fn open_burst(driver: &Driver, pairs: &[Pair]) -> u64 {
+        let mut due = lock(&driver.due);
+        let burst = due.next_burst;
+        due.next_burst += 1;
+        let until = Instant::now() + HOUR;
+        let map = BTreeMap::new();
+        due.bursts.insert(burst, Burst { until, pairs: map });
+        for pair in pairs {
+            due.join_burst(burst, pair.clone(), None);
+        }
+        burst
+    }
+
+    #[test]
+    fn the_sync_now_bound_beats_the_reply_timeout() {
+        assert_eq!(REPLY_TIMEOUT - SYNC_NOW_BOUND, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_passive_driver_dispatches_only_for_a_pair_in_a_burst() {
+        let control = idle_control();
+        let lanes = ReadyLanes {
+            peers: Vec::new(),
+            control: control.clone(),
+            bulk: None,
+        };
+        let (driver, _root) = policy_driver(lanes, &["repo-1", "repo-2"], passive(SHORT));
+        let peers = [ready_peer(ENDPOINT, "control", false, &control)];
+        // New, past its poll, and with a mark: none of it moves a passive driver.
+        assert!(dispatched(&driver, &peers).is_empty());
+        thread::sleep(PAST_SHORT);
+        driver.notified(ENDPOINT, &metadata("repo-1"));
+        driver.local_change("repo-1");
+        assert!(dispatched(&driver, &peers).is_empty());
+        assert!(lock(&driver.jobs).is_empty());
+        // Only what the burst selected, once.
+        let key = pair(ENDPOINT, "repo-1");
+        open_burst(&driver, std::slice::from_ref(&key));
+        assert_eq!(dispatched(&driver, &peers), [key]);
+        thread::sleep(PAST_SHORT);
+        assert!(dispatched(&driver, &peers).is_empty());
+    }
+
+    #[test]
+    fn a_passive_driver_is_not_marked_by_what_a_peer_says() {
+        let (driver, _root, _control) = dispatching(passive(SHORT));
+        let (poke, wake) = (driver.poke.current(), driver.wake.mark());
+        driver.notified(ENDPOINT, &metadata("repo-1"));
+        driver.notified(ENDPOINT, &demand_of("repo-1"));
+        assert_eq!(driver.poke.current(), poke);
+        assert_eq!(driver.wake.mark(), wake);
+        let due = lock(&driver.due);
+        assert!(due.exchange.is_empty() && due.demand.is_empty());
+    }
+
+    #[test]
+    fn a_passive_pump_asks_a_listener_nothing_outside_a_burst() {
+        let held = objects("held", 1);
+        let folder = Arc::new(FakeFolder {
+            held: held.clone(),
+            missing: wanted_of(&objects("there", 1)),
+            ..FakeFolder::default()
+        });
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&held),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let (driver, _root) = {
+            let root = tempfile::tempdir().unwrap();
+            let driver = Driver::with_policy(
+                Arc::new(ReadyLanes::one(false, bulk)),
+                Catalog::open(root.path()).unwrap(),
+                Arc::new(RepoFolders(vec![(
+                    "repo-1".to_owned(),
+                    fake_worker(folder),
+                    Vec::new(),
+                )])),
+                Seq::new(),
+                passive(SHORT),
+                Cancel::new(),
+            );
+            (driver, root)
+        };
+        let mut state = PumpState::default();
+        for _ in 0..3 {
+            assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+            thread::sleep(PAST_SHORT);
+        }
+        assert_eq!(driver.pump_wait(), PASSIVE_IDLE);
+        // A burst pushes, demand first, and pulls nothing unasked.
+        let key = pair(ENDPOINT, "repo-1");
+        open_burst(&driver, std::slice::from_ref(&key));
+        let calls = calls_of_round(&driver, &mut state, &listener);
+        assert_eq!(calls[..3], ["wanted/0", "store", "wanted/32"], "{calls:?}");
+        assert_eq!(calls_named(&calls, "fetch"), 0, "{calls:?}");
+        // Over: nothing again, even with a mark left behind.
+        lock(&driver.due).bursts.clear();
+        mark(&mut lock(&driver.due).background, key);
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        assert_eq!(driver.pump_wait(), PASSIVE_IDLE);
+    }
+
+    #[test]
+    fn a_passive_pump_still_pulls_what_a_reader_waits_for() {
+        let wanted = objects("wanted", 1);
+        let background = objects("background", 1);
+        let folder = Arc::new(FakeFolder {
+            missing: wanted_of(&background),
+            ..FakeFolder::default()
+        });
+        let listener = Arc::new(Listener {
+            held: [wanted.clone(), background].concat(),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let root = tempfile::tempdir().unwrap();
+        let driver = Driver::with_policy(
+            Arc::new(ReadyLanes::one(false, bulk)),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".to_owned(),
+                fake_worker(folder.clone()),
+                wanted_of(&wanted),
+            )])),
+            Seq::new(),
+            passive(SHORT),
+            Cancel::new(),
+        );
+        let mut state = PumpState::default();
+        assert_eq!(calls_of_round(&driver, &mut state, &listener), ["fetch"]);
+        assert_eq!(folder.written(), [wanted[0].digest]);
+    }
+
+    /// A passive driver of `repo-1`, running, whose peer's control lane is
+    /// `ready` (or down, while it is `dialed` all the same).
+    struct DownLanes {
+        ready: ReadyLanes,
+        dialed: Vec<String>,
+        error: Option<String>,
+    }
+
+    impl Lanes for DownLanes {
+        fn ready_peers(&self) -> Vec<ReadyPeer> {
+            self.ready.ready_peers()
+        }
+        fn bulk_endpoints(&self) -> Vec<String> {
+            self.ready.bulk_endpoints()
+        }
+        fn bulk_lane(&self, endpoint: &str, digest: &Digest) -> Option<Conn> {
+            self.ready.bulk_lane(endpoint, digest)
+        }
+        fn any_bulk_lane(&self, endpoint: &str) -> Option<Conn> {
+            self.ready.any_bulk_lane(endpoint)
+        }
+        fn dialed_endpoints(&self) -> Vec<String> {
+            self.dialed.clone()
+        }
+        fn lane_error(&self, _: &str) -> Option<String> {
+            self.error.clone()
+        }
+    }
+
+    fn down_lanes(error: Option<&str>) -> DownLanes {
+        DownLanes {
+            ready: ReadyLanes {
+                peers: Vec::new(),
+                control: idle_control(),
+                bulk: None,
+            },
+            dialed: vec![ENDPOINT.to_owned()],
+            error: error.map(str::to_owned),
+        }
+    }
+
+    fn folder_of(reply: &Value) -> &Value {
+        let folders = reply["folders"].as_array().unwrap();
+        assert_eq!(folders.len(), 1, "{reply}");
+        &folders[0]
+    }
+
+    #[test]
+    fn sync_now_with_no_peer_has_nothing_to_do() {
+        let lanes = ReadyLanes {
+            peers: Vec::new(),
+            control: idle_control(),
+            bulk: None,
+        };
+        let (driver, _root) = policy_driver(lanes, &["repo-1"], passive(SHORT));
+        let reply = driver.sync_now(&["repo-1".to_owned()], Duration::from_secs(5));
+        let folder = folder_of(&reply);
+        assert_eq!(folder["id"], "repo-1");
+        assert_eq!(folder["remaining"], 0, "{reply}");
+        assert!(folder["error"].is_null(), "{reply}");
+        assert!(lock(&driver.due).bursts.is_empty());
+    }
+
+    #[test]
+    fn sync_now_runs_out_its_budget_as_sync_now_timeout() {
+        let (driver, _root) = policy_driver(down_lanes(None), &["repo-1"], passive(SHORT));
+        let began = Instant::now();
+        let reply = driver.sync_now(&["repo-1".to_owned()], Duration::from_millis(200));
+        assert!(began.elapsed() < Duration::from_secs(5));
+        let folder = folder_of(&reply);
+        let error = folder["error"].as_str().unwrap();
+        assert!(error.starts_with("SYNC_NOW_TIMEOUT"), "{reply}");
+        assert!(folder["remaining"].is_null(), "{reply}");
+        // Its gate closed with it.
+        assert!(!lock(&driver.due).in_burst(&pair(ENDPOINT, "repo-1")));
+    }
+
+    #[test]
+    fn sync_now_gives_up_on_a_lane_that_stays_down_with_its_failure() {
+        let (driver, _root) = policy_driver(
+            down_lanes(Some("WS_CONNECT_FAILED: refused")),
+            &["repo-1"],
+            passive(SHORT),
+        );
+        let began = Instant::now();
+        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND);
+        let took = began.elapsed();
+        assert!(took >= LANE_WAIT, "{took:?}");
+        assert!(took < LANE_WAIT + Duration::from_secs(5), "{took:?}");
+        let error = folder_of(&reply)["error"].as_str().unwrap();
+        assert!(error.starts_with("WS_CONNECT_FAILED"), "{reply}");
+        assert!(error.contains(ENDPOINT), "{reply}");
+    }
+
+    #[test]
+    fn sync_now_stops_when_the_daemon_stops() {
+        let (driver, _root) = policy_driver(down_lanes(None), &["repo-1"], passive(SHORT));
+        let cancelling = driver.cancel.clone();
+        let stopper = thread::spawn(move || {
+            thread::sleep(PAST_SHORT);
+            cancelling.cancel();
+        });
+        let began = Instant::now();
+        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND);
+        assert!(began.elapsed() < Duration::from_secs(5));
+        stopper.join().unwrap();
+        let error = folder_of(&reply)["error"].as_str().unwrap();
+        assert!(error.starts_with("ORCHESTRATOR_STOPPING"), "{reply}");
+    }
+
+    #[test]
+    fn sync_now_reports_a_folder_that_is_not_syncing() {
+        let (driver, _root) = policy_driver(down_lanes(None), &["repo-1"], passive(SHORT));
+        let began = Instant::now();
+        let reply = driver.sync_now(&["paused".to_owned()], SYNC_NOW_BOUND);
+        assert!(began.elapsed() < LANE_WAIT);
+        let folder = folder_of(&reply);
+        assert_eq!(folder["id"], "paused");
+        let error = folder["error"].as_str().unwrap();
+        assert!(error.starts_with("WORKER_NOT_RUNNING"), "{reply}");
+    }
+
+    #[test]
+    fn a_failed_exchange_ends_its_pair_and_a_lost_lane_is_asked_again() {
+        let (driver, _root, control) = dispatching(passive(SHORT));
+        let peers = [ready_peer(ENDPOINT, "control", false, &control)];
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst(&driver, std::slice::from_ref(&key));
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        driver.finish(&task, task.cursor, Err(Failure::LaneLost));
+        assert!(lock(&driver.due).in_burst(&key));
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().expect("the lost lane was not asked again");
+        let error = "meta.exchange: REPO_NOT_PUBLISHED: paused";
+        driver.finish(&task, task.cursor, Err(Failure::Error(error.into())));
+        // No more for this pair, and no waiting for the budget to say so.
+        let due = lock(&driver.due);
+        assert!(!due.in_burst(&key));
+        let state = &due.bursts[&burst].pairs[&key];
+        assert_eq!(state.error.as_deref(), Some(error));
+        assert_eq!(state.exchanged, 0);
+    }
+
+    #[test]
+    fn a_burst_is_settled_only_when_its_last_page_came_back_empty() {
+        let (driver, _root, _control) = dispatching(passive(SHORT));
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst(&driver, std::slice::from_ref(&key));
+        let folder = BurstFolder {
+            id: "repo-1".into(),
+            repo: Some("repo-1".into()),
+            seen: Instant::now(),
+            error: None,
+        };
+        let settled = |driver: &Driver| {
+            let jobs = lock(&driver.jobs);
+            let due = lock(&driver.due);
+            burst_folder_settled(&jobs, &due, burst, &folder)
+        };
+        assert!(!settled(&driver));
+        {
+            let mut due = lock(&driver.due);
+            due.exchange.clear();
+            due.demand.clear();
+        }
+        let outcome = |pushed, remaining| push::PushOutcome {
+            pushed,
+            remaining,
+            ..push::PushOutcome::default()
+        };
+        // Stored a page: there may be more, so it is due again.
+        let mut state = PumpState::default();
+        let fake = Arc::new(FakeFolder::default());
+        let syncing = SyncFolder {
+            id: "repo-1".into(),
+            repo: "repo-1".into(),
+            link: fake_worker(fake),
+            demand: Vec::new(),
+        };
+        assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
+        assert!(!settled(&driver), "a sweep is under way");
+        driver.background_done(&key, &outcome(3, 0));
+        assert!(!settled(&driver), "a stored page is not the last");
+        // Left something listed.
+        assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
+        driver.background_done(&key, &outcome(0, 2));
+        assert!(!settled(&driver), "two objects are left");
+        // Empty.
+        assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
+        driver.background_done(&key, &outcome(0, 0));
+        assert!(settled(&driver));
+        let reply = burst_report(lock(&driver.due).bursts.get(&burst), &folder, None);
+        assert_eq!(reply["pushed"], 3, "{reply}");
+        assert_eq!(reply["remaining"], 0, "{reply}");
+    }
+
+    #[test]
+    fn an_exchange_that_moved_events_makes_the_burst_sweep_again_from_the_start() {
+        let (driver, _root, control) = dispatching(passive(SHORT));
+        let peers = [ready_peer(ENDPOINT, "control", false, &control)];
+        let key = pair(ENDPOINT, "repo-1");
+        open_burst(&driver, std::slice::from_ref(&key));
+        let mut state = PumpState::default();
+        let syncing = SyncFolder {
+            id: "repo-1".into(),
+            repo: "repo-1".into(),
+            link: fake_worker(Arc::new(FakeFolder::default())),
+            demand: Vec::new(),
+        };
+        let at = (syncing.id.clone(), ENDPOINT.to_owned());
+        state.push.peers.entry(at.clone()).or_default().scan = Some("7".into());
+        assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
+        assert_eq!(
+            state.push.peers[&at].scan, None,
+            "a burst starts from the top"
+        );
+        state.push.peers.entry(at.clone()).or_default().scan = Some("9".into());
+        driver.background_done(
+            &key,
+            &push::PushOutcome {
+                pushed: 0,
+                ..push::PushOutcome::default()
+            },
+        );
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        let moved = FeedCursor {
+            sent: 5,
+            received: 7,
+        };
+        driver.finish(&task, moved, Ok(()));
+        assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
+        assert_eq!(state.push.peers[&at].scan, None);
+    }
+
+    #[test]
+    fn a_running_driver_ends_sync_now_at_a_coded_failure_with_time_to_spare() {
+        // The stub worker refuses `feed.outgoing`.
+        let listener = Arc::new(Listener::default());
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let lanes = ReadyLanes::one(false, bulk);
+        let root = tempfile::tempdir().unwrap();
+        let driver = start(
+            Arc::new(lanes),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".to_owned(),
+                fake_worker(Arc::new(FakeFolder::default())),
+                Vec::new(),
+            )])),
+            Seq::new(),
+            passive(SHORT),
+            Cancel::new(),
+        )
+        .unwrap();
+        let began = Instant::now();
+        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND);
+        assert!(began.elapsed() < LANE_WAIT, "{reply}");
+        let error = folder_of(&reply)["error"].as_str().unwrap();
+        assert!(error.contains("UNSUPPORTED_OPERATION"), "{reply}");
+        assert!(error.contains(ENDPOINT), "{reply}");
+        driver.stop(Duration::from_secs(5));
     }
 
     /// One pump round, and the listener's calls it made.

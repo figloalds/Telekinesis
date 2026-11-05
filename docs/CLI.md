@@ -240,9 +240,11 @@ tkfs manage unpair INSTALLATION
   Pair on one side only: the dialing host drives the exchange, which carries
   events both ways.
 - `peers` prints the paired peers: endpoint, installation, direction, lanes
-  and their state, inbound sessions and `clock` (the measured offset and
-  round trip to that peer, `null` until the first measurement). It never
-  shows a code or a credential.
+  and their state, inbound sessions, `clock` (the measured offset and
+  round trip to that peer, `null` until the first measurement), and
+  `requests_served` and `notifies_sent` (what this host answered for that peer
+  and hinted to it since this orchestrator started; heartbeats count for
+  neither). It never shows a code or a credential.
 - `remote-list ENDPOINT` lists the folders a paired host publishes (`repo`
   and `label`).
 - `receive ENDPOINT REPO LABEL` creates a local folder of that repository
@@ -258,6 +260,44 @@ verifies the server certificate and host name with the platform trust store;
 use the same endpoint string for `pair`, `remote-list` and `receive`. The peer
 listener itself is plain WebSocket: see
 [remote access](CONFIGURATION.md#remote-access-through-a-tls-proxy).
+
+### Syncing now
+
+```sh
+tkfs manage sync-now
+tkfs manage sync-now STATE
+```
+
+`sync-now` syncs one folder, or every folder when none is named, with every
+peer this host dials, and waits for that to finish. It works in either profile,
+and it is the only way a host with `network.sync_profile = "passive"` asks its
+peers for anything: a passive host keeps its connections open and serves its
+own readers, but exchanges metadata and pushes only when told to. It:
+
+- makes connections waiting in a backoff redial at once (not those refused for
+  a credential or a version);
+- exchanges metadata until neither side has more;
+- pushes what each peer wants, what its readers wait for first, until a peer's
+  listing comes back empty. It does not download: a passive host fetches a file
+  when something reads it.
+
+It prints `{"folders": [{"id", "exchanged", "pushed", "remaining", "error"}]}`:
+
+- `exchanged`: metadata exchanges that finished;
+- `pushed`: objects a peer confirmed are durable;
+- `remaining`: what the last listing named and this host did not store. It is
+  an estimate, because later pages of a listing are not counted, and it is
+  `null` when no listing came back;
+- `error`: why the folder did not finish, or `null`. It is the code of the
+  failure, such as the connection's or the peer's refusal, or
+  `SYNC_NOW_TIMEOUT` when time ran out. A folder that is stopped or paused
+  reports `WORKER_NOT_RUNNING`. With no peer to dial there is nothing to do, and
+  it is `null`.
+
+An error here is reported, not fatal: the command exits 0 and what was done stays
+done. A peer that stays unreachable is reported after 10 seconds. The whole
+command takes at most 175 seconds, and it stops early if the orchestrator shuts
+down.
 
 ### Shutdown
 

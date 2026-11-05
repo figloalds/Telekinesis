@@ -163,6 +163,17 @@ impl PushState {
                 .is_some_and(|at| at > now)
     }
 
+    /// The next pass of `folder` to `endpoint` lists the listener's scan from
+    /// its start.
+    pub(super) fn restart_scan(&mut self, folder: &str, endpoint: &str) {
+        if let Some(peer) = self
+            .peers
+            .get_mut(&(folder.to_owned(), endpoint.to_owned()))
+        {
+            peer.scan = None;
+        }
+    }
+
     /// Forgets the (folder, endpoint) pairs not pushed to for [`FORGET_AFTER`]
     /// and the rests that ended. By age, not by the folders syncing now: a
     /// folder whose slot is busy sits out a round, and that must not cost it
