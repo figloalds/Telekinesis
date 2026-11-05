@@ -1271,6 +1271,14 @@ impl Store {
         self.namespace_changes.begin_global();
         Ok(())
     }
+    /// The journal's latest sequence (0 when it is empty): what a feed reader
+    /// that has seen everything pages after.
+    pub fn feed_position(&self) -> Result<u64> {
+        Ok(self
+            .db
+            .prepare_cached("SELECT COALESCE(MAX(seq),0) FROM events")?
+            .query_row([], |r| r.get(0))?)
+    }
     pub fn events_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Event)>> {
         ensure!(limit <= 4096, "FEED_BATCH_TOO_LARGE");
         let mut q = self

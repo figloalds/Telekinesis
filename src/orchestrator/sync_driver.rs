@@ -4,10 +4,14 @@
 //! `PeerService`'s.
 //!
 //! Threads (all end once the driver's [`Cancel`] fires; [`Driver::stop`]):
-//! * **scheduler** — every `sync_interval_ms`, for each paired peer with a
-//!   Ready control lane × each Running, unpaused folder, dispatches one
-//!   exchange per (peer, repo) to a pool of [`MAX_EXCHANGES`] exchange
-//!   threads (at most that many in flight overall). An exchange is
+//! * **scheduler** — looks at each paired peer with a Ready control lane × each
+//!   Running, unpaused folder when poked and every [`DUE_CHECK`] at most, and
+//!   dispatches an exchange for a (peer, repo) that is due, to a pool of
+//!   [`MAX_EXCHANGES`] exchange threads (at most that many in flight overall).
+//!   A pair is due when it is marked (a local change, a peer's metadata notify),
+//!   when its control session or worker is new, or when its poll elapsed:
+//!   `backup_poll_ms` on a session that gets notified, else `sync_interval_ms`.
+//!   A failed exchange polls again within the shorter of the two. An exchange is
 //!   `feed.outgoing {after: sent}` on the worker → `meta.exchange {repo}`
 //!   (`FeedRequest {after: received, events}`) on the peer's control lane →
 //!   `feed.apply` of the reply's events on the worker; then both cursors
@@ -37,16 +41,22 @@
 //!   next round. The pump never blocks the scheduler. After each pass it also
 //!   pushes ([`push`]), so a round runs: this side's demand, the listeners'
 //!   demand, background pull, background push. The background push stops
-//!   before its next call on a demand wake-up, as pass 2 does.
+//!   before its next call on a demand wake-up, as pass 2 does. The push steps
+//!   run only for a pair that is due, so an idle pair asks its listener nothing:
+//!   the demand step on a peer's demand notify, the background step on a local
+//!   change or an exchange that moved events, and both on the pair's poll. A
+//!   background step stays due until a page comes back empty.
 //! * **clock probes** — a short thread per probe, at most one per peer: at
 //!   every new control session (a Ready transition) and every
-//!   [`CLOCK_PROBE_EVERY`] scheduler rounds. The smoothed offset goes to the
+//!   [`CLOCK_PROBE_EVERY`] scheduler rounds. A round is one `sync_interval_ms`,
+//!   however often the scheduler is poked. The smoothed offset goes to the
 //!   catalog (`Catalog::set_clock`); one past `WARN_OFFSET_MS` logs
 //!   `CLOCK_OFFSET_LARGE`.
 use super::{
     catalog::Catalog,
+    config::SyncProfile,
     demand::Seq,
-    network::{Network, ReadyPeer},
+    network::{Network, NotifySink, ReadyPeer},
     push::{self, PushMode, PushState},
     sync::{FeedCursor, FeedPage, FeedReply, FeedRequest, Fetched, MAX_EXCLUDE},
     worker_client::{CALL_DEADLINE, WorkerLink},
@@ -54,9 +64,13 @@ use super::{
 use crate::{
     clock::{self, Offset, Sample, WARN_OFFSET_MS},
     content::Kind,
-    model::{content::Digest, orchestrator::CallError},
+    model::{
+        content::Digest,
+        orchestrator::CallError,
+        protocol::frame::{Notify, NotifyReason},
+    },
     session::{Conn, Priority},
-    util::{cancel::Cancel, lock::lock, log::event, time::now_ms},
+    util::{cancel::Cancel, fault, lock::lock, log::event, time::now_ms},
 };
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -94,11 +108,66 @@ const DEADLINE_STEP_BYTES: u64 = 256 * 1024;
 pub const UNAVAILABLE_FIRST: Duration = Duration::from_secs(5);
 /// …doubling each time to at most this.
 pub const UNAVAILABLE_MAX: Duration = Duration::from_secs(300);
+/// The scheduler looks for what came due at least this often, and so does the
+/// pump while a push step stays due: a new control session and a failed step
+/// send no poke.
+const DUE_CHECK: Duration = Duration::from_millis(500);
+/// Most marks kept per kind. A mark names a repo a paired peer chose, so it is
+/// bounded; past this one is not kept, and the pair's poll covers that.
+const MAX_MARKS: usize = 4096;
+/// Fault point: the background push steps do not run, so a test can hold bytes
+/// on this side until a reader on the other side asks for them.
+pub const FAULT_BACKGROUND_SKIP: &str = "sync.push.background.skip";
 /// A demanded digest just written is not fetched again for this long (the
 /// worker's demand list catches up at its next `watch`).
 const DEMAND_SUPPLIED: Duration = super::worker_client::WATCH_DEADLINE;
 
 pub(super) type Wanted = Vec<(Digest, Kind)>;
+
+/// How this orchestrator keeps its folders in sync.
+#[derive(Clone, Copy, Debug)]
+pub struct SyncPolicy {
+    pub profile: SyncProfile,
+    /// The poll of a session that gets no notify, and the length of a round.
+    pub interval: Duration,
+    /// The poll of a session that gets notified.
+    pub backup_poll: Duration,
+}
+
+impl SyncPolicy {
+    /// The poll of a session.
+    fn poll(&self, notify: bool) -> Duration {
+        if notify {
+            self.backup_poll
+        } else {
+            self.interval
+        }
+    }
+
+    /// The shorter poll: nothing comes due by time sooner than this.
+    fn shortest(&self) -> Duration {
+        self.interval.min(self.backup_poll)
+    }
+}
+
+/// (endpoint, repo).
+type Pair = (String, String);
+
+/// What is due before its poll says so.
+#[derive(Default)]
+struct Due {
+    exchange: BTreeSet<Pair>,
+    /// The demand push step.
+    demand: BTreeSet<Pair>,
+    /// The background push step.
+    background: BTreeSet<Pair>,
+}
+
+fn mark(marks: &mut BTreeSet<Pair>, pair: Pair) {
+    if marks.len() < MAX_MARKS {
+        marks.insert(pair);
+    }
+}
 
 /// The peer lanes the driver uses: the [`Network`] (tests stub it).
 pub trait Lanes: Send + Sync {
@@ -160,6 +229,8 @@ struct Slot {
     /// The peer control session the cursors were taken on.
     session: String,
     running: bool,
+    /// When its poll comes due.
+    next_poll: Option<Instant>,
 }
 
 /// One dispatched exchange.
@@ -203,6 +274,8 @@ struct PumpState {
     batch: BTreeMap<(String, String), usize>,
     /// The push steps' memory.
     push: PushState,
+    /// When each pair's push poll comes due; a pair not here is due.
+    polls: BTreeMap<Pair, Instant>,
 }
 
 /// A batch of `asked` objects timed out: half that, at least 1.
@@ -298,9 +371,13 @@ pub struct Driver {
     lanes: Arc<dyn Lanes>,
     catalog: Arc<Catalog>,
     folders: Arc<dyn SyncFolders>,
-    /// Bumped by folder watch threads when demand changes; wakes the pump.
+    /// Bumped by folder watch threads when demand changes, and by whatever
+    /// marks a push step due; wakes the pump.
     wake: Arc<Seq>,
-    interval: Duration,
+    /// Bumped by what marks an exchange due; wakes the scheduler.
+    poke: Arc<Seq>,
+    due: Mutex<Due>,
+    policy: SyncPolicy,
     cancel: Cancel,
     jobs: Mutex<BTreeMap<(String, String), Slot>>,
     busy: AtomicUsize,
@@ -319,10 +396,10 @@ pub fn start(
     catalog: Arc<Catalog>,
     folders: Arc<dyn SyncFolders>,
     wake: Arc<Seq>,
-    interval: Duration,
+    policy: SyncPolicy,
     cancel: Cancel,
 ) -> Result<Arc<Driver>> {
-    let driver = Driver::new(lanes, catalog, folders, wake, interval, cancel);
+    let driver = Driver::with_policy(lanes, catalog, folders, wake, policy, cancel);
     let (tasks, queue) = mpsc::channel::<Task>();
     let queue = Arc::new(Mutex::new(queue));
     let mut threads = Vec::new();
@@ -358,7 +435,8 @@ pub fn start(
 }
 
 impl Driver {
-    /// A driver with no threads yet (see [`start`]).
+    /// An active driver with no threads yet, polling every `interval`.
+    #[cfg(test)]
     fn new(
         lanes: Arc<dyn Lanes>,
         catalog: Arc<Catalog>,
@@ -367,12 +445,31 @@ impl Driver {
         interval: Duration,
         cancel: Cancel,
     ) -> Arc<Self> {
+        let policy = SyncPolicy {
+            profile: SyncProfile::Active,
+            interval,
+            backup_poll: interval,
+        };
+        Self::with_policy(lanes, catalog, folders, wake, policy, cancel)
+    }
+
+    /// A driver with no threads yet (see [`start`]).
+    fn with_policy(
+        lanes: Arc<dyn Lanes>,
+        catalog: Arc<Catalog>,
+        folders: Arc<dyn SyncFolders>,
+        wake: Arc<Seq>,
+        policy: SyncPolicy,
+        cancel: Cancel,
+    ) -> Arc<Self> {
         Arc::new(Driver {
             lanes,
             catalog,
             folders,
             wake,
-            interval,
+            poke: Seq::new(),
+            due: Mutex::new(Due::default()),
+            policy,
             cancel,
             jobs: Mutex::new(BTreeMap::new()),
             busy: AtomicUsize::new(0),
@@ -388,6 +485,7 @@ impl Driver {
     pub fn stop(&self, budget: Duration) {
         self.cancel.cancel();
         self.wake.bump();
+        self.poke.bump();
         let end = Instant::now() + budget;
         let threads = std::mem::take(&mut *lock(&self.threads));
         while Instant::now() < end && !threads.iter().all(JoinHandle::is_finished) {
@@ -419,25 +517,46 @@ impl Driver {
         Value::Object(map)
     }
 
+    /// `repo` changed on this side: every peer's pair of it is due.
+    pub fn local_change(&self, repo: &str) {
+        let peers = self.lanes.ready_peers();
+        {
+            let mut due = lock(&self.due);
+            for peer in &peers {
+                let pair = (peer.endpoint.clone(), repo.to_owned());
+                mark(&mut due.exchange, pair.clone());
+                mark(&mut due.background, pair);
+            }
+        }
+        self.poke.bump();
+        self.wake.bump();
+    }
+
     // ---- scheduler -------------------------------------------------------
 
     fn schedule(&self, tasks: Sender<Task>) {
-        let mut round: u64 = 0;
+        let look = self.policy.shortest().min(DUE_CHECK);
+        let (mut round, mut turn): (u64, u64) = (1, 0);
+        let mut next_round = Instant::now() + self.policy.interval;
         while !self.cancel.is_cancelled() {
-            round += 1;
+            let seen = self.poke.current();
+            let now = Instant::now();
+            if now >= next_round {
+                round += 1;
+                next_round = now + self.policy.interval;
+            }
+            turn += 1;
             let peers = self.lanes.ready_peers();
             self.probe_clocks(round, &peers);
-            self.dispatch(round, &peers, &tasks);
-            if self.cancel.sleep(self.interval) {
-                break;
-            }
+            self.dispatch(turn, &peers, &tasks);
+            self.poke.wait_past(seen, look);
         }
         // Dropping `tasks` ends the exchange threads once they are idle.
     }
 
-    /// Dispatches an exchange for every idle (peer, repo), within
-    /// [`MAX_EXCHANGES`]; the pairs are rotated each round so none starves.
-    fn dispatch(&self, round: u64, peers: &[ReadyPeer], tasks: &Sender<Task>) {
+    /// Dispatches an exchange for every idle (peer, repo) that is due, within
+    /// [`MAX_EXCHANGES`]; the pairs are rotated each `turn` so none starves.
+    fn dispatch(&self, turn: u64, peers: &[ReadyPeer], tasks: &Sender<Task>) {
         let folders = self.folders.syncing();
         let mut pairs: Vec<(&ReadyPeer, &SyncFolder)> = peers
             .iter()
@@ -446,8 +565,9 @@ impl Driver {
         if pairs.is_empty() {
             return;
         }
-        let turn = (round as usize) % pairs.len();
+        let turn = (turn as usize) % pairs.len();
         pairs.rotate_left(turn);
+        let now = Instant::now();
         let mut jobs = lock(&self.jobs);
         for (peer, folder) in pairs {
             if self.busy.load(Ordering::Acquire) >= MAX_EXCHANGES {
@@ -465,18 +585,25 @@ impl Driver {
                 link: Weak::new(),
                 session: String::new(),
                 running: false,
+                next_poll: None,
             });
             if slot.running {
                 continue;
             }
             // A restarted worker or a new control session: start over.
-            if !Weak::ptr_eq(&slot.link, &Arc::downgrade(&folder.link))
-                || slot.session != peer.session
-            {
+            let new = !Weak::ptr_eq(&slot.link, &Arc::downgrade(&folder.link))
+                || slot.session != peer.session;
+            if new {
                 slot.link = Arc::downgrade(&folder.link);
                 slot.session = peer.session.clone();
                 slot.job.cursor = FeedCursor::default();
             }
+            let polled = slot.next_poll.is_none_or(|at| at <= now);
+            let marked = lock(&self.due).exchange.remove(&key);
+            if !(new || polled || marked) {
+                continue;
+            }
+            slot.next_poll = Some(now + self.policy.poll(peer.notify));
             let task = Task {
                 key,
                 link: folder.link.clone(),
@@ -516,6 +643,12 @@ impl Driver {
     /// Records an exchange's outcome on its job, unless the job started over
     /// meanwhile.
     fn finish(&self, task: &Task, cursor: FeedCursor, result: Result<(), Failure>) {
+        self.record_finish(task, cursor, result);
+        // What came due while it ran, or waited for a free exchange.
+        self.poke.bump();
+    }
+
+    fn record_finish(&self, task: &Task, cursor: FeedCursor, result: Result<(), Failure>) {
         let mut jobs = lock(&self.jobs);
         self.busy.fetch_sub(1, Ordering::AcqRel);
         let Some(slot) = jobs.get_mut(&task.key) else {
@@ -529,6 +662,17 @@ impl Driver {
         }
         // Pages the peer and the worker both took stay taken.
         slot.job.cursor = cursor;
+        // Events moved: the objects they name may now be wanted, either way.
+        if cursor != task.cursor {
+            mark(&mut lock(&self.due).background, task.key.clone());
+            self.wake.bump();
+        }
+        // What this exchange carried is not across yet: no waiting for the
+        // backup poll.
+        if result.is_err() {
+            let retry = Instant::now() + self.policy.shortest();
+            slot.next_poll = Some(slot.next_poll.map_or(retry, |at| at.min(retry)));
+        }
         match result {
             Ok(()) => {
                 slot.job.last_exchange_ms = now_ms();
@@ -601,14 +745,92 @@ impl Driver {
             }
             if stored == 0 {
                 // Returns at once when a demand wake-up came meanwhile.
-                self.wake.wait_past(seen, self.interval);
+                self.wake.wait_past(seen, self.pump_wait());
             }
         }
     }
 
+    /// How long a round that stored nothing rests: until a poll may come due,
+    /// or [`DUE_CHECK`] while a push step of a syncing folder stays due. Marks
+    /// of a repo not synced here wait for it and do not keep the pump awake.
+    fn pump_wait(&self) -> Duration {
+        let repos: BTreeSet<String> = self
+            .folders
+            .syncing()
+            .into_iter()
+            .map(|folder| folder.repo)
+            .collect();
+        let due = lock(&self.due);
+        let pending = due
+            .demand
+            .iter()
+            .chain(&due.background)
+            .any(|(_, repo)| repos.contains(repo));
+        if pending {
+            self.policy.shortest().min(DUE_CHECK)
+        } else {
+            self.policy.shortest()
+        }
+    }
+
+    /// Marks both push steps due for the pairs whose poll came up, and drops
+    /// the marks of a peer with no Ready lane left. When it returns, its new
+    /// control session starts an exchange that moves events again.
+    fn mark_polls(
+        &self,
+        state: &mut PumpState,
+        endpoints: &[String],
+        peers: &[ReadyPeer],
+        folders: &[SyncFolder],
+    ) {
+        state
+            .polls
+            .retain(|(endpoint, _), _| endpoints.contains(endpoint));
+        let notified = |endpoint: &str| {
+            peers
+                .iter()
+                .any(|peer| peer.notify && peer.endpoint == endpoint)
+        };
+        let now = Instant::now();
+        let mut due = lock(&self.due);
+        let lanes = |endpoint: &String| {
+            endpoints.contains(endpoint) || peers.iter().any(|peer| peer.endpoint == *endpoint)
+        };
+        due.demand.retain(|(endpoint, _)| lanes(endpoint));
+        due.background.retain(|(endpoint, _)| lanes(endpoint));
+        for folder in folders {
+            for endpoint in endpoints {
+                let pair = (endpoint.clone(), folder.repo.clone());
+                if state.push.rests(&folder.id, endpoint, now)
+                    || state.polls.get(&pair).is_some_and(|at| *at > now)
+                {
+                    continue;
+                }
+                let poll = self.policy.poll(notified(endpoint));
+                state.polls.insert(pair.clone(), now + poll);
+                mark(&mut due.demand, pair.clone());
+                mark(&mut due.background, pair);
+            }
+        }
+    }
+
+    /// Whether `folder` to `endpoint` has its step in `marks` due and can run
+    /// it now. A pair at rest keeps its mark.
+    fn take_due(
+        &self,
+        state: &PumpState,
+        folder: &SyncFolder,
+        endpoint: &str,
+        marks: impl Fn(&mut Due) -> &mut BTreeSet<Pair>,
+    ) -> bool {
+        !state.push.rests(&folder.id, endpoint, Instant::now())
+            && marks(&mut lock(&self.due)).remove(&(endpoint.to_owned(), folder.repo.clone()))
+    }
+
     /// One round, in a fixed order. Pass 1 supplies every folder's pending
     /// demand, then the push pass serves the listeners' demand; pass 2 is the
-    /// background `objects.missing` work, then the background push. Both are
+    /// background `objects.missing` work, then the background push. The push
+    /// steps run only for the pairs that are due. Both background passes are
     /// abandoned before their next call as soon as the wake moves past `seen`
     /// (the next round starts with pass 1). Pull's rests hold back only the
     /// pull passes: a failure of one folder's fetch says nothing of another's
@@ -619,7 +841,9 @@ impl Driver {
         let round = state.round;
         state.resting.retain(|_, at| *at > round);
         let mut all = self.lanes.bulk_endpoints();
+        let peers = self.lanes.ready_peers();
         if all.is_empty() {
+            self.mark_polls(state, &all, &peers, &[]);
             return 0;
         }
         let turn = (round as usize) % all.len();
@@ -631,6 +855,7 @@ impl Driver {
         state.unavailable.retain(|id, _| syncing(id));
         state.scan.retain(|id, _| syncing(id));
         state.batch.retain(|(id, _), _| syncing(id));
+        self.mark_polls(state, &all, &peers, &folders);
         let now = Instant::now();
         state
             .supplied
@@ -649,14 +874,19 @@ impl Driver {
                 stored += self.supply(state, &endpoints, folder, demand, None).stored;
             }
         }
-        // What the listeners' readers wait for.
+        // What the listeners' readers wait for. A failure needs no mark: their
+        // notify repeats while they wait.
         for folder in &folders {
-            if self.cancel.is_cancelled() {
-                break;
+            for endpoint in &all {
+                if self.cancel.is_cancelled() {
+                    break;
+                }
+                if self.take_due(state, folder, endpoint, |due| &mut due.demand) {
+                    stored += self
+                        .push(state, endpoint, folder, PushMode::Demand, None)
+                        .pushed;
+                }
             }
-            stored += self
-                .push(state, &all, folder, PushMode::Demand, None)
-                .pushed;
         }
         // Pass 2: background prefetch. With every endpoint resting a page would
         // be passed over unasked.
@@ -684,24 +914,39 @@ impl Driver {
             }
         }
         // What the listeners lack.
+        if fault::hit(FAULT_BACKGROUND_SKIP).is_some() {
+            return stored;
+        }
         for folder in &folders {
-            if self.cancel.is_cancelled() || self.wake.current() != seen {
-                break;
-            }
-            let outcome = self.push(state, &all, folder, PushMode::Background, Some(seen));
-            stored += outcome.pushed;
-            if outcome.interrupted {
-                break;
+            for endpoint in &all {
+                if self.cancel.is_cancelled() || self.wake.current() != seen {
+                    return stored;
+                }
+                if !self.take_due(state, folder, endpoint, |due| &mut due.background) {
+                    continue;
+                }
+                let outcome = self.push(state, endpoint, folder, PushMode::Background, Some(seen));
+                stored += outcome.pushed;
+                // A page that listed something is not done. A listing that
+                // failed lists nothing: it waits for the pair's next trigger, so
+                // a hung listener does not hold this pump again at once.
+                if outcome.interrupted || outcome.pushed + outcome.remaining > 0 {
+                    let pair = (endpoint.clone(), folder.repo.clone());
+                    mark(&mut lock(&self.due).background, pair);
+                }
+                if outcome.interrupted {
+                    return stored;
+                }
             }
         }
         stored
     }
 
-    /// A push step of `folder`.
+    /// A push step of `folder` to `endpoint`.
     fn push(
         &self,
         state: &mut PumpState,
-        endpoints: &[String],
+        endpoint: &String,
         folder: &SyncFolder,
         mode: PushMode,
         interrupt: Option<u64>,
@@ -709,7 +954,7 @@ impl Driver {
         push::run(
             self.lanes.as_ref(),
             &mut state.push,
-            endpoints,
+            std::slice::from_ref(endpoint),
             folder,
             mode,
             interrupt.map(|seen| (self.wake.as_ref(), seen)),
@@ -927,6 +1172,23 @@ impl Driver {
             }
         }
         result
+    }
+}
+
+impl NotifySink for Driver {
+    /// Runs on the lane's I/O thread: only marks and bumps.
+    fn notified(&self, endpoint: &str, notify: &Notify) {
+        let pair = (endpoint.to_owned(), notify.repo.clone());
+        match notify.reason {
+            NotifyReason::Metadata => {
+                mark(&mut lock(&self.due).exchange, pair);
+                self.poke.bump();
+            }
+            NotifyReason::Demand => {
+                mark(&mut lock(&self.due).demand, pair);
+                self.wake.bump();
+            }
+        }
     }
 }
 
@@ -1634,7 +1896,7 @@ mod tests {
             Catalog::open(root.path()).unwrap(),
             folders.clone(),
             wake.clone(),
-            Duration::from_millis(50),
+            active(Duration::from_millis(50), Duration::from_millis(50)),
             Cancel::new(),
         )
         .unwrap();
@@ -2680,5 +2942,569 @@ mod tests {
             push_peer(&mut state, &folder).scan.as_deref(),
             Some(OBJECT_BATCH.to_string().as_str())
         );
+    }
+
+    // ---- what is due -----------------------------------------------------
+
+    const HOUR: Duration = Duration::from_secs(3600);
+    /// Longer than the [`SHORT`] interval, by a margin no scheduler hiccup in
+    /// these tests needs to beat: nothing here waits for an exact moment.
+    const PAST_SHORT: Duration = Duration::from_millis(40);
+    const SHORT: Duration = Duration::from_millis(10);
+
+    fn active(interval: Duration, backup_poll: Duration) -> SyncPolicy {
+        SyncPolicy {
+            profile: SyncProfile::Active,
+            interval,
+            backup_poll,
+        }
+    }
+
+    /// A control lane no test sends anything on.
+    fn idle_control() -> Conn {
+        let (client, server) = served(Arc::new(SkewedPeer {
+            skew_ms: Mutex::new(0),
+        }));
+        std::mem::forget(server);
+        client
+    }
+
+    fn ready_peer(endpoint: &str, session: &str, notify: bool, control: &Conn) -> ReadyPeer {
+        ReadyPeer {
+            endpoint: endpoint.into(),
+            installation: "peer-b".into(),
+            session: session.into(),
+            control: control.clone(),
+            notify,
+        }
+    }
+
+    /// The (endpoint, session, notify) peers with a Ready control lane, and one
+    /// bulk lane all of them use.
+    struct ReadyLanes {
+        peers: Vec<(String, String, bool)>,
+        control: Conn,
+        bulk: Option<Conn>,
+    }
+
+    impl ReadyLanes {
+        fn one(notify: bool, bulk: Conn) -> Self {
+            Self {
+                peers: vec![(ENDPOINT.into(), "control".into(), notify)],
+                control: idle_control(),
+                bulk: Some(bulk),
+            }
+        }
+    }
+
+    impl Lanes for ReadyLanes {
+        fn ready_peers(&self) -> Vec<ReadyPeer> {
+            self.peers
+                .iter()
+                .map(|(endpoint, session, notify)| {
+                    ready_peer(endpoint, session, *notify, &self.control)
+                })
+                .collect()
+        }
+        fn bulk_endpoints(&self) -> Vec<String> {
+            self.bulk
+                .iter()
+                .flat_map(|_| self.peers.iter().map(|(endpoint, _, _)| endpoint.clone()))
+                .collect()
+        }
+        fn bulk_lane(&self, _: &str, _: &Digest) -> Option<Conn> {
+            self.bulk.clone()
+        }
+        fn any_bulk_lane(&self, _: &str) -> Option<Conn> {
+            self.bulk.clone()
+        }
+    }
+
+    fn policy_driver(
+        lanes: impl Lanes + 'static,
+        repos: &[&str],
+        policy: SyncPolicy,
+    ) -> (Arc<Driver>, tempfile::TempDir) {
+        let folders = repos
+            .iter()
+            .map(|repo| {
+                let fake = Arc::new(FakeFolder::default());
+                ((*repo).to_owned(), fake_worker(fake), Vec::new())
+            })
+            .collect();
+        let root = tempfile::tempdir().unwrap();
+        let driver = Driver::with_policy(
+            Arc::new(lanes),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(folders)),
+            Seq::new(),
+            policy,
+            Cancel::new(),
+        );
+        (driver, root)
+    }
+
+    /// One dispatch: the pairs it started, each finished with nothing moved.
+    fn dispatched(driver: &Driver, peers: &[ReadyPeer]) -> Vec<Pair> {
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, peers, &tasks);
+        let mut pairs: Vec<Pair> = queue
+            .try_iter()
+            .map(|task| {
+                driver.finish(&task, task.cursor, Ok(()));
+                task.key
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    fn pair(endpoint: &str, repo: &str) -> Pair {
+        (endpoint.to_owned(), repo.to_owned())
+    }
+
+    fn metadata(repo: &str) -> Notify {
+        Notify {
+            repo: repo.into(),
+            reason: NotifyReason::Metadata,
+        }
+    }
+
+    fn demand_of(repo: &str) -> Notify {
+        Notify {
+            repo: repo.into(),
+            reason: NotifyReason::Demand,
+        }
+    }
+
+    /// A driver of one repo with no bulk lane, for what `dispatch` does.
+    fn dispatching(policy: SyncPolicy) -> (Arc<Driver>, tempfile::TempDir, Conn) {
+        let control = idle_control();
+        let lanes = ReadyLanes {
+            peers: Vec::new(),
+            control: control.clone(),
+            bulk: None,
+        };
+        let (driver, root) = policy_driver(lanes, &["repo-1"], policy);
+        (driver, root, control)
+    }
+
+    #[test]
+    fn a_notify_session_waits_for_the_backup_poll_when_nothing_changed() {
+        let (driver, _root, control) = dispatching(active(SHORT, HOUR));
+        let peers = [ready_peer(ENDPOINT, "control", true, &control)];
+        // New: due once.
+        assert_eq!(dispatched(&driver, &peers), [pair(ENDPOINT, "repo-1")]);
+        assert!(dispatched(&driver, &peers).is_empty());
+        // The sync interval passing is not its poll.
+        thread::sleep(PAST_SHORT);
+        assert!(dispatched(&driver, &peers).is_empty());
+        // The backup poll is.
+        let key = pair(ENDPOINT, "repo-1");
+        lock(&driver.jobs).get_mut(&key).unwrap().next_poll = Some(Instant::now());
+        assert_eq!(dispatched(&driver, &peers), [pair(ENDPOINT, "repo-1")]);
+        assert!(dispatched(&driver, &peers).is_empty());
+    }
+
+    #[test]
+    fn a_session_without_notify_keeps_the_sync_interval() {
+        let (driver, _root, control) = dispatching(active(SHORT, HOUR));
+        let peers = [ready_peer(ENDPOINT, "control", false, &control)];
+        assert_eq!(dispatched(&driver, &peers).len(), 1);
+        thread::sleep(PAST_SHORT);
+        assert_eq!(dispatched(&driver, &peers).len(), 1);
+        thread::sleep(PAST_SHORT);
+        assert_eq!(dispatched(&driver, &peers).len(), 1);
+    }
+
+    #[test]
+    fn a_notify_marks_only_its_peer_and_repo_due() {
+        let control = idle_control();
+        let lanes = ReadyLanes {
+            peers: Vec::new(),
+            control: control.clone(),
+            bulk: None,
+        };
+        let (driver, _root) = policy_driver(lanes, &["repo-1", "repo-2"], active(HOUR, HOUR));
+        let peers = [
+            ready_peer("ws://one", "control-1", true, &control),
+            ready_peer("ws://two", "control-2", true, &control),
+        ];
+        assert_eq!(dispatched(&driver, &peers).len(), 4);
+        assert!(dispatched(&driver, &peers).is_empty());
+
+        let (poke, wake) = (driver.poke.current(), driver.wake.current());
+        driver.notified("ws://one", &metadata("repo-2"));
+        assert!(driver.poke.current() > poke);
+        assert_eq!(driver.wake.current(), wake);
+        assert_eq!(dispatched(&driver, &peers), [pair("ws://one", "repo-2")]);
+        assert!(dispatched(&driver, &peers).is_empty());
+
+        // Demand is the pump's business, not the scheduler's.
+        driver.notified("ws://two", &demand_of("repo-1"));
+        assert!(driver.wake.current() > wake);
+        assert!(dispatched(&driver, &peers).is_empty());
+        let due = lock(&driver.due);
+        assert_eq!(
+            due.demand.iter().cloned().collect::<Vec<_>>(),
+            [pair("ws://two", "repo-1")]
+        );
+        assert!(due.background.is_empty());
+    }
+
+    #[test]
+    fn a_new_control_session_is_always_due() {
+        let (driver, _root, control) = dispatching(active(HOUR, HOUR));
+        let first = [ready_peer(ENDPOINT, "control", true, &control)];
+        assert_eq!(dispatched(&driver, &first).len(), 1);
+        let key = pair(ENDPOINT, "repo-1");
+        lock(&driver.jobs).get_mut(&key).unwrap().job.cursor = FeedCursor {
+            sent: 5,
+            received: 7,
+        };
+        assert!(dispatched(&driver, &first).is_empty());
+        // The lanes came back: due, from the start.
+        let second = [ready_peer(ENDPOINT, "control-again", true, &control)];
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &second, &tasks);
+        let task = queue.try_recv().expect("the new session was not due");
+        assert_eq!(task.cursor, FeedCursor::default());
+        driver.finish(&task, task.cursor, Ok(()));
+        assert!(dispatched(&driver, &second).is_empty());
+    }
+
+    #[test]
+    fn a_mark_that_finds_the_pair_busy_or_away_waits_for_it() {
+        let (driver, _root, control) = dispatching(active(HOUR, HOUR));
+        let peers = [ready_peer(ENDPOINT, "control", true, &control)];
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        // It arrives during the exchange: the exchange may be past it already.
+        driver.notified(ENDPOINT, &metadata("repo-1"));
+        driver.dispatch(1, &peers, &tasks);
+        assert!(queue.try_recv().is_err());
+        let poke = driver.poke.current();
+        driver.finish(&task, task.cursor, Ok(()));
+        assert!(driver.poke.current() > poke);
+        assert_eq!(dispatched(&driver, &peers).len(), 1);
+        // It arrives with no Ready peer: the next one to show up is told.
+        driver.notified(ENDPOINT, &metadata("repo-1"));
+        assert!(dispatched(&driver, &[]).is_empty());
+        assert_eq!(dispatched(&driver, &peers).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_exchange_does_not_wait_for_the_backup_poll() {
+        let (driver, _root, control) = dispatching(active(SHORT, HOUR));
+        let peers = [ready_peer(ENDPOINT, "control", true, &control)];
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        driver.finish(&task, task.cursor, Err(Failure::LaneLost));
+        thread::sleep(PAST_SHORT);
+        assert_eq!(dispatched(&driver, &peers).len(), 1);
+        // Once it works the backup poll applies again.
+        thread::sleep(PAST_SHORT);
+        assert!(dispatched(&driver, &peers).is_empty());
+    }
+
+    #[test]
+    fn a_local_change_marks_that_repo_for_every_peer() {
+        let control = idle_control();
+        let lanes = ReadyLanes {
+            peers: vec![
+                ("ws://one".into(), "control-1".into(), true),
+                ("ws://two".into(), "control-2".into(), true),
+            ],
+            control: control.clone(),
+            bulk: None,
+        };
+        let peers = lanes.ready_peers();
+        let (driver, _root) = policy_driver(lanes, &["repo-1", "repo-2"], active(HOUR, HOUR));
+        assert_eq!(dispatched(&driver, &peers).len(), 4);
+        let (poke, wake) = (driver.poke.current(), driver.wake.current());
+        driver.local_change("repo-1");
+        assert!(driver.poke.current() > poke);
+        assert!(driver.wake.current() > wake);
+        let expected = [pair("ws://one", "repo-1"), pair("ws://two", "repo-1")];
+        assert_eq!(dispatched(&driver, &peers), expected);
+        assert_eq!(
+            lock(&driver.due)
+                .background
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    /// One pump round, and the listener's calls it made.
+    fn calls_of_round(driver: &Driver, state: &mut PumpState, listener: &Listener) -> Vec<String> {
+        let before = listener.calls().len();
+        driver.pump_round(state, driver.wake.current());
+        listener.calls()[before..].to_vec()
+    }
+
+    /// A driver of one repo over a bulk lane to `listener`.
+    fn pushing_driver(
+        listener: &Arc<Listener>,
+        notify: bool,
+        policy: SyncPolicy,
+    ) -> (Arc<Driver>, tempfile::TempDir) {
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        policy_driver(ReadyLanes::one(notify, bulk), &["repo-1"], policy)
+    }
+
+    #[test]
+    fn an_idle_pair_asks_nothing_until_something_marks_it_due() {
+        let listener = Arc::new(Listener::default());
+        let (driver, _root) = pushing_driver(&listener, true, active(SHORT, HOUR));
+        let mut state = PumpState::default();
+        // New: its first poll.
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/0", "wanted/32"]
+        );
+        // Idle, past the sync interval: nothing.
+        for _ in 0..3 {
+            thread::sleep(PAST_SHORT);
+            assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        }
+        // A metadata notify is for the scheduler.
+        driver.notified(ENDPOINT, &metadata("repo-1"));
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        // A demand notify runs only the demand step.
+        driver.notified(ENDPOINT, &demand_of("repo-1"));
+        assert_eq!(calls_of_round(&driver, &mut state, &listener), ["wanted/0"]);
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        // A local change runs only the background step.
+        driver.local_change("repo-1");
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/32"]
+        );
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        // So does an exchange, once it moved events.
+        let peers = driver.lanes.ready_peers();
+        lock(&driver.due).exchange.insert(pair(ENDPOINT, "repo-1"));
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        driver.finish(&task, task.cursor, Ok(()));
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        lock(&driver.due).exchange.insert(pair(ENDPOINT, "repo-1"));
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        let wake = driver.wake.current();
+        let moved = FeedCursor {
+            sent: task.cursor.sent + 1,
+            ..task.cursor
+        };
+        driver.finish(&task, moved, Ok(()));
+        assert!(driver.wake.current() > wake);
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/32"]
+        );
+        // And its poll runs both.
+        state.polls.insert(pair(ENDPOINT, "repo-1"), Instant::now());
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/0", "wanted/32"]
+        );
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+    }
+
+    #[test]
+    fn a_session_without_notify_keeps_the_sync_interval_for_its_pushes_too() {
+        let listener = Arc::new(Listener::default());
+        let (driver, _root) = pushing_driver(&listener, false, active(SHORT, HOUR));
+        let mut state = PumpState::default();
+        assert_eq!(calls_of_round(&driver, &mut state, &listener).len(), 2);
+        thread::sleep(PAST_SHORT);
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/0", "wanted/32"]
+        );
+    }
+
+    #[test]
+    fn a_pair_stays_due_until_a_page_lists_nothing() {
+        // This side lacks what is listed: it goes in the next listing's exclude.
+        let lacked = objects("lacked", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&lacked),
+            ..Listener::default()
+        });
+        let (driver, _root) = pushing_driver(&listener, true, active(HOUR, HOUR));
+        let mut state = PumpState::default();
+        assert_eq!(calls_of_round(&driver, &mut state, &listener).len(), 2);
+        assert!(
+            lock(&driver.due)
+                .background
+                .contains(&pair(ENDPOINT, "repo-1"))
+        );
+        assert_eq!(driver.pump_wait(), DUE_CHECK);
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/32"]
+        );
+        assert!(lock(&driver.due).background.is_empty());
+        assert_eq!(driver.pump_wait(), HOUR);
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+    }
+
+    #[test]
+    fn a_listing_that_failed_waits_for_the_next_trigger() {
+        let listener = Arc::new(Listener {
+            unpublished: Some("repo-1".into()),
+            ..Listener::default()
+        });
+        let (driver, _root) = pushing_driver(&listener, true, active(HOUR, HOUR));
+        let mut state = PumpState::default();
+        let key = ("repo-1".to_owned(), ENDPOINT.to_owned());
+        // The demand step fails and rests the pair: the background step keeps
+        // its mark, and nothing is asked until the rest ends.
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["objects.wanted"]
+        );
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        assert!(!lock(&driver.due).background.is_empty());
+        // Then it fails too, and that ends it: no page, nothing left to do.
+        state.push.peers.get_mut(&key).unwrap().rest_until = None;
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["objects.wanted"]
+        );
+        assert!(lock(&driver.due).background.is_empty());
+        state.push.peers.get_mut(&key).unwrap().rest_until = None;
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        // Until something marks it due again.
+        driver.local_change("repo-1");
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["objects.wanted"]
+        );
+    }
+
+    /// A driver of one repo whose worker is `fake`, over a bulk lane to
+    /// `listener` of a notified session, that never polls again.
+    fn holding_driver(
+        listener: &Arc<Listener>,
+        fake: FakeFolder,
+        wake: Arc<Seq>,
+    ) -> (Arc<Driver>, tempfile::TempDir) {
+        let root = tempfile::tempdir().unwrap();
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let driver = Driver::with_policy(
+            Arc::new(ReadyLanes::one(true, bulk)),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".into(),
+                fake_worker(Arc::new(fake)),
+                Vec::new(),
+            )])),
+            wake,
+            active(HOUR, HOUR),
+            Cancel::new(),
+        );
+        (driver, root)
+    }
+
+    fn background_due(driver: &Driver) -> bool {
+        lock(&driver.due)
+            .background
+            .contains(&pair(ENDPOINT, "repo-1"))
+    }
+
+    #[test]
+    fn a_store_that_failed_stays_due_and_waits_out_its_rest() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            stall_above: Some(0),
+            ..Listener::default()
+        });
+        let fake = FakeFolder {
+            held: all,
+            ..FakeFolder::default()
+        };
+        let (driver, _root) = holding_driver(&listener, fake, Seq::new());
+        let mut state = PumpState::default();
+        state.push.deadline = |_| Duration::from_millis(100);
+        // The store outlasts its deadline: what it held stays to do.
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/0", "wanted/32", "store"]
+        );
+        assert!(background_due(&driver));
+        // While the endpoint rests the mark waits.
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        assert!(background_due(&driver));
+        // A wake that already moved stops the step before it takes its mark.
+        state.push.resting.clear();
+        let before = listener.calls().len();
+        driver.pump_round(&mut state, driver.wake.current().wrapping_add(1));
+        assert_eq!(listener.calls().len(), before);
+        assert!(background_due(&driver));
+    }
+
+    #[test]
+    fn a_pass_a_wake_stopped_stays_due() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let wake = Seq::new();
+        let fake = FakeFolder {
+            held: all,
+            wake_on_read: Some(wake.clone()),
+            ..FakeFolder::default()
+        };
+        let (driver, _root) = holding_driver(&listener, fake, wake);
+        let mut state = PumpState::default();
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/0", "wanted/32"]
+        );
+        assert!(background_due(&driver));
+    }
+
+    #[test]
+    fn a_mark_of_a_repo_not_here_does_not_keep_the_pump_awake() {
+        let listener = Arc::new(Listener::default());
+        let (driver, _root) = pushing_driver(&listener, true, active(HOUR, HOUR));
+        driver.notified(ENDPOINT, &demand_of("repo-elsewhere"));
+        assert_eq!(driver.pump_wait(), HOUR);
+        driver.notified(ENDPOINT, &demand_of("repo-1"));
+        assert_eq!(driver.pump_wait(), DUE_CHECK);
+    }
+
+    #[test]
+    fn the_marks_a_peer_can_cause_are_bounded() {
+        let (driver, _root, _control) = dispatching(active(HOUR, HOUR));
+        for index in 0..MAX_MARKS + 10 {
+            driver.notified(ENDPOINT, &metadata(&format!("repo-{index}")));
+        }
+        assert_eq!(lock(&driver.due).exchange.len(), MAX_MARKS);
+    }
+
+    #[test]
+    fn the_marks_of_a_peer_with_no_lane_left_are_dropped() {
+        let listener = Arc::new(Listener::default());
+        let (driver, _root) = pushing_driver(&listener, true, active(HOUR, HOUR));
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        driver.notified("ws://gone", &demand_of("repo-1"));
+        lock(&driver.due)
+            .background
+            .insert(pair("ws://gone", "repo-1"));
+        driver.pump_round(&mut state, driver.wake.current());
+        let due = lock(&driver.due);
+        assert!(due.demand.is_empty());
+        assert!(due.background.is_empty());
     }
 }

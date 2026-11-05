@@ -11,7 +11,10 @@
 //!   worker (`kill_verified`) and counts as a failure. The watch thread
 //!   also keeps the worker's latest object demand ([`Controller::demand`])
 //!   and, when it changes to a non-empty set, bumps the wake the sync
-//!   driver's object pump sleeps on ([`Controller::with_wake`]).
+//!   driver's object pump sleeps on ([`Controller::with_wake`]). It tells the
+//!   peers what they need to know ([`FolderSignals`]): the worker's feed moved,
+//!   or its readers are blocked. A reader's wait is shorter than the backup
+//!   poll, so that one is repeated while it lasts.
 //! * Failures (an exit while starting or running, a lost heartbeat, a failed
 //!   connect, spawn or adoption, no Ready line in time) back off by
 //!   [`backoff_delay`]; [`BREAKER_FAILURES`] within [`BREAKER_WINDOW`] trip
@@ -75,6 +78,9 @@ const WATCH_RETRY: Duration = Duration::from_millis(500);
 const DEMAND_POLL: Duration = Duration::from_millis(100);
 /// `stop` re-reads the clock at least this often while waiting for an exit.
 const STOP_POLL: Duration = Duration::from_millis(50);
+/// While the same demand stays pending, peers are told again this often, so
+/// that losing one hint costs a blocked reader a short delay and not its read.
+const DEMAND_NOTIFY_EVERY: Duration = Duration::from_secs(2);
 
 /// The backoff after `attempt` failures in a row: `1 s · 2^(attempt−1)`
 /// capped at [`BACKOFF_CAP`], then `× (1 + jitter)` with `jitter` clamped to
@@ -172,6 +178,58 @@ impl Launcher for RealLauncher {
     }
 }
 
+/// What a folder's peers should hear about, as its watch thread finds it. The
+/// calls run on that thread: they must not wait for long.
+pub trait FolderSignals: Send + Sync {
+    /// The worker's feed moved: local events to exchange.
+    fn changed(&self, repo: &str);
+    /// The worker's readers are blocked on objects it lacks.
+    fn demanding(&self, repo: &str);
+}
+
+/// Who a watch thread tells about a folder of `repo`.
+struct Listeners {
+    repo: String,
+    wake: Option<Arc<Seq>>,
+    signals: Option<Arc<dyn FolderSignals>>,
+}
+
+impl Listeners {
+    /// Tells `signals` about one `watch` reply. `feed` is the position last
+    /// seen (`None`: this is the first reply, which only sets it), `told` when
+    /// demand was last told. Compares `feed`, because the heartbeat moves `seq`
+    /// every second and must not cause an exchange.
+    fn watched(
+        &self,
+        watch: &Watch,
+        demand_changed: bool,
+        feed: &mut Option<u64>,
+        told: &mut Option<Instant>,
+    ) {
+        let moved = feed.is_some_and(|last| watch.feed > last);
+        *feed = Some(watch.feed);
+        if watch.demand.is_empty() {
+            *told = None;
+        }
+        let Some(signals) = &self.signals else {
+            return;
+        };
+        if moved {
+            signals.changed(&self.repo);
+        }
+        if !watch.demand.is_empty()
+            && (demand_changed || told.is_none_or(|at| at.elapsed() >= DEMAND_NOTIFY_EVERY))
+        {
+            *told = Some(Instant::now());
+            signals.demanding(&self.repo);
+            // This side's pump retries too: its next round may be far off.
+            if !demand_changed && let Some(wake) = &self.wake {
+                wake.bump();
+            }
+        }
+    }
+}
+
 /// The background long poll of one running worker.
 struct WatchThread {
     results: Receiver<Result<Watch, CallError>>,
@@ -181,11 +239,11 @@ struct WatchThread {
 impl WatchThread {
     /// Loops `link.watch(after)` and sends every result; ends once the stop
     /// flag is set, the link is closed or the receiver is gone. Each result's
-    /// demand replaces `demand`; a change to a non-empty set bumps `wake`.
+    /// demand replaces `demand`; a change to a non-empty set bumps the wake.
     fn start(
         link: Arc<WorkerLink>,
         demand: Arc<Mutex<Vec<(Digest, Kind)>>>,
-        wake: Option<Arc<Seq>>,
+        listeners: Listeners,
     ) -> std::io::Result<Self> {
         let (sender, results) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
@@ -194,20 +252,27 @@ impl WatchThread {
             .name("tkfs-folder-watch".into())
             .spawn(move || {
                 let mut after = 0;
+                let (mut feed, mut told) = (None, None);
                 while !stopped.load(Ordering::Acquire) {
                     let result = link.watch(after);
                     let failed = result.is_err();
                     let mut idle_demand = false;
                     if let Ok(watch) = &result {
-                        let mut current = lock(&demand);
-                        let changed = *current != watch.demand;
-                        idle_demand = !watch.demand.is_empty() && watch.seq == after && !changed;
-                        if changed {
-                            current.clone_from(&watch.demand);
-                            if let (false, Some(wake)) = (current.is_empty(), &wake) {
-                                wake.bump();
+                        let changed = {
+                            let mut current = lock(&demand);
+                            let changed = *current != watch.demand;
+                            if changed {
+                                current.clone_from(&watch.demand);
                             }
+                            changed
+                        };
+                        idle_demand = !watch.demand.is_empty() && watch.seq == after && !changed;
+                        if let (true, false, Some(wake)) =
+                            (changed, watch.demand.is_empty(), &listeners.wake)
+                        {
+                            wake.bump();
                         }
+                        listeners.watched(watch, changed, &mut feed, &mut told);
                         after = watch.seq;
                     }
                     if sender.send(result).is_err() || (failed && !link.alive()) {
@@ -255,6 +320,8 @@ pub struct Controller {
     demand: Arc<Mutex<Vec<(Digest, Kind)>>>,
     /// Bumped when that demand changes to a non-empty set.
     wake: Option<Arc<Seq>>,
+    /// Told when the worker's feed moves or its readers are blocked.
+    signals: Option<Arc<dyn FolderSignals>>,
     last_beat: Instant,
     watch_errors: u32,
     /// When the current Starting or Running phase began.
@@ -293,6 +360,7 @@ impl Controller {
             heartbeat: None,
             demand: Arc::new(Mutex::new(Vec::new())),
             wake: None,
+            signals: None,
             last_beat: now,
             watch_errors: 0,
             phase_start: now,
@@ -313,6 +381,13 @@ impl Controller {
     /// (the sync driver's object pump sleeps on it).
     pub fn with_wake(mut self, wake: Arc<Seq>) -> Self {
         self.wake = Some(wake);
+        self
+    }
+
+    /// Tells `signals` when the worker's feed moves and while its readers are
+    /// blocked.
+    pub fn with_signals(mut self, signals: Arc<dyn FolderSignals>) -> Self {
+        self.signals = Some(signals);
         self
     }
 
@@ -657,8 +732,12 @@ impl Controller {
         self.last_beat = now;
         self.watch_errors = 0;
         // Without a watch thread the probe still runs every HEARTBEAT_LOST.
-        self.watch = match WatchThread::start(link.clone(), self.demand.clone(), self.wake.clone())
-        {
+        let listeners = Listeners {
+            repo: self.record.repo.clone(),
+            wake: self.wake.clone(),
+            signals: self.signals.clone(),
+        };
+        self.watch = match WatchThread::start(link.clone(), self.demand.clone(), listeners) {
             Ok(watch) => Some(watch),
             Err(error) => {
                 event!(error, FOLDER_WATCH_START_FAILED, {
@@ -1120,7 +1199,12 @@ mod tests {
         let link = WorkerLink::connect(&ready(&address, PID), 1).unwrap();
         let demand = Arc::new(Mutex::new(Vec::new()));
         let wake = Seq::new();
-        let watch = WatchThread::start(link.clone(), demand.clone(), Some(wake.clone())).unwrap();
+        let listeners = Listeners {
+            repo: "repo-1".into(),
+            wake: Some(wake.clone()),
+            signals: None,
+        };
+        let watch = WatchThread::start(link.clone(), demand.clone(), listeners).unwrap();
         assert_eq!(wake.wait_past(0, Duration::from_secs(5)), 1);
         assert_eq!(*lock(&demand), wanted);
         // The same demand again: no further wake, and the thread paces its
@@ -1131,6 +1215,107 @@ mod tests {
         assert!((2..=12).contains(&count), "{count} watches in 600 ms");
         drop(watch);
         link.close();
+    }
+
+    /// What a folder's signals were told.
+    #[derive(Default)]
+    struct Told {
+        changed: Mutex<Vec<String>>,
+        demanding: Mutex<Vec<String>>,
+    }
+
+    impl FolderSignals for Told {
+        fn changed(&self, repo: &str) {
+            lock(&self.changed).push(repo.to_owned());
+        }
+        fn demanding(&self, repo: &str) {
+            lock(&self.demanding).push(repo.to_owned());
+        }
+    }
+
+    fn watch_reply(seq: u64, feed: u64, demand: Vec<(Digest, Kind)>) -> Watch {
+        Watch {
+            seq,
+            feed,
+            heartbeat: Value::Null,
+            demand,
+        }
+    }
+
+    fn told_listeners() -> (Arc<Told>, Listeners, Arc<Seq>) {
+        let told = Arc::new(Told::default());
+        let wake = Seq::new();
+        let listeners = Listeners {
+            repo: "repo-1".into(),
+            wake: Some(wake.clone()),
+            signals: Some(told.clone()),
+        };
+        (told, listeners, wake)
+    }
+
+    #[test]
+    fn only_the_feed_moving_signals_a_change_not_a_heartbeat() {
+        let (told, listeners, _wake) = told_listeners();
+        let (mut feed, mut demand_told) = (None, None);
+        let mut watched = |seq, position| {
+            listeners.watched(
+                &watch_reply(seq, position, vec![]),
+                false,
+                &mut feed,
+                &mut demand_told,
+            )
+        };
+        // The first reply only sets where the feed stands.
+        watched(1, 7);
+        assert!(lock(&told.changed).is_empty());
+        // Heartbeats: `seq` moves, `feed` does not.
+        for seq in 2..10 {
+            watched(seq, 7);
+        }
+        assert!(lock(&told.changed).is_empty());
+        assert!(lock(&told.demanding).is_empty());
+        // One local change: told once, whatever `seq` does next.
+        watched(10, 8);
+        assert_eq!(*lock(&told.changed), ["repo-1"]);
+        watched(11, 8);
+        assert_eq!(lock(&told.changed).len(), 1);
+    }
+
+    #[test]
+    fn demand_is_told_at_once_on_any_change_and_repeated_while_it_lasts() {
+        let (told, listeners, wake) = told_listeners();
+        let (mut feed, mut demand_told) = (None, None);
+        let first = vec![(Digest::bytes(b"first"), Kind::Chunk)];
+        let second = vec![(Digest::bytes(b"second"), Kind::Chunk)];
+        let count = || lock(&told.demanding).len();
+        let mut watched = |demand: &[(Digest, Kind)], changed, told: &mut Option<Instant>| {
+            listeners.watched(
+                &watch_reply(1, 0, demand.to_vec()),
+                changed,
+                &mut feed,
+                told,
+            )
+        };
+        watched(&first, true, &mut demand_told);
+        assert_eq!(count(), 1);
+        // The same demand a moment later: not yet.
+        watched(&first, false, &mut demand_told);
+        assert_eq!(count(), 1);
+        // Another digest is told at once: a reader goes from chunk to chunk.
+        watched(&second, true, &mut demand_told);
+        assert_eq!(count(), 2);
+        // Past the period it is told again, and this side's pump is woken too.
+        let woken = wake.current();
+        demand_told = Instant::now().checked_sub(DEMAND_NOTIFY_EVERY);
+        watched(&second, false, &mut demand_told);
+        assert_eq!(count(), 3);
+        assert_eq!(wake.current(), woken + 1);
+        // Once it is gone, new demand counts as new.
+        watched(&[], true, &mut demand_told);
+        assert_eq!(demand_told, None);
+        assert_eq!(count(), 3);
+        watched(&second, false, &mut demand_told);
+        assert_eq!(count(), 4);
     }
 
     #[test]

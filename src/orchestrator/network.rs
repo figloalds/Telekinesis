@@ -22,6 +22,12 @@
 //! is served by a [`PeerService`] and kept so a pairing-code reset can send
 //! it `GOAWAY{PAIRING_CODE_CHANGED}` and shutdown can close it.
 //!
+//! **Notify.** [`Network::notify`] hints to the paired dialers on inbound
+//! control sessions that asked for it that a repo changed or wants objects. On
+//! this side's outbound control lanes, what the listener hints goes to the
+//! [`NotifySink`]. A hint may be lost: the dialer's backup poll, and the
+//! repeated demand notify, cover that.
+//!
 //! **Pairing.** `pair` dials a probe lane with the code, enrolls a fresh
 //! secret (`peer.enroll`, header `{"endpoint": advertise}`, `null` on a
 //! dial-only host, whose peer then stores no endpoint for it), saves the peer
@@ -44,7 +50,7 @@ use crate::{
         errors::{ErrorClass, ErrorWire},
         protocol::{
             LaneRole, LaneSpec, features,
-            frame::{ClientHello, Limits},
+            frame::{ClientHello, Limits, Notify, NotifyReason},
             ops::{PEER_ENROLL, PEER_REVOKE},
         },
     },
@@ -70,7 +76,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     net::{SocketAddr, TcpListener, TcpStream},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -91,6 +97,13 @@ pub const MAX_POOL: usize = 16;
 /// this host store without having been asked; an evicted digest is just
 /// listed again by the next `objects.wanted`.
 const MAX_LISTED: usize = 4096;
+/// At most one notify per (session, repo, reason) this often.
+pub const NOTIFY_MIN_GAP: Duration = Duration::from_millis(100);
+/// Fault point: a notify of any reason is not sent.
+pub const FAULT_NOTIFY_DROP: &str = "peer.notify.drop";
+/// Fault point: a demand notify is not sent. Its own point, because a metadata
+/// notify usually comes first and `TKFS_FAULT_COUNT` counts every hit.
+pub const FAULT_NOTIFY_DROP_DEMAND: &str = "peer.notify.drop.demand";
 /// Deadline of one request this side originates (`catalog.list`, …).
 const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// How often a Ready lane checks whether its session ended.
@@ -136,6 +149,12 @@ pub trait FolderDirectory: Send + Sync {
     fn link_by_repo(&self, repo: &str) -> Option<Arc<WorkerLink>>;
     /// `[{"repo","label"}]` of every folder, paused ones included.
     fn published(&self) -> Vec<Value>;
+}
+
+/// Who hears what the listeners hint on this side's control lanes. Runs on the
+/// lane's I/O thread: it must not block, and a panic in it is not caught.
+pub trait NotifySink: Send + Sync {
+    fn notified(&self, endpoint: &str, notify: &Notify);
 }
 
 /// The backoff after `attempt` failures in a row: `1 s · 2^(attempt−1)`
@@ -261,7 +280,11 @@ struct Target {
     pool: usize,
     /// Advertised in `HELLO.features` (`protocol::features`).
     features: Vec<String>,
+    /// Hears the listener's hints, once one is registered.
+    sink: NotifySlot,
 }
+
+type NotifySlot = Arc<OnceLock<Arc<dyn NotifySink>>>;
 
 /// What a dialer asks of its listeners: an active one wants notifications, a
 /// passive one says so and polls instead.
@@ -324,6 +347,17 @@ impl ListedDigests {
     }
 }
 
+/// When a notify key last went out.
+struct NotifyGap {
+    sent: Instant,
+    /// One was held back, and a thread will send it when the gap ends.
+    held: bool,
+}
+
+/// (session, repo, reason) of what [`Network::notify`] sends.
+type NotifyKey = (String, String, NotifyReason);
+type NotifyGaps = Arc<Mutex<BTreeMap<NotifyKey, NotifyGap>>>;
+
 /// A peer with a Ready control lane.
 pub struct ReadyPeer {
     pub endpoint: String,
@@ -331,6 +365,8 @@ pub struct ReadyPeer {
     /// The control session's id (a new one is a Ready transition).
     pub session: String,
     pub control: Conn,
+    /// This session gets notified, so a long poll is enough for it.
+    pub notify: bool,
 }
 
 pub struct Network {
@@ -349,6 +385,9 @@ pub struct Network {
     /// session, because a digest may be listed on one bulk lane and stored on
     /// another. In memory only.
     listed: Mutex<BTreeMap<(String, String), ListedDigests>>,
+    notify_gaps: NotifyGaps,
+    /// Registered after the lanes start; lanes read it per hint.
+    notify_sink: NotifySlot,
     pre_auth: AtomicUsize,
     stopping: Cancel,
 }
@@ -382,6 +421,8 @@ pub fn start(
         peers: Mutex::new(BTreeMap::new()),
         inbound: Mutex::new(Vec::new()),
         listed: Mutex::new(BTreeMap::new()),
+        notify_gaps: Arc::new(Mutex::new(BTreeMap::new())),
+        notify_sink: Arc::new(OnceLock::new()),
         pre_auth: AtomicUsize::new(0),
         stopping: stopping.child(),
     });
@@ -610,6 +651,34 @@ impl Network {
             .for_each(|(digest, kind)| set.insert(*digest, *kind));
     }
 
+    /// Hints `reason` for `repo` to every paired dialer on an inbound control
+    /// session that asked for notify. Never waits for a peer.
+    pub fn notify(&self, repo: &str, reason: NotifyReason) {
+        let sessions = self.sessions();
+        lock(&self.notify_gaps).retain(|(session, _, _), _| {
+            sessions.iter().any(|conn| conn.peer().session == *session)
+        });
+        for conn in &sessions {
+            let peer = conn.peer();
+            if peer.role == LaneRole::Control
+                && peer.has_feature(features::NOTIFY)
+                && self.catalog.paired_key(&peer.installation).is_ok()
+            {
+                let notify = Notify {
+                    repo: repo.to_owned(),
+                    reason,
+                };
+                notify_coalesced(&self.notify_gaps, conn, notify);
+            }
+        }
+    }
+
+    /// Who hears the listeners' hints; the first call wins. Hints that arrive
+    /// before it are ignored.
+    pub fn set_notify_sink(&self, sink: Arc<dyn NotifySink>) {
+        let _ = self.notify_sink.set(sink);
+    }
+
     /// A new pairing code: every inbound credential is revoked, every inbound
     /// session gets `GOAWAY{PAIRING_CODE_CHANGED}` and every outbound lane is
     /// closed (the `peers` rows stay for a re-pair).
@@ -760,6 +829,9 @@ impl Network {
                     endpoint: endpoint.clone(),
                     installation: lanes.installation.clone(),
                     session: control.peer().session.clone(),
+                    // A passive dialer did not ask, whatever the listener offers.
+                    notify: self.sync_profile == SyncProfile::Active
+                        && control.peer().has_feature(features::NOTIFY),
                     control,
                 })
             })
@@ -844,6 +916,7 @@ impl Network {
             local: self.installation.clone(),
             pool,
             features: dialer_features(self.sync_profile),
+            sink: self.notify_sink.clone(),
         });
         let cancel = self.stopping.child();
         let lanes: Vec<Arc<Lane>> = (0..pool).map(|index| Lane::new(index, pool)).collect();
@@ -933,6 +1006,73 @@ impl Network {
             peer,
         }));
     }
+}
+
+/// Sends `notify` on `conn` unless one of its key went out within
+/// [`NOTIFY_MIN_GAP`]. The last of such a burst is sent when the gap ends, not
+/// dropped: the frame before it may have started an exchange that already
+/// passed what this one is about.
+fn notify_coalesced(gaps: &NotifyGaps, conn: &Conn, notify: Notify) {
+    let key = (
+        conn.peer().session.clone(),
+        notify.repo.clone(),
+        notify.reason,
+    );
+    let now = Instant::now();
+    let wait = {
+        let mut gaps = lock(gaps);
+        match gaps.get_mut(&key) {
+            None => {
+                let held = false;
+                gaps.insert(key.clone(), NotifyGap { sent: now, held });
+                None
+            }
+            Some(gap) if gap.held => return,
+            Some(gap) => {
+                let since = now.saturating_duration_since(gap.sent);
+                gap.held = since < NOTIFY_MIN_GAP;
+                if !gap.held {
+                    gap.sent = now;
+                }
+                gap.held.then(|| NOTIFY_MIN_GAP - since)
+            }
+        }
+    };
+    let Some(wait) = wait else {
+        send_notify(conn, &notify);
+        return;
+    };
+    let (held_gaps, held_key, conn) = (gaps.clone(), key.clone(), conn.clone());
+    let spawned = thread::Builder::new()
+        .name("tkfs-notify-held".into())
+        .spawn(move || {
+            thread::sleep(wait);
+            if let Some(gap) = lock(&held_gaps).get_mut(&held_key) {
+                gap.sent = Instant::now();
+                gap.held = false;
+            }
+            send_notify(&conn, &notify);
+        });
+    if spawned.is_err()
+        && let Some(gap) = lock(gaps).get_mut(&key)
+    {
+        // That hint is lost, which is allowed. Later ones must not be.
+        gap.held = false;
+    }
+}
+
+fn send_notify(conn: &Conn, notify: &Notify) {
+    let dropped = fault::hit(FAULT_NOTIFY_DROP).is_some()
+        || (notify.reason == NotifyReason::Demand
+            && fault::hit(FAULT_NOTIFY_DROP_DEMAND).is_some());
+    if dropped {
+        event!(info, PEER_NOTIFY_DROPPED, {
+            "repo": notify.repo.clone(),
+            "reason": notify.reason,
+        });
+        return;
+    }
+    conn.notify(notify);
 }
 
 /// Accepts peer connections until the network is gone; each handshake runs
@@ -1040,6 +1180,14 @@ fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
         let error = match dialed {
             Ok(conn) => {
                 let ready_at = Instant::now();
+                if lane.role == LaneRole::Control {
+                    let (sink, endpoint) = (target.sink.clone(), target.endpoint.clone());
+                    conn.on_notify(Arc::new(move |notify: &Notify| {
+                        if let Some(sink) = sink.get() {
+                            sink.notified(&endpoint, notify);
+                        }
+                    }));
+                }
                 {
                     let mut slot = lock(&lane.slot);
                     slot.state = LaneState::Ready {
@@ -2075,6 +2223,108 @@ mod tests {
         }
     }
 
+    /// The client's hints, and the server `Conn` behind them, as an inbound
+    /// session of `network` from `installation`.
+    fn notified_session(
+        network: &Network,
+        installation: &str,
+        role: LaneRole,
+        features: &[&str],
+    ) -> (Conn, Arc<Mutex<Vec<Notify>>>) {
+        let (client, server) = ws_pair();
+        let peer = PeerInfo {
+            installation: installation.into(),
+            session: format!("{installation}/{}", role.as_str()),
+            features: features.iter().map(|f| f.to_string()).collect(),
+            ..info(role)
+        };
+        let client =
+            Conn::from_established(client, Side::Client, peer.clone(), ConnOptions::default())
+                .unwrap();
+        let server =
+            Conn::from_established(server, Side::Server, peer, ConnOptions::default()).unwrap();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = heard.clone();
+        client.on_notify(Arc::new(move |notify: &Notify| {
+            lock(&sink).push(notify.clone());
+        }));
+        lock(&network.inbound).push(server);
+        (client, heard)
+    }
+
+    fn wait_heard(heard: &Mutex<Vec<Notify>>, count: usize) {
+        let end = Instant::now() + Duration::from_secs(5);
+        while lock(heard).len() < count {
+            assert!(
+                Instant::now() < end,
+                "{} of {count} hints",
+                lock(heard).len()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn notify_reaches_only_paired_control_sessions_that_asked() {
+        let root = tempfile::tempdir().unwrap();
+        let network = network(root.path());
+        network.catalog.save_paired("paired", [7; 32]).unwrap();
+        let (_good, good) =
+            notified_session(&network, "paired", LaneRole::Control, &[features::NOTIFY]);
+        let (_bulk, bulk) =
+            notified_session(&network, "paired", LaneRole::Bulk, &[features::NOTIFY]);
+        let (_silent, silent) = notified_session(&network, "paired", LaneRole::Control, &[]);
+        let (_stranger, stranger) =
+            notified_session(&network, "stranger", LaneRole::Control, &[features::NOTIFY]);
+        network.notify("repo-1", NotifyReason::Demand);
+        wait_heard(&good, 1);
+        assert_eq!(
+            lock(&good)[0],
+            Notify {
+                repo: "repo-1".into(),
+                reason: NotifyReason::Demand
+            }
+        );
+        // A later hint arrives behind anything the others were sent.
+        thread::sleep(NOTIFY_MIN_GAP);
+        network.notify("repo-1", NotifyReason::Metadata);
+        wait_heard(&good, 2);
+        assert!(lock(&bulk).is_empty());
+        assert!(lock(&silent).is_empty());
+        assert!(lock(&stranger).is_empty());
+    }
+
+    #[test]
+    fn a_burst_of_notifies_coalesces_and_its_last_still_goes_out() {
+        let root = tempfile::tempdir().unwrap();
+        let network = network(root.path());
+        network.catalog.save_paired("paired", [7; 32]).unwrap();
+        let (_client, heard) =
+            notified_session(&network, "paired", LaneRole::Control, &[features::NOTIFY]);
+        let began = Instant::now();
+        for _ in 0..50 {
+            network.notify("repo-1", NotifyReason::Metadata);
+        }
+        // Another repo and another reason are not held back by that burst.
+        network.notify("repo-2", NotifyReason::Metadata);
+        network.notify("repo-1", NotifyReason::Demand);
+        assert!(
+            began.elapsed() < NOTIFY_MIN_GAP,
+            "the burst outlasted the gap: this run shows nothing"
+        );
+        // The first of the burst, the two others, and the burst's last.
+        wait_heard(&heard, 4);
+        assert!(began.elapsed() >= NOTIFY_MIN_GAP);
+        thread::sleep(NOTIFY_MIN_GAP * 2);
+        let heard = lock(&heard).clone();
+        assert_eq!(heard.len(), 4, "{heard:?}");
+        let burst = heard
+            .iter()
+            .filter(|hint| hint.repo == "repo-1" && hint.reason == NotifyReason::Metadata)
+            .count();
+        assert_eq!(burst, 2, "{heard:?}");
+    }
+
     /// A peer daemon with an invalid clock never starts, so the dial side of
     /// `CLOCK_INVALID` is checked here: the lane backs off before any dial.
     #[test]
@@ -2091,6 +2341,7 @@ mod tests {
             local: "peer-a".into(),
             pool: 2,
             features: Vec::new(),
+            sink: Arc::new(OnceLock::new()),
         };
         let lanes: Vec<Arc<Lane>> = (0..2).map(|index| Lane::new(index, 2)).collect();
         let cancel = Cancel::new();

@@ -47,15 +47,19 @@ use super::{
     config::Config,
     demand::Seq,
     endpoint,
-    folder::{Controller, FORCE_STOP_WAIT, Launcher, Phase, RealLauncher, STOP_WAIT, StopOutcome},
+    folder::{
+        Controller, FORCE_STOP_WAIT, FolderSignals, Launcher, Phase, RealLauncher, STOP_WAIT,
+        StopOutcome,
+    },
     network::{self, FolderDirectory, Network},
     process::{self, READY_TIMEOUT},
     signals,
-    sync_driver::{self, Driver, SyncFolder, SyncFolders},
+    sync_driver::{self, Driver, SyncFolder, SyncFolders, SyncPolicy},
     worker::{EXIT_CONFIG, RECORD_FILE, WorkerRecord},
     worker_client::{CALL_DEADLINE, WorkerLink},
 };
 use crate::{
+    model::protocol::frame::NotifyReason,
     runtime::Engine,
     util::{
         cancel::Cancel,
@@ -337,6 +341,9 @@ pub struct Daemon {
     network: OnceLock<Arc<Network>>,
     /// The sync driver, started with the network.
     sync: OnceLock<Arc<Driver>>,
+    /// The daemon's folders, as the network, the driver and the folders' own
+    /// watch threads see them.
+    directory: Arc<Directory>,
     /// Bumped by folder watch threads on new demand; wakes the object pump.
     wake: Arc<Seq>,
     /// Serializes `maximum_running` admission with the start it admits.
@@ -489,6 +496,7 @@ impl Daemon {
             listener: Mutex::new(listener),
             network: OnceLock::new(),
             sync: OnceLock::new(),
+            directory: Arc::new(Directory::default()),
             wake: Seq::new(),
             admission: Mutex::new(()),
             requests: AtomicUsize::new(0),
@@ -514,7 +522,8 @@ impl Daemon {
                 self.launcher.clone(),
                 self.clock.clone(),
             )
-            .with_wake(self.wake.clone()),
+            .with_wake(self.wake.clone())
+            .with_signals(self.directory.clone()),
         );
         lock(&self.folders).insert(id, slot.clone());
         slot
@@ -533,24 +542,29 @@ impl Daemon {
 
     /// Starts the peer network on the bound listener, then the sync driver.
     fn start_network(self: &Arc<Self>) -> Result<()> {
+        let _ = self.directory.0.set(Arc::downgrade(self));
         let listener = lock(&self.listener).take();
-        let directory = Arc::new(Directory(Arc::downgrade(self)));
         let network = network::start(
             &self.config,
             self.catalog.clone(),
-            directory.clone(),
+            self.directory.clone(),
             self.stopping.clone(),
             listener,
         )?;
         let _ = self.network.set(network.clone());
         let driver = sync_driver::start(
-            network,
+            network.clone(),
             self.catalog.clone(),
-            directory,
+            self.directory.clone(),
             self.wake.clone(),
-            Duration::from_millis(self.config.network.sync_interval_ms),
+            SyncPolicy {
+                profile: self.config.network.sync_profile,
+                interval: Duration::from_millis(self.config.network.sync_interval_ms),
+                backup_poll: Duration::from_millis(self.config.network.backup_poll_ms),
+            },
             self.stopping.child(),
         )?;
+        network.set_notify_sink(driver.clone());
         let _ = self.sync.set(driver);
         Ok(())
     }
@@ -1115,13 +1129,21 @@ impl Timings {
     }
 }
 
-/// The daemon's folders as the peer network sees them.
-struct Directory(Weak<Daemon>);
+/// The daemon's folders as the peer network sees them. Controllers hold it from
+/// the start, and it knows the daemon once the network starts.
+#[derive(Default)]
+struct Directory(OnceLock<Weak<Daemon>>);
+
+impl Directory {
+    fn daemon(&self) -> Option<Arc<Daemon>> {
+        self.0.get()?.upgrade()
+    }
+}
 
 impl SyncFolders for Directory {
     /// Never waits for a busy controller: one is skipped this round.
     fn syncing(&self) -> Vec<SyncFolder> {
-        let Some(daemon) = self.0.upgrade() else {
+        let Some(daemon) = self.daemon() else {
             return Vec::new();
         };
         daemon
@@ -1144,9 +1166,32 @@ impl SyncFolders for Directory {
     }
 }
 
+impl FolderSignals for Directory {
+    fn changed(&self, repo: &str) {
+        let Some(daemon) = self.daemon() else {
+            return;
+        };
+        if let Some(network) = daemon.network.get() {
+            network.notify(repo, NotifyReason::Metadata);
+        }
+        if let Some(driver) = daemon.sync.get() {
+            driver.local_change(repo);
+        }
+    }
+
+    fn demanding(&self, repo: &str) {
+        let Some(daemon) = self.daemon() else {
+            return;
+        };
+        if let Some(network) = daemon.network.get() {
+            network.notify(repo, NotifyReason::Demand);
+        }
+    }
+}
+
 impl FolderDirectory for Directory {
     fn link_by_repo(&self, repo: &str) -> Option<Arc<WorkerLink>> {
-        let daemon = self.0.upgrade()?;
+        let daemon = self.daemon()?;
         daemon
             .catalog
             .folders()
@@ -1163,7 +1208,7 @@ impl FolderDirectory for Directory {
     }
 
     fn published(&self) -> Vec<Value> {
-        let Some(daemon) = self.0.upgrade() else {
+        let Some(daemon) = self.daemon() else {
             return Vec::new();
         };
         daemon

@@ -152,6 +152,17 @@ impl PushState {
             .insert(endpoint.to_owned(), Instant::now() + REST);
     }
 
+    /// Whether `folder` to `endpoint` sits out a failure at `now`: a pass would
+    /// ask nothing.
+    pub(super) fn rests(&self, folder: &str, endpoint: &str, now: Instant) -> bool {
+        self.resting.get(endpoint).is_some_and(|at| *at > now)
+            || self
+                .peers
+                .get(&(folder.to_owned(), endpoint.to_owned()))
+                .and_then(|peer| peer.rest_until)
+                .is_some_and(|at| at > now)
+    }
+
     /// Forgets the (folder, endpoint) pairs not pushed to for [`FORGET_AFTER`]
     /// and the rests that ended. By age, not by the folders syncing now: a
     /// folder whose slot is busy sits out a round, and that must not cost it

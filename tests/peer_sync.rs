@@ -652,6 +652,23 @@ fn nothing_missing(state: &Path) -> Result<bool> {
     Ok(page.missing.is_empty())
 }
 
+/// Waits until the tree at `state` has `path` with content of `len` bytes.
+/// Its name alone is not enough: an import creates the entry and then sets its
+/// content, in two events, and an exchange can fall between them.
+fn wait_entry(state: &Path, path: &str, len: usize, bound: Duration) -> Result<()> {
+    wait_until(bound, &format!("{path} of {len} bytes in the tree"), || {
+        let tree: Value = serde_json::from_str(&folder(state, &["tree"])?)?;
+        let entries: Vec<&Value> = match &tree {
+            Value::Object(entries) => entries.values().collect(),
+            Value::Array(entries) => entries.iter().collect(),
+            _ => anyhow::bail!("unexpected tree: {tree}"),
+        };
+        Ok(entries
+            .iter()
+            .any(|entry| entry["name"] == path && entry["content"]["total_len"] == len))
+    })
+}
+
 /// Waits until the folder at `state` knows `path` and lacks no object.
 fn wait_settled(state: &Path, path: &str, bound: Duration) -> Result<()> {
     wait_until(bound, &format!("{path} settled"), || {
@@ -767,9 +784,7 @@ fn a_listener_read_fails_cleanly_while_the_dialer_is_away_then_succeeds() -> Res
     } = shared_pair_of(a, TestDaemon::start()?, &[])?;
     let content = text(100 * 1024, 31);
     import(&a, &state_a, "away.txt", &content)?;
-    wait_until(REPLICATED, "away.txt in B's tree", || {
-        Ok(folder(&state_b, &["tree"])?.contains("away.txt"))
-    })?;
+    wait_entry(&state_b, "away.txt", content.len(), REPLICATED)?;
     let home_a = a.shutdown_keep_home()?;
 
     let began = Instant::now();
@@ -931,6 +946,273 @@ fn a_paused_listener_causes_backoff_and_resumes() -> Result<()> {
     ensure!(failures == 1, "{failures} failures in A's log:\n{log}");
     b.manage(&["resume", "Shared"])?;
     wait_file(&state_b, "paused.txt", &content, REPLICATED)?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+// ---- active sync: notify and the backup poll -----------------------------
+
+/// Polls so long that only a notify or a local change can explain a quick
+/// arrival.
+const NOTIFY_ONLY: &str = "sync_interval_ms = 60000\nbackup_poll_ms = 60000\n";
+/// How long a notified change may take, against a poll of 60 s.
+const NOTIFIED: Duration = Duration::from_secs(10);
+/// The reader's own wait (`Demand::FETCH_WAIT`).
+const FETCH_WAIT: Duration = Duration::from_secs(10);
+/// How long a blocked reader may wait behind a background transfer.
+const READER_BOUND: Duration = Duration::from_secs(5);
+
+/// How many `PEER_NOTIFY_DROPPED` lines of `reason` are in `daemon`'s log.
+fn notifies_dropped(daemon: &TestDaemon, reason: &str) -> usize {
+    daemon
+        .log_text()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["code"] == "PEER_NOTIFY_DROPPED" && line["reason"] == reason)
+        .count()
+}
+
+/// Waits until `path` is readable at `state`, and fails past `bound` even if
+/// a read that began in time ended late.
+fn arrives_within(state: &Path, path: &str, expected: &str, bound: Duration) -> Result<()> {
+    let began = Instant::now();
+    wait_file(state, path, expected, bound)?;
+    let took = began.elapsed();
+    ensure!(took < bound, "{path} took {took:?}, past {bound:?}");
+    Ok(())
+}
+
+#[test]
+fn a_change_on_either_side_arrives_by_notify_well_inside_the_poll() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        endpoint_b,
+        state_a,
+        state_b,
+    } = shared_pair_of(
+        TestDaemon::start_with(NOTIFY_ONLY)?,
+        TestDaemon::start_with(NOTIFY_ONLY)?,
+        &[],
+    )?;
+    // The dialer's own change.
+    let from_a = text(1000, 53);
+    import(&a, &state_a, "from-a.txt", &from_a)?;
+    arrives_within(&state_b, "from-a.txt", &from_a, NOTIFIED)?;
+    // The listener's change, which only a notify can announce.
+    let from_b = text(1000, 59);
+    import(&b, &state_b, "from-b.txt", &from_b)?;
+    arrives_within(&state_a, "from-b.txt", &from_b, NOTIFIED)?;
+
+    // Once those settle, heartbeats alone start no exchange on the dialer. The
+    // worker's `seq` moves every second, so a quiet window spans several of them,
+    // and a pair that exchanged on each one would never see such a window.
+    let last_exchange = || -> Result<u64> {
+        let inspected = a.manage(&["inspect", "Shared"])?;
+        inspected["sync"][endpoint_b.as_str()]["last_exchange_ms"]
+            .as_u64()
+            .with_context(|| format!("no last_exchange_ms: {inspected}"))
+    };
+    wait_until(Duration::from_secs(30), "a quiet idle window", || {
+        let before = last_exchange()?;
+        std::thread::sleep(Duration::from_secs(4));
+        Ok(last_exchange()? == before)
+    })?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn the_backup_poll_delivers_a_change_when_notify_is_suppressed() -> Result<()> {
+    const POLLED: &str = "sync_interval_ms = 60000\nbackup_poll_ms = 2000\n";
+    let a = TestDaemon::start_with(POLLED)?;
+    let b = TestDaemon::start_env(POLLED, &[("TKFS_FAULT_POINT", "peer.notify.drop")])?;
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(a, b, &[])?;
+    let from_b = text(1000, 61);
+    import(&b, &state_b, "from-b.txt", &from_b)?;
+    // Well before the 60 s interval, and with every notify of B dropped.
+    arrives_within(&state_a, "from-b.txt", &from_b, Duration::from_secs(20))?;
+    // The poll may beat B's watch to the change, so the drop can come just after.
+    wait_until(NOTIFIED, "a suppressed notify in B's log", || {
+        Ok(notifies_dropped(&b, "metadata") > 0)
+    })?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_repeated_demand_notify_saves_a_blocked_reader() -> Result<()> {
+    // A pushes only what is asked for, so the bytes stay on A until B's reader
+    // asks; B loses its first demand notify and no other.
+    let a = TestDaemon::start_env(
+        NOTIFY_ONLY,
+        &[("TKFS_FAULT_POINT", "sync.push.background.skip")],
+    )?;
+    let b = TestDaemon::start_env(
+        NOTIFY_ONLY,
+        &[
+            ("TKFS_FAULT_POINT", "peer.notify.drop.demand"),
+            ("TKFS_FAULT_COUNT", "1"),
+        ],
+    )?;
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(a, b, &[])?;
+    let content = text(1000, 67);
+    import(&a, &state_a, "only-a.txt", &content)?;
+    wait_entry(&state_b, "only-a.txt", content.len(), NOTIFIED)?;
+    ensure!(
+        pack_bytes(&state_b) < content.len() as u64,
+        "the bytes reached B before its reader asked"
+    );
+
+    let began = Instant::now();
+    let bytes = folder(&state_b, &["cat", "only-a.txt"])?;
+    let took = began.elapsed();
+    ensure!(bytes == content, "only-a.txt differs on B");
+    ensure!(took < FETCH_WAIT, "the read took {took:?}");
+    ensure!(
+        notifies_dropped(&b, "demand") == 1,
+        "the first demand notify was not the one dropped:\n{}",
+        b.log_text()
+    );
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+/// A small file imported on A reaches a reader on B within [`READER_BOUND`],
+/// while a transfer into the packs at `busy` (which held `base` bytes before
+/// it) keeps running.
+fn reader_goes_first(
+    (a, state_a): (&TestDaemon, &Path),
+    state_b: &Path,
+    (busy, base): (&Path, u64),
+    (path, seed): (&str, u64),
+) -> Result<()> {
+    let content = text(1000, seed);
+    import(a, state_a, path, &content)?;
+    wait_entry(state_b, path, content.len(), NOTIFIED)?;
+    let began = Instant::now();
+    let bytes = folder(state_b, &["cat", path])?;
+    let took = began.elapsed();
+    ensure!(bytes == content, "{path} differs on B");
+    ensure!(took < READER_BOUND, "the read of {path} took {took:?}");
+    let at = pack_bytes(busy);
+    ensure!(
+        at < base + LARGE as u64,
+        "the transfer had finished by then ({at} bytes in the packs)"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_waiting_reader_goes_ahead_of_background_transfer() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(
+        TestDaemon::start_with(NOTIFY_ONLY)?,
+        TestDaemon::start_with(NOTIFY_ONLY)?,
+        &[],
+    )?;
+    // From A to B: A's pump is pushing.
+    let base = pack_bytes(&state_b);
+    import_large(&a, &state_a, "big-a.txt", &text(LARGE, 71))?;
+    wait_push_under_way(&state_b, base, LARGE)?;
+    reader_goes_first(
+        (&a, &state_a),
+        &state_b,
+        (&state_b, base),
+        ("small-1.txt", 73),
+    )?;
+    wait_settled(&state_b, "big-a.txt", LARGE_PUSH)?;
+    wait_settled(&state_a, "big-a.txt", LARGE_PUSH)?;
+
+    // From B to A: A's pump is pulling.
+    let base = pack_bytes(&state_a);
+    import_large(&b, &state_b, "big-b.txt", &text(LARGE, 79))?;
+    wait_push_under_way(&state_a, base, LARGE)?;
+    reader_goes_first(
+        (&a, &state_a),
+        &state_b,
+        (&state_a, base),
+        ("small-2.txt", 83),
+    )?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+/// In the test above a background page also lists demand, so the reader is
+/// served either way. Here A pushes only what is asked for, so only the demand
+/// notify can get it the file, and it has to cut into A's running pull.
+#[test]
+fn a_demand_notify_cuts_into_a_background_pull() -> Result<()> {
+    let a = TestDaemon::start_env(
+        NOTIFY_ONLY,
+        &[("TKFS_FAULT_POINT", "sync.push.background.skip")],
+    )?;
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(a, TestDaemon::start_with(NOTIFY_ONLY)?, &[])?;
+    let base = pack_bytes(&state_a);
+    import_large(&b, &state_b, "big-b.txt", &text(LARGE, 101))?;
+    wait_push_under_way(&state_a, base, LARGE)?;
+    reader_goes_first(
+        (&a, &state_a),
+        &state_b,
+        (&state_a, base),
+        ("small.txt", 103),
+    )?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn an_edit_made_while_lanes_are_down_arrives_when_they_return() -> Result<()> {
+    // B on a fixed port, so A's lanes find it again after it restarts.
+    const LONG_POLL: &str = "backup_poll_ms = 60000\n";
+    let a = TestDaemon::start_with(LONG_POLL)?;
+    let b = TestDaemon::start_listening(&free_address()?, LONG_POLL)?;
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(a, b, &[])?;
+    let first = text(1000, 89);
+    import(&a, &state_a, "first.txt", &first)?;
+    arrives_within(&state_b, "first.txt", &first, NOTIFIED)?;
+
+    let home_b = b.shutdown_keep_home()?;
+    let offline = text(1000, 97);
+    import(&a, &state_a, "offline.txt", &offline)?;
+    let b = TestDaemon::start_in(home_b)?;
+    b.wait_phase("Shared", "Running", REPLICATED)?;
+    arrives_within(&state_b, "offline.txt", &offline, Duration::from_secs(20))?;
     a.shutdown()?;
     b.shutdown()?;
     Ok(())

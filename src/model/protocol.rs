@@ -409,7 +409,7 @@ pub mod frame {
     }
 
     /// Why a listener sends `NOTIFY`.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum NotifyReason {
         /// The listener's metadata for the repo changed.

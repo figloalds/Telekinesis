@@ -24,11 +24,15 @@ pub const WATCH_WAIT_MS: u64 = 2000;
 /// Deadline of one `watch`: its park plus slack for the reply.
 pub const WATCH_DEADLINE: Duration = Duration::from_secs(4);
 
-/// A `watch` reply: the worker's wake-up counter, its health summary and the
-/// objects its readers are waiting for.
+/// A `watch` reply: the worker's wake-up counter, its latest feed position,
+/// its health summary and the objects its readers are waiting for.
 #[derive(Debug, Deserialize)]
 pub struct Watch {
     pub seq: u64,
+    /// The value `feed.outgoing` pages after to find nothing new. An adopted
+    /// worker from before this field reports 0 and so never signals a change.
+    #[serde(default)]
+    pub feed: u64,
     pub heartbeat: Value,
     pub demand: Vec<(Digest, Kind)>,
 }

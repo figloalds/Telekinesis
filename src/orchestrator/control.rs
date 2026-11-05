@@ -143,9 +143,11 @@ pub fn heartbeat(engine: &Engine) -> Result<Value> {
     }))
 }
 
-/// `watch {after_seq, wait_ms}` → `{seq, heartbeat, demand}`. Returns at once
-/// when `seq > after_seq` or objects are wanted; otherwise waits at most
-/// `min(wait_ms, WATCH_MAX_WAIT_MS)` for the next wake-up.
+/// `watch {after_seq, wait_ms}` → `{seq, feed, heartbeat, demand}`. Returns at
+/// once when `seq > after_seq` or objects are wanted; otherwise waits at most
+/// `min(wait_ms, WATCH_MAX_WAIT_MS)` for the next wake-up. `feed` is the journal's
+/// latest position. It moves only when the journal does, unlike `seq`, which the
+/// heartbeat bumps every second.
 pub fn watch(engine: &Engine, seq: &Seq, demand: &Demand, p: &Value) -> Result<Value> {
     let after = p["after_seq"].as_u64().unwrap_or(0);
     let wait = p["wait_ms"].as_u64().unwrap_or(0).min(WATCH_MAX_WAIT_MS);
@@ -155,8 +157,10 @@ pub fn watch(engine: &Engine, seq: &Seq, demand: &Demand, p: &Value) -> Result<V
     } else {
         seq.wait_past(after, Duration::from_millis(wait))
     };
+    let feed = lock(&engine.store).feed_position()?;
     Ok(json!({
         "seq": seq,
+        "feed": feed,
         "heartbeat": heartbeat(engine)?,
         "demand": demand.pending(),
     }))
@@ -415,6 +419,40 @@ pub fn execute(engine: &Engine, settings: &Settings, operation: &str, p: &Value)
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn watch_reports_the_feed_position_which_only_the_journal_moves() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = Engine::open(root.path(), None)?;
+        let seq = Seq::new();
+        let demand = Demand::new(seq.clone(), engine.working.content().packs.clone());
+        let watch = |after: u64| -> Result<Value> {
+            watch(
+                &engine,
+                &seq,
+                &demand,
+                &json!({"after_seq": after, "wait_ms": 0}),
+            )
+        };
+        let before = watch(0)?["feed"].as_u64().context("no feed")?;
+        // What a heartbeat does moves `seq`, not `feed`.
+        seq.bump();
+        let beat = watch(0)?;
+        assert_eq!(beat["seq"], 1);
+        assert_eq!(beat["feed"], before);
+        // A local change moves it to the journal's last event.
+        {
+            let mut store = lock(&engine.store);
+            store.create("f", EntryKind::File)?;
+            store.sync_metadata()?;
+        }
+        let after = watch(1)?["feed"].as_u64().context("no feed")?;
+        assert!(after > before, "{before} -> {after}");
+        let rows = lock(&engine.store).events_after(0, 4096)?;
+        assert_eq!(rows.last().map(|(n, _)| *n), Some(after));
+        engine.shutdown()?;
+        Ok(())
+    }
 
     #[test]
     fn shutdown_without_force_is_refused_while_a_writable_handle_is_open() -> Result<()> {
