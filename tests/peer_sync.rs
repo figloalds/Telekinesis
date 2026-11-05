@@ -1449,10 +1449,135 @@ fn sync_now_reports_an_unreachable_peer_within_its_bound() -> Result<()> {
     b.shutdown()?;
     let (reply, took) = sync_now(&a)?;
     ensure!(reply["error"].is_string(), "{reply}");
-    ensure!(reply.get("remaining").is_some(), "{reply}");
+    // No listing came back, so nothing is known of what is left.
+    ensure!(reply["remaining"].is_null(), "{reply}");
     // The lane wait, not the whole bound.
     ensure!(took < Duration::from_secs(30), "it took {took:?}: {reply}");
     a.shutdown()?;
+    Ok(())
+}
+
+/// A peer that never held a repo is told apart at once. So B's folder, which A
+/// exchanged with already, gets a moment when it stops answering.
+const NOT_PUBLISHED_WAIT: Duration = Duration::from_secs(10);
+
+#[test]
+fn sync_now_outlasts_a_listener_folder_that_stops_for_a_moment() -> Result<()> {
+    let Shared { a, b, .. } = passive_pair(&[])?;
+    sync_now_clean(&a)?;
+    b.manage(&["pause", "Shared"])?;
+    // It comes back while A is asking.
+    let reply = std::thread::scope(|scope| {
+        let asking = scope.spawn(|| sync_now(&a));
+        std::thread::sleep(Duration::from_secs(3));
+        let resumed = b.manage(&["resume", "Shared"]);
+        let reply = asking.join().expect("the sync-now thread panicked");
+        resumed.and(reply)
+    })?;
+    ensure!(reply.0["error"].is_null(), "{}", reply.0);
+    ensure!(reply.1 >= Duration::from_secs(2), "it took {:?}", reply.1);
+    // It stays away: A says so, and soon.
+    b.manage(&["pause", "Shared"])?;
+    let (reply, took) = sync_now(&a)?;
+    let error = reply["error"].as_str().unwrap_or_default();
+    ensure!(error.contains("REPO_NOT_PUBLISHED"), "{reply}");
+    ensure!(took >= NOT_PUBLISHED_WAIT, "it took {took:?}");
+    ensure!(took < Duration::from_secs(30), "it took {took:?}");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_peer_that_does_not_hold_a_folder_is_no_error_and_does_not_hold_it_up() -> Result<()> {
+    let Shared { a, b, .. } = passive_pair(&[])?;
+    let c = TestDaemon::start()?;
+    let code = c.manage(&["reset-pairing-code"])?["code"]
+        .as_str()
+        .context("no code")?
+        .to_string();
+    let endpoint_c = c.listen_endpoint()?;
+    a.manage(&["pair", &endpoint_c, "--code", &code])?;
+    a.wait_lanes(&endpoint_c, 4, "Ready", LANES_READY)?;
+    let (reply, took) = sync_now(&a)?;
+    ensure!(reply["error"].is_null(), "{reply}");
+    ensure!(reply["exchanged"].as_u64() > Some(0), "{reply}");
+    ensure!(reply["remaining"] == 0, "{reply}");
+    ensure!(took < NOT_PUBLISHED_WAIT, "it took {took:?}");
+    // A folder neither of them holds is reported, just as soon.
+    a.manage(&["create", "Local", "--headless"])?;
+    a.wait_phase("Local", "Running", REPLICATED)?;
+    let began = Instant::now();
+    let reply = a.manage(&["sync-now", "Local"])?;
+    let took = began.elapsed();
+    let error = reply["folders"][0]["error"].as_str().unwrap_or_default();
+    ensure!(error.contains("REPO_NOT_PUBLISHED"), "{reply}");
+    ensure!(took < NOT_PUBLISHED_WAIT, "it took {took:?}");
+    a.shutdown()?;
+    b.shutdown()?;
+    c.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn sync_now_says_when_a_listener_takes_no_pushes() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(
+        TestDaemon::start_with(PASSIVE)?,
+        TestDaemon::start_env("", &[("TKFS_FAULT_POINT", "session.features.none")])?,
+        &[],
+    )?;
+    import(&a, &state_a, "new.txt", "new")?;
+    import(&b, &state_b, "from-b.txt", "from b")?;
+    let (reply, _) = sync_now(&a)?;
+    let error = reply["error"].as_str().unwrap_or_default();
+    ensure!(error.contains("PEER_PUSH_UNAVAILABLE"), "{reply}");
+    ensure!(reply["remaining"].is_null(), "{reply}");
+    ensure!(reply["exchanged"].as_u64() > Some(0), "{reply}");
+    // The metadata moved all the same.
+    let tree = folder(&state_a, &["tree"])?;
+    ensure!(tree.contains("from-b.txt"), "{tree}");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn sync_now_works_on_an_active_dialer() -> Result<()> {
+    // Polls too long to matter, and every notify of B lost: only asking moves it.
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(
+        TestDaemon::start_with(NOTIFY_ONLY)?,
+        TestDaemon::start_env(NOTIFY_ONLY, &[("TKFS_FAULT_POINT", "peer.notify.drop")])?,
+        &[],
+    )?;
+    let from_b = text(1000, 127);
+    import(&b, &state_b, "from-b.txt", &from_b)?;
+    std::thread::sleep(Duration::from_secs(3));
+    let tree = folder(&state_a, &["tree"])?;
+    ensure!(!tree.contains("from-b.txt"), "unasked: {tree}");
+    let from_a = text(1000, 131);
+    import(&a, &state_a, "from-a.txt", &from_a)?;
+    let reply = sync_now_clean(&a)?;
+    ensure!(reply["exchanged"].as_u64() > Some(0), "{reply}");
+    ensure!(reply["remaining"] == 0, "{reply}");
+    let tree = folder(&state_a, &["tree"])?;
+    ensure!(tree.contains("from-b.txt"), "asked: {tree}");
+    // Its bytes come as an active dialer's do, and A's went across.
+    arrives_within(&state_a, "from-b.txt", &from_b, NOTIFIED)?;
+    arrives_within(&state_b, "from-a.txt", &from_a, NOTIFIED)?;
+    a.shutdown()?;
+    b.shutdown()?;
     Ok(())
 }
 

@@ -316,7 +316,8 @@ The desktop app shows the same codes. The code tells you what to do:
 | `REPO_NOT_PUBLISHED` | The paired host publishes no running, unpaused folder of that repository. | `manage remote-list ENDPOINT`; start or resume the folder there. |
 | `OBJECT_NOT_WANTED` | A paired peer pushed an object this host never listed to it (or listed and since evicted or stored). Only that object is refused; the session stays usable. | None: the peer asks `objects.wanted` again. |
 | `INVALID_PEER_OBJECT` | A pushed or written object's digest does not match its bytes. Only that object is refused. | None for the operator; the sending peer has a bug or a corrupt pack. |
-| `SYNC_NOW_TIMEOUT` | `manage sync-now` ran out of time, or a peer's control lane never came up with no failure to report. Reported per folder; what was done stays done. | Run it again; check `manage peers`. |
+| `PEER_PUSH_UNAVAILABLE` | `manage sync-now`: a peer running an older version takes no pushes, so nothing of this host's went to it. Metadata still moved, and it can still fetch from this host if it dials it. | Upgrade the peer. |
+| `SYNC_NOW_TIMEOUT` | `manage sync-now` ran out of time with nothing failing, or a peer's lanes never came up with no failure to report. If something was failing, the reply names that instead. Reported per folder; what was done stays done. | Run it again; check `manage peers`. |
 | `REPO_ALREADY_PRESENT` | This orchestrator already has a folder of that repository. | Use that folder. |
 | `PAIRING_CODE_CHANGED`, `INVALID_PAIRING_CODE`, `PEER_REVOKED` | The peer's code was reset, the code is wrong, or the peer revoked this host. | Get the current code (`reset-pairing-code` there) and `manage pair` again. |
 | `PEER_LANES_SKIPPED` | Logged: the connections to a paired peer could not be set up (for example its credential is missing). | Restart the orchestrator; if it repeats, `manage unpair` and `manage pair` again. |

@@ -47,6 +47,17 @@ pub const REST: Duration = Duration::from_secs(1);
 /// any backoff, so none is cut short.
 const FORGET_AFTER: Duration = Duration::from_secs(2 * UNAVAILABLE_MAX.as_secs());
 
+/// Why [`run`] asked `objects.wanted` nothing of an endpoint, with no failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unlisted {
+    /// It has no Ready bulk lane now.
+    NoLane,
+    /// It does not advertise [`features::CONTENT_PUSH`].
+    NoPush,
+    /// It sits out an earlier failure.
+    Resting,
+}
+
 /// What one [`run`] pushes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PushMode {
@@ -67,7 +78,16 @@ pub struct PushOutcome {
     /// It stopped before a next call (a wake-up or cancel).
     pub interrupted: bool,
     /// The last failure, if any.
-    pub error: Option<String>,
+    pub error: Option<Failure>,
+    /// A listing came back, so `remaining` says something.
+    pub listed: bool,
+    /// That listing was asked from the start of the scan. Only an empty page
+    /// that began there says nothing is missing: past it, it says only that
+    /// the rest of the scan is clean.
+    pub from_top: bool,
+    /// Why nothing was listed, when nothing failed. With several endpoints, of
+    /// the last that was skipped.
+    pub unlisted: Option<Unlisted>,
 }
 
 /// What the pass counted for one (folder, endpoint).
@@ -205,13 +225,16 @@ pub fn run(
             break;
         }
         let Some(lane) = lanes.any_bulk_lane(endpoint) else {
+            outcome.unlisted = Some(Unlisted::NoLane);
             continue;
         };
         if !lane.peer().has_feature(features::CONTENT_PUSH) {
+            outcome.unlisted = Some(Unlisted::NoPush);
             continue;
         }
         let now = Instant::now();
         if state.resting.get(endpoint).is_some_and(|at| *at > now) {
+            outcome.unlisted = Some(Unlisted::Resting);
             continue;
         }
         let deadline = state.deadline;
@@ -221,6 +244,7 @@ pub fn run(
             .or_default();
         peer.touched = now;
         if peer.rest_until.is_some_and(|at| at > now) {
+            outcome.unlisted = Some(Unlisted::Resting);
             continue;
         }
         let result = Pass {
@@ -257,12 +281,12 @@ pub fn run(
             });
             peer.counters.last_error = Some(error.clone());
         }
-        outcome.error = Some(error);
         if timed_out || failure == Failure::LaneLost {
             state.rest_endpoint(endpoint);
         } else {
             peer.rest_until = Some(Instant::now() + REST);
         }
+        outcome.error = Some(failure);
     }
     outcome
 }
@@ -311,6 +335,8 @@ impl Pass<'_> {
             after.as_deref(),
             self.cancel,
         )?;
+        self.outcome.listed = true;
+        self.outcome.from_top = after.is_none();
         if mode == PushMode::Background {
             // An expired backoff is kept while its object is still listed (the
             // next one doubles); one no longer listed is forgotten. A Demand

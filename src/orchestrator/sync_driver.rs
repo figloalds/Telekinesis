@@ -63,8 +63,16 @@
 //! lanes are up, and that needs no poll: a folder's watch bumps the wake. Only a
 //! burst ([`Driver::sync_now`], which works in either profile) opens the rest,
 //! for the pairs it selected: an exchange until neither side has more, then
-//! pushes until the listener's scan comes back empty. A passive burst still does
-//! no background pull.
+//! pushes until the listener's scan, asked from its start, comes back empty. A
+//! passive burst still does no background pull.
+//!
+//! A burst outlasts what may pass. A lost lane or a timeout is asked again until
+//! the budget ends, which reports the last failure; the push pass's own recovery
+//! (a halved batch, a listing asked afresh) does the rest. A peer that does not
+//! hold a folder ends that pair: at once if it never answered for the repo, else
+//! after [`REPO_WAIT`], since its folder may only be restarting. Any other coded
+//! failure would repeat itself, so it ends the pair. A peer without a folder is
+//! an error only when no peer took it.
 use super::{
     catalog::Catalog,
     config::SyncProfile,
@@ -134,6 +142,11 @@ const MAX_MARKS: usize = 4096;
 pub const SYNC_NOW_BOUND: Duration = Duration::from_secs(REPLY_TIMEOUT.as_secs() - 5);
 /// How long a burst waits for a peer's lanes before it reports that peer.
 const LANE_WAIT: Duration = Duration::from_secs(10);
+/// How long a burst keeps asking a peer that answered for a repo before and now
+/// says it does not publish it: its folder may be restarting.
+const REPO_WAIT: Duration = LANE_WAIT;
+/// How long a burst waits between those asks.
+const REPO_ASK_EVERY: Duration = Duration::from_secs(1);
 /// How long a burst waits for a selected folder to be Running and unpaused. A
 /// folder whose controller is only busy is back well within this.
 const FOLDER_WAIT: Duration = Duration::from_secs(2);
@@ -231,7 +244,7 @@ fn in_burst(bursts: &BTreeMap<u64, Burst>, pair: &Pair) -> bool {
             && burst
                 .pairs
                 .get(pair)
-                .is_some_and(|state| state.error.is_none())
+                .is_some_and(|state| state.error.is_none() && state.not_published.is_none())
     })
 }
 
@@ -251,13 +264,47 @@ struct BurstPair {
     /// What the last page listed and its pass did not store: an estimate of the
     /// work left. `None` until a page came back.
     remaining: Option<usize>,
-    /// A background push ran to its end since its mark was last taken.
+    /// A background push, asked from the start of the scan, found nothing missing
+    /// since this mark was last taken.
     swept: bool,
+    /// The peer does not take pushes, so no sweep will come.
+    no_push: bool,
     /// The listener's scan must start over: what the exchange just told it may
     /// lie behind where the scan stood.
     rescan: bool,
     /// It failed in a way waiting will not cure, so this pair is finished.
     error: Option<String>,
+    /// The peer does not publish the repo, so this pair is finished: an error
+    /// only if no other peer took the folder.
+    not_published: Option<String>,
+    /// The last failure that is being asked again. What a budget that ran out
+    /// reports.
+    failure: Option<String>,
+    /// The peer answered for this repo before and now says it does not publish
+    /// it: since when, and when to ask again.
+    absent: Option<(Instant, Instant)>,
+}
+
+impl BurstPair {
+    /// The peer says it does not publish the repo, and may be restarting it.
+    fn note_absent(&mut self, error: String, now: Instant) {
+        let since = self.absent.map_or(now, |(since, _)| since);
+        self.absent = Some((since, now + REPO_ASK_EVERY));
+        self.failure = Some(error);
+    }
+
+    /// What was failing is past.
+    fn answered(&mut self) {
+        self.failure = None;
+        self.absent = None;
+    }
+
+    /// Why this pair is reported as failed, if it is.
+    fn reason(&self) -> Option<&str> {
+        self.error.as_deref().or(self
+            .no_push
+            .then_some("PEER_PUSH_UNAVAILABLE: this peer does not take pushes"))
+    }
 }
 
 /// A folder `sync-now` was asked about.
@@ -475,9 +522,14 @@ struct Supplied {
 
 /// Why an exchange or a fetch did not complete.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Failure {
+pub enum Failure {
     /// The peer lane went away (closed, GOAWAY, cancelled): not a repo error.
     LaneLost,
+    /// No reply in time. Uncertain, so nothing is replayed, and a slow link may
+    /// well answer the next request.
+    TimedOut(String),
+    /// The peer has no running, unpaused folder of the repo.
+    NotPublished(String),
     Error(String),
 }
 
@@ -485,7 +537,9 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failure::LaneLost => f.write_str("LANE_LOST: the peer lane went away"),
-            Failure::Error(error) => f.write_str(error),
+            Failure::TimedOut(error) | Failure::NotPublished(error) | Failure::Error(error) => {
+                f.write_str(error)
+            }
         }
     }
 }
@@ -494,6 +548,10 @@ pub(super) fn peer_failure(op: &str, error: CallError) -> Failure {
     match error {
         CallError::ConnectionLost(_) | CallError::Unavailable(_) | CallError::Cancelled => {
             Failure::LaneLost
+        }
+        CallError::Timeout { .. } => Failure::TimedOut(format!("{op}: {error}")),
+        CallError::Remote(ref wire) if wire.code == "REPO_NOT_PUBLISHED" => {
+            Failure::NotPublished(format!("{op}: {error}"))
         }
         error => Failure::Error(format!("{op}: {error}")),
     }
@@ -689,6 +747,7 @@ impl Driver {
     /// Lanes in a transient backoff redial at once. It returns when every pair
     /// is done or given up on, and within `budget` either way. `remaining` is an
     /// estimate from the last `objects.wanted` page, `null` when none came back.
+    /// A budget that runs out reports the last failure being retried.
     /// A peer with no Ready control lane or no Ready bulk lane for [`LANE_WAIT`]
     /// is reported with the control lane's failure, so it costs that wait and not
     /// the budget, and a daemon that is stopping ends this at once.
@@ -799,12 +858,28 @@ impl Driver {
                 None => {}
             }
         }
-        if let Some(burst) = due.bursts.get_mut(&burst) {
+        let Due {
+            bursts, exchange, ..
+        } = &mut *due;
+        if let Some(burst) = bursts.get_mut(&burst) {
             for (endpoint, error) in failed {
                 for ((peer, _), state) in &mut burst.pairs {
                     if *peer == endpoint {
                         state.error.get_or_insert_with(|| error.clone());
                     }
+                }
+            }
+            for (pair, state) in &mut burst.pairs {
+                let Some((since, ask)) = state.absent else {
+                    continue;
+                };
+                if now.duration_since(since) >= REPO_WAIT {
+                    state.not_published = state.failure.take();
+                    state.absent = None;
+                } else if ask <= now {
+                    state.absent = Some((since, now + REPO_ASK_EVERY));
+                    exchange.insert(pair.clone());
+                    joined = true;
                 }
             }
         }
@@ -824,7 +899,10 @@ impl Driver {
             .iter()
             .map(|folder| {
                 let settled = burst_folder_settled(&jobs, &due, burst, folder);
-                let unfinished = failure.clone().filter(|_| !settled);
+                let unfinished = failure
+                    .as_ref()
+                    .filter(|_| !settled)
+                    .map(|failure| last_failure(&jobs, &due, burst, folder, failure));
                 burst_report(due.bursts.get(&burst), folder, unfinished)
             })
             .collect();
@@ -976,7 +1054,8 @@ impl Driver {
             mark(&mut lock(&self.due).background, task.key.clone());
             self.wake.nudge();
         }
-        self.burst_exchanged(&task.key, moved, &result);
+        let answered = slot.job.last_exchange_ms > 0;
+        self.burst_exchanged(&task.key, moved, answered, &result);
         // What this exchange carried is not across yet: no waiting for the
         // backup poll.
         if result.is_err() {
@@ -989,7 +1068,8 @@ impl Driver {
                 slot.job.error = None;
             }
             Err(Failure::LaneLost) => {}
-            Err(Failure::Error(error)) => {
+            Err(failure) => {
+                let error = failure.to_string();
                 if slot.job.error.as_deref() != Some(error.as_str()) {
                     event!(warn, SYNC_EXCHANGE_FAILED, {
                         "peer": task.key.0.clone(),
@@ -1002,23 +1082,41 @@ impl Driver {
         }
     }
 
-    /// Tells the open bursts of `key` how its exchange went. A lost lane is
-    /// asked again, by the next session if it takes that. Any other failure
-    /// would only repeat itself, so it ends the pair.
-    fn burst_exchanged(&self, key: &Pair, moved: bool, result: &Result<(), Failure>) {
+    /// Tells the open bursts of `key` how its exchange went. A lost lane or a
+    /// timeout is asked again at once, by the next session if it takes that. A
+    /// peer that says it lacks the repo ends the pair, unless it `answered` for
+    /// that repo before: then [`Self::burst_look`] asks again for a while. Any
+    /// other failure would only repeat itself, so it ends the pair.
+    fn burst_exchanged(
+        &self,
+        key: &Pair,
+        moved: bool,
+        answered: bool,
+        result: &Result<(), Failure>,
+    ) {
+        let now = Instant::now();
         let mut due = lock(&self.due);
         let wanted = due.in_burst(key);
         for state in due.burst_pairs(key) {
             state.rescan |= moved;
             match result {
-                Ok(()) => state.exchanged += 1,
-                Err(Failure::LaneLost) => {}
+                Ok(()) => {
+                    state.exchanged += 1;
+                    state.answered();
+                }
+                Err(Failure::NotPublished(error)) if answered => {
+                    state.note_absent(error.clone(), now);
+                }
+                Err(Failure::NotPublished(error)) => {
+                    state.not_published.get_or_insert_with(|| error.clone());
+                }
                 Err(Failure::Error(error)) => {
                     state.error.get_or_insert_with(|| error.clone());
                 }
+                Err(failure) => state.failure = Some(failure.to_string()),
             }
         }
-        if wanted && matches!(result, Err(Failure::LaneLost)) {
+        if wanted && matches!(result, Err(Failure::LaneLost | Failure::TimedOut(_))) {
             due.exchange.insert(key.clone());
         }
     }
@@ -1208,28 +1306,57 @@ impl Driver {
     /// A background step ended: what stays due, and what the bursts learn of it.
     /// A page that listed something is not done. A listing that failed lists
     /// nothing: it waits for the pair's next trigger, so a hung listener does not
-    /// hold this pump again at once. In a burst a lost lane is such a trigger,
-    /// and any other failure ends the pair.
+    /// hold this pump again at once.
+    ///
+    /// A burst is such a trigger, and it believes only what a pass saw. A pass
+    /// that listed nothing says nothing of what is left, and an empty page says
+    /// the scan is clean only if the pass began at its top: what a page before it
+    /// left behind is behind the cursor. The rests of a failed pass pace asking
+    /// again, and the wait of a page past the top is cut short.
     fn background_done(&self, pair: &Pair, outcome: &push::PushOutcome) {
-        let lost = outcome.error == Some(Failure::LaneLost.to_string());
+        let now = Instant::now();
+        let clean = outcome.listed && outcome.error.is_none() && !outcome.interrupted;
+        let empty = clean && outcome.pushed + outcome.remaining == 0;
         let mut due = lock(&self.due);
-        if outcome.interrupted
-            || outcome.pushed + outcome.remaining > 0
-            || (lost && due.in_burst(pair))
-        {
+        if outcome.interrupted || outcome.pushed + outcome.remaining > 0 {
             mark(&mut due.background, pair.clone());
         }
+        let wanted = due.in_burst(pair);
+        let retry = match &outcome.error {
+            Some(Failure::Error(_)) => false,
+            Some(_) => true,
+            None => matches!(
+                outcome.unlisted,
+                Some(push::Unlisted::NoLane | push::Unlisted::Resting)
+            ),
+        };
+        let restart = empty && !outcome.from_top;
         for state in due.burst_pairs(pair) {
             state.pushed += outcome.pushed as u64;
-            state.swept = true;
-            // A pass that listed nothing because it failed or stopped says
-            // nothing of what is left.
-            if outcome.remaining > 0 || (outcome.error.is_none() && !outcome.interrupted) {
+            if outcome.remaining > 0 || clean {
                 state.remaining = Some(outcome.remaining);
             }
-            if let Some(error) = outcome.error.as_ref().filter(|_| !lost) {
-                state.error.get_or_insert_with(|| error.clone());
+            state.no_push |= outcome.unlisted == Some(push::Unlisted::NoPush);
+            state.rescan |= restart;
+            state.swept = empty && outcome.from_top;
+            if clean {
+                state.answered();
             }
+            match &outcome.error {
+                None => {}
+                Some(Failure::NotPublished(error)) => state.note_absent(error.clone(), now),
+                Some(Failure::Error(error)) => {
+                    state.error.get_or_insert_with(|| error.clone());
+                }
+                Some(failure) => state.failure = Some(failure.to_string()),
+            }
+        }
+        if wanted && (retry || restart) {
+            due.background.insert(pair.clone());
+        }
+        drop(due);
+        if wanted && restart {
+            self.wake.nudge();
         }
     }
 
@@ -1616,10 +1743,50 @@ impl NotifySink for Driver {
     }
 }
 
+/// Whether nothing more will happen for `state` of `pair`: it is given up on, or
+/// it has nothing running or due and its sweep found nothing missing, or its peer
+/// takes no pushes.
+fn burst_pair_settled(
+    jobs: &BTreeMap<Pair, Slot>,
+    due: &Due,
+    pair: &Pair,
+    state: &BurstPair,
+) -> bool {
+    state.error.is_some()
+        || state.not_published.is_some()
+        || ((state.swept || state.no_push)
+            && state.absent.is_none()
+            && !due.exchange.contains(pair)
+            && !due.demand.contains(pair)
+            && !due.background.contains(pair)
+            && !jobs.get(pair).is_some_and(|slot| slot.running))
+}
+
+/// What to report of a burst stopped by `failure` for `folder`: the last failure
+/// of a pair that did not finish, if one was being retried.
+fn last_failure(
+    jobs: &BTreeMap<Pair, Slot>,
+    due: &Due,
+    burst: u64,
+    folder: &BurstFolder,
+    failure: &str,
+) -> String {
+    due.bursts
+        .get(&burst)
+        .into_iter()
+        .flat_map(|burst| &burst.pairs)
+        .filter(|((_, repo), _)| Some(repo) == folder.repo.as_ref())
+        .filter(|(pair, state)| !burst_pair_settled(jobs, due, pair, state))
+        .find_map(|((endpoint, _), state)| {
+            let failure = state.failure.as_ref()?;
+            Some(format!("{failure} (peer {endpoint})"))
+        })
+        .unwrap_or_else(|| failure.to_owned())
+}
+
 /// Whether nothing more will happen for `folder` in `burst`: it is given up on,
-/// or each of its pairs is, or each has no exchange running or due and its last
-/// page listed nothing left. Take `jobs` before `due`, as `dispatch` does, so a
-/// job that just took its mark shows as running.
+/// or each of its pairs is settled. Take `jobs` before `due`, as `dispatch` does,
+/// so a job that just took its mark shows as running.
 fn burst_folder_settled(
     jobs: &BTreeMap<Pair, Slot>,
     due: &Due,
@@ -1636,15 +1803,7 @@ fn burst_folder_settled(
         .pairs
         .iter()
         .filter(|((_, of), _)| of == repo)
-        .all(|(pair, state)| {
-            state.error.is_some()
-                || (state.swept
-                    && state.remaining == Some(0)
-                    && !due.exchange.contains(pair)
-                    && !due.demand.contains(pair)
-                    && !due.background.contains(pair)
-                    && !jobs.get(pair).is_some_and(|slot| slot.running))
-        })
+        .all(|(pair, state)| burst_pair_settled(jobs, due, pair, state))
 }
 
 /// `{id, exchanged, pushed, remaining, error}` of `folder`, over its pairs in
@@ -1655,14 +1814,24 @@ fn burst_report(burst: Option<&Burst>, folder: &BurstFolder, unfinished: Option<
         .flat_map(|burst| &burst.pairs)
         .filter(|((_, repo), _)| Some(repo) == folder.repo.as_ref())
         .collect();
+    let with_peer = |endpoint: &String, error: &str| format!("{error} (peer {endpoint})");
+    let (lacking, took): (Vec<_>, Vec<_>) = pairs
+        .iter()
+        .partition(|(_, state)| state.not_published.is_some());
     let error = folder.error.clone().or_else(|| {
-        pairs
-            .iter()
-            .find_map(|((endpoint, _), state)| {
-                let error = state.error.as_ref()?;
-                Some(format!("{error} (peer {endpoint})"))
-            })
+        took.iter()
+            .find_map(|((endpoint, _), state)| Some(with_peer(endpoint, state.reason()?)))
             .or(unfinished)
+            // A peer without the folder matters only if no peer took it.
+            .or_else(|| {
+                took.is_empty()
+                    .then(|| {
+                        lacking.first().and_then(|((endpoint, _), state)| {
+                            Some(with_peer(endpoint, state.not_published.as_deref()?))
+                        })
+                    })
+                    .flatten()
+            })
     });
     // Unknown only if some peer was asked and none answered.
     let remaining = pairs
@@ -1895,11 +2064,18 @@ mod tests {
             CallError::Remote(ErrorWire::coded("REPO_NOT_PUBLISHED", "paused")),
         );
         assert!(
-            matches!(&remote, Failure::Error(e) if e.contains("REPO_NOT_PUBLISHED")),
+            matches!(&remote, Failure::NotPublished(e) if e.contains("REPO_NOT_PUBLISHED")),
             "{remote:?}"
         );
         assert!(matches!(
             peer_failure("objects.fetch", CallError::Timeout { after_ms: 1 }),
+            Failure::TimedOut(_)
+        ));
+        assert!(matches!(
+            peer_failure(
+                "objects.fetch",
+                CallError::Remote(ErrorWire::coded("OP_NOT_ALLOWED", "no"))
+            ),
             Failure::Error(_)
         ));
     }
@@ -3183,7 +3359,7 @@ mod tests {
         // Its rest ended, it fails alike: the error stays as logged.
         push_peer(&mut state, &paused).rest_until = None;
         let outcome = push_once(&lanes, &mut state, &paused, PushMode::Demand);
-        assert_eq!(outcome.error.as_ref(), Some(&logged));
+        assert_eq!(outcome.error.map(|e| e.to_string()).as_ref(), Some(&logged));
     }
 
     #[test]
@@ -3201,7 +3377,7 @@ mod tests {
             ..PushState::default()
         };
         let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
-        let logged = outcome.error.unwrap();
+        let logged = outcome.error.unwrap().to_string();
         state.resting.clear();
         // A Demand pass with nothing to do lists cleanly.
         let outcome = push_once(&lanes, &mut state, &folder, PushMode::Demand);
@@ -4024,7 +4200,7 @@ mod tests {
         assert!(lock(&driver.due).in_burst(&key));
         driver.dispatch(1, &peers, &tasks);
         let task = queue.try_recv().expect("the lost lane was not asked again");
-        let error = "meta.exchange: REPO_NOT_PUBLISHED: paused";
+        let error = "feed.apply: FATAL_STORE_ERROR: broken";
         driver.finish(&task, task.cursor, Err(Failure::Error(error.into())));
         // No more for this pair, and no waiting for the budget to say so.
         let due = lock(&driver.due);
@@ -4059,6 +4235,8 @@ mod tests {
         let outcome = |pushed, remaining| push::PushOutcome {
             pushed,
             remaining,
+            listed: true,
+            from_top: true,
             ..push::PushOutcome::default()
         };
         // Stored a page: there may be more, so it is due again.
@@ -4154,6 +4332,392 @@ mod tests {
         assert!(error.contains("UNSUPPORTED_OPERATION"), "{reply}");
         assert!(error.contains(ENDPOINT), "{reply}");
         driver.stop(Duration::from_secs(5));
+    }
+
+    // ---- what a sync-now reply can claim -----------------------------------
+
+    fn repo_folder() -> BurstFolder {
+        BurstFolder {
+            id: "repo-1".into(),
+            repo: Some("repo-1".into()),
+            seen: Instant::now(),
+            error: None,
+        }
+    }
+
+    fn settled_now(driver: &Driver, burst: u64) -> bool {
+        let jobs = lock(&driver.jobs);
+        let due = lock(&driver.due);
+        burst_folder_settled(&jobs, &due, burst, &repo_folder())
+    }
+
+    fn report_now(driver: &Driver, burst: u64) -> Value {
+        burst_report(lock(&driver.due).bursts.get(&burst), &repo_folder(), None)
+    }
+
+    /// The burst's exchanges went through: only the push steps are left.
+    fn exchange_done(driver: &Driver) {
+        lock(&driver.due).exchange.clear();
+    }
+
+    /// A passive driver of `repo-1`, not running, whose worker holds `held`.
+    fn burst_driver(
+        lanes: impl Lanes + 'static,
+        held: &[Object],
+    ) -> (Arc<Driver>, tempfile::TempDir) {
+        let fake = Arc::new(FakeFolder {
+            held: held.to_vec(),
+            ..FakeFolder::default()
+        });
+        let root = tempfile::tempdir().unwrap();
+        let driver = Driver::with_policy(
+            Arc::new(lanes),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".to_owned(),
+                fake_worker(fake),
+                Vec::new(),
+            )])),
+            Seq::new(),
+            passive(HOUR),
+            Cancel::new(),
+        );
+        (driver, root)
+    }
+
+    #[test]
+    fn a_peer_that_takes_no_pushes_is_reported_and_settles_on_no_count() {
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&objects("there", 1)),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[]);
+        let (driver, _root) = burst_driver(ReadyLanes::one(false, bulk), &[]);
+        let burst = open_burst(&driver, &[pair(ENDPOINT, "repo-1")]);
+        let mut state = PumpState::default();
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        // Its metadata still moves: that is not over yet.
+        assert!(lock(&driver.due).in_burst(&pair(ENDPOINT, "repo-1")));
+        assert!(!settled_now(&driver, burst));
+        exchange_done(&driver);
+        assert!(settled_now(&driver, burst));
+        let report = report_now(&driver, burst);
+        assert!(report["remaining"].is_null(), "{report}");
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("PEER_PUSH_UNAVAILABLE"), "{report}");
+        assert!(error.contains(ENDPOINT), "{report}");
+    }
+
+    /// Bulk lanes that look Ready when a round starts and are gone when asked.
+    struct GoneLanes;
+
+    impl Lanes for GoneLanes {
+        fn ready_peers(&self) -> Vec<ReadyPeer> {
+            Vec::new()
+        }
+        fn bulk_endpoints(&self) -> Vec<String> {
+            vec![ENDPOINT.to_owned()]
+        }
+        fn bulk_lane(&self, _: &str, _: &Digest) -> Option<Conn> {
+            None
+        }
+        fn any_bulk_lane(&self, _: &str) -> Option<Conn> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_lane_gone_during_a_round_leaves_the_pair_due_and_uncounted() {
+        let (driver, _root) = burst_driver(GoneLanes, &[]);
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst(&driver, std::slice::from_ref(&key));
+        exchange_done(&driver);
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        assert!(!settled_now(&driver, burst));
+        assert!(lock(&driver.due).background.contains(&key));
+        let report = report_now(&driver, burst);
+        assert!(report["remaining"].is_null(), "{report}");
+        assert!(report["error"].is_null(), "{report}");
+    }
+
+    /// One bulk lane that does not own `skip` while it is set.
+    struct SkippingLanes {
+        lane: Conn,
+        skip: Arc<Mutex<Option<Digest>>>,
+    }
+
+    impl Lanes for SkippingLanes {
+        fn ready_peers(&self) -> Vec<ReadyPeer> {
+            Vec::new()
+        }
+        fn bulk_endpoints(&self) -> Vec<String> {
+            vec![ENDPOINT.to_owned()]
+        }
+        fn bulk_lane(&self, _: &str, digest: &Digest) -> Option<Conn> {
+            (*lock(&self.skip) != Some(*digest)).then(|| self.lane.clone())
+        }
+        fn any_bulk_lane(&self, _: &str) -> Option<Conn> {
+            Some(self.lane.clone())
+        }
+    }
+
+    #[test]
+    fn an_empty_page_past_the_top_of_the_scan_does_not_settle_a_burst() {
+        let all = objects("object", OBJECT_BATCH);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let skip = Arc::new(Mutex::new(Some(all[0].digest)));
+        let lanes = SkippingLanes {
+            lane: listener.lane_with("session", &[features::CONTENT_PUSH]),
+            skip: skip.clone(),
+        };
+        let (driver, _root) = burst_driver(lanes, &all);
+        let burst = open_burst(&driver, &[pair(ENDPOINT, "repo-1")]);
+        exchange_done(&driver);
+        let mut state = PumpState::default();
+        // The page goes but for the digest whose lane is not Ready, and the scan
+        // moves past it.
+        let stored = driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(stored, OBJECT_BATCH - 1);
+        // So the next page, past that one, is empty. That says nothing of it.
+        driver.pump_round(&mut state, driver.wake.current());
+        assert!(
+            !settled_now(&driver, burst),
+            "{}",
+            report_now(&driver, burst)
+        );
+        // The lane is back: the sweep from the top finds it.
+        *lock(&skip) = None;
+        for _ in 0..4 {
+            driver.pump_round(&mut state, driver.wake.current());
+        }
+        assert_eq!(listener.stored().len(), OBJECT_BATCH);
+        assert!(settled_now(&driver, burst));
+        let report = report_now(&driver, burst);
+        assert_eq!(report["remaining"], 0, "{report}");
+        assert_eq!(report["pushed"], OBJECT_BATCH, "{report}");
+        assert!(report["error"].is_null(), "{report}");
+    }
+
+    #[test]
+    fn a_timed_out_store_stays_in_the_burst_and_goes_through_at_half_the_batch() {
+        let all = objects("slow-link", OBJECT_BATCH);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            stall_above: Some(16),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let (driver, _root) = burst_driver(ReadyLanes::one(false, bulk), &all);
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst(&driver, std::slice::from_ref(&key));
+        exchange_done(&driver);
+        let mut state = PumpState {
+            push: PushState {
+                deadline: |_| Duration::from_millis(300),
+                ..PushState::default()
+            },
+            ..PumpState::default()
+        };
+        driver.pump_round(&mut state, driver.wake.current());
+        assert!(listener.stored().is_empty());
+        assert!(lock(&driver.due).in_burst(&key), "one timeout ended it");
+        assert!(!settled_now(&driver, burst));
+        let end = Instant::now() + Duration::from_secs(30);
+        while !settled_now(&driver, burst) {
+            assert!(Instant::now() < end, "{:?}", listener.calls());
+            state.push.resting.clear();
+            driver.pump_round(&mut state, driver.wake.current());
+        }
+        assert_eq!(listener.stored().len(), OBJECT_BATCH);
+        // What it failed on is past: nothing to report.
+        let report = report_now(&driver, burst);
+        assert!(report["error"].is_null(), "{report}");
+        assert_eq!(report["remaining"], 0, "{report}");
+    }
+
+    #[test]
+    fn a_timed_out_exchange_is_asked_again_and_the_budget_reports_the_last_failure() {
+        let (driver, _root, control) = dispatching(passive(SHORT));
+        let peers = [ready_peer(ENDPOINT, "control", false, &control)];
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst(&driver, std::slice::from_ref(&key));
+        let timed_out = || peer_failure("meta.exchange", CallError::Timeout { after_ms: 7 });
+        let (tasks, queue) = mpsc::channel();
+        for _ in 0..2 {
+            driver.dispatch(1, &peers, &tasks);
+            let task = queue.try_recv().expect("it was not asked again");
+            driver.finish(&task, task.cursor, Err(timed_out()));
+            assert!(lock(&driver.due).in_burst(&key));
+            assert!(!settled_now(&driver, burst));
+        }
+        let reply = driver.close_burst(
+            burst,
+            &[repo_folder()],
+            Some("SYNC_NOW_TIMEOUT: not finished".to_owned()),
+        );
+        let error = folder_of(&reply)["error"].as_str().unwrap();
+        assert!(error.contains("REQUEST_TIMEOUT"), "{reply}");
+        assert!(error.contains(ENDPOINT), "{reply}");
+    }
+
+    /// A burst over `ws://one` and `ws://two`, with `ws://one` wholly synced and
+    /// `ws://two` given `not_there`'s answer: what `ws://two` makes of the folder.
+    fn with_a_peer_that_lacks_the_repo(one_took_it: bool) -> Value {
+        let (driver, _root, control) = dispatching(passive(SHORT));
+        let (one, two) = (pair("ws://one", "repo-1"), pair("ws://two", "repo-1"));
+        let burst = open_burst(&driver, &[one.clone(), two.clone()]);
+        let peers = [
+            ready_peer("ws://one", "control-1", false, &control),
+            ready_peer("ws://two", "control-2", false, &control),
+        ];
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &peers, &tasks);
+        let not_there = || {
+            peer_failure(
+                "meta.exchange",
+                CallError::Remote(ErrorWire::coded("REPO_NOT_PUBLISHED", "no such folder")),
+            )
+        };
+        for task in queue.try_iter() {
+            if task.key == two || !one_took_it {
+                driver.finish(&task, task.cursor, Err(not_there()));
+            } else {
+                driver.finish(&task, task.cursor, Ok(()));
+            }
+        }
+        if one_took_it {
+            let mut due = lock(&driver.due);
+            due.demand.remove(&one);
+            due.background.remove(&one);
+            let state = due
+                .bursts
+                .get_mut(&burst)
+                .unwrap()
+                .pairs
+                .get_mut(&one)
+                .unwrap();
+            state.swept = true;
+            state.remaining = Some(0);
+        }
+        assert!(settled_now(&driver, burst), "it holds the burst open");
+        report_now(&driver, burst)
+    }
+
+    #[test]
+    fn a_peer_that_answered_before_gets_a_while_to_publish_the_repo_again() {
+        let (driver, _root, control) = dispatching(passive(SHORT));
+        let peers = [ready_peer(ENDPOINT, "control", false, &control)];
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst(&driver, std::slice::from_ref(&key));
+        let not_there = || {
+            Err(peer_failure(
+                "meta.exchange",
+                CallError::Remote(ErrorWire::coded("REPO_NOT_PUBLISHED", "restarting")),
+            ))
+        };
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        driver.finish(&task, task.cursor, Ok(()));
+        exchange_done(&driver);
+        lock(&driver.due).exchange.insert(key.clone());
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        driver.finish(&task, task.cursor, not_there());
+        // Still wanted, not due until its next ask, and not settled meanwhile.
+        assert!(lock(&driver.due).in_burst(&key));
+        assert!(!lock(&driver.due).exchange.contains(&key));
+        {
+            let mut due = lock(&driver.due);
+            due.demand.clear();
+            due.background.clear();
+            let state = due
+                .bursts
+                .get_mut(&burst)
+                .unwrap()
+                .pairs
+                .get_mut(&key)
+                .unwrap();
+            state.swept = true;
+        }
+        assert!(!settled_now(&driver, burst));
+        let (mut folders, mut seen) = (Vec::new(), BTreeMap::new());
+        driver.burst_look(burst, &mut folders, &mut seen);
+        assert!(!lock(&driver.due).exchange.contains(&key));
+        // Its ask comes up: asked again.
+        let set_absent = |since, ask| {
+            let mut due = lock(&driver.due);
+            let state = due
+                .bursts
+                .get_mut(&burst)
+                .unwrap()
+                .pairs
+                .get_mut(&key)
+                .unwrap();
+            assert!(state.absent.is_some());
+            state.absent = Some((since, ask));
+        };
+        let now = Instant::now();
+        set_absent(now, now);
+        driver.burst_look(burst, &mut folders, &mut seen);
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().expect("it was not asked again");
+        driver.finish(&task, task.cursor, not_there());
+        // Too long: it is given up on, and reported as the only peer.
+        set_absent(now.checked_sub(REPO_WAIT).unwrap(), now + HOUR);
+        driver.burst_look(burst, &mut folders, &mut seen);
+        assert!(!lock(&driver.due).in_burst(&key));
+        assert!(settled_now(&driver, burst));
+        let report = report_now(&driver, burst);
+        let error = report["error"].as_str().unwrap();
+        assert!(error.contains("REPO_NOT_PUBLISHED"), "{report}");
+        // An answer in time would have cleared it.
+        let mut state = BurstPair::default();
+        state.note_absent("x".into(), now);
+        state.answered();
+        assert!(state.absent.is_none() && state.failure.is_none());
+    }
+
+    #[test]
+    fn a_push_that_finds_the_folder_gone_is_asked_again_and_not_settled() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            unpublished: Some("repo-1".into()),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let (driver, _root) = burst_driver(ReadyLanes::one(false, bulk), &all);
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst(&driver, std::slice::from_ref(&key));
+        exchange_done(&driver);
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        let due = lock(&driver.due);
+        assert!(due.in_burst(&key));
+        assert!(due.background.contains(&key));
+        drop(due);
+        assert!(!settled_now(&driver, burst));
+    }
+
+    #[test]
+    fn a_peer_without_the_repo_is_no_error_when_another_peer_took_it() {
+        let report = with_a_peer_that_lacks_the_repo(true);
+        assert!(report["error"].is_null(), "{report}");
+        assert_eq!(report["remaining"], 0, "{report}");
+        assert_eq!(report["exchanged"], 1, "{report}");
+    }
+
+    #[test]
+    fn a_repo_no_peer_took_is_reported() {
+        let report = with_a_peer_that_lacks_the_repo(false);
+        let error = report["error"].as_str().unwrap();
+        assert!(error.contains("REPO_NOT_PUBLISHED"), "{report}");
+        assert!(report["remaining"].is_null(), "{report}");
     }
 
     /// One pump round, and the listener's calls it made.

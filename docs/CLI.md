@@ -286,18 +286,30 @@ It prints `{"folders": [{"id", "exchanged", "pushed", "remaining", "error"}]}`:
 - `exchanged`: metadata exchanges that finished;
 - `pushed`: objects a peer confirmed are durable;
 - `remaining`: what the last listing named and this host did not store. It is
-  an estimate, because later pages of a listing are not counted, and it is
-  `null` when no listing came back;
-- `error`: why the folder did not finish, or `null`. It is the code of the
-  failure, such as the connection's or the peer's refusal, or
-  `SYNC_NOW_TIMEOUT` when time ran out. A folder that is stopped or paused
-  reports `WORKER_NOT_RUNNING`. With no peer to dial there is nothing to do, and
-  it is `null`.
+  an estimate, because later pages of a listing are not counted. `0` with no
+  error means a peer's listing, read from its start, named nothing this host
+  holds and has not sent. It is `null` when no listing came back;
+- `error`: why the folder did not finish, or `null`. See below.
 
 An error here is reported, not fatal: the command exits 0 and what was done stays
-done. A peer that stays unreachable is reported after 10 seconds. The whole
-command takes at most 175 seconds, and it stops early if the orchestrator shuts
-down.
+done. The whole command takes at most 175 seconds, and it stops early if the
+orchestrator shuts down. The `error` of a folder is:
+
+- the failure of a peer's connection, when its connections stay down for 10
+  seconds;
+- `REPO_NOT_PUBLISHED`, when no peer took the folder. A peer without the folder
+  is no error if another peer took it. A peer that has answered for the folder
+  since this orchestrator started gets 10 seconds to publish it again, since its
+  folder may only be restarting; any other is told apart at once;
+- `PEER_PUSH_UNAVAILABLE`, when a peer is too old to take pushes. Its metadata
+  still moved, and `remaining` is `null` if no other peer answered;
+- `WORKER_NOT_RUNNING`, when this folder is stopped or paused;
+- the last failure, or `SYNC_NOW_TIMEOUT` if nothing was failing, when time ran
+  out. A timeout or a lost connection does not end the command: a slow link gets
+  asked again, in smaller batches, until the 175 seconds are up;
+- any other failure's code, at once, since asking again would repeat it.
+
+With no peer to dial there is nothing to do, and it is `null`.
 
 ### Shutdown
 
