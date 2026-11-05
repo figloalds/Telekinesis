@@ -952,6 +952,36 @@ fn a_paused_listener_causes_backoff_and_resumes() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_listener_whose_store_fails_is_asked_ever_more_slowly_and_gets_the_bytes() -> Result<()> {
+    // Its first three stores fail, as on a full disk.
+    let b = TestDaemon::start_env(
+        "",
+        &[
+            ("TKFS_FAULT_POINT", "objects.store.write"),
+            ("TKFS_FAULT_ACTION", "fail"),
+            ("TKFS_FAULT_COUNT", "3"),
+        ],
+    )?;
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(TestDaemon::start()?, b, &[])?;
+    let content = text(2000, 71);
+    let began = Instant::now();
+    import(&a, &state_a, "full.txt", &content)?;
+    wait_file(&state_b, "full.txt", &content, REPLICATED)?;
+    // Rests of 1, 2 and 4 s between its four stores. A fixed rest takes 3 s.
+    let took = began.elapsed();
+    ensure!(took >= Duration::from_secs(6), "it took {took:?}");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
 // ---- active sync: notify and the backup poll -----------------------------
 
 /// Polls so long that only a notify or a local change can explain a quick

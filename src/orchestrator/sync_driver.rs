@@ -27,7 +27,8 @@
 //!   abandoned before its next call as soon as a demand wake-up (the
 //!   wake [`Seq`] the folders' watch threads bump) arrives, so the next
 //!   round's pass 1 waits at most for one call in flight (≤
-//!   [`FETCH_DEADLINE_MAX`]). Objects are asked of each peer in turn, per
+//!   [`FETCH_DEADLINE_MAX`], and a wake cancels a background one). Objects are
+//!   asked of each peer in turn, per
 //!   owning Ready bulk lane: manifests (size unknown) in batches of ≤
 //!   [`MANIFEST_BATCH`], then chunks in batches of ≤ [`OBJECT_BATCH`], each
 //!   within a deadline that grows with what it asks ([`fetch_deadline`]),
@@ -37,8 +38,11 @@
 //!   the rest is asked again at once. A digest every asked
 //!   peer omitted is excluded for a backoff (5 s doubling to 5 min), which
 //!   spares re-asking it when the scan comes around again. A round that stored nothing sleeps
-//!   `sync_interval_ms` unless woken. A peer whose fetch failed sits out the
-//!   next round. The pump never blocks the scheduler. After each pass it also
+//!   `sync_interval_ms` unless woken. A peer whose fetch timed out or lost its
+//!   lane sits out the next round, and a coded failure rests only that (folder,
+//!   peer), as a push failure does. A reader's fetch gives a peer [`DEMAND_TRY`]
+//!   while another could answer, with a peer known not to answer asked last. The
+//!   pump never blocks the scheduler. After each pass it also
 //!   pushes ([`push`]), so a round runs: this side's demand, the listeners'
 //!   demand, background pull, background push. The background push stops
 //!   before its next call on a demand wake-up, as pass 2 does. Only a reader
@@ -49,7 +53,8 @@
 //!   run only for a pair that is due, so an idle pair asks its listener nothing:
 //!   the demand step on a peer's demand notify, the background step on a local
 //!   change or an exchange that moved events, and both on the pair's poll. A
-//!   background step stays due until a page comes back empty.
+//!   background step stays due until a whole sweep of the listener's scan stored
+//!   nothing ([`push`]), and a failed one waits out a rest that grows.
 //! * **clock probes** — a short thread per probe, at most one per peer: at
 //!   every new control session (a Ready transition) and every
 //!   [`CLOCK_PROBE_EVERY`] scheduler rounds. A round is one `sync_interval_ms`,
@@ -63,12 +68,14 @@
 //! lanes are up, and that needs no poll: a folder's watch bumps the wake. Only a
 //! burst ([`Driver::sync_now`], which works in either profile) opens the rest,
 //! for the pairs it selected: an exchange until neither side has more, then
-//! pushes until the listener's scan, asked from its start, comes back empty. A
-//! passive burst still does no background pull.
+//! pushes until a whole sweep of the listener's scan, from its start, stored
+//! nothing. A passive burst still does no background pull.
 //!
 //! A burst outlasts what may pass. A lost lane or a timeout is asked again until
-//! the budget ends, which reports the last failure; the push pass's own recovery
-//! (a halved batch, a listing asked afresh) does the rest. A peer that does not
+//! the budget ends, which reports the last failure, at the pace of the push
+//! pass's rests; its own recovery (a halved batch, a listing asked afresh) does
+//! the rest. What a peer refused ends that pair's sweep and is reported by its
+//! code, with what stays unsent in `remaining`. A peer that does not
 //! hold a folder ends that pair: at once if it never answered for the repo, else
 //! after [`REPO_WAIT`], since its folder may only be restarting. Any other coded
 //! failure would repeat itself, so it ends the pair. A peer without a folder is
@@ -134,9 +141,18 @@ pub const UNAVAILABLE_MAX: Duration = Duration::from_secs(300);
 /// pump while a push step stays due: a new control session and a failed step
 /// send no poke.
 const DUE_CHECK: Duration = Duration::from_millis(500);
-/// Most marks kept per kind. A mark names a repo a paired peer chose, so it is
-/// bounded; past this one is not kept, and the pair's poll covers that.
-const MAX_MARKS: usize = 4096;
+/// How long a reader's `objects.fetch` waits for a peer when another could answer
+/// or the peer is known not to, so that one that hangs does not use up the
+/// reader's own wait (`Demand::FETCH_WAIT`).
+const DEMAND_TRY: Duration = Duration::from_secs(3);
+/// After a sweep that stored nothing, the pair's next poll is at least this many
+/// times as long as the sweep took. A short one changes nothing. A long one is
+/// many requests for a listener to scan, listing what neither side holds, and a
+/// poll is no reason to start it over at once. What says something changed still
+/// does.
+const SWEEP_PACE: u32 = 10;
+/// That wait is at most this: the longest backup poll there is.
+const SWEEP_PACE_MAX: Duration = Duration::from_secs(3600);
 /// How long [`Driver::sync_now`] may take: its reply beats the control client's
 /// timeout, so the client never takes a slow burst for a lost connection.
 pub const SYNC_NOW_BOUND: Duration = Duration::from_secs(REPLY_TIMEOUT.as_secs() - 5);
@@ -220,8 +236,7 @@ impl Due {
             .filter_map(move |burst| burst.pairs.get_mut(pair))
     }
 
-    /// `pair` joins `burst`, with everything due. Past [`MAX_MARKS`] too: that
-    /// bound is for names a peer chose, and these are this side's.
+    /// `pair` joins `burst`, with everything due.
     fn join_burst(&mut self, burst: u64, pair: Pair, error: Option<String>) {
         if let Some(burst) = self.bursts.get_mut(&burst) {
             let state = BurstPair {
@@ -274,6 +289,9 @@ struct BurstPair {
     rescan: bool,
     /// It failed in a way waiting will not cure, so this pair is finished.
     error: Option<String>,
+    /// What this side holds did not all get across: the peer refused it, or no
+    /// reply can carry it.
+    refusal: Option<String>,
     /// The peer does not publish the repo, so this pair is finished: an error
     /// only if no other peer took the folder.
     not_published: Option<String>,
@@ -301,9 +319,12 @@ impl BurstPair {
 
     /// Why this pair is reported as failed, if it is.
     fn reason(&self) -> Option<&str> {
-        self.error.as_deref().or(self
-            .no_push
-            .then_some("PEER_PUSH_UNAVAILABLE: this peer does not take pushes"))
+        self.error
+            .as_deref()
+            .or(self
+                .no_push
+                .then_some("PEER_PUSH_UNAVAILABLE: this peer does not take pushes"))
+            .or(self.refusal.as_deref())
     }
 }
 
@@ -323,11 +344,6 @@ struct BurstPeer {
     seen: Instant,
     /// Why it was given up on.
     error: Option<String>,
-}
-
-/// Whether it is a new mark. A full set keeps none.
-fn mark(marks: &mut BTreeSet<Pair>, pair: Pair) -> bool {
-    marks.len() < MAX_MARKS && marks.insert(pair)
 }
 
 /// The peer lanes the driver uses: the [`Network`] (tests stub it).
@@ -392,6 +408,11 @@ pub struct SyncFolder {
 pub trait SyncFolders: Send + Sync {
     /// Every Running, unpaused folder with a worker link.
     fn syncing(&self) -> Vec<SyncFolder>;
+    /// Whether `repo` is a folder of this daemon, whatever it is doing now. A mark
+    /// is kept only for those, so what a paired peer can make this side remember
+    /// is bounded by its own folders and peers. Runs on a lane's I/O thread: no
+    /// database, and no waiting for a busy controller.
+    fn knows(&self, repo: &str) -> bool;
 }
 
 /// The metadata exchange state of one (peer, repo).
@@ -440,8 +461,11 @@ struct PumpState {
     round: u64,
     /// Peers sitting out: endpoint → the first round they are asked again.
     resting: BTreeMap<String, u64>,
-    /// The last error logged per peer endpoint (fetch) or folder id
-    /// (`objects.missing`): logged again only when it changes.
+    /// The same of one folder only: (folder id, endpoint), after a failure that
+    /// says nothing of the peer's other folders.
+    folder_resting: BTreeMap<(String, String), u64>,
+    /// The last error logged per (peer endpoint, folder) of a fetch, or per
+    /// folder id of `objects.missing`: logged again only when it changes.
     logged: BTreeMap<String, String>,
     /// Per folder id: the digests no asked peer had, and until when they are
     /// excluded.
@@ -472,6 +496,18 @@ pub(super) fn grown_batch(size: usize) -> usize {
 }
 
 impl PumpState {
+    /// Of `endpoints`, the ones `id` can ask now.
+    fn askable(&self, endpoints: &[String], id: &str) -> Vec<String> {
+        endpoints
+            .iter()
+            .filter(|endpoint| {
+                let folder_peer = (id.to_owned(), (*endpoint).clone());
+                !self.folder_resting.contains_key(&folder_peer)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The objects asked of `endpoint` per fetch for folder `id`.
     fn batch_size(&self, id: &str, endpoint: &str) -> usize {
         self.batch
@@ -743,8 +779,8 @@ impl Driver {
             let mut due = lock(&self.due);
             for peer in &peers {
                 let pair = (peer.endpoint.clone(), repo.to_owned());
-                mark(&mut due.exchange, pair.clone());
-                mark(&mut due.background, pair);
+                due.exchange.insert(pair.clone());
+                due.background.insert(pair);
             }
         }
         self.poke.bump();
@@ -904,16 +940,22 @@ impl Driver {
     /// Ends `burst` and reports it. `failure` is why it stopped, for the folders
     /// it did not finish.
     fn close_burst(&self, burst: u64, folders: &[BurstFolder], failure: Option<String>) -> Value {
+        // A daemon that is stopping says so: what was being retried did not end
+        // this, and time did not run out.
+        let stopping = self.cancel.is_cancelled();
         let jobs = lock(&self.jobs);
         let mut due = lock(&self.due);
         let reports: Vec<Value> = folders
             .iter()
             .map(|folder| {
                 let settled = burst_folder_settled(&jobs, &due, burst, folder);
-                let unfinished = failure
-                    .as_ref()
-                    .filter(|_| !settled)
-                    .map(|failure| last_failure(&jobs, &due, burst, folder, failure));
+                let unfinished = failure.as_ref().filter(|_| !settled).map(|failure| {
+                    if stopping {
+                        failure.clone()
+                    } else {
+                        last_failure(&jobs, &due, burst, folder, failure)
+                    }
+                });
                 burst_report(due.bursts.get(&burst), folder, unfinished)
             })
             .collect();
@@ -1062,7 +1104,7 @@ impl Driver {
         // Events moved: the objects they name may now be wanted, either way.
         let moved = cursor != task.cursor;
         if moved {
-            mark(&mut lock(&self.due).background, task.key.clone());
+            lock(&self.due).background.insert(task.key.clone());
             self.wake.nudge();
         }
         let answered = slot.job.last_exchange_ms > 0;
@@ -1218,9 +1260,10 @@ impl Driver {
     }
 
     /// Marks both push steps due for the pairs whose poll came up, and drops
-    /// the marks of a peer with no Ready lane left. When it returns, its new
-    /// control session starts an exchange that moves events again. What a burst
-    /// marked stays, since it waits for that peer. A passive driver has no polls.
+    /// the marks of a peer with no Ready lane left, or of a folder this daemon no
+    /// longer has. When the peer returns, its new control session starts an
+    /// exchange that moves events again. What a burst marked stays, since it waits
+    /// for that peer. A passive driver has no polls.
     fn mark_polls(
         &self,
         state: &mut PumpState,
@@ -1243,12 +1286,16 @@ impl Driver {
         };
         {
             let Due {
+                exchange,
                 demand,
                 background,
                 bursts,
                 ..
             } = &mut *due;
-            let keep = |pair: &Pair| lanes(&pair.0) || in_burst(bursts, pair);
+            let keep = |pair: &Pair| {
+                (lanes(&pair.0) && self.folders.knows(&pair.1)) || in_burst(bursts, pair)
+            };
+            exchange.retain(keep);
             demand.retain(keep);
             background.retain(keep);
         }
@@ -1265,8 +1312,8 @@ impl Driver {
                 }
                 let poll = self.policy.poll(notified(endpoint));
                 state.polls.insert(pair.clone(), now + poll);
-                mark(&mut due.demand, pair.clone());
-                mark(&mut due.background, pair);
+                due.demand.insert(pair.clone());
+                due.background.insert(pair);
             }
         }
     }
@@ -1315,22 +1362,25 @@ impl Driver {
     }
 
     /// A background step ended: what stays due, and what the bursts learn of it.
-    /// A page that listed something is not done. A listing that failed lists
-    /// nothing: it waits for the pair's next trigger, so a hung listener does not
-    /// hold this pump again at once.
+    /// The pass says whether the pair has more to do ([`push`]). Otherwise it
+    /// waits for its next trigger: after a sweep that changed nothing, or a
+    /// listing that failed, so a hung listener does not hold this pump again at
+    /// once.
     ///
     /// A burst is such a trigger, and it believes only what a pass saw. A pass
-    /// that listed nothing says nothing of what is left, and an empty page says
-    /// the scan is clean only if the pass began at its top: what a page before it
-    /// left behind is behind the cursor. The rests of a failed pass pace asking
-    /// again, and the wait of a page past the top is cut short.
+    /// that listed nothing says nothing of what is left, and only a sweep that
+    /// ran from the top of the scan to its end says it is done: what a page before
+    /// it left behind is behind the cursor. Then `remaining` is what this side
+    /// holds and knows did not get across, since what it lacks is not its to send.
+    /// Short of that it is at least the last page's, and what the sweep has left so
+    /// far. The rests of a failed pass
+    /// pace asking again, and the wait for a next page of a sweep is cut short.
     fn background_done(&self, pair: &Pair, outcome: &push::PushOutcome) {
         let now = Instant::now();
         let clean = outcome.listed && outcome.error.is_none() && !outcome.interrupted;
-        let empty = clean && outcome.pushed + outcome.remaining == 0;
         let mut due = lock(&self.due);
-        if outcome.interrupted || outcome.pushed + outcome.remaining > 0 {
-            mark(&mut due.background, pair.clone());
+        if outcome.interrupted || outcome.again {
+            due.background.insert(pair.clone());
         }
         let wanted = due.in_burst(pair);
         let retry = match &outcome.error {
@@ -1341,15 +1391,28 @@ impl Driver {
                 Some(push::Unlisted::NoLane | push::Unlisted::Resting)
             ),
         };
-        let restart = empty && !outcome.from_top;
+        let next_page = clean && outcome.again;
+        let refusal = outcome
+            .refusal
+            .as_ref()
+            .filter(|_| outcome.unsent > 0)
+            .map(|code| {
+                let unsent = outcome.unsent;
+                format!("{code}: {unsent} object(s) this host holds did not get across")
+            });
         for state in due.burst_pairs(pair) {
             state.pushed += outcome.pushed as u64;
-            if outcome.remaining > 0 || clean {
-                state.remaining = Some(outcome.remaining);
+            if outcome.swept {
+                state.remaining = Some(outcome.unsent);
+            } else if outcome.remaining > 0 || clean {
+                let known = outcome.unsent.max(outcome.left);
+                state.remaining = Some(outcome.remaining.max(known));
+            }
+            if outcome.listed {
+                state.refusal = refusal.clone();
             }
             state.no_push |= outcome.unlisted == Some(push::Unlisted::NoPush);
-            state.rescan |= restart;
-            state.swept = empty && outcome.from_top;
+            state.swept = outcome.swept;
             if clean {
                 state.answered();
             }
@@ -1362,11 +1425,11 @@ impl Driver {
                 Some(failure) => state.failure = Some(failure.to_string()),
             }
         }
-        if wanted && (retry || restart) {
+        if wanted && retry {
             due.background.insert(pair.clone());
         }
         drop(due);
-        if wanted && restart {
+        if wanted && next_page {
             self.wake.nudge();
         }
     }
@@ -1399,6 +1462,7 @@ impl Driver {
         state.unavailable.retain(|id, _| syncing(id));
         state.scan.retain(|id, _| syncing(id));
         state.batch.retain(|(id, _), _| syncing(id));
+        state.folder_resting.retain(|_, at| *at > round);
         self.mark_polls(state, &all, &peers, &folders);
         let now = Instant::now();
         state
@@ -1415,7 +1479,11 @@ impl Driver {
                 .copied()
                 .collect();
             if !demand.is_empty() && !endpoints.is_empty() && !self.cancel.is_cancelled() {
-                stored += self.supply(state, &endpoints, folder, demand, None).stored;
+                // A peer known not to answer is asked last: it may be the only
+                // one that holds this, so it is not passed over.
+                let mut asked = state.askable(&endpoints, &folder.id);
+                asked.sort_by_key(|endpoint| state.push.endpoint_rests(endpoint, now));
+                stored += self.supply(state, &asked, folder, demand, None).stored;
             }
         }
         // What the listeners' readers wait for. A failure needs no mark: their
@@ -1447,13 +1515,21 @@ impl Driver {
             {
                 break;
             }
+            // A peer that rests is not asked for what no reader waits for. With
+            // nobody to ask for this folder, its page is not to be passed over.
+            let now = Instant::now();
+            let mut asked = state.askable(&endpoints, &folder.id);
+            asked.retain(|endpoint| !state.push.endpoint_rests(endpoint, now));
+            if asked.is_empty() {
+                continue;
+            }
             let Some((wanted, cursor)) = self.background(state, folder) else {
                 continue;
             };
             let supplied = if wanted.is_empty() {
                 Supplied::default()
             } else {
-                self.supply(state, &endpoints, folder, wanted, Some(seen))
+                self.supply(state, &asked, folder, wanted, Some(seen))
             };
             stored += supplied.stored;
             if supplied.interrupted {
@@ -1480,7 +1556,13 @@ impl Driver {
                 }
                 let outcome = self.push(state, endpoint, folder, PushMode::Background, Some(seen));
                 stored += outcome.pushed;
-                self.background_done(&(endpoint.clone(), folder.repo.clone()), &outcome);
+                let pair = (endpoint.clone(), folder.repo.clone());
+                if outcome.swept {
+                    let at = Instant::now() + (outcome.took * SWEEP_PACE).min(SWEEP_PACE_MAX);
+                    let poll = state.polls.entry(pair.clone()).or_insert(at);
+                    *poll = (*poll).max(at);
+                }
+                self.background_done(&pair, &outcome);
                 if outcome.interrupted {
                     return stored;
                 }
@@ -1573,8 +1655,12 @@ impl Driver {
     /// bulk lane and at most [`OBJECT_BATCH`] per call, for what is still
     /// missing, and what arrives is written to the worker. A digest that
     /// every asked peer omitted (none failing) is unavailable for a backoff
-    /// (5 s doubling to 5 min). A failing peer sits out the next round. With
-    /// `interrupt`, stops before the next call once the wake moved past it.
+    /// (5 s doubling to 5 min). A peer whose lane is unusable sits out the next
+    /// round, and one that gave a coded failure does so for this folder alone.
+    /// With `interrupt`, stops once the wake moved past it, cancelling the call in
+    /// flight: no failure, and what it asked stays missing and is listed again.
+    /// Without it a reader is waiting, so a peer gets [`DEMAND_TRY`] while another
+    /// could answer or when it is known not to.
     fn supply(
         &self,
         state: &mut PumpState,
@@ -1587,13 +1673,20 @@ impl Driver {
         let mut asked = BTreeSet::new();
         let mut failed = BTreeSet::new();
         let mut result = Supplied::default();
-        'peers: for endpoint in endpoints {
+        'peers: for (index, endpoint) in endpoints.iter().enumerate() {
             if remaining.is_empty() {
                 break;
             }
-            if state.resting.contains_key(endpoint) {
+            let folder_peer = (folder.id.clone(), endpoint.clone());
+            if state.resting.contains_key(endpoint)
+                || state.folder_resting.contains_key(&folder_peer)
+            {
                 continue;
             }
+            let logged = format!("{endpoint} {}", folder.id);
+            let hurried = interrupt.is_none()
+                && (index + 1 < endpoints.len()
+                    || state.push.endpoint_rests(endpoint, Instant::now()));
             for (conn, batch) in lanes_for(self.lanes.as_ref(), endpoint, &remaining) {
                 // Objects of unknown size (manifests) first, in their own
                 // small batches; then the chunks.
@@ -1603,9 +1696,12 @@ impl Driver {
                     .chain(batch.iter().filter(|(_, kind)| *kind == Kind::Chunk))
                     .copied()
                     .collect();
+                let stop = || {
+                    self.cancel.is_cancelled()
+                        || interrupt.is_some_and(|seen| self.wake.current() != seen)
+                };
                 while let Some(&(_, kind)) = queue.front() {
-                    let woken = interrupt.is_some_and(|seen| self.wake.current() != seen);
-                    if self.cancel.is_cancelled() || woken {
+                    if stop() {
                         result.interrupted = true;
                         break 'peers;
                     }
@@ -1620,32 +1716,46 @@ impl Driver {
                     {
                         chunk.extend(queue.pop_front());
                     }
-                    let deadline = (self.fetch_deadline)(&chunk);
-                    let fetched = match fetch(&conn, &folder.repo, &chunk, deadline, &self.cancel) {
+                    let mut deadline = (self.fetch_deadline)(&chunk);
+                    if hurried {
+                        deadline = deadline.min(DEMAND_TRY);
+                    }
+                    let fetched = match fetch(&conn, &folder.repo, &chunk, deadline, &stop) {
                         Ok(fetched) => {
                             state.grow(&folder.id, endpoint);
+                            state.push.answered(endpoint);
                             fetched
                         }
-                        Err(FetchFailure { failure, timed_out }) => {
+                        Err(failure) if failure.abandoned => {
+                            result.interrupted = true;
+                            break 'peers;
+                        }
+                        Err(FetchFailure {
+                            failure, timed_out, ..
+                        }) => {
                             failed.extend(chunk.iter().map(|(digest, _)| *digest));
                             if timed_out {
                                 state.shrink(&folder.id, endpoint, chunk.len());
                             }
-                            state.resting.insert(endpoint.clone(), state.round + 2);
-                            // The lane is unusable, for pushes too. A coded
-                            // failure is this folder's alone.
+                            // The lane is unusable, for the other folders and for
+                            // pushes too. A coded failure is this folder's alone.
                             if timed_out || failure == Failure::LaneLost {
+                                state.resting.insert(endpoint.clone(), state.round + 2);
                                 state.push.rest_endpoint(endpoint);
+                            } else {
+                                state
+                                    .folder_resting
+                                    .insert(folder_peer.clone(), state.round + 2);
                             }
                             let error = failure.to_string();
-                            if state.logged.get(endpoint) != Some(&error) {
+                            if state.logged.get(&logged) != Some(&error) {
                                 event!(warn, SYNC_FETCH_FAILED, {
                                     "peer": endpoint.clone(),
                                     "repo": folder.repo.clone(),
                                     "error": error.clone(),
                                     "batch": chunk.len(),
                                 });
-                                state.logged.insert(endpoint.clone(), error);
+                                state.logged.insert(logged.clone(), error);
                             }
                             continue 'peers;
                         }
@@ -1674,9 +1784,15 @@ impl Driver {
                             String::new()
                         });
                     }
-                    // Only what was asked (the worker takes ≤ OBJECT_BATCH).
+                    // Only what was asked, as what it was asked as: a paired peer
+                    // does not get to store a wrong kind here, and the worker takes
+                    // ≤ OBJECT_BATCH.
                     let mut objects = fetched.objects;
-                    objects.retain(|object| chunk.iter().any(|(d, _)| *d == object.digest));
+                    objects.retain(|object| {
+                        chunk
+                            .iter()
+                            .any(|(d, kind)| *d == object.digest && *kind == object.kind)
+                    });
                     if objects.is_empty() {
                         continue;
                     }
@@ -1684,7 +1800,7 @@ impl Driver {
                     match folder.link.write(objects) {
                         Ok(count) => {
                             result.stored += count;
-                            state.logged.remove(endpoint);
+                            state.logged.remove(&logged);
                             let now = Instant::now();
                             for digest in &received {
                                 state.supplied.insert((folder.id.clone(), *digest), now);
@@ -1730,30 +1846,35 @@ impl Driver {
 }
 
 impl NotifySink for Driver {
-    /// Runs on the lane's I/O thread: only marks and bumps. A demand notify
-    /// repeats while its reader waits, whether or not the repo is synced here,
-    /// and a peer picks the name: only a new mark looks any further. A passive
-    /// driver did not ask for hints, and the other side does not get to wake it.
+    /// Runs on the lane's I/O thread: only marks and bumps. A peer picks the name,
+    /// so one of no folder here is ignored and costs nothing. A demand notify
+    /// repeats while its reader waits: only a new mark looks any further, to stop
+    /// background work, and a repeat rouses the pump, in case it sleeps on a mark
+    /// it could not take. A passive driver did not ask for hints, and the other
+    /// side does not get to wake it.
     fn notified(&self, endpoint: &str, notify: &Notify) {
-        if self.passive() {
+        if self.passive() || !self.folders.knows(&notify.repo) {
             return;
         }
         let pair = (endpoint.to_owned(), notify.repo.clone());
         match notify.reason {
             NotifyReason::Metadata => {
-                mark(&mut lock(&self.due).exchange, pair);
+                lock(&self.due).exchange.insert(pair);
                 self.poke.bump();
             }
             NotifyReason::Demand => {
-                if !mark(&mut lock(&self.due).demand, pair) {
-                    return;
-                }
-                let here = self.folders.syncing();
-                if here.iter().any(|folder| folder.repo == notify.repo) {
+                let new = lock(&self.due).demand.insert(pair);
+                let here = new
+                    && self
+                        .folders
+                        .syncing()
+                        .iter()
+                        .any(|folder| folder.repo == notify.repo);
+                if here {
                     self.wake.bump();
                 } else {
-                    // Not syncing now, which may be a slot that is only busy:
-                    // the pump looks again, and nothing is interrupted.
+                    // A repeat, or not syncing now, which may be a slot that is
+                    // only busy: the pump looks again, and nothing is interrupted.
                     self.wake.nudge();
                 }
             }
@@ -1937,10 +2058,12 @@ fn exchange(
     }
 }
 
-/// Why a fetch failed, and whether its deadline passed.
+/// Why a fetch failed, and whether its deadline passed or its caller gave it up.
 pub(super) struct FetchFailure {
     pub(super) failure: Failure,
     pub(super) timed_out: bool,
+    /// A stop cancelled it: not a failure of the peer. Nothing rests or shrinks.
+    pub(super) abandoned: bool,
 }
 
 impl From<Failure> for FetchFailure {
@@ -1948,6 +2071,7 @@ impl From<Failure> for FetchFailure {
         Self {
             failure,
             timed_out: false,
+            abandoned: false,
         }
     }
 }
@@ -1968,13 +2092,13 @@ pub fn fetch_deadline(wanted: &[(Digest, Kind)]) -> Duration {
 }
 
 /// `objects.fetch` of ≤ [`OBJECT_BATCH`] objects on a peer bulk lane, within
-/// `deadline`.
+/// `deadline`, until `stop`.
 fn fetch(
     conn: &Conn,
     repo: &str,
     wanted: &[(Digest, Kind)],
     deadline: Duration,
-    cancel: &Cancel,
+    stop: &dyn Fn() -> bool,
 ) -> Result<Fetched, FetchFailure> {
     let body = serde_json::to_vec(wanted).map_err(|e| worker_failure("objects.fetch", e))?;
     let reply = conn
@@ -1984,10 +2108,11 @@ fn fetch(
             body,
             Priority::Data,
             deadline,
-            &|| cancel.is_cancelled(),
+            stop,
         )
         .map_err(|error| FetchFailure {
             timed_out: matches!(error, CallError::Timeout { .. }),
+            abandoned: matches!(error, CallError::Cancelled),
             failure: peer_failure("objects.fetch", error),
         })?;
     Fetched::from_reply(&reply.header, &reply.body).map_err(|error| {
@@ -2237,6 +2362,8 @@ mod tests {
         wake_on_read: Option<Arc<Seq>>,
         /// Runs during every `objects.fetch`.
         during_read: Option<Hook>,
+        /// What `objects.fetch` leaves out as too large for any reply.
+        oversized: Vec<Digest>,
     }
 
     /// Something that happens while a request is being served.
@@ -2296,6 +2423,10 @@ mod tests {
                     let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
                     let mut fetched = Fetched::default();
                     for (index, (digest, kind)) in wanted.into_iter().enumerate() {
+                        if self.oversized.contains(&digest) {
+                            fetched.oversized.push(digest);
+                            continue;
+                        }
                         let Some(object) = self.held.iter().find(|o| o.digest == digest) else {
                             continue;
                         };
@@ -2454,6 +2585,9 @@ mod tests {
                     demand: lock(demand).clone(),
                 })
                 .collect()
+        }
+        fn knows(&self, repo: &str) -> bool {
+            repo == "repo-1"
         }
     }
 
@@ -2844,6 +2978,18 @@ mod tests {
         wake_on_store: Option<Arc<Seq>>,
         /// Runs during every `objects.fetch`.
         during_fetch: Option<Hook>,
+        /// No request is ever answered, while the lane stays up.
+        hang: bool,
+        /// An `objects.fetch` is never answered.
+        hang_fetch: bool,
+        /// An `objects.store` naming one of these is never answered.
+        hang_store_of: BTreeSet<Digest>,
+        /// An `objects.store` fails with this code.
+        fail_store: Mutex<Option<String>>,
+        /// A reply to a store also names these as stored.
+        claims: Vec<Digest>,
+        /// Readers that began waiting later.
+        late_demand: Mutex<Wanted>,
         stored: Mutex<Vec<(Digest, Kind)>>,
         calls: Mutex<Vec<String>>,
         store_sizes: Mutex<Vec<usize>>,
@@ -2863,6 +3009,11 @@ mod tests {
         }
 
         fn serve(&self, req: Incoming) {
+            if self.hang {
+                lock(&self.calls).push(req.op.clone());
+                std::mem::forget(req);
+                return;
+            }
             if self.unpublished.as_deref() == req.header["repo"].as_str() {
                 lock(&self.calls).push(req.op.clone());
                 req.responder
@@ -2876,6 +3027,10 @@ mod tests {
                     lock(&self.calls).push("fetch".into());
                     if let Some(hook) = &self.during_fetch {
                         hook();
+                    }
+                    if self.hang_fetch {
+                        std::mem::forget(req);
+                        return;
                     }
                     if self.stall_fetch {
                         thread::sleep(Duration::from_millis(900));
@@ -2905,10 +3060,12 @@ mod tests {
                 .as_str()
                 .map_or(0, |after| after.parse().unwrap());
             let stored = self.stored();
+            let late = lock(&self.late_demand).clone();
             let mut page = WantedPage {
                 demand: self
                     .demand
                     .iter()
+                    .chain(&late)
                     .filter(|(digest, _)| !stored.contains(digest))
                     .copied()
                     .collect(),
@@ -2934,6 +3091,17 @@ mod tests {
             lock(&self.calls).push("store".into());
             let objects: Vec<Object> = serde_json::from_slice(&req.body).unwrap();
             lock(&self.store_sizes).push(objects.len());
+            if objects
+                .iter()
+                .any(|object| self.hang_store_of.contains(&object.digest))
+            {
+                std::mem::forget(req);
+                return;
+            }
+            if let Some(code) = lock(&self.fail_store).clone() {
+                req.responder.error(ErrorWire::coded(&code, "failing"));
+                return;
+            }
             if self.stall_above.is_some_and(|most| objects.len() > most) {
                 thread::sleep(Duration::from_millis(900));
                 return;
@@ -2953,8 +3121,11 @@ mod tests {
                     reply.stored.push(object.digest);
                 }
             }
+            reply.stored.extend(self.claims.iter().copied());
             if let Some(wake) = &self.wake_on_store {
                 wake.bump();
+                // The caller sees the wake before the reply, every time.
+                thread::sleep(Duration::from_millis(100));
             }
             req.responder
                 .reply(json!({}), serde_json::to_vec(&reply).unwrap());
@@ -3080,9 +3251,11 @@ mod tests {
         );
         assert!(outcome.interrupted);
         assert!(outcome.error.is_none());
-        assert_eq!(outcome.pushed, OBJECT_BATCH);
-        assert_eq!(outcome.remaining, OBJECT_BATCH);
+        // Cancelled, so uncertain, and not counted: the listener may well hold it.
+        assert_eq!(outcome.pushed, 0);
+        assert_eq!(outcome.remaining, 2 * OBJECT_BATCH);
         assert_eq!(listener.calls(), ["wanted/32", "store"]);
+        assert_eq!(listener.stored().len(), OBJECT_BATCH);
         // The page was not finished: the scan stays on it.
         assert_eq!(push_peer(&mut state, &folder).scan, None);
         // A wake that already moved stops it before any call.
@@ -3257,7 +3430,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_digest_is_dropped_from_the_round_and_listed_again() {
+    fn a_refused_digest_is_dropped_from_the_round_and_backed_off() {
         let all = objects("object", 3);
         let listener = Arc::new(Listener {
             missing: wanted_of(&all),
@@ -3272,15 +3445,31 @@ mod tests {
         assert_eq!(outcome.remaining, 1);
         assert!(outcome.error.is_none());
         assert_eq!(*lock(&listener.store_sizes), [3]);
+        assert_eq!(outcome.unsent, 1);
+        assert_eq!(outcome.refusal.as_deref(), Some("OBJECT_NOT_WANTED"));
         let peer = push_peer(&mut state, &folder);
-        assert!(peer.lacks.is_empty());
+        assert_eq!(peer.lacks.keys().collect::<Vec<_>>(), [&all[1].digest]);
         assert_eq!(peer.counters.pushed, 2);
         assert_eq!(peer.counters.refused, 1);
-        // Still wanted: listed and offered again next round.
+        // Meanwhile it is excluded, and still known to be unsent. A demand pass,
+        // for a reader, does not offer it again either.
         let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
         assert_eq!(outcome.pushed, 0);
+        assert_eq!(outcome.remaining, 0);
+        assert_eq!(outcome.unsent, 1);
+        assert!(outcome.swept);
+        assert_eq!(*lock(&listener.store_sizes), [3]);
+        // Past its backoff it is offered again, and refused again it doubles.
+        let peer = push_peer(&mut state, &folder);
+        peer.lacks
+            .values_mut()
+            .for_each(|u| u.until = Instant::now());
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
         assert_eq!(outcome.remaining, 1);
         assert_eq!(*lock(&listener.store_sizes), [3, 1]);
+        let peer = push_peer(&mut state, &folder);
+        let backoff = peer.lacks[&all[1].digest].backoff;
+        assert_eq!(backoff, UNAVAILABLE_FIRST * 2);
     }
 
     /// Digests go to the lane their first byte's parity names.
@@ -3489,6 +3678,9 @@ mod tests {
                 })
                 .collect()
         }
+        fn knows(&self, repo: &str) -> bool {
+            self.0.iter().any(|(known, _, _)| known == repo)
+        }
     }
 
     const UNPUBLISHED: &str = "unpublished-repo";
@@ -3534,7 +3726,9 @@ mod tests {
         // The pull of the first folder fails: the pull passes rest, the second
         // folder's background push goes on in this very round.
         assert_eq!(driver.pump_round(&mut state, seen), OBJECT_BATCH);
-        assert!(state.resting.contains_key(ENDPOINT));
+        assert!(!state.resting.contains_key(ENDPOINT));
+        let rested = (UNPUBLISHED.to_owned(), ENDPOINT.to_owned());
+        assert!(state.folder_resting.contains_key(&rested));
         assert!(!state.push.resting.contains_key(ENDPOINT));
         // The round pull sits out holds no call of it, and still pushes.
         assert_eq!(driver.pump_round(&mut state, seen), 8);
@@ -4047,7 +4241,7 @@ mod tests {
         assert_eq!(calls_named(&calls, "fetch"), 0, "{calls:?}");
         // Over: nothing again, even with a mark left behind.
         lock(&driver.due).bursts.clear();
-        mark(&mut lock(&driver.due).background, key);
+        lock(&driver.due).background.insert(key);
         assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
         assert_eq!(driver.pump_wait(), PASSIVE_IDLE);
     }
@@ -4250,11 +4444,12 @@ mod tests {
             due.exchange.clear();
             due.demand.clear();
         }
-        let outcome = |pushed, remaining| push::PushOutcome {
+        let outcome = |pushed, remaining, again, swept| push::PushOutcome {
             pushed,
             remaining,
+            again,
+            swept,
             listed: true,
-            from_top: true,
             ..push::PushOutcome::default()
         };
         // Stored a page: there may be more, so it is due again.
@@ -4268,15 +4463,15 @@ mod tests {
         };
         assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
         assert!(!settled(&driver), "a sweep is under way");
-        driver.background_done(&key, &outcome(3, 0));
+        driver.background_done(&key, &outcome(3, 0, true, false));
         assert!(!settled(&driver), "a stored page is not the last");
-        // Left something listed.
+        // A page that stored nothing, with more of the scan to go.
         assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
-        driver.background_done(&key, &outcome(0, 2));
-        assert!(!settled(&driver), "two objects are left");
-        // Empty.
+        driver.background_done(&key, &outcome(0, 2, true, false));
+        assert!(!settled(&driver), "the sweep is not over");
+        // The end of a whole sweep that stored nothing.
         assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
-        driver.background_done(&key, &outcome(0, 0));
+        driver.background_done(&key, &outcome(0, 2, false, true));
         assert!(settled(&driver));
         let reply = burst_report(lock(&driver.due).bursts.get(&burst), &folder, None);
         assert_eq!(reply["pushed"], 3, "{reply}");
@@ -4507,6 +4702,9 @@ mod tests {
             "{}",
             report_now(&driver, burst)
         );
+        // Nor does the reply take it for all sent, should time run out here.
+        let report = report_now(&driver, burst);
+        assert_eq!(report["remaining"], 1, "{report}");
         // The lane is back: the sweep from the top finds it.
         *lock(&skip) = None;
         for _ in 0..4 {
@@ -4831,8 +5029,8 @@ mod tests {
 
     #[test]
     fn a_pair_stays_due_until_a_page_lists_nothing() {
-        // This side lacks what is listed: it goes in the next listing's exclude.
-        let lacked = objects("lacked", 1);
+        // This side lacks all of a page and of what follows it.
+        let lacked = objects("lacked", OBJECT_BATCH + 1);
         let listener = Arc::new(Listener {
             missing: wanted_of(&lacked),
             ..Listener::default()
@@ -4840,19 +5038,50 @@ mod tests {
         let (driver, _root) = pushing_driver(&listener, true, active(HOUR, HOUR));
         let mut state = PumpState::default();
         assert_eq!(calls_of_round(&driver, &mut state, &listener).len(), 2);
-        assert!(
-            lock(&driver.due)
-                .background
-                .contains(&pair(ENDPOINT, "repo-1"))
-        );
+        assert!(background_due(&driver), "the scan is not over");
         assert_eq!(driver.pump_wait(), DUE_CHECK);
+        // Its last page: the whole sweep stored nothing, and that is the end.
         assert_eq!(
             calls_of_round(&driver, &mut state, &listener),
             ["wanted/32"]
         );
-        assert!(lock(&driver.due).background.is_empty());
+        assert!(!background_due(&driver));
         assert_eq!(driver.pump_wait(), HOUR);
         assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+    }
+
+    #[test]
+    fn a_sweep_that_stored_something_goes_over_the_scan_again() {
+        // The last of two pages holds only what this side lacks.
+        let all = objects("object", OBJECT_BATCH + 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let fake = FakeFolder {
+            held: all[1..OBJECT_BATCH].to_vec(),
+            ..FakeFolder::default()
+        };
+        let (driver, _root) = holding_driver(&listener, fake, Seq::new());
+        let mut state = PumpState::default();
+        // Stored most of its page, and moved past what it lacks.
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener)[..2],
+            ["wanted/0", "wanted/32"]
+        );
+        assert!(background_due(&driver));
+        // The end of the scan, having stored something: from the top again.
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/32"]
+        );
+        assert!(background_due(&driver));
+        // A whole sweep that stores nothing, and it is over.
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/32"]
+        );
+        assert!(!background_due(&driver));
     }
 
     #[test]
@@ -4980,16 +5209,62 @@ mod tests {
         let wake = driver.wake.mark();
         driver.notified(ENDPOINT, &demand_of("repo-elsewhere"));
         assert_eq!(driver.pump_wait(), HOUR);
-        // It rouses the pump once and interrupts nothing, and its repeats, which
-        // last as long as a reader there waits, do neither.
-        assert_ne!(driver.wake.mark(), wake);
-        assert_eq!(driver.wake.current(), wake.value);
-        let once = driver.wake.mark();
-        driver.notified(ENDPOINT, &demand_of("repo-elsewhere"));
-        assert_eq!(driver.wake.mark(), once);
+        // No folder here: it is not even kept, and rouses nothing.
+        assert!(lock(&driver.due).demand.is_empty());
+        assert_eq!(driver.wake.mark(), wake);
         driver.notified(ENDPOINT, &demand_of("repo-1"));
         assert_eq!(driver.pump_wait(), DUE_CHECK);
         assert!(driver.wake.current() > wake.value);
+    }
+
+    /// A folder this daemon has and whose slot is busy now, then one running.
+    struct BusySlot(RepoFolders);
+
+    impl SyncFolders for BusySlot {
+        fn syncing(&self) -> Vec<SyncFolder> {
+            self.0.syncing()
+        }
+        fn knows(&self, repo: &str) -> bool {
+            repo == "repo-busy" || self.0.knows(repo)
+        }
+    }
+
+    #[test]
+    fn a_mark_for_a_busy_folder_waits_for_it_and_interrupts_nothing() {
+        let listener = Arc::new(Listener::default());
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let root = tempfile::tempdir().unwrap();
+        let folders = RepoFolders(vec![(
+            "repo-1".into(),
+            fake_worker(Arc::new(FakeFolder::default())),
+            Vec::new(),
+        )]);
+        let driver = Driver::with_policy(
+            Arc::new(ReadyLanes::one(true, bulk)),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(BusySlot(folders)),
+            Seq::new(),
+            active(HOUR, HOUR),
+            Cancel::new(),
+        );
+        let wake = driver.wake.mark();
+        driver.notified(ENDPOINT, &demand_of("repo-busy"));
+        driver.notified(ENDPOINT, &metadata("repo-busy"));
+        // Kept, and the pump neither stays awake for it nor stops what it does.
+        let key = pair(ENDPOINT, "repo-busy");
+        assert!(lock(&driver.due).demand.contains(&key));
+        assert!(lock(&driver.due).exchange.contains(&key));
+        assert_eq!(driver.pump_wait(), HOUR);
+        assert_ne!(driver.wake.mark(), wake);
+        assert_eq!(driver.wake.current(), wake.value);
+        // A round that cannot run it leaves it.
+        driver.pump_round(&mut PumpState::default(), wake.value);
+        assert!(lock(&driver.due).demand.contains(&key));
+        // Its repeat rouses a pump asleep on it, and so finds the slot free.
+        let held = driver.wake.mark();
+        driver.notified(ENDPOINT, &demand_of("repo-busy"));
+        assert_ne!(driver.wake.mark(), held);
+        assert_eq!(driver.wake.current(), wake.value);
     }
 
     /// The driver a hook acts on, set once the driver exists.
@@ -5177,12 +5452,17 @@ mod tests {
     }
 
     #[test]
-    fn the_marks_a_peer_can_cause_are_bounded() {
+    fn a_notify_for_a_folder_not_here_leaves_no_mark() {
         let (driver, _root, _control) = dispatching(active(HOUR, HOUR));
-        for index in 0..MAX_MARKS + 10 {
-            driver.notified(ENDPOINT, &metadata(&format!("repo-{index}")));
+        let (poke, wake) = (driver.poke.current(), driver.wake.mark());
+        for index in 0..100 {
+            driver.notified(ENDPOINT, &metadata(&format!("made-up-{index}")));
+            driver.notified(ENDPOINT, &demand_of(&format!("made-up-{index}")));
         }
-        assert_eq!(lock(&driver.due).exchange.len(), MAX_MARKS);
+        let due = lock(&driver.due);
+        assert!(due.exchange.is_empty() && due.demand.is_empty());
+        assert_eq!(driver.poke.current(), poke);
+        assert_eq!(driver.wake.mark(), wake);
     }
 
     #[test]
@@ -5199,5 +5479,841 @@ mod tests {
         let due = lock(&driver.due);
         assert!(due.demand.is_empty());
         assert!(due.background.is_empty());
+    }
+
+    // ---- marks: what a peer can make this side remember --------------------
+
+    #[test]
+    fn a_flood_of_made_up_repos_does_not_stop_the_marks_of_a_real_one() {
+        let wanted = objects("wanted", 1);
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&wanted),
+            ..Listener::default()
+        });
+        let fake = FakeFolder {
+            held: wanted,
+            ..FakeFolder::default()
+        };
+        let (driver, _root) = holding_driver(&listener, fake, Seq::new());
+        let key = pair(ENDPOINT, "repo-1");
+        let mut state = PumpState::default();
+        state.polls.insert(key.clone(), Instant::now() + HOUR);
+        for index in 0..5000 {
+            let made_up = format!("made-up-{index}");
+            driver.notified(ENDPOINT, &metadata(&made_up));
+            driver.notified(ENDPOINT, &demand_of(&made_up));
+        }
+        // A waiting reader is still served, not left for the poll.
+        driver.notified(ENDPOINT, &demand_of("repo-1"));
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/0", "store"]
+        );
+        // And a local change still marks its exchange and its push.
+        driver.local_change("repo-1");
+        assert!(lock(&driver.due).exchange.contains(&key));
+        assert_eq!(
+            calls_of_round(&driver, &mut state, &listener),
+            ["wanted/32"]
+        );
+    }
+
+    #[test]
+    fn the_pump_purges_the_marks_of_a_repo_or_a_peer_that_is_gone() {
+        let listener = Arc::new(Listener::default());
+        let (driver, _root) = pushing_driver(&listener, true, active(HOUR, HOUR));
+        {
+            let mut due = lock(&driver.due);
+            for gone in [pair(ENDPOINT, "repo-gone"), pair("ws://gone", "repo-1")] {
+                due.exchange.insert(gone.clone());
+                due.demand.insert(gone.clone());
+                due.background.insert(gone);
+            }
+        }
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        let due = lock(&driver.due);
+        assert!(due.exchange.is_empty(), "{:?}", due.exchange);
+        assert!(due.demand.is_empty(), "{:?}", due.demand);
+        assert!(due.background.is_empty(), "{:?}", due.background);
+    }
+
+    #[test]
+    fn a_repeated_demand_notify_rouses_a_pump_whose_mark_is_held() {
+        let listener = Arc::new(Listener::default());
+        let (driver, _root) = pushing_driver(&listener, true, active(HOUR, HOUR));
+        driver.notified(ENDPOINT, &demand_of("repo-1"));
+        let held = driver.wake.mark();
+        driver.notified(ENDPOINT, &demand_of("repo-1"));
+        assert_ne!(driver.wake.mark(), held, "the repeat was swallowed");
+        // It only rouses: the bump of the first one already stopped what it had to.
+        assert_eq!(driver.wake.current(), held.value);
+    }
+
+    // ---- passes that store nothing -----------------------------------------
+
+    #[test]
+    fn a_permanently_refused_digest_goes_idle_on_an_active_host() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            refuse: [all[0].digest].into(),
+            ..Listener::default()
+        });
+        let fake = FakeFolder {
+            held: all,
+            ..FakeFolder::default()
+        };
+        let (driver, _root) = holding_driver(&listener, fake, Seq::new());
+        let mut state = PumpState::default();
+        for _ in 0..6 {
+            driver.pump_round(&mut state, driver.wake.current());
+        }
+        let calls = listener.calls();
+        assert_eq!(calls_named(&calls, "store"), 1, "{calls:?}");
+        assert!(!background_due(&driver));
+        assert_eq!(driver.pump_wait(), HOUR);
+    }
+
+    #[test]
+    fn more_lacked_digests_than_an_exclude_holds_go_idle_on_an_active_host() {
+        let lacked = objects("lacked", MAX_EXCLUDE + 44);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&lacked),
+            ..Listener::default()
+        });
+        let (driver, _root) = holding_driver(&listener, FakeFolder::default(), Seq::new());
+        let mut state = PumpState::default();
+        for _ in 0..20 {
+            driver.pump_round(&mut state, driver.wake.current());
+            if !background_due(&driver) {
+                break;
+            }
+        }
+        assert!(!background_due(&driver), "{:?}", listener.calls());
+        assert_eq!(driver.pump_wait(), HOUR);
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+    }
+
+    #[test]
+    fn more_lacked_digests_than_an_exclude_holds_end_a_burst_early() {
+        let lacked = objects("lacked", MAX_EXCLUDE + 44);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&lacked),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let (driver, _root) = burst_driver(ReadyLanes::one(false, bulk), &[]);
+        let burst = open_burst(&driver, &[pair(ENDPOINT, "repo-1")]);
+        exchange_done(&driver);
+        let mut state = PumpState::default();
+        for _ in 0..20 {
+            driver.pump_round(&mut state, driver.wake.current());
+            if settled_now(&driver, burst) {
+                break;
+            }
+        }
+        let report = report_now(&driver, burst);
+        assert!(settled_now(&driver, burst), "{report}");
+        // None of it is this side's to send.
+        assert_eq!(report["remaining"], 0, "{report}");
+        assert!(report["error"].is_null(), "{report}");
+    }
+
+    #[test]
+    fn a_burst_reports_a_refusal_by_its_code_and_does_not_call_it_done() {
+        let all = objects("object", OBJECT_BATCH + 8);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            refuse: [all[3].digest].into(),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let (driver, _root) = burst_driver(ReadyLanes::one(false, bulk), &all);
+        let burst = open_burst(&driver, &[pair(ENDPOINT, "repo-1")]);
+        exchange_done(&driver);
+        let mut state = PumpState::default();
+        for _ in 0..20 {
+            driver.pump_round(&mut state, driver.wake.current());
+            if settled_now(&driver, burst) {
+                break;
+            }
+        }
+        let report = report_now(&driver, burst);
+        assert!(settled_now(&driver, burst), "{report}");
+        assert_eq!(report["pushed"], all.len() - 1, "{report}");
+        // Excluded from the listing by now, and still known to be unsent.
+        assert_eq!(report["remaining"], 1, "{report}");
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("OBJECT_NOT_WANTED"), "{report}");
+        assert!(error.contains(ENDPOINT), "{report}");
+        let calls = listener.calls();
+        assert!(calls_named(&calls, "store") <= 3, "{calls:?}");
+    }
+
+    /// `until` is about `expected` from now, to within what a test takes to look.
+    fn close_to(until: Instant, expected: Duration) {
+        let left = until.saturating_duration_since(Instant::now());
+        assert!(
+            left <= expected && left + Duration::from_secs(1) > expected,
+            "{left:?} left, expected about {expected:?}"
+        );
+    }
+
+    #[test]
+    fn a_failing_store_rests_ever_longer_and_success_starts_over() {
+        let all = objects("object", 2);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all[..1]),
+            fail_store: Mutex::new(Some("FATAL_STORE_ERROR".into())),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        for seconds in [1, 2, 4, 8, 16, 32, 60, 60] {
+            let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+            assert!(outcome.error.is_some());
+            let peer = push_peer(&mut state, &folder);
+            close_to(peer.rest_until.unwrap(), Duration::from_secs(seconds));
+            peer.rest_until = Some(Instant::now());
+        }
+        // It works again: the next failure is a first one.
+        *lock(&listener.fail_store) = None;
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 1);
+        let failing = Arc::new(Listener {
+            missing: wanted_of(&all[1..]),
+            fail_store: Mutex::new(Some("FATAL_STORE_ERROR".into())),
+            ..Listener::default()
+        });
+        let lanes = failing.lane();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert!(outcome.error.is_some());
+        let peer = push_peer(&mut state, &folder);
+        close_to(peer.rest_until.unwrap(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_store_that_times_out_rests_its_endpoint_ever_longer() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            stall_above: Some(0),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState {
+            deadline: |_| Duration::from_millis(50),
+            ..PushState::default()
+        };
+        for seconds in [1, 2, 4] {
+            push_once(&lanes, &mut state, &folder, PushMode::Background);
+            close_to(state.resting[ENDPOINT], Duration::from_secs(seconds));
+            state.resting.clear();
+        }
+    }
+
+    #[test]
+    fn a_burst_on_a_timing_out_link_runs_to_its_budget_at_a_growing_pace() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            stall_above: Some(0),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let (driver, _root) = burst_driver(ReadyLanes::one(false, bulk), &all);
+        let burst = open_burst(&driver, &[pair(ENDPOINT, "repo-1")]);
+        exchange_done(&driver);
+        let mut state = PumpState::default();
+        state.push.deadline = |_| Duration::from_millis(100);
+        // Rests of 1, 2 and 4 s: stores at about 0, 1.1 and 3.2 s, and no more
+        // before the budget ends at 5 s. A fixed rest would make it 5. A slow
+        // machine may get only 2.
+        let end = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < end {
+            driver.pump_round(&mut state, driver.wake.current());
+            thread::sleep(Duration::from_millis(20));
+        }
+        let calls = listener.calls();
+        let stores = calls_named(&calls, "store");
+        assert!((2..=3).contains(&stores), "{calls:?}");
+        assert!(!settled_now(&driver, burst));
+        let reply = driver.close_burst(
+            burst,
+            &[repo_folder()],
+            Some("SYNC_NOW_TIMEOUT: not finished".to_owned()),
+        );
+        let folder = folder_of(&reply);
+        let error = folder["error"].as_str().unwrap();
+        assert!(error.contains("REQUEST_TIMEOUT"), "{reply}");
+        assert_eq!(folder["remaining"], 1, "{reply}");
+    }
+
+    // ---- a listener that hangs ---------------------------------------------
+
+    /// Bulk lanes to several endpoints, in this order. A pump's first round
+    /// starts with the second.
+    struct Endpoints(Vec<(String, Conn)>);
+
+    impl Lanes for Endpoints {
+        fn ready_peers(&self) -> Vec<ReadyPeer> {
+            Vec::new()
+        }
+        fn bulk_endpoints(&self) -> Vec<String> {
+            self.0
+                .iter()
+                .map(|(endpoint, _)| endpoint.clone())
+                .collect()
+        }
+        fn bulk_lane(&self, endpoint: &str, _: &Digest) -> Option<Conn> {
+            self.any_bulk_lane(endpoint)
+        }
+        fn any_bulk_lane(&self, endpoint: &str) -> Option<Conn> {
+            self.0
+                .iter()
+                .find(|(name, _)| name == endpoint)
+                .map(|(_, conn)| conn.clone())
+        }
+    }
+
+    /// How long a reader may take with a hung listener in the way: well inside
+    /// its 10 s (`Demand::FETCH_WAIT`).
+    const PAST_A_HUNG_LISTENER: Duration = Duration::from_secs(6);
+
+    /// Waits for `done`, bounded, and says how long it took.
+    fn time_until(mut done: impl FnMut() -> bool) -> Duration {
+        let began = Instant::now();
+        while !done() {
+            assert!(began.elapsed() < Duration::from_secs(20), "never happened");
+            thread::sleep(Duration::from_millis(10));
+        }
+        began.elapsed()
+    }
+
+    /// A running driver of `repo-1` whose first round asks a hung listener first
+    /// and `healthy` next. Readers on this side wait for `demand`.
+    fn started_past_a_hung_listener(
+        healthy: &Arc<Listener>,
+        fake: Arc<FakeFolder>,
+        demand: Wanted,
+    ) -> (Arc<Driver>, tempfile::TempDir) {
+        let hung = Arc::new(Listener {
+            hang: true,
+            ..Listener::default()
+        });
+        let lane = |listener: &Arc<Listener>, session: &str| {
+            listener.lane_with(session, &[features::CONTENT_PUSH])
+        };
+        let root = tempfile::tempdir().unwrap();
+        let driver = start(
+            Arc::new(Endpoints(vec![
+                ("ws://healthy".into(), lane(healthy, "healthy")),
+                ("ws://hung".into(), lane(&hung, "hung")),
+            ])),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".into(),
+                fake_worker(fake),
+                demand,
+            )])),
+            Seq::new(),
+            active(HOUR, HOUR),
+            Cancel::new(),
+        )
+        .unwrap();
+        (driver, root)
+    }
+
+    #[test]
+    fn a_reader_on_a_healthy_peer_is_served_past_a_hung_listener() {
+        let wanted = objects("wanted", 1);
+        let healthy = Arc::new(Listener {
+            demand: wanted_of(&wanted),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder {
+            held: wanted,
+            ..FakeFolder::default()
+        });
+        let (driver, _root) = started_past_a_hung_listener(&healthy, fake, Vec::new());
+        let took = time_until(|| !healthy.stored().is_empty());
+        driver.stop(Duration::from_secs(2));
+        assert!(took < PAST_A_HUNG_LISTENER, "{took:?}");
+    }
+
+    #[test]
+    fn a_reader_here_is_served_by_a_healthy_peer_past_a_hung_listener() {
+        let wanted = objects("wanted", 1);
+        let healthy = Arc::new(Listener {
+            held: wanted.clone(),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder::default());
+        let (driver, _root) =
+            started_past_a_hung_listener(&healthy, fake.clone(), wanted_of(&wanted));
+        let took = time_until(|| !fake.written().is_empty());
+        driver.stop(Duration::from_secs(2));
+        assert!(took < PAST_A_HUNG_LISTENER, "{took:?}");
+    }
+
+    // ---- a failing folder keeps no other from pulling -----------------------
+
+    #[test]
+    fn a_paused_folder_does_not_starve_another_folder_of_its_pulls() {
+        let (paused, open) = (objects("paused", 1), objects("open", 1));
+        let listener = Arc::new(Listener {
+            held: open.clone(),
+            unpublished: Some(UNPUBLISHED.into()),
+            ..Listener::default()
+        });
+        let fake_of = |missing: &[Object]| {
+            Arc::new(FakeFolder {
+                missing: wanted_of(missing),
+                ..FakeFolder::default()
+            })
+        };
+        let (first, second) = (fake_of(&paused), fake_of(&open));
+        let folders = Arc::new(RepoFolders(vec![
+            (UNPUBLISHED.into(), fake_worker(first), Vec::new()),
+            ("repo-1".into(), fake_worker(second.clone()), Vec::new()),
+        ]));
+        let (driver, _root) = driver(listener.lane(), folders, Seq::new());
+        let mut state = PumpState::default();
+        for _ in 0..6 {
+            driver.pump_round(&mut state, driver.wake.current());
+        }
+        assert_eq!(second.written(), [open[0].digest], "{:?}", listener.calls());
+        // What the other folder's success says does not make this one log again.
+        assert_eq!(state.logged.len(), 1, "{:?}", state.logged);
+    }
+
+    // ---- a wake cancels what is in flight -----------------------------------
+
+    /// Bumps `wake` in a moment, as a reader starting to wait does.
+    fn bump_soon(wake: &Arc<Seq>) -> JoinHandle<()> {
+        let wake = wake.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            wake.bump();
+        })
+    }
+
+    #[test]
+    fn a_wake_during_a_background_store_cancels_it_with_no_failure_to_count() {
+        let all = objects("object", 2);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            hang_store_of: [all[0].digest].into(),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        let wake = Seq::new();
+        let seen = wake.current();
+        let bumper = bump_soon(&wake);
+        let began = Instant::now();
+        let outcome = push::run(
+            &lanes,
+            &mut state,
+            &[ENDPOINT.to_owned()],
+            &folder,
+            PushMode::Background,
+            Some((wake.as_ref(), seen)),
+            &Cancel::new(),
+        );
+        let took = began.elapsed();
+        bumper.join().unwrap();
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(outcome.interrupted);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert!(state.resting.is_empty());
+        let peer = push_peer(&mut state, &folder);
+        assert!(peer.rest_until.is_none());
+        assert!(peer.counters.last_error.is_none());
+        assert_eq!(peer.batch, OBJECT_BATCH);
+        // Uncertain, so not replayed: only a later listing brings it back.
+        assert_eq!(peer.scan, None);
+    }
+
+    #[test]
+    fn a_wake_during_a_background_fetch_cancels_it_with_no_failure_to_count() {
+        let here = objects("here", 1);
+        let listener = Arc::new(Listener {
+            held: here.clone(),
+            hang_fetch: true,
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder {
+            missing: wanted_of(&here),
+            ..FakeFolder::default()
+        });
+        let wake = Seq::new();
+        let folders = Arc::new(RepoFolders(vec![(
+            "repo-1".into(),
+            fake_worker(fake),
+            Vec::new(),
+        )]));
+        let (driver, _root) = driver(listener.lane(), folders, wake.clone());
+        let mut state = PumpState::default();
+        let seen = wake.current();
+        let bumper = bump_soon(&wake);
+        let began = Instant::now();
+        driver.pump_round(&mut state, seen);
+        let took = began.elapsed();
+        bumper.join().unwrap();
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(state.resting.is_empty());
+        assert!(state.push.resting.is_empty());
+        assert!(state.batch.is_empty());
+    }
+
+    #[test]
+    fn a_reader_is_served_at_once_while_a_background_store_hangs() {
+        let (background, wanted) = (objects("background", 1), objects("wanted", 1));
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&background),
+            hang_store_of: [background[0].digest].into(),
+            ..Listener::default()
+        });
+        let fake = FakeFolder {
+            held: [background, wanted.clone()].concat(),
+            ..FakeFolder::default()
+        };
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let root = tempfile::tempdir().unwrap();
+        let driver = start(
+            Arc::new(ReadyLanes::one(true, bulk)),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".into(),
+                fake_worker(Arc::new(fake)),
+                Vec::new(),
+            )])),
+            Seq::new(),
+            active(HOUR, HOUR),
+            Cancel::new(),
+        )
+        .unwrap();
+        time_until(|| calls_named(&listener.calls(), "store") > 0);
+        *lock(&listener.late_demand) = wanted_of(&wanted);
+        driver.notified(ENDPOINT, &demand_of("repo-1"));
+        let took = time_until(|| listener.stored().contains(&wanted[0].digest));
+        driver.stop(Duration::from_secs(2));
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    // ---- what a peer says is checked ----------------------------------------
+
+    #[test]
+    fn a_store_reply_counts_only_what_was_sent() {
+        let (all, other) = (objects("object", 1), objects("other", 1));
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            claims: vec![all[0].digest, other[0].digest],
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 1);
+        assert_eq!(push_peer(&mut state, &folder).counters.pushed, 1);
+    }
+
+    #[test]
+    fn a_pulled_object_of_another_kind_than_asked_is_not_written() {
+        let asked = objects("object", 1);
+        let answered: Vec<Object> = asked
+            .iter()
+            .map(|object| Object {
+                kind: Kind::Manifest,
+                ..object.clone()
+            })
+            .collect();
+        let folder = Arc::new(FakeFolder {
+            missing: wanted_of(&asked),
+            ..FakeFolder::default()
+        });
+        let link = fake_worker(folder.clone());
+        let peer = Peer::new(&answered, &[], Duration::ZERO);
+        let folders = Arc::new(Folders(vec![("f1".into(), link, Mutex::new(Vec::new()))]));
+        let (driver, _root) = driver(OneLane(peer.lane()), folders, Seq::new());
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        assert!(folder.written().is_empty());
+    }
+
+    #[test]
+    fn a_demand_push_reads_again_what_this_side_lately_lacked() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&all),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let lacking = pushing_folder("repo-1", &[]);
+        let mut state = PushState::default();
+        push_once(&lanes, &mut state, &lacking, PushMode::Demand);
+        assert_eq!(push_peer(&mut state, &lacking).lacks.len(), 1);
+        // This side gets it by some other way, well within the backoff.
+        let holding = pushing_folder("repo-1", &all);
+        let outcome = push_once(&lanes, &mut state, &holding, PushMode::Demand);
+        assert_eq!(outcome.pushed, 1);
+        assert_eq!(listener.stored(), [all[0].digest]);
+    }
+
+    #[test]
+    fn a_daemon_stopping_is_not_reported_as_the_last_failure() {
+        let (driver, _root, control) = dispatching(passive(SHORT));
+        let peers = [ready_peer(ENDPOINT, "control", false, &control)];
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst(&driver, std::slice::from_ref(&key));
+        let (tasks, queue) = mpsc::channel();
+        driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        let timed_out = peer_failure("meta.exchange", CallError::Timeout { after_ms: 7 });
+        driver.finish(&task, task.cursor, Err(timed_out));
+        driver.cancel.cancel();
+        let reply = driver.close_burst(
+            burst,
+            &[repo_folder()],
+            Some("ORCHESTRATOR_STOPPING: the orchestrator is shutting down".to_owned()),
+        );
+        let error = folder_of(&reply)["error"].as_str().unwrap();
+        assert!(error.starts_with("ORCHESTRATOR_STOPPING"), "{reply}");
+    }
+
+    #[test]
+    fn a_failing_store_of_a_full_page_rests_ever_longer_too() {
+        // A full page has a cursor, so a clean empty page follows each failure.
+        let all = objects("object", OBJECT_BATCH);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            fail_store: Mutex::new(Some("FATAL_STORE_ERROR".into())),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        for seconds in [1, 2, 4, 8] {
+            let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+            assert!(outcome.error.is_some());
+            let peer = push_peer(&mut state, &folder);
+            close_to(peer.rest_until.unwrap(), Duration::from_secs(seconds));
+            peer.rest_until = None;
+            let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+            assert!(outcome.error.is_none());
+            assert!(outcome.again, "the failed sweep is not the last");
+        }
+    }
+
+    #[test]
+    fn a_long_sweep_that_stored_nothing_is_not_started_over_by_the_next_poll() {
+        // Most pages list only what neither side holds, past what an exclude
+        // can name, so each is another request.
+        let lacked = objects("lacked", MAX_EXCLUDE + 44);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&lacked),
+            ..Listener::default()
+        });
+        let (driver, _root) = pushing_driver(&listener, true, active(HOUR, SHORT));
+        let mut state = PumpState::default();
+        let mut pages = 0;
+        loop {
+            driver.pump_round(&mut state, driver.wake.current());
+            thread::sleep(Duration::from_millis(30));
+            pages += 1;
+            assert!(pages < 30, "{:?}", listener.calls());
+            if !background_due(&driver) {
+                break;
+            }
+        }
+        // Its poll comes up in moments. The listener is left alone a good while.
+        let calls = listener.calls().len();
+        for _ in 0..5 {
+            thread::sleep(PAST_SHORT);
+            driver.pump_round(&mut state, driver.wake.current());
+        }
+        assert_eq!(
+            listener.calls().len(),
+            calls,
+            "{:?}",
+            &listener.calls()[calls..]
+        );
+        // A trigger that says something changed still starts one at once.
+        driver.local_change("repo-1");
+        assert!(calls_of_round(&driver, &mut state, &listener).contains(&"wanted/32".to_owned()));
+    }
+
+    #[test]
+    fn a_listing_that_timed_out_gets_longer_next_time_and_a_demand_listing_does_not() {
+        let listener = Arc::new(Listener {
+            hang: true,
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &[]);
+        let mut state = PushState::default();
+        state
+            .peers
+            .entry((folder.id.clone(), ENDPOINT.to_owned()))
+            .or_default()
+            .listing = Duration::from_millis(50);
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert!(matches!(outcome.error, Some(Failure::TimedOut(_))));
+        assert!(!outcome.again, "a hung listener is not asked again at once");
+        assert_eq!(
+            push_peer(&mut state, &folder).listing,
+            Duration::from_millis(100)
+        );
+        // A demand listing does not scan, so it keeps its short deadline.
+        state.resting.clear();
+        let began = Instant::now();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Demand);
+        assert!(matches!(outcome.error, Some(Failure::TimedOut(_))));
+        let took = began.elapsed();
+        assert!(took >= push::WANTED_DEADLINE, "{took:?}");
+        assert!(took < PEER_DEADLINE, "{took:?}");
+        assert_eq!(
+            push_peer(&mut state, &folder).listing,
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn what_no_reply_can_carry_is_reported_and_stays_in_remaining() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let root = tempfile::tempdir().unwrap();
+        let fake = FakeFolder {
+            oversized: vec![all[0].digest],
+            ..FakeFolder::default()
+        };
+        let driver = Driver::with_policy(
+            Arc::new(ReadyLanes::one(false, bulk)),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".to_owned(),
+                fake_worker(Arc::new(fake)),
+                Vec::new(),
+            )])),
+            Seq::new(),
+            passive(HOUR),
+            Cancel::new(),
+        );
+        let burst = open_burst(&driver, &[pair(ENDPOINT, "repo-1")]);
+        exchange_done(&driver);
+        let mut state = PumpState::default();
+        for _ in 0..3 {
+            driver.pump_round(&mut state, driver.wake.current());
+        }
+        assert!(settled_now(&driver, burst));
+        let report = report_now(&driver, burst);
+        assert_eq!(report["remaining"], 1, "{report}");
+        let error = report["error"].as_str().unwrap_or_default();
+        assert!(error.starts_with("SYNC_OBJECT_TOO_LARGE"), "{report}");
+    }
+
+    #[test]
+    fn a_listener_known_not_to_answer_is_asked_last_for_a_reader() {
+        let wanted = objects("wanted", 1);
+        let healthy = Arc::new(Listener {
+            held: wanted.clone(),
+            ..Listener::default()
+        });
+        let hung = Arc::new(Listener {
+            hang: true,
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder::default());
+        let (driver, _root) = {
+            let root = tempfile::tempdir().unwrap();
+            let lanes = Endpoints(vec![
+                ("ws://healthy".into(), healthy.lane_with("h", &[])),
+                ("ws://hung".into(), hung.lane_with("x", &[])),
+            ]);
+            let driver = Driver::with_policy(
+                Arc::new(lanes),
+                Catalog::open(root.path()).unwrap(),
+                Arc::new(RepoFolders(vec![(
+                    "repo-1".into(),
+                    fake_worker(fake.clone()),
+                    wanted_of(&wanted),
+                )])),
+                Seq::new(),
+                active(HOUR, HOUR),
+                Cancel::new(),
+            );
+            (driver, root)
+        };
+        let mut state = PumpState::default();
+        state.push.rest_endpoint("ws://hung");
+        // Its first round would start with it.
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(fake.written(), [wanted[0].digest]);
+        assert!(hung.calls().is_empty(), "{:?}", hung.calls());
+    }
+
+    #[test]
+    fn a_background_pull_leaves_a_listener_alone_while_it_rests() {
+        let here = objects("here", 1);
+        let listener = Arc::new(Listener {
+            held: here.clone(),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder {
+            missing: wanted_of(&here),
+            ..FakeFolder::default()
+        });
+        let folders = Arc::new(RepoFolders(vec![(
+            "repo-1".into(),
+            fake_worker(fake.clone()),
+            Vec::new(),
+        )]));
+        let (driver, _root) = driver(listener.lane(), folders, Seq::new());
+        let mut state = PumpState::default();
+        state.push.rest_endpoint(ENDPOINT);
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 0);
+        // The rest over, nothing was passed over.
+        state.push.resting.clear();
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(fake.written(), [here[0].digest], "{:?}", listener.calls());
+    }
+
+    #[test]
+    fn an_answered_fetch_starts_the_rest_of_its_endpoint_over() {
+        let here = objects("here", 1);
+        let listener = Arc::new(Listener {
+            held: here.clone(),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder {
+            missing: wanted_of(&here),
+            ..FakeFolder::default()
+        });
+        let folders = Arc::new(RepoFolders(vec![(
+            "repo-1".into(),
+            fake_worker(fake),
+            Vec::new(),
+        )]));
+        let (driver, _root) = driver(OneLane(listener.lane_with("s", &[])), folders, Seq::new());
+        let mut state = PumpState::default();
+        state.push.rest_endpoint(ENDPOINT);
+        state.push.rest_endpoint(ENDPOINT);
+        state.push.rest_endpoint(ENDPOINT);
+        state.push.resting.clear();
+        // This listener takes no pushes: only its answers to pulls can say so.
+        driver.pump_round(&mut state, driver.wake.current());
+        state.push.rest_endpoint(ENDPOINT);
+        close_to(state.push.resting[ENDPOINT], Duration::from_secs(1));
     }
 }

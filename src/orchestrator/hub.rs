@@ -151,6 +151,9 @@ pub const FOLDER_OPS: &[&str] = &[
 
 /// One folder: its controller and the view the last tick saw.
 struct Slot {
+    /// The folder's repository, which never changes: readable with the controller
+    /// busy, and without the catalog.
+    repo: String,
     controller: Mutex<Controller>,
     view: Mutex<Value>,
     /// A stop (action or reconciler) is in progress.
@@ -163,6 +166,7 @@ impl Slot {
     fn new(controller: Controller) -> Arc<Self> {
         let view = controller.view();
         Arc::new(Self {
+            repo: controller.record().repo.clone(),
             controller: Mutex::new(controller),
             view: Mutex::new(view),
             stopping: AtomicBool::new(false),
@@ -1175,6 +1179,13 @@ impl SyncFolders for Directory {
                 })
             })
             .collect()
+    }
+
+    /// From the slots: a stopping folder's controller may be busy for seconds,
+    /// and this runs on a lane's I/O thread.
+    fn knows(&self, repo: &str) -> bool {
+        self.daemon()
+            .is_some_and(|daemon| lock(&daemon.folders).values().any(|slot| slot.repo == repo))
     }
 }
 

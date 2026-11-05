@@ -285,23 +285,27 @@ own readers, but exchanges metadata and pushes only when told to. It:
 - makes connections waiting in a backoff redial at once (not those refused for
   a credential or a version);
 - exchanges metadata until neither side has more;
-- pushes what each peer wants, what its readers wait for first, until a peer's
-  listing comes back empty. It does not download: a passive host fetches a file
-  when something reads it.
+- pushes what each peer wants, what its readers wait for first, until a whole
+  pass over a peer's listing stores nothing. It does not download: a passive host
+  fetches a file when something reads it.
 
 It prints `{"folders": [{"id", "exchanged", "pushed", "remaining", "error"}]}`:
 
 - `exchanged`: metadata exchanges that finished;
 - `pushed`: objects a peer confirmed are durable;
-- `remaining`: what the last listing named and this host did not store. It is
-  an estimate, because later pages of a listing are not counted. `0` with no
-  error means a peer's listing, read from its start, named nothing this host
-  holds and has not sent. It is `null` when no listing came back;
+- `remaining`: once a whole pass over a listing stored nothing, the objects this
+  host holds and knows did not get across. What this host does not hold is not
+  counted: it is not this host's to send. Short of that it is an estimate, what
+  the last page of a listing named and this host did not store. `0` with no error
+  means a peer's listing, read from its start, named nothing this host holds and
+  has not sent. It is `null` when no listing came back;
 - `error`: why the folder did not finish, or `null`. See below.
 
 An error here is reported, not fatal: the command exits 0 and what was done stays
 done. The whole command takes at most 175 seconds, and it stops early if the
-orchestrator shuts down. The `error` of a folder is:
+orchestrator shuts down. A failure of a request starts with the operation that
+failed and then its code, as in `objects.store: FATAL_STORE_ERROR: ...`, and an
+error of one peer ends with `(peer ENDPOINT)`. The `error` of a folder is:
 
 - the failure of a peer's connection, when its connections stay down for 10
   seconds;
@@ -312,10 +316,14 @@ orchestrator shuts down. The `error` of a folder is:
 - `PEER_PUSH_UNAVAILABLE`, when a peer is too old to take pushes. Its metadata
   still moved, and `remaining` is `null` if no other peer answered;
 - `WORKER_NOT_RUNNING`, when this folder is stopped or paused;
+- the code of what a peer refused (`OBJECT_NOT_WANTED`, `INVALID_PEER_OBJECT`), or
+  `SYNC_OBJECT_TOO_LARGE` for what no reply can carry, with how many objects, at
+  the end of a pass that stored nothing else. They count in `remaining`;
 - the last failure, or `SYNC_NOW_TIMEOUT` if nothing was failing, when time ran
   out. A timeout or a lost connection does not end the command: a slow link gets
-  asked again, in smaller batches, until the 175 seconds are up;
-- any other failure's code, at once, since asking again would repeat it.
+  asked again, in smaller batches and less and less often (a rest from 1 up to 60
+  seconds), until the 175 seconds are up;
+- any other failure, at once, since asking again would repeat it.
 
 With no peer to dial there is nothing to do, and it is `null`.
 

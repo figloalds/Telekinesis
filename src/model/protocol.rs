@@ -72,11 +72,13 @@ impl LaneSpec {
 
 /// Optional capabilities exchanged in `HELLO` / `HELLO_ACK` `features`.
 pub mod features {
-    /// The listener pushes content to its dialer (`content.push`).
+    /// The listener takes content its dialer pushes: `objects.wanted` and
+    /// `objects.store`, requests the dialer makes.
     pub const CONTENT_PUSH: &str = "content-push";
     /// The listener sends `notify` to the dialer when its folders change.
     pub const NOTIFY: &str = "notify";
-    /// The dialer polls on a long interval and wants no notifications.
+    /// The dialer makes no sync requests of its own unless asked to, and wants
+    /// no notifications.
     pub const PROFILE_PASSIVE: &str = "profile-passive";
     /// Fault point: both sides send and record an empty feature list, which
     /// simulates a peer that predates feature negotiation.

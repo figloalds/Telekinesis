@@ -359,10 +359,11 @@ struct ListedDigests {
 }
 
 impl ListedDigests {
-    /// Lists `digest`; past [`MAX_LISTED`] the oldest listed one is dropped.
+    /// Lists `digest`, as the newest even if it was listed before; past
+    /// [`MAX_LISTED`] the oldest listed one is dropped.
     fn insert(&mut self, digest: Digest, kind: Kind) {
         if self.kinds.insert(digest, kind).is_some() {
-            return;
+            self.order.retain(|listed| *listed != digest);
         }
         self.order.push_back(digest);
         while self.order.len() > MAX_LISTED {
@@ -2661,5 +2662,22 @@ mod tests {
         let view = lanes[1].view();
         assert_eq!(view["state"], "Idle");
         assert_eq!(view["role"], "bulk");
+    }
+
+    #[test]
+    fn a_digest_listed_again_is_the_newest_and_the_oldest_goes_first() {
+        let digest = |index: usize| Digest::bytes(&index.to_le_bytes());
+        let mut listed = ListedDigests::default();
+        for index in 0..MAX_LISTED {
+            listed.insert(digest(index), Kind::Chunk);
+        }
+        listed.insert(digest(0), Kind::Chunk);
+        // Past the bound: what was listed longest ago goes, not what was just
+        // listed again.
+        listed.insert(digest(MAX_LISTED), Kind::Chunk);
+        assert_eq!(listed.kind(&digest(0)), Some(Kind::Chunk));
+        assert_eq!(listed.kind(&digest(1)), None);
+        assert_eq!(listed.order.len(), MAX_LISTED);
+        assert_eq!(listed.kinds.len(), MAX_LISTED);
     }
 }

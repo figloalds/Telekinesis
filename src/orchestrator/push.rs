@@ -11,14 +11,29 @@
 //!
 //! The rules are the pull path's. What this side lacks is no error: it is
 //! backed off ([`UNAVAILABLE_FIRST`] doubling to [`UNAVAILABLE_MAX`]) and
-//! excluded from the listing meanwhile. A store that timed out halves the
-//! batch of that (folder, endpoint), and each answered one grows it back by a
-//! quarter. A failure logs `SYNC_PUSH_FAILED` once per distinct error and
-//! rests, for [`REST`], that (folder, endpoint), so one folder the listener
-//! does not publish keeps no other from pushing, or the whole endpoint when
-//! the failure says the lane is gone or not answering. Nothing uncertain is
-//! replayed: its digests stay missing on the listener and are listed again.
-//! So are the digests the listener refused, which are dropped from the round.
+//! excluded from the listing meanwhile. A demand pass does not wait that out,
+//! since its read is local and a reader is waiting. What the listener refused
+//! is backed off alike, by every pass, and stays reported as unsent. A store
+//! that timed out halves the batch of that (folder, endpoint), and each answered
+//! one grows it back by a quarter. A failure logs `SYNC_PUSH_FAILED` once per
+//! distinct error and rests that (folder, endpoint), so one folder the listener
+//! does not publish keeps no other from pushing, or the whole endpoint when the
+//! failure says the lane is gone or not answering. A rest grows from [`REST`] to
+//! [`REST_MAX`] with each failure in a row. Nothing uncertain is replayed: its
+//! digests stay missing on the listener and are listed again.
+//!
+//! **Sweeps.** Background passes walk the listener's scan page by page. A sweep
+//! runs from its top to its end, and a pass says whether the pair has more to do
+//! ([`PushOutcome::again`]): it stored something, its page has a cursor, or its
+//! store failed. A whole sweep that stored nothing and failed nothing is the end
+//! of it ([`PushOutcome::swept`]), whatever its pages listed, and the pair waits
+//! for its next trigger. So what neither side holds costs one sweep per trigger,
+//! even past what an `exclude` can name.
+//!
+//! **Interrupted.** A wake cancels a background call in flight. That is no
+//! failure: nothing rests or shrinks, and the request is abandoned as uncertain
+//! and never replayed. Its digests return only through a later listing, and
+//! storing one twice is harmless.
 use super::{
     demand::Seq,
     network::StoreReply,
@@ -41,8 +56,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long a failed push leaves what it failed on alone.
+/// How long a failed push leaves what it failed on alone…
 pub const REST: Duration = Duration::from_secs(1);
+/// …doubling with each failure in a row to at most this. An answered store or a
+/// clean background pass starts it over.
+pub const REST_MAX: Duration = Duration::from_secs(60);
+/// The deadline of an `objects.wanted`. Nothing is sent or scanned by a demand
+/// listing, so a listener that does not answer this soon is not to hold up a
+/// reader that another peer can serve.
+pub const WANTED_DEADLINE: Duration = Duration::from_secs(3);
+/// Why what this side holds did not get across, when the listener did not refuse
+/// it: no reply can carry it.
+const TOO_LARGE: &str = "SYNC_OBJECT_TOO_LARGE";
 /// What a pass remembers of a (folder, endpoint) lasts this long unused: past
 /// any backoff, so none is cut short.
 const FORGET_AFTER: Duration = Duration::from_secs(2 * UNAVAILABLE_MAX.as_secs());
@@ -75,16 +100,30 @@ pub struct PushOutcome {
     /// Objects listed by this run and not stored by it. An estimate of the
     /// work left: a scan's later pages are not counted.
     pub remaining: usize,
-    /// It stopped before a next call (a wake-up or cancel).
+    /// It stopped before a next call, or cancelled one (a wake-up or cancel).
     pub interrupted: bool,
     /// The last failure, if any.
     pub error: Option<Failure>,
     /// A listing came back, so `remaining` says something.
     pub listed: bool,
-    /// That listing was asked from the start of the scan. Only an empty page
-    /// that began there says nothing is missing: past it, it says only that
-    /// the rest of the scan is clean.
-    pub from_top: bool,
+    /// The pair has more to do with no new trigger. Not set by a listing that
+    /// failed, so a hung listener does not hold the pump again at once.
+    pub again: bool,
+    /// It ended a sweep that ran from the top of the scan to its end, stored
+    /// nothing and failed nothing: there is nothing more to do.
+    pub swept: bool,
+    /// How long that sweep took.
+    pub took: Duration,
+    /// Objects this side holds and known not to have got across, for as long as
+    /// the listener may still want them. Excluded from a listing, they are not in
+    /// `remaining`.
+    pub unsent: usize,
+    /// Why, for one of those.
+    pub refusal: Option<String>,
+    /// Objects the pages of this sweep listed so far and did not store, and which
+    /// this side does not know it lacks. With what `remaining` leaves out of it:
+    /// an empty page at the end of a scan does not make them sent.
+    pub left: usize,
     /// Why nothing was listed, when nothing failed. With several endpoints, of
     /// the last that was skipped.
     pub unlisted: Option<Unlisted>,
@@ -103,19 +142,48 @@ pub struct PushCounters {
     pub last_refusal: Option<String>,
 }
 
+/// What a sweep of the listener's scan has seen so far.
+#[derive(Default)]
+struct Sweep {
+    /// When it began at the top of the scan, if it did: what it did not see then
+    /// cannot lie before it.
+    began: Option<Instant>,
+    /// It stored something, which may have changed what is missing.
+    stored: bool,
+    /// Something in it failed or could not be tried, so it says nothing of what
+    /// is left.
+    failed: bool,
+    /// The digests of `PushPeer::unsent` it listed.
+    unsent: BTreeSet<Digest>,
+    /// The objects its pages listed and did not store, less what this side lacks.
+    left: usize,
+}
+
 /// The memory of one (folder, endpoint).
 pub(super) struct PushPeer {
     /// Where the listener's scan resumes (`None`: from the start).
     pub(super) scan: Option<String>,
+    /// The sweep under way.
+    sweep: Sweep,
     /// The objects read and stored per request: halved by a timeout, grown
     /// back by answers.
     pub(super) batch: usize,
-    /// What this side lacks, and until when it is not tried again.
+    /// How long a background listing may take: a page of a large repo can take
+    /// the listener a while to scan. Grown by a timeout, up to [`PEER_DEADLINE`].
+    /// A wake cancels it, so it never holds up a reader.
+    pub(super) listing: Duration,
+    /// What is not tried again until when: what this side lacks, and what it
+    /// holds and the listener refused.
     pub(super) lacks: BTreeMap<Digest, Unavailable>,
+    /// Of what `lacks` holds, what this side does hold, with the code of why it
+    /// did not get across.
+    unsent: BTreeMap<Digest, String>,
     /// The digests already logged as too large to send.
     too_large: BTreeSet<Digest>,
     /// Until when this (folder, endpoint) sits out after a failure.
     pub(super) rest_until: Option<Instant>,
+    /// The failures in a row of this (folder, endpoint), which set its rest.
+    failures: u32,
     /// The last pass that got this far.
     pub(super) touched: Instant,
     pub(super) counters: PushCounters,
@@ -125,14 +193,49 @@ impl Default for PushPeer {
     fn default() -> Self {
         Self {
             scan: None,
+            sweep: Sweep::default(),
             batch: OBJECT_BATCH,
+            listing: WANTED_DEADLINE,
             lacks: BTreeMap::new(),
+            unsent: BTreeMap::new(),
             too_large: BTreeSet::new(),
             rest_until: None,
+            failures: 0,
             touched: Instant::now(),
             counters: PushCounters::default(),
         }
     }
+}
+
+impl PushPeer {
+    /// `digest` is not tried again for a while, longer each time.
+    fn back_off(&mut self, digest: Digest, now: Instant) {
+        let backoff = self
+            .lacks
+            .get(&digest)
+            .map_or(UNAVAILABLE_FIRST, |entry| entry.backoff * 2)
+            .min(UNAVAILABLE_MAX);
+        self.lacks.insert(
+            digest,
+            Unavailable {
+                until: now + backoff,
+                backoff,
+            },
+        );
+    }
+
+    /// Another failure in a row: this (folder, endpoint) sits out for longer.
+    fn rest(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        self.rest_until = Some(Instant::now() + rest_after(self.failures));
+    }
+}
+
+/// The rest after `failures` failures in a row: [`REST`], doubling to
+/// [`REST_MAX`].
+fn rest_after(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    REST.saturating_mul(1 << doublings).min(REST_MAX)
 }
 
 /// The push pass's memory across rounds.
@@ -142,6 +245,9 @@ pub struct PushState {
     /// Endpoints whose lanes are gone or not answering, and until when no
     /// folder pushes to them.
     pub(super) resting: BTreeMap<String, Instant>,
+    /// Per endpoint, its failures in a row, which set its rest, and when the last
+    /// one was.
+    pub(super) failures: BTreeMap<String, (u32, Instant)>,
     /// The deadline of an `objects.store` ([`fetch_deadline`]; tests shorten
     /// it).
     pub(super) deadline: fn(&[(Digest, Kind)]) -> Duration,
@@ -152,6 +258,7 @@ impl Default for PushState {
         Self {
             peers: BTreeMap::new(),
             resting: BTreeMap::new(),
+            failures: BTreeMap::new(),
             deadline: fetch_deadline,
         }
     }
@@ -165,17 +272,34 @@ impl PushState {
             .map(|peer| &peer.counters)
     }
 
-    /// No folder pushes to `endpoint` for [`REST`]: its lanes are gone or not
-    /// answering.
+    /// `endpoint` answered: its next failure is a first one.
+    pub(super) fn answered(&mut self, endpoint: &str) {
+        self.failures.remove(endpoint);
+    }
+
+    /// No folder pushes to `endpoint` for a while, longer with each failure in a
+    /// row: its lanes are gone or not answering.
     pub(super) fn rest_endpoint(&mut self, endpoint: &str) {
+        let now = Instant::now();
+        let failures = self
+            .failures
+            .get(endpoint)
+            .map_or(0, |(failures, _)| *failures)
+            .saturating_add(1);
+        self.failures.insert(endpoint.to_owned(), (failures, now));
         self.resting
-            .insert(endpoint.to_owned(), Instant::now() + REST);
+            .insert(endpoint.to_owned(), now + rest_after(failures));
+    }
+
+    /// Whether `endpoint` as a whole sits out a failure at `now`.
+    pub(super) fn endpoint_rests(&self, endpoint: &str, now: Instant) -> bool {
+        self.resting.get(endpoint).is_some_and(|at| *at > now)
     }
 
     /// Whether `folder` to `endpoint` sits out a failure at `now`: a pass would
     /// ask nothing.
     pub(super) fn rests(&self, folder: &str, endpoint: &str, now: Instant) -> bool {
-        self.resting.get(endpoint).is_some_and(|at| *at > now)
+        self.endpoint_rests(endpoint, now)
             || self
                 .peers
                 .get(&(folder.to_owned(), endpoint.to_owned()))
@@ -202,6 +326,8 @@ impl PushState {
         self.peers
             .retain(|_, peer| now.saturating_duration_since(peer.touched) < FORGET_AFTER);
         self.resting.retain(|_, until| *until > now);
+        self.failures
+            .retain(|_, (_, last)| now.saturating_duration_since(*last) < FORGET_AFTER);
     }
 }
 
@@ -233,7 +359,7 @@ pub fn run(
             continue;
         }
         let now = Instant::now();
-        if state.resting.get(endpoint).is_some_and(|at| *at > now) {
+        if state.endpoint_rests(endpoint, now) {
             outcome.unlisted = Some(Unlisted::Resting);
             continue;
         }
@@ -247,7 +373,7 @@ pub fn run(
             outcome.unlisted = Some(Unlisted::Resting);
             continue;
         }
-        let result = Pass {
+        let mut pass = Pass {
             lanes,
             peer: &mut *peer,
             endpoint,
@@ -257,13 +383,39 @@ pub fn run(
             deadline,
             outcome: &mut outcome,
             stored: BTreeSet::new(),
+            answered: false,
+            no_lane: false,
+            sound: false,
+        };
+        let result = pass.run(&lane, mode);
+        let (answered, sound, no_lane, stored) = (
+            pass.answered,
+            pass.sound,
+            pass.no_lane,
+            !pass.stored.is_empty(),
+        );
+        outcome.unsent += peer.unsent.len();
+        outcome.refusal = peer.unsent.values().next().cloned().or(outcome.refusal);
+        // Past a store that failed, a page with nothing to store proves nothing:
+        // only the sweep it is part of can.
+        let clean = sound && result.is_ok() && !outcome.interrupted;
+        if answered || clean {
+            peer.failures = 0;
+            state.failures.remove(endpoint);
         }
-        .run(&lane, mode);
-        let Err(FetchFailure { failure, timed_out }) = result else {
+        let Err(FetchFailure {
+            failure, timed_out, ..
+        }) = result
+        else {
             // A clean Demand pass says nothing about what a Background one
             // failed on: only that pass, or an answered store, clears it.
-            if mode == PushMode::Background && !outcome.interrupted {
+            if clean {
                 peer.counters.last_error = None;
+            }
+            // A lane that owns some of what was listed is down, and nothing else
+            // moved: no need to ask again until it may be back.
+            if no_lane && !stored {
+                peer.rest();
             }
             continue;
         };
@@ -284,7 +436,7 @@ pub fn run(
         if timed_out || failure == Failure::LaneLost {
             state.rest_endpoint(endpoint);
         } else {
-            peer.rest_until = Some(Instant::now() + REST);
+            peer.rest();
         }
         outcome.error = Some(failure);
     }
@@ -308,11 +460,18 @@ struct Pass<'a> {
     outcome: &'a mut PushOutcome,
     /// What the listener named durable in this pass.
     stored: BTreeSet<Digest>,
+    /// The listener answered a store, so that much of its lanes works.
+    answered: bool,
+    /// Something listed has no Ready lane here.
+    no_lane: bool,
+    /// It is a background pass, in a sweep where nothing failed so far.
+    sound: bool,
 }
 
 impl Pass<'_> {
     fn run(&mut self, lane: &Conn, mode: PushMode) -> Result<(), FetchFailure> {
         let now = Instant::now();
+        let background = mode == PushMode::Background;
         let (limit, exclude, after) = match mode {
             PushMode::Demand => (0, Vec::new(), None),
             PushMode::Background => (
@@ -327,29 +486,59 @@ impl Pass<'_> {
                 self.peer.scan.clone(),
             ),
         };
+        if background && after.is_none() {
+            self.peer.sweep = Sweep {
+                began: Some(now),
+                ..Sweep::default()
+            };
+        }
+        let deadline = if background {
+            self.peer.listing
+        } else {
+            WANTED_DEADLINE
+        };
         let page = wanted(
             lane,
             &self.folder.repo,
             limit,
             &exclude,
             after.as_deref(),
+            deadline,
+            self.interrupt,
             self.cancel,
-        )?;
+        );
+        let page = match page {
+            Ok(page) => page,
+            Err(failure) if failure.abandoned => {
+                self.outcome.interrupted = true;
+                return Ok(());
+            }
+            Err(failure) => {
+                if background {
+                    self.peer.sweep.failed = true;
+                    if failure.timed_out {
+                        self.peer.listing = (self.peer.listing * 2).min(PEER_DEADLINE);
+                    }
+                }
+                return Err(failure);
+            }
+        };
         self.outcome.listed = true;
-        self.outcome.from_top = after.is_none();
-        if mode == PushMode::Background {
+        if background {
             // An expired backoff is kept while its object is still listed (the
-            // next one doubles); one no longer listed is forgotten. A Demand
-            // page lists too little to tell.
+            // next one doubles), and while it counts as unsent, which a sweep's
+            // end settles; one no longer listed is forgotten. A Demand page lists
+            // too little to tell.
             let listed: BTreeSet<Digest> = page
                 .demand
                 .iter()
                 .chain(&page.missing)
                 .map(|(digest, _)| *digest)
                 .collect();
-            self.peer
-                .lacks
-                .retain(|digest, entry| entry.until > now || listed.contains(digest));
+            let unsent = &self.peer.unsent;
+            self.peer.lacks.retain(|digest, entry| {
+                entry.until > now || listed.contains(digest) || unsent.contains_key(digest)
+            });
         }
         // A digest both in demand and missing goes once, as demand.
         let mut seen = BTreeSet::new();
@@ -363,35 +552,95 @@ impl Pass<'_> {
         let missing = first(&page.missing);
         let listed = demand.len() + missing.len();
         let result = self
-            .store_listed(&demand)
-            .and_then(|()| self.store_listed(&missing));
+            .store_listed(&demand, mode)
+            .and_then(|()| self.store_listed(&missing, mode));
         self.outcome.remaining += listed.saturating_sub(self.stored.len());
-        // A page wholly stored is listed afresh from the same position (what
-        // was stored is no longer missing); any other moves on, and a scan at
-        // its end starts over. Interrupted, its rest is listed again.
-        let wholly_stored = page.missing.len() >= OBJECT_BATCH
-            && page.missing.iter().all(|(d, _)| self.stored.contains(d));
-        if mode == PushMode::Background && !self.outcome.interrupted && !wholly_stored {
-            self.peer.scan = page.cursor;
+        if background {
+            let seen: Vec<Digest> = demand.iter().chain(&missing).map(|(d, _)| *d).collect();
+            self.page_done(&seen, &page, result.is_err());
         }
         result
     }
 
-    /// Reads and stores `listed`, per owning lane, skipping what this side
-    /// lately lacked.
-    fn store_listed(&mut self, listed: &[(Digest, Kind)]) -> Result<(), FetchFailure> {
+    /// A background page was listed and worked through: where the scan and the
+    /// sweep stand, and whether the pair has more to do.
+    fn page_done(&mut self, listed: &[Digest], page: &WantedPage, failed: bool) {
+        let stored = !self.stored.is_empty();
+        let peer = &mut *self.peer;
+        peer.sweep.stored |= stored;
+        peer.sweep.failed |= failed || self.no_lane;
+        self.sound = !peer.sweep.failed;
+        let unsent = listed.iter().filter(|d| peer.unsent.contains_key(*d));
+        peer.sweep.unsent.extend(unsent);
+        // Interrupted, its rest is listed again.
+        if self.outcome.interrupted {
+            return;
+        }
+        peer.sweep.left += listed
+            .iter()
+            .filter(|digest| {
+                !self.stored.contains(*digest)
+                    && (!peer.lacks.contains_key(*digest) || peer.unsent.contains_key(*digest))
+            })
+            .count();
+        self.outcome.left = peer.sweep.left;
+        // A page wholly stored is listed afresh from the same position (what
+        // was stored is no longer missing); any other moves on, and a scan at
+        // its end starts over.
+        let wholly_stored = page.missing.len() >= OBJECT_BATCH
+            && page.missing.iter().all(|(d, _)| self.stored.contains(d));
+        if !wholly_stored {
+            peer.scan = page.cursor.clone();
+        }
+        self.outcome.again |= stored || failed || page.cursor.is_some() || wholly_stored;
+        if page.cursor.is_some() || wholly_stored {
+            return;
+        }
+        // The end of the scan. Only a whole sweep that changed nothing is the end
+        // of the work; any other goes over it again, from the top.
+        let sweep = std::mem::take(&mut peer.sweep);
+        let Some(began) = sweep.began.filter(|_| !sweep.stored && !sweep.failed) else {
+            self.outcome.again = true;
+            return;
+        };
+        self.outcome.swept = true;
+        self.outcome.took = began.elapsed();
+        // Unsent still means the listener wants it: it was listed, or its backoff
+        // keeps it from being listed.
+        let now = Instant::now();
+        let lacks = &peer.lacks;
+        peer.unsent.retain(|digest, _| {
+            sweep.unsent.contains(digest)
+                || lacks.get(digest).is_some_and(|entry| entry.until > now)
+        });
+    }
+
+    /// Reads and stores `listed`, per owning lane, skipping what is backed off.
+    /// What this side lately lacked it may hold by now, and the read is local, so
+    /// a [`PushMode::Demand`] pass, with a reader waiting, reads it again. What
+    /// the listener refused it would only refuse again.
+    fn store_listed(
+        &mut self,
+        listed: &[(Digest, Kind)],
+        mode: PushMode,
+    ) -> Result<(), FetchFailure> {
         let now = Instant::now();
         let due: Vec<(Digest, Kind)> = listed
             .iter()
             .filter(|(digest, _)| {
-                self.peer
+                let backed_off = self
+                    .peer
                     .lacks
                     .get(digest)
-                    .is_none_or(|entry| entry.until <= now)
+                    .is_some_and(|entry| entry.until > now);
+                !backed_off || (mode == PushMode::Demand && !self.peer.unsent.contains_key(digest))
             })
             .copied()
             .collect();
-        for (conn, batch) in lanes_for(self.lanes, self.endpoint, &due) {
+        let lanes = lanes_for(self.lanes, self.endpoint, &due);
+        let owned: usize = lanes.iter().map(|(_, batch)| batch.len()).sum();
+        self.no_lane |= owned < due.len();
+        for (conn, batch) in lanes {
             let mut queue: VecDeque<(Digest, Kind)> = batch.into();
             while !queue.is_empty() {
                 if stopped(self.interrupt, self.cancel) {
@@ -415,6 +664,7 @@ impl Pass<'_> {
                     queue.push_front(*object);
                 }
                 for digest in &fetched.oversized {
+                    self.peer.unsent.insert(*digest, TOO_LARGE.to_owned());
                     if self.peer.too_large.insert(*digest) {
                         event!(warn, SYNC_OBJECT_TOO_LARGE, {
                             "peer": self.endpoint,
@@ -439,31 +689,27 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// Of `looked`, what `read` does not hold is backed off; the rest is not.
+    /// Of `looked`, what `read` does not hold is backed off, unless it still is:
+    /// a Demand pass reading it early does not lengthen that. What was read is
+    /// not, unless the listener refused it, whose backoff its next answer settles.
     fn note_lacks(&mut self, looked: &[(Digest, Kind)], read: &[Object]) {
         let now = Instant::now();
         for (digest, _) in looked {
             if read.iter().any(|object| object.digest == *digest) {
-                self.peer.lacks.remove(digest);
+                if !self.peer.unsent.contains_key(digest) {
+                    self.peer.lacks.remove(digest);
+                }
                 continue;
             }
-            let backoff = self
-                .peer
-                .lacks
-                .get(digest)
-                .map_or(UNAVAILABLE_FIRST, |entry| entry.backoff * 2)
-                .min(UNAVAILABLE_MAX);
-            self.peer.lacks.insert(
-                *digest,
-                Unavailable {
-                    until: now + backoff,
-                    backoff,
-                },
-            );
+            let waiting = self.peer.lacks.get(digest);
+            if waiting.is_none_or(|entry| entry.until <= now) {
+                self.peer.back_off(*digest, now);
+            }
         }
     }
 
-    /// One `objects.store` of one read.
+    /// One `objects.store` of one read. A wake cancels it: then what it held
+    /// stays missing there and is listed again.
     fn store(&mut self, conn: &Conn, objects: Vec<Object>) -> Result<(), FetchFailure> {
         let sent: Vec<(Digest, Kind)> = objects.iter().map(|o| (o.digest, o.kind)).collect();
         let body = serde_json::to_vec(&objects).map_err(|e| worker_failure("objects.store", e))?;
@@ -475,32 +721,59 @@ impl Pass<'_> {
             json!({"repo": self.folder.repo}),
             body,
             deadline,
+            self.interrupt,
             self.cancel,
-        )
-        .inspect_err(|failure| {
-            if failure.timed_out {
-                self.shrink(sent.len());
+        );
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(failure) if failure.abandoned => {
+                self.outcome.interrupted = true;
+                return Ok(());
             }
-        })?;
+            Err(failure) => {
+                if failure.timed_out {
+                    self.shrink(sent.len());
+                }
+                return Err(failure);
+            }
+        };
         let reply: StoreReply = serde_json::from_slice(&reply)
             .map_err(|error| Failure::Error(format!("objects.store: malformed reply: {error}")))?;
+        self.answered = true;
         self.peer.batch = grown_batch(self.peer.batch);
-        let counters = &mut self.peer.counters;
-        counters.last_error = None;
-        counters.pushed += reply.stored.len() as u64;
-        counters.refused += reply.refused.len() as u64;
-        self.outcome.pushed += reply.stored.len();
-        self.stored.extend(reply.stored);
-        for refused in reply.refused {
-            if counters.last_refusal.as_ref() != Some(&refused.code) {
+        // A listener speaks only for what it was sent: goal 5 lets a later design
+        // free what is named here.
+        let was_sent = |digest: &Digest| sent.iter().any(|(sent, _)| sent == digest);
+        let stored: BTreeSet<Digest> = reply.stored.into_iter().filter(was_sent).collect();
+        let refused: BTreeMap<Digest, String> = reply
+            .refused
+            .into_iter()
+            .filter(|refused| was_sent(&refused.digest) && !stored.contains(&refused.digest))
+            .map(|refused| (refused.digest, refused.code))
+            .collect();
+        let now = Instant::now();
+        let peer = &mut *self.peer;
+        peer.counters.last_error = None;
+        peer.counters.pushed += stored.len() as u64;
+        peer.counters.refused += refused.len() as u64;
+        self.outcome.pushed += stored.len();
+        for digest in &stored {
+            peer.lacks.remove(digest);
+            peer.unsent.remove(digest);
+        }
+        self.stored.extend(stored);
+        for (digest, code) in refused {
+            if peer.counters.last_refusal.as_ref() != Some(&code) {
                 event!(warn, SYNC_PUSH_REFUSED, {
                     "peer": self.endpoint,
                     "repo": self.folder.repo.clone(),
-                    "digest": refused.digest.to_string(),
-                    "code": refused.code.clone(),
+                    "digest": digest.to_string(),
+                    "code": code.clone(),
                 });
-                counters.last_refusal = Some(refused.code);
+                peer.counters.last_refusal = Some(code.clone());
             }
+            peer.unsent.insert(digest, code);
+            peer.back_off(digest, now);
         }
         Ok(())
     }
@@ -517,12 +790,15 @@ impl Pass<'_> {
 }
 
 /// `objects.wanted` on a bulk lane of the listener.
+#[allow(clippy::too_many_arguments)]
 fn wanted(
     lane: &Conn,
     repo: &str,
     limit: usize,
     exclude: &[Digest],
     after: Option<&str>,
+    deadline: Duration,
+    interrupt: Option<(&Seq, u64)>,
     cancel: &Cancel,
 ) -> Result<WantedPage, FetchFailure> {
     let body = call(
@@ -530,28 +806,31 @@ fn wanted(
         "objects.wanted",
         json!({"repo": repo, "limit": limit, "exclude": exclude, "after": after}),
         Vec::new(),
-        PEER_DEADLINE,
+        deadline,
+        interrupt,
         cancel,
     )?;
     serde_json::from_slice(&body)
         .map_err(|error| Failure::Error(format!("objects.wanted: malformed reply: {error}")).into())
 }
 
-/// One data-priority request on a peer lane: the reply body.
+/// One data-priority request on a peer lane: the reply body. A stop abandons it.
 fn call(
     conn: &Conn,
     op: &str,
     header: serde_json::Value,
     body: Vec<u8>,
     deadline: Duration,
+    interrupt: Option<(&Seq, u64)>,
     cancel: &Cancel,
 ) -> Result<Vec<u8>, FetchFailure> {
     conn.call_cancellable(op, header, body, Priority::Data, deadline, &|| {
-        cancel.is_cancelled()
+        stopped(interrupt, cancel)
     })
     .map(|reply| reply.body)
     .map_err(|error| FetchFailure {
         timed_out: matches!(error, CallError::Timeout { .. }),
+        abandoned: matches!(error, CallError::Cancelled),
         failure: peer_failure(op, error),
     })
 }
