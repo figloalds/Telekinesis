@@ -1092,6 +1092,7 @@ mod tests {
             lane: None,
             session: "session".into(),
             verifier_generation: 1,
+            features: Vec::new(),
         }
     }
 

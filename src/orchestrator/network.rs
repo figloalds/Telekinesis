@@ -29,7 +29,12 @@
 //! credential (`paired` is cleared), sends the GOAWAY above and closes every
 //! outbound lane; the `peers` rows stay (listed with `"paired": false`, no
 //! lanes) so the owner can re-pair by endpoint.
-use super::{catalog::Catalog, catalog::Peer, config::Config, worker_client::WorkerLink};
+use super::{
+    catalog::Catalog,
+    catalog::Peer,
+    config::{Config, SyncProfile},
+    worker_client::WorkerLink,
+};
 use crate::{
     clock,
     content::Kind,
@@ -37,7 +42,7 @@ use crate::{
         content::Digest,
         errors::{ErrorClass, ErrorWire},
         protocol::{
-            LaneRole, LaneSpec,
+            LaneRole, LaneSpec, features,
             frame::{ClientHello, Limits},
             ops::{PEER_ENROLL, PEER_REVOKE},
         },
@@ -247,6 +252,17 @@ struct Target {
     /// This orchestrator's installation.
     local: String,
     pool: usize,
+    /// Advertised in `HELLO.features` (`protocol::features`).
+    features: Vec<String>,
+}
+
+/// What a dialer asks of its listeners: an active one wants notifications, a
+/// passive one says so and polls instead.
+fn dialer_features(profile: SyncProfile) -> Vec<String> {
+    match profile {
+        SyncProfile::Active => vec![features::NOTIFY.into()],
+        SyncProfile::Passive => vec![features::PROFILE_PASSIVE.into()],
+    }
 }
 
 /// The lanes of one outbound peer.
@@ -282,6 +298,7 @@ pub struct Network {
     installation: String,
     /// Default lanes per peer (`Config::pool`).
     pool: usize,
+    sync_profile: SyncProfile,
     /// The endpoint peers are told in `peer.enroll`.
     advertise: Option<String>,
     folders: Arc<dyn FolderDirectory>,
@@ -315,6 +332,7 @@ pub fn start(
         catalog,
         installation,
         pool: config.pool().min(MAX_POOL),
+        sync_profile: config.network.sync_profile,
         advertise,
         folders,
         peers: Mutex::new(BTreeMap::new()),
@@ -749,6 +767,7 @@ impl Network {
             key: peer.key()?,
             local: self.installation.clone(),
             pool,
+            features: dialer_features(self.sync_profile),
         });
         let cancel = self.stopping.child();
         let lanes: Vec<Arc<Lane>> = (0..pool).map(|index| Lane::new(index, pool)).collect();
@@ -921,8 +940,9 @@ fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
         let dialed = (target.check_clock)()
             .map_err(|error| ErrorWire::new("CLOCK_INVALID", format!("{error:#}")))
             .and_then(|()| {
-                let hello =
+                let mut hello =
                     session::client_hello(&target.local, lane.role, lane.spec, target.pool as u32);
+                hello.features = target.features.clone();
                 session::dial_cancellable(
                     &target.endpoint,
                     hello,
@@ -1175,6 +1195,18 @@ impl Handler for PeerService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_passive_dialer_never_asks_for_notify() {
+        assert_eq!(
+            dialer_features(SyncProfile::Active),
+            vec![features::NOTIFY.to_string()]
+        );
+        assert_eq!(
+            dialer_features(SyncProfile::Passive),
+            vec![features::PROFILE_PASSIVE.to_string()]
+        );
+    }
+
     use super::*;
     use crate::{model::orchestrator::CallError, orchestrator::catalog::Catalog};
     use tungstenite::{WebSocket, stream::MaybeTlsStream};
@@ -1229,6 +1261,7 @@ mod tests {
             lane: (role == LaneRole::Bulk).then_some(LaneSpec::new(0, 1)),
             session: "session".into(),
             verifier_generation: 1,
+            features: Vec::new(),
         }
     }
 
@@ -1399,6 +1432,7 @@ mod tests {
             key: [7; 32],
             local: "peer-a".into(),
             pool: 2,
+            features: Vec::new(),
         };
         let lanes: Vec<Arc<Lane>> = (0..2).map(|index| Lane::new(index, 2)).collect();
         let cancel = Cancel::new();

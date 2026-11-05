@@ -125,6 +125,7 @@ fn peer() -> PeerInfo {
         lane: None,
         session: "session-test".into(),
         verifier_generation: 1,
+        features: Vec::new(),
     }
 }
 

@@ -20,7 +20,7 @@ use tkfs::{
         errors::{ErrorClass, ErrorWire},
         protocol::{
             LANE_HEADER, LEGACY_NEEDS_UPGRADE_REPLY, LaneRole, LaneSpec, PROTOCOL_NAME,
-            TOKEN_HEADER, UPGRADE_HEADER, UPGRADE_LOOPBACK,
+            TOKEN_HEADER, UPGRADE_HEADER, UPGRADE_LOOPBACK, features,
             frame::{ClientHello, Limits, ServerHello},
         },
     },
@@ -386,11 +386,42 @@ fn right_code_authenticates_the_client_for_every_role() {
                 lane,
                 session,
                 verifier_generation: GENERATION,
+                features: Vec::new(),
             }
         );
         assert_eq!(policy.admitted.lock().unwrap().len(), 1);
         exchange_after_auth(&mut client_ws, &mut server_ws);
     }
+}
+
+#[test]
+fn features_are_exchanged_in_both_directions() {
+    let (code, _, policy) = paired();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        session::accept(stream, policy, ConnOptions::default())
+    });
+    let mut dialer = hello(LaneRole::Control, None);
+    dialer.features = vec![features::NOTIFY.into(), features::PROFILE_PASSIVE.into()];
+    let (client_conn, _) = session::dial(
+        &endpoint,
+        dialer,
+        &CodeAuth { code },
+        None,
+        ConnOptions::default(),
+    )
+    .unwrap();
+    let (server_conn, _) = server.join().unwrap().unwrap();
+    assert!(client_conn.peer().has_feature(features::CONTENT_PUSH));
+    assert!(client_conn.peer().has_feature(features::NOTIFY));
+    assert!(!client_conn.peer().has_feature(features::PROFILE_PASSIVE));
+    assert!(server_conn.peer().has_feature(features::NOTIFY));
+    assert!(server_conn.peer().has_feature(features::PROFILE_PASSIVE));
+    assert!(!server_conn.peer().has_feature(features::CONTENT_PUSH));
+    client_conn.close();
+    server_conn.close();
 }
 
 #[test]
@@ -1439,6 +1470,7 @@ fn dial_and_accept_hand_the_authenticated_socket_to_conn() {
         lane: Some(LaneSpec::new(2, 3)),
         session: session_id,
         verifier_generation: GENERATION,
+        features: Vec::new(),
     };
     if let (Ok((conn, server_hello)), Ok((server_conn, peer))) = (&dialed, &accepted) {
         assert_eq!(server_hello.installation, SERVER);

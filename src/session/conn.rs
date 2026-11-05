@@ -199,6 +199,17 @@ pub struct PeerInfo {
     /// Session uuid from `ClientHello.session`.
     pub session: String,
     pub verifier_generation: u64,
+    /// The other side's advertised features: the server's on a dialer's
+    /// `Conn`, the dialer's on a listener's.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+impl PeerInfo {
+    /// Whether the other side advertised `name` (`protocol::features`).
+    pub fn has_feature(&self, name: &str) -> bool {
+        self.features.iter().any(|feature| feature == name)
+    }
 }
 
 /// What the accepting side learns about the dialer.

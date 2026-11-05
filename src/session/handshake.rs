@@ -8,7 +8,7 @@ use crate::{
         errors::{ErrorClass, ErrorWire},
         protocol::{
             LANE_HEADER, LaneRole, LaneSpec, PROTOCOL_NAME, PROTOCOL_VERSION, SUPPORTED_VERSIONS,
-            TOKEN_HEADER, UPGRADE_HEADER, UPGRADE_LOOPBACK, UPGRADE_V3,
+            TOKEN_HEADER, UPGRADE_HEADER, UPGRADE_LOOPBACK, UPGRADE_V3, features,
             frame::{
                 Auth, AuthOk, ClientHello, DIAL_ATTEMPT, FrameKind, GOAWAY_HANDSHAKE_CODES, Goaway,
                 HANDSHAKE_TIMEOUT, KNOWN_FLAGS, Limits, MAX_CHUNK, MAX_HEADER, MAX_HEADER_PRE_AUTH,
@@ -21,7 +21,7 @@ use crate::{
         auth::{valid_id, verify_credential},
         conn::{AcceptedPeer, Conn, ConnOptions, PeerInfo, Side},
     },
-    util::{cancel::Cancel, secret::ct_eq},
+    util::{cancel::Cancel, fault, secret::ct_eq},
     ws::{self, RawSocket, watchdog::Watchdog},
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -162,6 +162,16 @@ pub fn client_hello(
     }
 }
 
+/// `features`, or nothing under the `session.features.none` fault (an older
+/// peer).
+fn negotiated(features: Vec<String>) -> Vec<String> {
+    if fault::hit(features::FAULT_NONE).is_some() {
+        Vec::new()
+    } else {
+        features
+    }
+}
+
 /// Dials `endpoint`, runs the v3 handshake and returns the authenticated
 /// connection and the server's hello. The caller checks
 /// `ServerHello.installation` against its catalog, or uses
@@ -269,6 +279,7 @@ fn dial_with(
         lane,
         session,
         verifier_generation: server.verifier_generation,
+        features: negotiated(server.features.clone()),
     };
     let conn = into_conn(ws, Side::Client, peer, o)
         .map_err(|error| DialError::Connect(format!("session I/O did not start: {error}")))?;
@@ -657,6 +668,14 @@ fn client_steps(
     hello: &ClientHello,
     auth: &dyn ClientAuth,
 ) -> Result<ServerHello, DialError> {
+    let mut sent;
+    let hello = if fault::hit(features::FAULT_NONE).is_some() {
+        sent = hello.clone();
+        sent.features.clear();
+        &sent
+    } else {
+        hello
+    };
     guarded
         .write_frame(FrameKind::Hello, hello)
         .map_err(StepError::into_dial)?;
@@ -932,7 +951,7 @@ fn server_auth(
         lane: hello.lane,
         salt: verifier.salt.clone(),
         verifier_generation: generation,
-        features: Vec::new(),
+        features: negotiated(vec![features::CONTENT_PUSH.into(), features::NOTIFY.into()]),
         limits,
     };
     guarded.write_frame(FrameKind::HelloAck, &server)?;
@@ -992,6 +1011,7 @@ fn server_auth(
         lane: hello.lane,
         session: hello.session,
         verifier_generation: generation,
+        features: negotiated(hello.features),
     })
 }
 
@@ -1057,6 +1077,7 @@ fn loopback_peer(role: LaneRole) -> PeerInfo {
         lane: None,
         session: uuid::Uuid::new_v4().to_string(),
         verifier_generation: 0,
+        features: Vec::new(),
     }
 }
 

@@ -111,9 +111,19 @@ impl TestDaemon {
         Self::start_listening("127.0.0.1:0", network_toml)
     }
 
+    /// [`Self::start_with`] with `env` set on the daemon process (for
+    /// example a `TKFS_FAULT_*` point).
+    pub fn start_env(network_toml: &str, env: &[(&str, &str)]) -> Result<Self> {
+        Self::listening_env("127.0.0.1:0", network_toml, env)
+    }
+
     /// A daemon on a fresh home listening on `listen` (a fixed port keeps
     /// its endpoint across a restart with [`Self::start_in`]).
     pub fn start_listening(listen: &str, network_toml: &str) -> Result<Self> {
+        Self::listening_env(listen, network_toml, &[])
+    }
+
+    fn listening_env(listen: &str, network_toml: &str, env: &[(&str, &str)]) -> Result<Self> {
         let home = tempfile::tempdir()?;
         fs::write(
             home.path().join("orchestrator.toml"),
@@ -123,7 +133,7 @@ impl TestDaemon {
                  listen = \"{listen}\"\n{network_toml}\n"
             ),
         )?;
-        Self::start_in(home)
+        Self::launch_env(home, env).map_err(|(_, error)| error)
     }
 
     /// A daemon on a fresh, empty home: it creates `orchestrator.toml`
@@ -169,6 +179,13 @@ impl TestDaemon {
     /// [`Self::start_in`]; a daemon that exits before writing
     /// `orchestrator.json` hands the home back with the error.
     fn launch(home: TempDir) -> std::result::Result<Self, (Option<TempDir>, anyhow::Error)> {
+        Self::launch_env(home, &[])
+    }
+
+    fn launch_env(
+        home: TempDir,
+        env: &[(&str, &str)],
+    ) -> std::result::Result<Self, (Option<TempDir>, anyhow::Error)> {
         let failed = |home, error| (Some(home), error);
         static LOGS: AtomicUsize = AtomicUsize::new(0);
         let config = home.path().join("orchestrator.toml");
@@ -189,6 +206,7 @@ impl TestDaemon {
             .stderr(file.1)
             .env_remove("TKFS_FAKE_NOW_MS")
             .env_remove("TKFS_UNSUPERVISED_EXIT_S")
+            .envs(env.iter().copied())
             .spawn();
         let child = match child {
             Ok(child) => child,

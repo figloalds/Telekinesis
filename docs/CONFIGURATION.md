@@ -29,6 +29,8 @@ advertise = ""
 connections = 4
 worker_lanes = 2
 sync_interval_ms = 500
+sync_profile = "active"
+backup_poll_ms = 30000
 
 [freshness]
 open_wait_ms = 250
@@ -45,6 +47,8 @@ open_wait_ms = 250
 | `network.connections` | The default pool per peer, 1-16 (default 4): lane 0 carries metadata, the other lanes file content, so the pool is at least 2. `manage pair --connections N` overrides it per peer (`INVALID_CONNECTION_COUNT` outside 1-16). |
 | `network.worker_lanes` | Loopback connections from the orchestrator to each worker, 1-8 (default 2): one control lane plus the rest for object transfer (`INVALID_WORKER_LANES`). |
 | `network.sync_interval_ms` | How often each folder exchanges metadata with each peer, 50-60,000 ms (default 500) (`INVALID_SYNC_INTERVAL`). The measured clock offset of each peer is refreshed every 60 intervals. |
+| `network.sync_profile` | `"active"` (default) or `"passive"` (`INVALID_SYNC_PROFILE` otherwise). An active orchestrator tells each peer it dials that it wants change notifications; a passive one does not, and relies on `network.backup_poll_ms` instead. Takes effect when the peer's lanes next connect. |
+| `network.backup_poll_ms` | How often a passive orchestrator polls each peer for changes, 1,000-3,600,000 ms (default 30,000) (`INVALID_BACKUP_POLL`). |
 | `freshness.open_wait_ms` | How long opening a file waits for a newer remote version, 0-5,000 ms (default 250; `INVALID_OPEN_WAIT`). Validated and stored for the mounts plan; nothing opens files through the orchestrator yet. |
 
 ## Data directory and catalog

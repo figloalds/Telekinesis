@@ -35,6 +35,30 @@ pub struct Network {
     pub connections: usize,
     pub worker_lanes: usize,
     pub sync_interval_ms: u64,
+    /// `active` (default) asks the listener to notify this orchestrator of
+    /// changes; `passive` does not, and relies on `backup_poll_ms`.
+    pub sync_profile: SyncProfile,
+    /// How often a passive orchestrator polls each peer, 1,000-3,600,000 ms.
+    pub backup_poll_ms: u64,
+}
+
+/// How an orchestrator learns of a peer's changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncProfile {
+    #[default]
+    Active,
+    Passive,
+}
+
+impl<'de> Deserialize<'de> for SyncProfile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "active" => Ok(Self::Active),
+            "passive" => Ok(Self::Passive),
+            _ => Err(serde::de::Error::custom("INVALID_SYNC_PROFILE")),
+        }
+    }
 }
 
 impl Default for Network {
@@ -45,6 +69,8 @@ impl Default for Network {
             connections: 4,
             worker_lanes: 2,
             sync_interval_ms: 500,
+            sync_profile: SyncProfile::Active,
+            backup_poll_ms: 30_000,
         }
     }
 }
@@ -145,6 +171,11 @@ impl Config {
             );
         }
         let mut config: Self = toml::from_str(&text).map_err(|error| {
+            if error.message().contains("INVALID_SYNC_PROFILE") {
+                return anyhow::anyhow!(
+                    "INVALID_SYNC_PROFILE: network.sync_profile must be \"active\" or \"passive\""
+                );
+            }
             anyhow::anyhow!(
                 "INVALID_CONFIG: this build requires the folder-first format_version=2 configuration: {error}"
             )
@@ -169,6 +200,10 @@ impl Config {
         ensure!(
             (50..=60000).contains(&config.network.sync_interval_ms),
             "INVALID_SYNC_INTERVAL: network.sync_interval_ms must be 50..=60000"
+        );
+        ensure!(
+            (1000..=3_600_000).contains(&config.network.backup_poll_ms),
+            "INVALID_BACKUP_POLL: network.backup_poll_ms must be 1000..=3600000"
         );
         ensure!(
             config.freshness.open_wait_ms <= 5000,
@@ -440,6 +475,58 @@ folders = []
         );
         let path = write(&sub, &body);
         assert_eq!(Config::load(&path).unwrap().data_directory, absolute);
+    }
+
+    #[test]
+    fn sync_profile_defaults_to_active_and_accepts_passive() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |extra: &str| Config::load(&write(dir.path(), &format!("{BASE}{extra}")));
+        assert_eq!(load("").unwrap().network.sync_profile, SyncProfile::Active);
+        let profile = |value: &str| {
+            load(&format!(
+                "[network]
+sync_profile = '{value}'
+"
+            ))
+            .map(|config| config.network.sync_profile)
+        };
+        assert_eq!(profile("active").unwrap(), SyncProfile::Active);
+        assert_eq!(profile("passive").unwrap(), SyncProfile::Passive);
+        let rejected = load(
+            "[network]
+sync_profile = 'other'
+",
+        );
+        assert!(err(rejected).starts_with("INVALID_SYNC_PROFILE"));
+    }
+
+    #[test]
+    fn backup_poll_must_be_within_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |value: u64| {
+            Config::load(&write(
+                dir.path(),
+                &format!(
+                    "{BASE}[network]
+backup_poll_ms = {value}
+"
+                ),
+            ))
+        };
+        for bad in [999, 3_600_001] {
+            let message = err(load(bad));
+            assert!(
+                message.starts_with(
+                    "INVALID_BACKUP_POLL: network.backup_poll_ms must be 1000..=3600000"
+                ),
+                "{bad}: {message}"
+            );
+        }
+        for good in [1000, 3_600_000] {
+            assert_eq!(load(good).unwrap().network.backup_poll_ms, good);
+        }
+        let default = Config::load(&write(dir.path(), BASE)).unwrap();
+        assert_eq!(default.network.backup_poll_ms, 30_000);
     }
 
     #[test]
