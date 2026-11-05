@@ -1335,6 +1335,22 @@ impl Store {
             })
             .collect()
     }
+    /// The content of every current head that is not the visible version, for
+    /// entities with more than one head; heads without content are skipped.
+    /// The key is `"{entity}/{version}"`.
+    pub fn conflict_references(&self) -> Result<Vec<(String, FileContentRef)>> {
+        let projection = self.projection();
+        let mut references = Vec::new();
+        for (entity, heads) in projection.heads.iter().filter(|(_, h)| h.len() > 1) {
+            let visible = projection.visible.get(entity);
+            for head in heads.iter().filter(|head| Some(*head) != visible) {
+                if let Some(content) = self.version(head)?.and_then(|event| event.state.content) {
+                    references.push((format!("{entity}/{head}"), content));
+                }
+            }
+        }
+        Ok(references)
+    }
     pub fn resolve(&mut self, entity: &str, selected: &str) -> Result<Event> {
         let heads = self
             .projection()

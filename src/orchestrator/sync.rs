@@ -213,8 +213,9 @@ impl Service {
             more: page.more,
         })
     }
-    /// Content objects of live entries in the current projection that the
-    /// packs lack, in a deterministic scan: every file's root first (by entry
+    /// Content objects of live entries in the current projection, and of the
+    /// other versions of conflicted entities (keyed "{entity}/{version}"),
+    /// that the packs lack, in a deterministic scan: every file's root first (by
     /// key), then the chunks of manifests that are present. At most `limit`
     /// (clamped to [`BATCH`]), without duplicates within the page and without
     /// the digests of `exclude`, resuming after `after`. The cursor names the
@@ -233,15 +234,25 @@ impl Service {
                 cursor: after.map(ScanAt::encode),
             });
         }
-        let entries = lock(&self.engine.store).projection().entries.clone();
+        let (entries, conflicts) = {
+            let store = lock(&self.engine.store);
+            (
+                store.projection().entries.clone(),
+                store.conflict_references()?,
+            )
+        };
         let content = self.engine.working.content();
-        // In key order (the projection is a BTreeMap).
-        let references: Vec<_> = entries
+        // Visible versions under their entity, other conflict heads under
+        // "{entity}/{version}", in one order by key. `ScanAt` compares whole
+        // keys, so every key is sorted and resumed against the same string.
+        let mut references: Vec<(String, _)> = entries
             .iter()
             .filter(|(_, entry)| !entry.deleted)
-            .filter_map(|(key, entry)| Some((key.as_str(), entry.content.as_ref()?)))
+            .filter_map(|(key, entry)| Some((key.clone(), entry.content.clone()?)))
+            .chain(conflicts)
             .filter(|(_, reference)| reference.validate().is_ok())
             .collect();
+        references.sort_by(|(a, _), (b, _)| a.cmp(b));
         let page = |wanted: Vec<(Digest, Kind)>, at: ScanAt| MissingPage {
             missing: wanted,
             cursor: Some(at.encode()),
@@ -260,7 +271,7 @@ impl Service {
         let roots_from = match after {
             None => 0,
             Some(ScanAt::Roots(last)) => {
-                references.partition_point(|(key, _)| *key <= last.as_str())
+                references.partition_point(|(key, _)| key.as_str() <= last.as_str())
             }
             Some(ScanAt::Chunks(..)) => references.len(),
         };
@@ -270,7 +281,7 @@ impl Service {
                 ContentKind::Manifest => Kind::Manifest,
             };
             if full(&mut wanted, reference.digest, kind)? {
-                return Ok(page(wanted, ScanAt::Roots((*key).to_owned())));
+                return Ok(page(wanted, ScanAt::Roots(key.clone())));
             }
         }
         let resume = match after {
@@ -278,7 +289,8 @@ impl Service {
             _ => None,
         };
         for (key, reference) in references.iter().filter(|(key, reference)| {
-            reference.kind == ContentKind::Manifest && resume.is_none_or(|(from, _)| *key >= from)
+            reference.kind == ContentKind::Manifest
+                && resume.is_none_or(|(from, _)| key.as_str() >= from)
         }) {
             // Only a present manifest: `chunks` would otherwise block on the
             // fetcher, which is this worker's own demand.
@@ -289,12 +301,12 @@ impl Service {
                 continue;
             };
             let start = match resume {
-                Some((from, index)) if from == *key => index,
+                Some((from, index)) if from == key => index,
                 _ => 0,
             };
             for (index, digest) in chunks.into_iter().enumerate().skip(start) {
                 if full(&mut wanted, digest, Kind::Chunk)? {
-                    return Ok(page(wanted, ScanAt::Chunks((*key).to_owned(), index + 1)));
+                    return Ok(page(wanted, ScanAt::Chunks(key.clone(), index + 1)));
                 }
             }
         }
@@ -457,7 +469,8 @@ mod tests {
     use super::*;
     use crate::{
         content::ObjectFetcher,
-        model::errors::ErrorWire,
+        core::{EntryKind, MAIN, Operation, Store},
+        model::{content::FileContentRef, errors::ErrorWire},
         session::{Conn, Priority},
     };
     use anyhow::Context;
@@ -1379,6 +1392,178 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(code(&error), "INVALID_REQUEST", "{error:#}");
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    /// Events for one entity, created under the id `entity`, with one head per
+    /// item of `versions` (more than one is a conflict), and the content
+    /// reference of each. The bytes stay in `store`, not in the receiver.
+    fn heads(
+        store: &mut Store,
+        entity: &str,
+        versions: &[&[u8]],
+    ) -> Result<(Vec<Event>, Vec<FileContentRef>)> {
+        let created = store.create(&format!("name-{entity}"), EntryKind::File)?;
+        let mut create = store
+            .events_after(0, 4096)?
+            .into_iter()
+            .map(|(_, event)| event)
+            .find(|event| event.entity == created.id)
+            .context("the create event")?;
+        create.entity = entity.into();
+        create.state.id = entity.into();
+        let mut events = vec![create.clone()];
+        let mut references = Vec::new();
+        for bytes in versions {
+            let mut state = create.state.clone();
+            let reference = store.content.import(bytes)?;
+            state.content = Some(reference.clone());
+            events.push(store.event(MAIN, state, vec![create.id.clone()], Operation::Content));
+            references.push(reference);
+        }
+        Ok((events, references))
+    }
+
+    /// Every page of an `objects.missing` scan, `limit` at a time, ending with
+    /// a `None` cursor. Bounded: a scan that never ends fails.
+    fn pages(service: &Service, limit: u64) -> Result<Vec<Vec<(Digest, Kind)>>> {
+        let (mut cursor, mut pages) = (None::<String>, Vec::new());
+        for _ in 0..64 {
+            let page: MissingPage = serde_json::from_slice(&call(
+                service,
+                "objects.missing",
+                json!({"limit": limit, "after": cursor}),
+                &[],
+            )?)?;
+            pages.push(page.missing);
+            match page.cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(pages),
+            }
+        }
+        anyhow::bail!("the scan did not end within 64 pages")
+    }
+
+    fn digests(pages: &[Vec<(Digest, Kind)>]) -> Vec<Digest> {
+        pages.iter().flatten().map(|(digest, _)| *digest).collect()
+    }
+
+    fn apply(service: &Service, events: &[Event]) -> Result<()> {
+        call(
+            service,
+            "feed.apply",
+            json!({}),
+            &serde_json::to_vec(events)?,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_lists_the_bytes_of_every_conflict_head() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let mut scratch = Store::open(scratch.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        let incoming = service(&target);
+        let (events, references) = heads(&mut scratch, "aa", &[b"left", b"right"])?;
+        apply(&incoming, &events)?;
+        {
+            let store = lock(&target.store);
+            assert_eq!(store.projection().heads["aa"].len(), 2);
+            assert_eq!(store.conflict_references()?.len(), 1);
+        }
+        let listed = digests(&pages(&incoming, 64)?);
+        for reference in &references {
+            assert!(
+                listed.contains(&reference.digest),
+                "{} of a conflict head is not listed: {listed:?}",
+                reference.digest
+            );
+        }
+        assert_eq!(listed.len(), 2);
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_conflict_head_scan_resumes_from_its_cursor() -> Result<()> {
+        let scratch = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let mut scratch = Store::open(scratch.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        let incoming = service(&target);
+        // Sorted keys: "a", "a/{v}", "aa", "aa-b", "aa/{v}", "ab", "ab/{v}".
+        // A plain key ("aa-b") falls between an entity and its conflict keys
+        // ('-' < '/'), and a prefix ("a") sorts before the longer ones.
+        let mut expected = BTreeSet::new();
+        for (entity, versions) in [
+            ("aa", vec![b"aa-1".as_slice(), b"aa-2"]),
+            ("aa-b", vec![b"b-1".as_slice()]),
+            ("ab", vec![b"ab-1".as_slice(), b"ab-2", b"ab-3"]),
+            ("a", vec![b"a-1".as_slice(), b"a-2"]),
+        ] {
+            let (events, references) = heads(&mut scratch, entity, &versions)?;
+            apply(&incoming, &events)?;
+            expected.extend(references.iter().map(|r| r.digest));
+        }
+        assert_eq!(expected.len(), 8);
+        for limit in [64, 1, 2, 3] {
+            let paged = pages(&incoming, limit)?;
+            let listed = digests(&paged);
+            // Across pages, not only within one.
+            assert_eq!(listed.len(), 8, "limit {limit}: {listed:?}");
+            assert_eq!(listed.iter().copied().collect::<BTreeSet<_>>(), expected);
+            for page in &paged[..paged.len() - 1] {
+                assert_eq!(page.len() as u64, limit, "a page with a cursor is full");
+            }
+        }
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_conflict_manifest_lists_its_chunks_once_present() -> Result<()> {
+        let source_home = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let source = Engine::open(source_home.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        let (outgoing, incoming) = (service(&source), service(&target));
+        let size = crate::model::content::CHUNK_SIZE as usize;
+        let (left, right) = (vec![1; size + 1], vec![2; size + 1]);
+        let (events, references) = {
+            let mut store = lock(&source.store);
+            heads(&mut store, "aa", &[&left, &right])?
+        };
+        assert!(
+            references
+                .iter()
+                .all(|reference| reference.kind == ContentKind::Manifest)
+        );
+        apply(&incoming, &events)?;
+        let roots = digests(&pages(&incoming, 64)?);
+        assert_eq!(roots.len(), 2, "both manifests, no chunks yet: {roots:?}");
+        // Supply both manifests, as the orchestrator would.
+        let wanted: Vec<_> = references
+            .iter()
+            .map(|reference| (reference.digest, Kind::Manifest))
+            .collect();
+        let fetched = call(
+            &outgoing,
+            FETCH_OP,
+            json!({"repo":"repo"}),
+            &serde_json::to_vec(&wanted)?,
+        )?;
+        call(&incoming, "objects.write", json!({"repo":"repo"}), &fetched)?;
+        let mut expected = BTreeSet::new();
+        for reference in &references {
+            expected.extend(source.working.content().chunks(reference)?);
+        }
+        assert_eq!(expected.len(), 4);
+        let listed = digests(&pages(&incoming, 3)?);
+        assert_eq!(listed.len(), 4, "{listed:?}");
+        assert_eq!(listed.into_iter().collect::<BTreeSet<_>>(), expected);
         source.shutdown()?;
         target.shutdown()?;
         Ok(())
