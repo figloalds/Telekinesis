@@ -1,1 +1,0 @@
-dev.tkfs.spike:drawable/ic_folder = 0x7f010000
