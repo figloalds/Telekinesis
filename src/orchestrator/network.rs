@@ -291,34 +291,34 @@ impl PeerLanes {
     }
 }
 
-/// The digests this listener told one peer it wants, oldest first: the
-/// admission set of `objects.store`.
+/// The objects this listener told one peer it wants, oldest first, with the
+/// kind it named: the admission set of `objects.store`.
 #[derive(Default)]
 struct ListedDigests {
     order: VecDeque<Digest>,
-    set: BTreeSet<Digest>,
+    kinds: BTreeMap<Digest, Kind>,
 }
 
 impl ListedDigests {
     /// Lists `digest`; past [`MAX_LISTED`] the oldest listed one is dropped.
-    fn insert(&mut self, digest: Digest) {
-        if !self.set.insert(digest) {
+    fn insert(&mut self, digest: Digest, kind: Kind) {
+        if self.kinds.insert(digest, kind).is_some() {
             return;
         }
         self.order.push_back(digest);
         while self.order.len() > MAX_LISTED {
             if let Some(oldest) = self.order.pop_front() {
-                self.set.remove(&oldest);
+                self.kinds.remove(&oldest);
             }
         }
     }
 
-    fn contains(&self, digest: &Digest) -> bool {
-        self.set.contains(digest)
+    fn kind(&self, digest: &Digest) -> Option<Kind> {
+        self.kinds.get(digest).copied()
     }
 
     fn remove(&mut self, digest: &Digest) {
-        if self.set.remove(digest) {
+        if self.kinds.remove(digest).is_some() {
             self.order.retain(|listed| listed != digest);
         }
     }
@@ -600,12 +600,14 @@ impl Network {
 
     /// Lists `digests` to `installation` for `repo`: `objects.store` accepts
     /// them from it.
-    fn record_listed(&self, installation: &str, repo: &str, digests: &[Digest]) {
+    fn record_listed(&self, installation: &str, repo: &str, objects: &[(Digest, Kind)]) {
         let mut listed = lock(&self.listed);
         let set = listed
             .entry((installation.to_owned(), repo.to_owned()))
             .or_default();
-        digests.iter().for_each(|digest| set.insert(*digest));
+        objects
+            .iter()
+            .for_each(|(digest, kind)| set.insert(*digest, *kind));
     }
 
     /// A new pairing code: every inbound credential is revoked, every inbound
@@ -1180,10 +1182,15 @@ impl PeerService {
             for object in objects {
                 let refusal = if Digest::bytes(&object.bytes) != object.digest {
                     Some("INVALID_PEER_OBJECT")
-                } else if !listed.is_some_and(|set| set.contains(&object.digest)) {
-                    Some("OBJECT_NOT_WANTED")
                 } else {
-                    None
+                    // The kind the host listed is the kind it stores: a
+                    // mis-tagged object would be refused by the pack or, worse,
+                    // stored under the wrong kind for good.
+                    match listed.and_then(|set| set.kind(&object.digest)) {
+                        None => Some("OBJECT_NOT_WANTED"),
+                        Some(kind) if kind != object.kind => Some("INVALID_PEER_OBJECT"),
+                        Some(_) => None,
+                    }
                 };
                 match refusal {
                     Some(code) => refused.push(Refused {
@@ -1295,16 +1302,12 @@ impl PeerService {
                     .wanted(limit, &exclude, after.as_deref())
                     .map_err(|error| error.to_wire())?;
                 // Listing is the admission: store only what was told here.
-                let digests: Vec<Digest> = page
-                    .demand
-                    .iter()
-                    .chain(&page.missing)
-                    .map(|(digest, _)| *digest)
-                    .collect();
+                let listed: Vec<(Digest, Kind)> =
+                    page.demand.iter().chain(&page.missing).copied().collect();
                 self.network.record_listed(
                     &self.peer.installation,
                     header["repo"].as_str().unwrap_or_default(),
-                    &digests,
+                    &listed,
                 );
                 Ok((json!({}), encode(&page)?))
             }
@@ -1899,20 +1902,64 @@ mod tests {
         let listener = listener();
         let client = bulk(&listener);
         let object = listener.objects[0].clone();
-        let fillers: Vec<Digest> = (0..MAX_LISTED)
-            .map(|n| Digest::bytes(format!("filler {n}").as_bytes()))
+        let fillers: Vec<(Digest, Kind)> = (0..MAX_LISTED)
+            .map(|n| (Digest::bytes(format!("filler {n}").as_bytes()), Kind::Chunk))
             .collect();
         listener
             .network
-            .record_listed("peer-a", "r1", &[object.digest]);
+            .record_listed("peer-a", "r1", &[(object.digest, Kind::Chunk)]);
         listener.network.record_listed("peer-a", "r1", &fillers);
         let reply = store(&client, std::slice::from_ref(&object)).unwrap();
         assert!(reply.refused_only(object.digest, "OBJECT_NOT_WANTED"));
         listener
             .network
-            .record_listed("peer-a", "r1", &[object.digest]);
+            .record_listed("peer-a", "r1", &[(object.digest, Kind::Chunk)]);
         let reply = store(&client, std::slice::from_ref(&object)).unwrap();
         assert_eq!(reply.stored, vec![object.digest]);
+    }
+
+    #[test]
+    fn a_wrongly_tagged_oversized_object_is_refused_without_failing_the_batch() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let good = listener.objects[0].clone();
+        // Listed as a manifest, pushed as a chunk: too large for a chunk.
+        let big_bytes = vec![7u8; 70 * 1024];
+        let big = crate::orchestrator::sync::Object {
+            digest: Digest::bytes(&big_bytes),
+            kind: Kind::Chunk,
+            bytes: big_bytes,
+        };
+        listener.network.record_listed(
+            "peer-a",
+            "r1",
+            &[(good.digest, Kind::Chunk), (big.digest, Kind::Manifest)],
+        );
+        let batch = vec![good.clone(), big.clone()];
+        let reply = store(&client, &batch).unwrap();
+        assert_eq!(reply.stored, vec![good.digest]);
+        assert_eq!(
+            reply.refused,
+            vec![(big.digest, "INVALID_PEER_OBJECT".to_owned())]
+        );
+        assert!(held(&listener, good.digest));
+        assert!(!held(&listener, big.digest));
+    }
+
+    #[test]
+    fn a_chunk_tagged_as_a_manifest_is_refused_and_a_correct_push_is_accepted() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let object = listener.objects[0].clone();
+        wanted(&client, 64, None).unwrap();
+        let mut mistagged = object.clone();
+        mistagged.kind = Kind::Manifest;
+        let reply = store(&client, &[mistagged]).unwrap();
+        assert!(reply.refused_only(object.digest, "INVALID_PEER_OBJECT"));
+        assert!(!held(&listener, object.digest));
+        let reply = store(&client, std::slice::from_ref(&object)).unwrap();
+        assert_eq!(reply.stored, vec![object.digest]);
+        assert!(held(&listener, object.digest));
     }
 
     #[test]
@@ -1922,10 +1969,10 @@ mod tests {
         let object = listener.objects[0].clone();
         listener
             .network
-            .record_listed("peer-b", "r1", &[object.digest]);
+            .record_listed("peer-b", "r1", &[(object.digest, Kind::Chunk)]);
         listener
             .network
-            .record_listed("peer-a", "r2", &[object.digest]);
+            .record_listed("peer-a", "r2", &[(object.digest, Kind::Chunk)]);
         let reply = store(&client, std::slice::from_ref(&object)).unwrap();
         assert!(reply.refused_only(object.digest, "OBJECT_NOT_WANTED"));
     }
