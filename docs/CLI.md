@@ -246,7 +246,7 @@ tkfs manage unpair INSTALLATION
   and hinted to it since this orchestrator started; heartbeats count for
   neither), `features` (what the peer advertised, so `[]` for an older one),
   `profile` (`"active"` or `"passive"`, as that peer declared when it dialed
-  this host; `null` with no inbound session) and `two_way_content` (whether
+  this host; `null` with no inbound session, or for an older one that declared nothing) and `two_way_content` (whether
   content moves both ways with that peer: `false` for an older one, which is
   only pulled from). It never shows a code or a credential. Per-folder
   `inspect` gains `pushed` and `last_push_error` for each peer.

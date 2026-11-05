@@ -812,7 +812,7 @@ impl Network {
     /// since this process started. `features` joins what its listener lane
     /// advertised and what its inbound sessions advertised as a dialer;
     /// `profile` is `"active"` or `"passive"` as that dialer declared, `null`
-    /// with no inbound session; `two_way_content` is whether content moves both
+    /// with no inbound session or an older dialer that declared nothing; `two_way_content` is whether content moves both
     /// ways: it takes our pushes, or it is a current dialer that pushes.
     pub fn peers(&self) -> Value {
         let outbound = self.catalog.peers().unwrap_or_default();
@@ -840,18 +840,21 @@ impl Network {
             let Some(all) = dialed.get(installation) else {
                 return (Vec::new(), Value::Null, false);
             };
+            // An older dialer declares nothing, so it has no profile to show.
             let profile = if all
                 .iter()
                 .any(|f| f.iter().any(|f| f == features::PROFILE_PASSIVE))
             {
-                "passive"
+                json!("passive")
+            } else if all.iter().any(|f| !f.is_empty()) {
+                json!("active")
             } else {
-                "active"
+                Value::Null
             };
             let merged: BTreeSet<String> = all.iter().flatten().cloned().collect();
             (
                 merged.into_iter().collect(),
-                json!(profile),
+                profile,
                 all.iter().any(|f| !f.is_empty()),
             )
         };

@@ -133,11 +133,10 @@ folder **host A** and the one that should receive it **host B**.
 The folder appears on host B and starts downloading. You can follow it in
 **Details → Sync** and **Content**.
 
-> **Current limitation: content flows toward the host that paired.** Changes
-> to file names and history sync both ways, but file *content* is only
-> downloaded by the host that dialed (host B above). For edits made on host
-> B to reach host A, pair in the other direction too: host B must be
-> reachable (step 1 on host B), and host A pairs with host B.
+> **One pairing moves content both ways.** Edits made on host B reach host A
+> without pairing in the other direction. Pairing both ways is needed only
+> against a peer running an older version, which is pulled from but takes no
+> pushes (`manage peers` shows `two_way_content: false` for it).
 
 ### 5. Manage a folder (Details)
 
@@ -234,8 +233,9 @@ tkfs manage peers
 tkfs manage unpair INSTALLATION_ID
 ```
 
-The same limitation applies: file content is downloaded by the host that
-ran `pair`. For edits to flow both ways, pair in both directions.
+One `pair` moves file content both ways. Pair in both directions only
+against a peer running an older version (`two_way_content: false` in
+`manage peers`).
 
 A host with `listen = ""` can still pair (it only dials out). The other host
 keeps the pairing but never dials back.

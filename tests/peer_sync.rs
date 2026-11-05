@@ -1756,6 +1756,8 @@ fn an_older_dialer_keeps_the_short_poll() -> Result<()> {
     let row = row_of(&b, &a)?;
     ensure!(row["notifies_sent"] == 0, "{row}");
     ensure!(row["two_way_content"] == false, "{row}");
+    ensure!(row["profile"].is_null(), "{row}");
+    ensure!(row["features"] == serde_json::json!([]), "{row}");
     a.shutdown()?;
     b.shutdown()?;
     Ok(())
