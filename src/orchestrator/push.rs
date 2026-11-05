@@ -145,6 +145,13 @@ impl PushState {
             .map(|peer| &peer.counters)
     }
 
+    /// No folder pushes to `endpoint` for [`REST`]: its lanes are gone or not
+    /// answering.
+    pub(super) fn rest_endpoint(&mut self, endpoint: &str) {
+        self.resting
+            .insert(endpoint.to_owned(), Instant::now() + REST);
+    }
+
     /// Forgets the (folder, endpoint) pairs not pushed to for [`FORGET_AFTER`]
     /// and the rests that ended. By age, not by the folders syncing now: a
     /// folder whose slot is busy sits out a round, and that must not cost it
@@ -218,12 +225,6 @@ pub fn run(
             outcome.interrupted = true;
             break;
         }
-        let rest = Instant::now() + REST;
-        if timed_out || failure == Failure::LaneLost {
-            state.resting.insert(endpoint.clone(), rest);
-        } else {
-            peer.rest_until = Some(rest);
-        }
         let error = failure.to_string();
         if peer.counters.last_error.as_ref() != Some(&error) {
             event!(warn, SYNC_PUSH_FAILED, {
@@ -235,6 +236,11 @@ pub fn run(
             peer.counters.last_error = Some(error.clone());
         }
         outcome.error = Some(error);
+        if timed_out || failure == Failure::LaneLost {
+            state.rest_endpoint(endpoint);
+        } else {
+            peer.rest_until = Some(Instant::now() + REST);
+        }
     }
     outcome
 }
@@ -370,9 +376,16 @@ impl Pass<'_> {
                     }
                 }
                 self.note_lacks(&asked[..looked], &fetched.objects);
-                if !fetched.objects.is_empty() {
-                    self.store(&conn, fetched.objects)?;
+                if fetched.objects.is_empty() {
+                    continue;
                 }
+                // A wake during the read: what was read stays missing there
+                // and is listed again.
+                if stopped(self.interrupt, self.cancel) {
+                    self.outcome.interrupted = true;
+                    return Ok(());
+                }
+                self.store(&conn, fetched.objects)?;
             }
         }
         Ok(())

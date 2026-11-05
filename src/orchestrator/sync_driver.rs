@@ -610,19 +610,22 @@ impl Driver {
     /// demand, then the push pass serves the listeners' demand; pass 2 is the
     /// background `objects.missing` work, then the background push. Both are
     /// abandoned before their next call as soon as the wake moves past `seen`
-    /// (the next round starts with pass 1). The number of objects stored, here
-    /// or on a listener.
+    /// (the next round starts with pass 1). Pull's rests hold back only the
+    /// pull passes: a failure of one folder's fetch says nothing of another's
+    /// push, and what says the lane is unusable rests the push steps by itself
+    /// ([`Self::supply`]). The number of objects stored, here or on a listener.
     fn pump_round(&self, state: &mut PumpState, seen: u64) -> usize {
         state.round += 1;
         let round = state.round;
         state.resting.retain(|_, at| *at > round);
-        let mut endpoints = self.lanes.bulk_endpoints();
-        endpoints.retain(|endpoint| !state.resting.contains_key(endpoint));
-        if endpoints.is_empty() {
+        let mut all = self.lanes.bulk_endpoints();
+        if all.is_empty() {
             return 0;
         }
-        let turn = (round as usize) % endpoints.len();
-        endpoints.rotate_left(turn);
+        let turn = (round as usize) % all.len();
+        all.rotate_left(turn);
+        let mut endpoints = all.clone();
+        endpoints.retain(|endpoint| !state.resting.contains_key(endpoint));
         let folders = self.folders.syncing();
         let syncing = |id: &String| folders.iter().any(|folder| folder.id == *id);
         state.unavailable.retain(|id, _| syncing(id));
@@ -642,7 +645,7 @@ impl Driver {
                 .filter(|(digest, _)| !state.supplied.contains_key(&(folder.id.clone(), *digest)))
                 .copied()
                 .collect();
-            if !demand.is_empty() && !self.cancel.is_cancelled() {
+            if !demand.is_empty() && !endpoints.is_empty() && !self.cancel.is_cancelled() {
                 stored += self.supply(state, &endpoints, folder, demand, None).stored;
             }
         }
@@ -652,12 +655,13 @@ impl Driver {
                 break;
             }
             stored += self
-                .push(state, &endpoints, folder, PushMode::Demand, None)
+                .push(state, &all, folder, PushMode::Demand, None)
                 .pushed;
         }
-        // Pass 2: background prefetch.
+        // Pass 2: background prefetch. With every endpoint resting a page would
+        // be passed over unasked.
         for folder in &folders {
-            if self.cancel.is_cancelled() || self.wake.current() != seen {
+            if self.cancel.is_cancelled() || self.wake.current() != seen || endpoints.is_empty() {
                 break;
             }
             let Some((wanted, cursor)) = self.background(state, folder) else {
@@ -684,7 +688,7 @@ impl Driver {
             if self.cancel.is_cancelled() || self.wake.current() != seen {
                 break;
             }
-            let outcome = self.push(state, &endpoints, folder, PushMode::Background, Some(seen));
+            let outcome = self.push(state, &all, folder, PushMode::Background, Some(seen));
             stored += outcome.pushed;
             if outcome.interrupted {
                 break;
@@ -693,7 +697,7 @@ impl Driver {
         stored
     }
 
-    /// A push step of `folder`, to the endpoints not sitting out this round.
+    /// A push step of `folder`.
     fn push(
         &self,
         state: &mut PumpState,
@@ -702,15 +706,10 @@ impl Driver {
         mode: PushMode,
         interrupt: Option<u64>,
     ) -> push::PushOutcome {
-        let endpoints: Vec<String> = endpoints
-            .iter()
-            .filter(|endpoint| !state.resting.contains_key(*endpoint))
-            .cloned()
-            .collect();
         push::run(
             self.lanes.as_ref(),
             &mut state.push,
-            &endpoints,
+            endpoints,
             folder,
             mode,
             interrupt.map(|seen| (self.wake.as_ref(), seen)),
@@ -834,6 +833,11 @@ impl Driver {
                                 state.shrink(&folder.id, endpoint, chunk.len());
                             }
                             state.resting.insert(endpoint.clone(), state.round + 2);
+                            // The lane is unusable, for pushes too. A coded
+                            // failure is this folder's alone.
+                            if timed_out || failure == Failure::LaneLost {
+                                state.push.rest_endpoint(endpoint);
+                            }
                             let error = failure.to_string();
                             if state.logged.get(endpoint) != Some(&error) {
                                 event!(warn, SYNC_FETCH_FAILED, {
@@ -1282,6 +1286,9 @@ mod tests {
         held: Vec<Object>,
         /// `objects.fetch` stops after this many objects (`truncated_at`).
         read_cut: Option<usize>,
+        /// Bumped by every `objects.fetch`, as a reader's demand arriving
+        /// during the read.
+        wake_on_read: Option<Arc<Seq>>,
     }
 
     impl FakeFolder {
@@ -1329,6 +1336,9 @@ mod tests {
                     serde_json::to_vec(&json!({"stored": objects.len()})).unwrap()
                 }
                 "objects.fetch" => {
+                    if let Some(wake) = &self.wake_on_read {
+                        wake.bump();
+                    }
                     let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
                     let mut fetched = Fetched::default();
                     for (index, (digest, kind)) in wanted.into_iter().enumerate() {
@@ -1495,7 +1505,7 @@ mod tests {
 
     fn driver(
         lanes: OneLane,
-        folders: Arc<Folders>,
+        folders: Arc<dyn SyncFolders>,
         wake: Arc<Seq>,
     ) -> (Arc<Driver>, tempfile::TempDir) {
         let root = tempfile::tempdir().unwrap();
@@ -1873,6 +1883,8 @@ mod tests {
         held: Vec<Object>,
         refuse: BTreeSet<Digest>,
         stall_above: Option<usize>,
+        /// An `objects.fetch` outlasts its deadline.
+        stall_fetch: bool,
         unpublished: Option<String>,
         /// Bumped by every store, as a reader's demand arriving meanwhile.
         wake_on_store: Option<Arc<Seq>>,
@@ -1906,6 +1918,10 @@ mod tests {
                 "objects.store" => self.store(req),
                 "objects.fetch" => {
                     lock(&self.calls).push("fetch".into());
+                    if self.stall_fetch {
+                        thread::sleep(Duration::from_millis(900));
+                        return;
+                    }
                     let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
                     let objects: Vec<&Object> = wanted
                         .iter()
@@ -2452,6 +2468,181 @@ mod tests {
         push_once(&lanes, &mut state, &other, PushMode::Background);
         assert!(state.counters(&lacking.id, ENDPOINT).is_none());
         assert!(state.counters(&other.id, ENDPOINT).is_some());
+    }
+
+    #[test]
+    fn a_wake_during_the_read_stops_a_background_push_before_its_store() {
+        let all = objects("object", 2);
+        let wake = Seq::new();
+        let fake = Arc::new(FakeFolder {
+            held: all.clone(),
+            wake_on_read: Some(wake.clone()),
+            ..FakeFolder::default()
+        });
+        let folder = SyncFolder {
+            id: "f1".into(),
+            repo: "repo-1".into(),
+            link: fake_worker(fake),
+            demand: Vec::new(),
+        };
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let mut state = PushState::default();
+        let endpoints = [ENDPOINT.to_owned()];
+        let seen = wake.current();
+        let outcome = push::run(
+            &lanes,
+            &mut state,
+            &endpoints,
+            &folder,
+            PushMode::Background,
+            Some((wake.as_ref(), seen)),
+            &Cancel::new(),
+        );
+        assert!(outcome.interrupted);
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.pushed, 0);
+        assert_eq!(outcome.remaining, 2);
+        assert_eq!(listener.calls(), ["wanted/32"]);
+        // This side does hold them, and they stay missing: listed again.
+        let peer = push_peer(&mut state, &folder);
+        assert!(peer.lacks.is_empty());
+        assert_eq!(peer.scan, None);
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 2);
+    }
+
+    /// Running folders, each of its own repo (its id here), with set demand.
+    struct RepoFolders(Vec<(String, Arc<WorkerLink>, Wanted)>);
+
+    impl SyncFolders for RepoFolders {
+        fn syncing(&self) -> Vec<SyncFolder> {
+            self.0
+                .iter()
+                .map(|(repo, link, demand)| SyncFolder {
+                    id: repo.clone(),
+                    repo: repo.clone(),
+                    link: link.clone(),
+                    demand: demand.clone(),
+                })
+                .collect()
+        }
+    }
+
+    const UNPUBLISHED: &str = "unpublished-repo";
+
+    /// A folder of [`UNPUBLISHED`] that lists `missing` and whose readers wait
+    /// for `demand`, then one of `repo-1` that holds `held`.
+    fn unpublished_then_open(
+        missing: &[Object],
+        demand: &[Object],
+        held: &[Object],
+    ) -> Arc<RepoFolders> {
+        let unpublished = Arc::new(FakeFolder {
+            missing: wanted_of(missing),
+            ..FakeFolder::default()
+        });
+        let open = Arc::new(FakeFolder {
+            held: held.to_vec(),
+            ..FakeFolder::default()
+        });
+        Arc::new(RepoFolders(vec![
+            (
+                UNPUBLISHED.into(),
+                fake_worker(unpublished),
+                wanted_of(demand),
+            ),
+            ("repo-1".into(), fake_worker(open), Vec::new()),
+        ]))
+    }
+
+    #[test]
+    fn a_coded_pull_failure_of_one_folder_does_not_starve_the_pushes_of_the_others() {
+        // More than a page to push, so a second round has work.
+        let there = objects("there", OBJECT_BATCH + 8);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&there),
+            unpublished: Some(UNPUBLISHED.into()),
+            ..Listener::default()
+        });
+        let folders = unpublished_then_open(&objects("here", 1), &[], &there);
+        let (driver, _root) = driver(listener.lane(), folders, Seq::new());
+        let mut state = PumpState::default();
+        let seen = driver.wake.current();
+        // The pull of the first folder fails: the pull passes rest, the second
+        // folder's background push goes on in this very round.
+        assert_eq!(driver.pump_round(&mut state, seen), OBJECT_BATCH);
+        assert!(state.resting.contains_key(ENDPOINT));
+        assert!(!state.push.resting.contains_key(ENDPOINT));
+        // The round pull sits out holds no call of it, and still pushes.
+        assert_eq!(driver.pump_round(&mut state, seen), 8);
+        assert_eq!(listener.stored().len(), there.len());
+        let fetches = listener
+            .calls()
+            .iter()
+            .filter(|call| *call == "objects.fetch")
+            .count();
+        assert_eq!(fetches, 1, "{:?}", listener.calls());
+    }
+
+    #[test]
+    fn a_blocked_reader_of_one_folder_does_not_skip_the_demand_push_of_the_others() {
+        let wanted_there = objects("wanted-there", 1);
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&wanted_there),
+            unpublished: Some(UNPUBLISHED.into()),
+            ..Listener::default()
+        });
+        let folders = unpublished_then_open(&[], &objects("here", 1), &wanted_there);
+        let (driver, _root) = driver(listener.lane(), folders, Seq::new());
+        let mut state = PumpState::default();
+        assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 1);
+        assert_eq!(listener.stored(), [wanted_there[0].digest]);
+        assert_eq!(
+            listener.calls(),
+            [
+                "objects.fetch",
+                "objects.wanted",
+                "wanted/0",
+                "store",
+                "wanted/32"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pull_that_timed_out_rests_the_push_steps_too() {
+        let here = objects("here", 1);
+        let there = objects("there", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&there),
+            stall_fetch: true,
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder {
+            missing: wanted_of(&here),
+            held: there.clone(),
+            ..FakeFolder::default()
+        });
+        let folders = Arc::new(RepoFolders(vec![(
+            "repo-1".into(),
+            fake_worker(fake),
+            Vec::new(),
+        )]));
+        let (mut driver, _root) = driver(listener.lane(), folders, Seq::new());
+        Arc::get_mut(&mut driver).unwrap().fetch_deadline = |_| Duration::from_millis(100);
+        let mut state = PumpState::default();
+        let seen = driver.wake.current();
+        // The lane is not answering: no more calls to it in this round, nor in
+        // the next, whichever step would make them.
+        assert_eq!(driver.pump_round(&mut state, seen), 0);
+        assert_eq!(listener.calls(), ["wanted/0", "fetch"]);
+        assert!(state.push.resting.contains_key(ENDPOINT));
+        assert_eq!(driver.pump_round(&mut state, seen), 0);
+        assert_eq!(listener.calls(), ["wanted/0", "fetch"]);
     }
 
     #[test]
