@@ -984,6 +984,28 @@ fn arrives_within(state: &Path, path: &str, expected: &str, bound: Duration) -> 
     Ok(())
 }
 
+/// When `daemon` last exchanged "Shared" with `endpoint`; 0 if it has not yet.
+fn last_exchange(daemon: &TestDaemon, endpoint: &str) -> Result<u64> {
+    let inspected = daemon.manage(&["inspect", "Shared"])?;
+    inspected["sync"][endpoint]["last_exchange_ms"]
+        .as_u64()
+        .with_context(|| format!("no last_exchange_ms: {inspected}"))
+}
+
+/// Waits until `daemon` has exchanged "Shared" with `endpoint` and then stayed
+/// quiet. Its first exchange is due because the session is new, and it comes up
+/// to a scheduler look after the folder runs. What that exchange applies moves
+/// the feed, which the folder's watch reports as a change, so one more follows.
+/// The worker's `seq` moves every second, so a quiet window spans several of
+/// them, and a pair that exchanged on each one would never see such a window.
+fn wait_exchanges_settled(daemon: &TestDaemon, endpoint: &str) -> Result<()> {
+    wait_until(Duration::from_secs(30), "a quiet idle window", || {
+        let before = last_exchange(daemon, endpoint)?;
+        std::thread::sleep(Duration::from_secs(4));
+        Ok(before > 0 && last_exchange(daemon, endpoint)? == before)
+    })
+}
+
 #[test]
 fn a_change_on_either_side_arrives_by_notify_well_inside_the_poll() -> Result<()> {
     let Shared {
@@ -1006,20 +1028,8 @@ fn a_change_on_either_side_arrives_by_notify_well_inside_the_poll() -> Result<()
     import(&b, &state_b, "from-b.txt", &from_b)?;
     arrives_within(&state_a, "from-b.txt", &from_b, NOTIFIED)?;
 
-    // Once those settle, heartbeats alone start no exchange on the dialer. The
-    // worker's `seq` moves every second, so a quiet window spans several of them,
-    // and a pair that exchanged on each one would never see such a window.
-    let last_exchange = || -> Result<u64> {
-        let inspected = a.manage(&["inspect", "Shared"])?;
-        inspected["sync"][endpoint_b.as_str()]["last_exchange_ms"]
-            .as_u64()
-            .with_context(|| format!("no last_exchange_ms: {inspected}"))
-    };
-    wait_until(Duration::from_secs(30), "a quiet idle window", || {
-        let before = last_exchange()?;
-        std::thread::sleep(Duration::from_secs(4));
-        Ok(last_exchange()? == before)
-    })?;
+    // Once those settle, heartbeats alone start no exchange on the dialer.
+    wait_exchanges_settled(&a, &endpoint_b)?;
     a.shutdown()?;
     b.shutdown()?;
     Ok(())
@@ -1553,28 +1563,43 @@ fn sync_now_works_on_an_active_dialer() -> Result<()> {
     let Shared {
         a,
         b,
+        endpoint_b,
         state_a,
         state_b,
-        ..
     } = shared_pair_of(
         TestDaemon::start_with(NOTIFY_ONLY)?,
         TestDaemon::start_env(NOTIFY_ONLY, &[("TKFS_FAULT_POINT", "peer.notify.drop")])?,
         &[],
     )?;
+    // What is due from setting up is not what this test is about.
+    wait_exchanges_settled(&a, &endpoint_b)?;
+    let exchanged = last_exchange(&a, &endpoint_b)?;
+    let dropped = notifies_dropped(&b, "metadata");
     let from_b = text(1000, 127);
     import(&b, &state_b, "from-b.txt", &from_b)?;
+    // B has told A all it can, and lost it. A gets time to act on it wrongly.
+    wait_until(NOTIFIED, "a suppressed notify in B's log", || {
+        Ok(notifies_dropped(&b, "metadata") > dropped)
+    })?;
     std::thread::sleep(Duration::from_secs(3));
     let tree = folder(&state_a, &["tree"])?;
     ensure!(!tree.contains("from-b.txt"), "unasked: {tree}");
-    let from_a = text(1000, 131);
-    import(&a, &state_a, "from-a.txt", &from_a)?;
+    ensure!(
+        last_exchange(&a, &endpoint_b)? == exchanged,
+        "A exchanged unasked, well before its 60 s poll"
+    );
     let reply = sync_now_clean(&a)?;
     ensure!(reply["exchanged"].as_u64() > Some(0), "{reply}");
     ensure!(reply["remaining"] == 0, "{reply}");
     let tree = folder(&state_a, &["tree"])?;
     ensure!(tree.contains("from-b.txt"), "asked: {tree}");
-    // Its bytes come as an active dialer's do, and A's went across.
+    // Its bytes come as an active dialer's do.
     arrives_within(&state_a, "from-b.txt", &from_b, NOTIFIED)?;
+    // And the other way: the burst leaves nothing of A's behind.
+    let from_a = text(1000, 131);
+    import(&a, &state_a, "from-a.txt", &from_a)?;
+    let reply = sync_now_clean(&a)?;
+    ensure!(reply["remaining"] == 0, "{reply}");
     arrives_within(&state_b, "from-a.txt", &from_a, NOTIFIED)?;
     a.shutdown()?;
     b.shutdown()?;
