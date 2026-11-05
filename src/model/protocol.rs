@@ -230,6 +230,7 @@ pub mod frame {
                     | FrameKind::AuthOk
                     | FrameKind::Heartbeat
                     | FrameKind::Goaway
+                    | FrameKind::Notify
                     | FrameKind::Cancel
                     | FrameKind::Progress
             )
@@ -405,6 +406,24 @@ pub mod frame {
     pub struct Goaway {
         pub code: String,
         pub message: String,
+    }
+
+    /// Why a listener sends `NOTIFY`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum NotifyReason {
+        /// The listener's metadata for the repo changed.
+        Metadata,
+        /// The listener wants objects it does not have.
+        Demand,
+    }
+
+    /// `NOTIFY` header (listener to dialer): a hint to sync `repo` soon. It
+    /// is not a request and gets no reply; losing it is harmless.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Notify {
+        pub repo: String,
+        pub reason: NotifyReason,
     }
 }
 

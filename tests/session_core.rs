@@ -3365,28 +3365,22 @@ fn notify_is_dropped_not_blocking_when_the_control_queue_is_full() {
     let cap = options.sanitized().control_queue_bytes as u64;
     let (mut raw, server_ws) = ws_pair(Transport::Plain);
     let server = Conn::from_established(server_ws, Side::Server, peer(), options).unwrap();
-    if let MaybeTlsStream::Plain(stream) = raw.get_mut() {
-        stream
-            .set_write_timeout(Some(Duration::from_millis(500)))
-            .unwrap();
-    }
+    // Small batches, checked against the queue: stop as soon as it is over its
+    // bound, so no write ever blocks on a socket the server stopped reading.
     let started = Instant::now();
     let mut sent = 0u64;
-    'flood: while started.elapsed() < Duration::from_secs(30) {
-        for _ in 0..256 {
+    while server.health().queued_bytes <= cap {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the control queue never passed its bound ({sent} requests)"
+        );
+        for _ in 0..64 {
             sent += 1;
             let request = raw_frame(5, 0, 0, &request_header(sent, "ping", None), b"");
-            if raw.write(request).is_err() {
-                break 'flood;
-            }
+            raw.write(request).unwrap();
         }
-        if raw.flush().is_err() {
-            break;
-        }
+        raw.flush().unwrap();
     }
-    wait_until("the control queue to pass its bound", Duration::from_secs(10), || {
-        server.health().queued_bytes > cap
-    });
     let queued = server.health().queued_bytes;
 
     let began = Instant::now();
@@ -3418,7 +3412,6 @@ fn notify_is_dropped_not_blocking_when_the_control_queue_is_full() {
             drain.elapsed() < Duration::from_secs(20),
             "no answer after the drain ({sent} requests)"
         );
-        let _ = raw.flush();
         match raw.read() {
             Ok(Message::Binary(bytes)) => {
                 quiet_since = Instant::now();
@@ -3426,8 +3419,7 @@ fn notify_is_dropped_not_blocking_when_the_control_queue_is_full() {
                 match frame.kind {
                     FrameKind::Notify => notifies += 1,
                     FrameKind::Response if asked => {
-                        answered =
-                            frame.header_as::<ResponseHeader>().unwrap().id == sent + 1;
+                        answered = frame.header_as::<ResponseHeader>().unwrap().id == sent + 1;
                     }
                     _ => {}
                 }

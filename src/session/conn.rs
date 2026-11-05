@@ -76,7 +76,7 @@ use std::{
     net::TcpStream,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc::Receiver,
     },
@@ -775,7 +775,12 @@ pub(crate) struct Shared {
     /// The I/O thread holds its reads: receivers are behind, or (server) the
     /// peer leaves our replies unread.
     pub(crate) rx_paused: AtomicBool,
+    /// (Client.) Runs on the I/O thread for each NOTIFY; set once.
+    pub(crate) notify_handler: OnceLock<NotifyHandler>,
 }
+
+/// Receives a listener's NOTIFY hints; must not block.
+pub type NotifyHandler = Arc<dyn Fn(&wire::Notify) + Send + Sync>;
 
 impl Shared {
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
@@ -1491,6 +1496,7 @@ impl Conn {
             rx_buffered: AtomicUsize::new(0),
             rx_taken: AtomicU64::new(0),
             rx_paused: AtomicBool::new(false),
+            notify_handler: OnceLock::new(),
         });
         io::start(ws, shared.clone())?;
         Ok(Conn { inner: shared })
@@ -1702,6 +1708,40 @@ impl Conn {
             }
         }
         shared.wake();
+    }
+
+    /// (Server side.) Sends a one-way hint to the dialer. It never blocks:
+    /// the frame is dropped when the connection is closed or closing, or when
+    /// the control queue is over its bound, since a hint is only a nudge.
+    pub fn notify(&self, notify: &wire::Notify) {
+        let shared = &self.inner;
+        if shared.side != Side::Server {
+            return;
+        }
+        let Ok(frame) = encode_with(FrameKind::Notify, 0, notify, &[], shared.send_limits()) else {
+            return;
+        };
+        {
+            let mut state = shared.lock();
+            if state.closed.is_some()
+                || state.close_request.is_some()
+                || state.goaway_sent.is_some()
+                || state.queues.control_bytes() > shared.tx_cap()
+            {
+                return;
+            }
+            state.queues.push(Lane::Control, 0, frame);
+        }
+        shared.wake();
+    }
+
+    /// (Client side.) Sets the handler for the listener's hints; the first
+    /// call wins. It runs on the I/O thread and must not block. Hints that
+    /// arrive before it is set are ignored.
+    pub fn on_notify(&self, handler: NotifyHandler) {
+        if self.inner.side == Side::Client {
+            let _ = self.inner.notify_handler.set(handler);
+        }
     }
 
     /// Closes the connection now: calls in flight fail with `ConnectionLost`

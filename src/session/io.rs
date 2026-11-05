@@ -56,7 +56,7 @@ use crate::{
         protocol::{
             self, PingReply,
             frame::{
-                CancelHeader, ChunkHeader, FrameKind, Goaway, Heartbeat, HeartbeatEcho,
+                CancelHeader, ChunkHeader, FrameKind, Goaway, Heartbeat, HeartbeatEcho, Notify,
                 ProgressHeader, RequestHeader, ResponseHeader,
             },
             ops,
@@ -743,6 +743,7 @@ impl Io {
             FrameKind::Cancel if side == Side::Server => self.on_cancel(frame),
             FrameKind::Heartbeat => self.on_heartbeat(frame),
             FrameKind::Goaway => self.on_goaway(frame),
+            FrameKind::Notify if side == Side::Client => self.on_notify(frame),
             kind => Err(violation(format!(
                 "PROTOCOL_VIOLATION: {kind:?} frame sent to the {side:?} side"
             ))),
@@ -1563,6 +1564,16 @@ impl Io {
             let deadline = after(Instant::now(), protocol::frame::GOAWAY_GRACE);
             state.goaway_deadline =
                 Some(state.goaway_deadline.map_or(deadline, |d| d.min(deadline)));
+        }
+        Ok(())
+    }
+
+    /// A hint from the listener. Without a handler it is ignored: it only
+    /// says "look soon", and the next sync finds the change anyway.
+    fn on_notify(&mut self, frame: FrameRef<'_>) -> Result<(), Stop> {
+        let notify: Notify = Self::header(&frame)?;
+        if let Some(handler) = self.shared.notify_handler.get() {
+            handler(&notify);
         }
         Ok(())
     }
