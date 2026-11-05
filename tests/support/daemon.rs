@@ -432,6 +432,34 @@ impl TestDaemon {
         self.release_home()
     }
 
+    /// Kills the daemon and every worker of its home at once, as a crash of
+    /// the host would, and hands the home over for another daemon. The
+    /// discovery file a killed daemon leaves is removed, so [`Self::start_in`]
+    /// waits for the next daemon's.
+    pub fn kill_keep_home(mut self) -> Result<TempDir> {
+        let child = self
+            .child
+            .as_mut()
+            .context("the daemon was already reaped")?;
+        child.kill()?;
+        if !wait_child(child, KILL_BOUND) {
+            bail!("STRANDED_PROCESS: daemon pid {}", child.id());
+        }
+        self.child = None;
+        let left: Vec<String> = kill_stranded_workers(&self.data())
+            .into_iter()
+            .filter(|message| message.contains("could not be killed"))
+            .collect();
+        if !left.is_empty() {
+            bail!("{}", left.join("; "));
+        }
+        let discovery = self.data().join("orchestrator.json");
+        if discovery.exists() {
+            fs::remove_file(discovery)?;
+        }
+        Ok(self.home.take().unwrap())
+    }
+
     /// The home of a daemon that has exited (see [`Self::wait_exit`]).
     pub fn into_home(mut self) -> Result<TempDir> {
         if self.child.is_some() {

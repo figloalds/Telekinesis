@@ -34,7 +34,10 @@
 //!   peer omitted is excluded for a backoff (5 s doubling to 5 min), which
 //!   spares re-asking it when the scan comes around again. A round that stored nothing sleeps
 //!   `sync_interval_ms` unless woken. A peer whose fetch failed sits out the
-//!   next round. The pump never blocks the scheduler.
+//!   next round. The pump never blocks the scheduler. After each pass it also
+//!   pushes ([`push`]), so a round runs: this side's demand, the listeners'
+//!   demand, background pull, background push. The background push stops
+//!   before its next call on a demand wake-up, as pass 2 does.
 //! * **clock probes** — a short thread per probe, at most one per peer: at
 //!   every new control session (a Ready transition) and every
 //!   [`CLOCK_PROBE_EVERY`] scheduler rounds. The smoothed offset goes to the
@@ -44,6 +47,7 @@ use super::{
     catalog::Catalog,
     demand::Seq,
     network::{Network, ReadyPeer},
+    push::{self, PushMode, PushState},
     sync::{FeedCursor, FeedPage, FeedReply, FeedRequest, Fetched, MAX_EXCLUDE},
     worker_client::{CALL_DEADLINE, WorkerLink},
 };
@@ -94,7 +98,7 @@ pub const UNAVAILABLE_MAX: Duration = Duration::from_secs(300);
 /// worker's demand list catches up at its next `watch`).
 const DEMAND_SUPPLIED: Duration = super::worker_client::WATCH_DEADLINE;
 
-type Wanted = Vec<(Digest, Kind)>;
+pub(super) type Wanted = Vec<(Digest, Kind)>;
 
 /// The peer lanes the driver uses: the [`Network`] (tests stub it).
 pub trait Lanes: Send + Sync {
@@ -104,6 +108,8 @@ pub trait Lanes: Send + Sync {
     fn bulk_endpoints(&self) -> Vec<String>;
     /// The Ready bulk lane to `endpoint` that owns `digest`.
     fn bulk_lane(&self, endpoint: &str, digest: &Digest) -> Option<Conn>;
+    /// Any Ready bulk lane to `endpoint`.
+    fn any_bulk_lane(&self, endpoint: &str) -> Option<Conn>;
 }
 
 impl Lanes for Network {
@@ -115,6 +121,9 @@ impl Lanes for Network {
     }
     fn bulk_lane(&self, endpoint: &str, digest: &Digest) -> Option<Conn> {
         Network::bulk_lane(self, endpoint, digest)
+    }
+    fn any_bulk_lane(&self, endpoint: &str) -> Option<Conn> {
+        Network::any_bulk_lane(self, endpoint)
     }
 }
 
@@ -192,6 +201,18 @@ struct PumpState {
     /// (folder id, endpoint) → the objects asked per `objects.fetch`, while
     /// below [`OBJECT_BATCH`]: halved by a timeout, grown back by replies.
     batch: BTreeMap<(String, String), usize>,
+    /// The push steps' memory.
+    push: PushState,
+}
+
+/// A batch of `asked` objects timed out: half that, at least 1.
+pub(super) fn halved_batch(size: usize, asked: usize) -> usize {
+    (size.min(asked) / 2).max(1)
+}
+
+/// A batch was answered: a quarter more (at least 1), up to [`OBJECT_BATCH`].
+pub(super) fn grown_batch(size: usize) -> usize {
+    (size + (size / 4).max(1)).min(OBJECT_BATCH)
 }
 
 impl PumpState {
@@ -205,7 +226,7 @@ impl PumpState {
 
     /// A fetch of `asked` objects timed out: half that, at least 1.
     fn shrink(&mut self, id: &str, endpoint: &str, asked: usize) {
-        let size = (self.batch_size(id, endpoint).min(asked) / 2).max(1);
+        let size = halved_batch(self.batch_size(id, endpoint), asked);
         self.batch
             .insert((id.to_owned(), endpoint.to_owned()), size);
         event!(info, SYNC_BATCH_SHRUNK, {
@@ -220,7 +241,7 @@ impl PumpState {
     fn grow(&mut self, id: &str, endpoint: &str) {
         let key = (id.to_owned(), endpoint.to_owned());
         if let Some(size) = self.batch.get(&key).copied() {
-            let size = size + (size / 4).max(1);
+            let size = grown_batch(size);
             if size >= OBJECT_BATCH {
                 self.batch.remove(&key);
             } else {
@@ -230,9 +251,9 @@ impl PumpState {
     }
 }
 
-struct Unavailable {
-    until: Instant,
-    backoff: Duration,
+pub(super) struct Unavailable {
+    pub(super) until: Instant,
+    pub(super) backoff: Duration,
 }
 
 /// What one [`Driver::supply`] did.
@@ -245,7 +266,7 @@ struct Supplied {
 
 /// Why an exchange or a fetch did not complete.
 #[derive(Debug, PartialEq, Eq)]
-enum Failure {
+pub(super) enum Failure {
     /// The peer lane went away (closed, GOAWAY, cancelled): not a repo error.
     LaneLost,
     Error(String),
@@ -260,7 +281,7 @@ impl std::fmt::Display for Failure {
     }
 }
 
-fn peer_failure(op: &str, error: CallError) -> Failure {
+pub(super) fn peer_failure(op: &str, error: CallError) -> Failure {
     match error {
         CallError::ConnectionLost(_) | CallError::Unavailable(_) | CallError::Cancelled => {
             Failure::LaneLost
@@ -269,7 +290,7 @@ fn peer_failure(op: &str, error: CallError) -> Failure {
     }
 }
 
-fn worker_failure(op: &str, error: impl std::fmt::Display) -> Failure {
+pub(super) fn worker_failure(op: &str, error: impl std::fmt::Display) -> Failure {
     Failure::Error(format!("{op}: {error}"))
 }
 
@@ -585,10 +606,12 @@ impl Driver {
         }
     }
 
-    /// One round. Pass 1 supplies every folder's pending demand; pass 2 the
-    /// background `objects.missing` work, abandoned before its next call as
-    /// soon as the wake moves past `seen` (the next round starts with pass
-    /// 1). The number of objects stored.
+    /// One round, in a fixed order. Pass 1 supplies every folder's pending
+    /// demand, then the push pass serves the listeners' demand; pass 2 is the
+    /// background `objects.missing` work, then the background push. Both are
+    /// abandoned before their next call as soon as the wake moves past `seen`
+    /// (the next round starts with pass 1). The number of objects stored, here
+    /// or on a listener.
     fn pump_round(&self, state: &mut PumpState, seen: u64) -> usize {
         state.round += 1;
         let round = state.round;
@@ -623,6 +646,15 @@ impl Driver {
                 stored += self.supply(state, &endpoints, folder, demand, None).stored;
             }
         }
+        // What the listeners' readers wait for.
+        for folder in &folders {
+            if self.cancel.is_cancelled() {
+                break;
+            }
+            stored += self
+                .push(state, &endpoints, folder, PushMode::Demand, None)
+                .pushed;
+        }
         // Pass 2: background prefetch.
         for folder in &folders {
             if self.cancel.is_cancelled() || self.wake.current() != seen {
@@ -647,7 +679,43 @@ impl Driver {
                 state.scan.insert(folder.id.clone(), cursor);
             }
         }
+        // What the listeners lack.
+        for folder in &folders {
+            if self.cancel.is_cancelled() || self.wake.current() != seen {
+                break;
+            }
+            let outcome = self.push(state, &endpoints, folder, PushMode::Background, Some(seen));
+            stored += outcome.pushed;
+            if outcome.interrupted {
+                break;
+            }
+        }
         stored
+    }
+
+    /// A push step of `folder`, to the endpoints not sitting out this round.
+    fn push(
+        &self,
+        state: &mut PumpState,
+        endpoints: &[String],
+        folder: &SyncFolder,
+        mode: PushMode,
+        interrupt: Option<u64>,
+    ) -> push::PushOutcome {
+        let endpoints: Vec<String> = endpoints
+            .iter()
+            .filter(|endpoint| !state.resting.contains_key(*endpoint))
+            .cloned()
+            .collect();
+        push::run(
+            self.lanes.as_ref(),
+            &mut state.push,
+            &endpoints,
+            folder,
+            mode,
+            interrupt.map(|seen| (self.wake.as_ref(), seen)),
+            &self.cancel,
+        )
     }
 
     /// The folder's background work: the next `objects.missing` page of its
@@ -728,7 +796,7 @@ impl Driver {
             if state.resting.contains_key(endpoint) {
                 continue;
             }
-            for (conn, batch) in self.lanes_for(endpoint, &remaining) {
+            for (conn, batch) in lanes_for(self.lanes.as_ref(), endpoint, &remaining) {
                 // Objects of unknown size (manifests) first, in their own
                 // small batches; then the chunks.
                 let mut queue: VecDeque<(Digest, Kind)> = batch
@@ -856,22 +924,26 @@ impl Driver {
         }
         result
     }
+}
 
-    /// `wanted` grouped by the Ready bulk lane of `endpoint` that owns each
-    /// digest (digests no Ready lane owns are left out).
-    fn lanes_for(&self, endpoint: &str, wanted: &[(Digest, Kind)]) -> Vec<(Conn, Wanted)> {
-        let mut lanes: BTreeMap<String, (Conn, Wanted)> = BTreeMap::new();
-        for object in wanted {
-            if let Some(conn) = self.lanes.bulk_lane(endpoint, &object.0) {
-                lanes
-                    .entry(conn.peer().session.clone())
-                    .or_insert_with(|| (conn, Vec::new()))
-                    .1
-                    .push(*object);
-            }
+/// `wanted` grouped by the Ready bulk lane of `endpoint` that owns each
+/// digest (digests no Ready lane owns are left out).
+pub(super) fn lanes_for(
+    lanes: &dyn Lanes,
+    endpoint: &str,
+    wanted: &[(Digest, Kind)],
+) -> Vec<(Conn, Wanted)> {
+    let mut owners: BTreeMap<String, (Conn, Wanted)> = BTreeMap::new();
+    for object in wanted {
+        if let Some(conn) = lanes.bulk_lane(endpoint, &object.0) {
+            owners
+                .entry(conn.peer().session.clone())
+                .or_insert_with(|| (conn, Vec::new()))
+                .1
+                .push(*object);
         }
-        lanes.into_values().collect()
     }
+    owners.into_values().collect()
 }
 
 /// One exchange of `repo` with the peer behind `conn`, repeated while either
@@ -926,9 +998,9 @@ fn exchange(
 }
 
 /// Why a fetch failed, and whether its deadline passed.
-struct FetchFailure {
-    failure: Failure,
-    timed_out: bool,
+pub(super) struct FetchFailure {
+    pub(super) failure: Failure,
+    pub(super) timed_out: bool,
 }
 
 impl From<Failure> for FetchFailure {
@@ -1032,9 +1104,15 @@ fn probe(catalog: &Catalog, installation: &str, conn: &Conn, cancel: &Cancel) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::orchestrator::sync::{MissingPage, Object};
+    use crate::orchestrator::{
+        network::{Refused, StoreReply},
+        sync::{MissingPage, Object, WantedPage},
+    };
     use crate::{
-        model::{errors::ErrorWire, protocol::LaneRole},
+        model::{
+            errors::ErrorWire,
+            protocol::{LaneRole, features},
+        },
         session::{ConnOptions, Handler, Incoming, PeerInfo, Side},
     };
     use std::net::{TcpListener, TcpStream};
@@ -1103,6 +1181,11 @@ mod tests {
 
     /// [`served`] as a session of `role`.
     fn served_as(role: LaneRole, handler: Arc<dyn Handler>) -> (Conn, Conn) {
+        served_info(info_as(role), handler)
+    }
+
+    /// [`served`] with the client seeing `info`.
+    fn served_info(info: PeerInfo, handler: Arc<dyn Handler>) -> (Conn, Conn) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = thread::spawn(move || {
@@ -1116,9 +1199,9 @@ mod tests {
         )
         .unwrap()
         .0;
+        let role = info.role;
         let client =
-            Conn::from_established(client, Side::Client, info_as(role), ConnOptions::default())
-                .unwrap();
+            Conn::from_established(client, Side::Client, info, ConnOptions::default()).unwrap();
         let server = Conn::from_established(
             server.join().unwrap(),
             Side::Server,
@@ -1194,6 +1277,11 @@ mod tests {
         missing: Vec<(Digest, Kind)>,
         written: Mutex<Vec<(Digest, Instant)>>,
         excludes: Mutex<Vec<usize>>,
+        /// What `objects.fetch` reads, as the worker does: in request order,
+        /// absent ones left out, with the kind asked.
+        held: Vec<Object>,
+        /// `objects.fetch` stops after this many objects (`truncated_at`).
+        read_cut: Option<usize>,
     }
 
     impl FakeFolder {
@@ -1239,6 +1327,26 @@ mod tests {
                     let now = Instant::now();
                     lock(&self.written).extend(objects.iter().map(|o| (o.digest, now)));
                     serde_json::to_vec(&json!({"stored": objects.len()})).unwrap()
+                }
+                "objects.fetch" => {
+                    let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
+                    let mut fetched = Fetched::default();
+                    for (index, (digest, kind)) in wanted.into_iter().enumerate() {
+                        let Some(object) = self.held.iter().find(|o| o.digest == digest) else {
+                            continue;
+                        };
+                        if self.read_cut == Some(fetched.objects.len()) {
+                            fetched.truncated_at = Some(index);
+                            break;
+                        }
+                        fetched.objects.push(Object {
+                            kind,
+                            ..object.clone()
+                        });
+                    }
+                    let body = serde_json::to_vec(&fetched.objects).unwrap();
+                    req.responder.reply(fetched.header(), body);
+                    return;
                 }
                 op => {
                     req.responder
@@ -1361,6 +1469,9 @@ mod tests {
             vec!["ws://peer".into()]
         }
         fn bulk_lane(&self, _: &str, _: &Digest) -> Option<Conn> {
+            Some(self.0.clone())
+        }
+        fn any_bulk_lane(&self, _: &str) -> Option<Conn> {
             Some(self.0.clone())
         }
     }
@@ -1745,5 +1856,638 @@ mod tests {
         let absent: BTreeSet<Digest> = all[10..].iter().map(|o| o.digest).collect();
         assert_eq!(unavailable, absent);
         assert!(state.resting.is_empty());
+    }
+
+    // ---- push ------------------------------------------------------------
+
+    /// A listener's bulk lane: lists `demand` and pages `missing` as the
+    /// worker does, less what was stored and what is excluded. A store of more
+    /// than `stall_above` objects outlasts its deadline and stores nothing. A
+    /// digest in `refuse` is refused. With `unpublished`, that repo answers
+    /// `REPO_NOT_PUBLISHED`. Also serves `objects.fetch` from `held`, for the
+    /// pull passes. `calls` records every request in order.
+    #[derive(Default)]
+    struct Listener {
+        demand: Wanted,
+        missing: Wanted,
+        held: Vec<Object>,
+        refuse: BTreeSet<Digest>,
+        stall_above: Option<usize>,
+        unpublished: Option<String>,
+        /// Bumped by every store, as a reader's demand arriving meanwhile.
+        wake_on_store: Option<Arc<Seq>>,
+        stored: Mutex<Vec<(Digest, Kind)>>,
+        calls: Mutex<Vec<String>>,
+        store_sizes: Mutex<Vec<usize>>,
+        excludes: Mutex<Vec<Vec<Digest>>>,
+    }
+
+    impl Listener {
+        fn calls(&self) -> Vec<String> {
+            lock(&self.calls).clone()
+        }
+
+        fn stored(&self) -> Vec<Digest> {
+            lock(&self.stored)
+                .iter()
+                .map(|(digest, _)| *digest)
+                .collect()
+        }
+
+        fn serve(&self, req: Incoming) {
+            if self.unpublished.as_deref() == req.header["repo"].as_str() {
+                lock(&self.calls).push(req.op.clone());
+                req.responder
+                    .error(ErrorWire::coded("REPO_NOT_PUBLISHED", "paused"));
+                return;
+            }
+            match req.op.as_str() {
+                "objects.wanted" => self.wanted(req),
+                "objects.store" => self.store(req),
+                "objects.fetch" => {
+                    lock(&self.calls).push("fetch".into());
+                    let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
+                    let objects: Vec<&Object> = wanted
+                        .iter()
+                        .filter_map(|(digest, _)| self.held.iter().find(|o| o.digest == *digest))
+                        .collect();
+                    req.responder
+                        .reply(json!({}), serde_json::to_vec(&objects).unwrap());
+                }
+                op => {
+                    let error = ErrorWire::coded("UNSUPPORTED_OPERATION", op);
+                    req.responder.error(error)
+                }
+            }
+        }
+
+        fn wanted(&self, req: Incoming) {
+            let limit = req.header["limit"].as_u64().unwrap() as usize;
+            lock(&self.calls).push(format!("wanted/{limit}"));
+            let exclude: Vec<Digest> =
+                serde_json::from_value(req.header["exclude"].clone()).unwrap();
+            let start: usize = req.header["after"]
+                .as_str()
+                .map_or(0, |after| after.parse().unwrap());
+            let stored = self.stored();
+            let mut page = WantedPage {
+                demand: self
+                    .demand
+                    .iter()
+                    .filter(|(digest, _)| !stored.contains(digest))
+                    .copied()
+                    .collect(),
+                ..WantedPage::default()
+            };
+            if limit > 0 {
+                for (index, object) in self.missing.iter().enumerate().skip(start) {
+                    if !exclude.contains(&object.0) && !stored.contains(&object.0) {
+                        page.missing.push(*object);
+                    }
+                    if page.missing.len() == limit {
+                        page.cursor = Some((index + 1).to_string());
+                        break;
+                    }
+                }
+            }
+            lock(&self.excludes).push(exclude);
+            req.responder
+                .reply(json!({}), serde_json::to_vec(&page).unwrap());
+        }
+
+        fn store(&self, req: Incoming) {
+            lock(&self.calls).push("store".into());
+            let objects: Vec<Object> = serde_json::from_slice(&req.body).unwrap();
+            lock(&self.store_sizes).push(objects.len());
+            if self.stall_above.is_some_and(|most| objects.len() > most) {
+                thread::sleep(Duration::from_millis(900));
+                return;
+            }
+            let mut reply = StoreReply {
+                stored: Vec::new(),
+                refused: Vec::new(),
+            };
+            for object in objects {
+                if self.refuse.contains(&object.digest) {
+                    reply.refused.push(Refused {
+                        digest: object.digest,
+                        code: "OBJECT_NOT_WANTED".into(),
+                    });
+                } else {
+                    lock(&self.stored).push((object.digest, object.kind));
+                    reply.stored.push(object.digest);
+                }
+            }
+            if let Some(wake) = &self.wake_on_store {
+                wake.bump();
+            }
+            req.responder
+                .reply(json!({}), serde_json::to_vec(&reply).unwrap());
+        }
+
+        /// A bulk lane to this listener whose peer advertises `features`.
+        fn lane_with(self: &Arc<Self>, session: &str, features: &[&str]) -> Conn {
+            let listener = self.clone();
+            let info = PeerInfo {
+                session: session.into(),
+                features: features.iter().map(|f| f.to_string()).collect(),
+                ..info_as(LaneRole::Bulk)
+            };
+            let (client, server) = served_info(
+                info,
+                Arc::new(FnHandler(move |req: Incoming| listener.serve(req))),
+            );
+            std::mem::forget(server);
+            client
+        }
+
+        /// A bulk lane to this listener, which takes pushes.
+        fn lane(self: &Arc<Self>) -> OneLane {
+            OneLane(self.lane_with("session", &[features::CONTENT_PUSH]))
+        }
+    }
+
+    /// A folder of `repo` whose worker holds `held`.
+    fn pushing_folder(repo: &str, held: &[Object]) -> SyncFolder {
+        let fake = Arc::new(FakeFolder {
+            held: held.to_vec(),
+            ..FakeFolder::default()
+        });
+        SyncFolder {
+            id: format!("folder-{repo}"),
+            repo: repo.into(),
+            link: fake_worker(fake),
+            demand: Vec::new(),
+        }
+    }
+
+    const ENDPOINT: &str = "ws://peer";
+
+    fn push_once(
+        lanes: &dyn Lanes,
+        state: &mut PushState,
+        folder: &SyncFolder,
+        mode: PushMode,
+    ) -> push::PushOutcome {
+        let endpoints = [ENDPOINT.to_owned()];
+        push::run(lanes, state, &endpoints, folder, mode, None, &Cancel::new())
+    }
+
+    fn push_peer<'a>(state: &'a mut PushState, folder: &SyncFolder) -> &'a mut push::PushPeer {
+        state
+            .peers
+            .get_mut(&(folder.id.clone(), ENDPOINT.to_owned()))
+            .unwrap()
+    }
+
+    #[test]
+    fn the_pump_runs_demand_pull_then_demand_push_then_background() {
+        let wanted_here = objects("wanted-here", 1);
+        let missing_here = objects("missing-here", 1);
+        let wanted_there = objects("wanted-there", 1);
+        let missing_there = objects("missing-there", 1);
+        let folder = Arc::new(FakeFolder {
+            missing: wanted_of(&missing_here),
+            held: [wanted_there.clone(), missing_there.clone()].concat(),
+            ..FakeFolder::default()
+        });
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&wanted_there),
+            missing: wanted_of(&missing_there),
+            held: [wanted_here.clone(), missing_here.clone()].concat(),
+            ..Listener::default()
+        });
+        let link = fake_worker(folder.clone());
+        let folders = Arc::new(Folders(vec![(
+            "f1".into(),
+            link,
+            Mutex::new(wanted_of(&wanted_here)),
+        )]));
+        let (driver, _root) = driver(listener.lane(), folders, Seq::new());
+        let mut state = PumpState::default();
+        // Two pulled, two pushed.
+        assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 4);
+        assert_eq!(
+            listener.calls(),
+            ["fetch", "wanted/0", "store", "fetch", "wanted/32", "store"]
+        );
+        assert_eq!(
+            listener.stored(),
+            [wanted_there[0].digest, missing_there[0].digest]
+        );
+    }
+
+    #[test]
+    fn a_push_round_stops_before_its_next_call_when_demand_arrives() {
+        // Two stores' worth, and demand here arrives during the first.
+        let all = objects("object", 2 * OBJECT_BATCH);
+        let wake = Seq::new();
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&all[..OBJECT_BATCH]),
+            missing: wanted_of(&all[OBJECT_BATCH..]),
+            wake_on_store: Some(wake.clone()),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        let endpoints = [ENDPOINT.to_owned()];
+        let cancel = Cancel::new();
+        let seen = wake.current();
+        let outcome = push::run(
+            &lanes,
+            &mut state,
+            &endpoints,
+            &folder,
+            PushMode::Background,
+            Some((wake.as_ref(), seen)),
+            &cancel,
+        );
+        assert!(outcome.interrupted);
+        assert!(outcome.error.is_none());
+        assert_eq!(outcome.pushed, OBJECT_BATCH);
+        assert_eq!(outcome.remaining, OBJECT_BATCH);
+        assert_eq!(listener.calls(), ["wanted/32", "store"]);
+        // The page was not finished: the scan stays on it.
+        assert_eq!(push_peer(&mut state, &folder).scan, None);
+        // A wake that already moved stops it before any call.
+        let outcome = push::run(
+            &lanes,
+            &mut state,
+            &endpoints,
+            &folder,
+            PushMode::Background,
+            Some((wake.as_ref(), seen)),
+            &cancel,
+        );
+        assert!(outcome.interrupted);
+        assert_eq!(listener.calls().len(), 2);
+        // The next round finishes the job.
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, OBJECT_BATCH);
+        assert_eq!(listener.stored().len(), 2 * OBJECT_BATCH);
+    }
+
+    #[test]
+    fn a_listener_without_content_push_is_never_pushed_to() {
+        let all = objects("object", 2);
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&all[..1]),
+            missing: wanted_of(&all[1..]),
+            ..Listener::default()
+        });
+        let lanes = OneLane(listener.lane_with("session", &[features::NOTIFY]));
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        for mode in [PushMode::Demand, PushMode::Background] {
+            let outcome = push_once(&lanes, &mut state, &folder, mode);
+            assert_eq!(outcome.pushed, 0);
+            assert!(outcome.error.is_none());
+        }
+        assert!(listener.calls().is_empty(), "{:?}", listener.calls());
+    }
+
+    #[test]
+    fn a_digest_this_side_lacks_is_backed_off_and_not_an_error() {
+        let all = objects("object", 3);
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&all[..1]),
+            missing: wanted_of(&all[1..]),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        // This side holds only the middle one: part of what is wanted.
+        let folder = pushing_folder("repo-1", &all[1..2]);
+        let mut state = PushState::default();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 1);
+        assert_eq!(outcome.remaining, 2);
+        assert!(outcome.error.is_none());
+        assert_eq!(listener.stored(), [all[1].digest]);
+        let peer = push_peer(&mut state, &folder);
+        assert!(peer.counters.last_error.is_none());
+        let lacks: BTreeSet<Digest> = peer.lacks.keys().copied().collect();
+        let expected: BTreeSet<Digest> = [all[0].digest, all[2].digest].into();
+        assert_eq!(lacks, expected);
+        assert!(peer.lacks.values().all(|u| u.backoff == UNAVAILABLE_FIRST));
+
+        // Meanwhile they are excluded from the listing, and not read: demand
+        // is not excluded by the listener, so it is skipped here.
+        let calls = listener.calls().len();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 0);
+        assert!(outcome.error.is_none());
+        assert_eq!(lock(&listener.excludes).last().unwrap().len(), 2);
+        assert_eq!(listener.calls().len(), calls + 1, "{:?}", listener.calls());
+
+        // Lacked again after the backoff: it doubles.
+        let peer = push_peer(&mut state, &folder);
+        for entry in peer.lacks.values_mut() {
+            entry.until = Instant::now();
+        }
+        push_once(&lanes, &mut state, &folder, PushMode::Background);
+        let peer = push_peer(&mut state, &folder);
+        assert_eq!(peer.lacks.len(), 2);
+        assert!(
+            peer.lacks
+                .values()
+                .all(|u| u.backoff == UNAVAILABLE_FIRST * 2)
+        );
+        assert!(peer.lacks.values().all(|u| u.until > Instant::now()));
+        // Doubling stops at the bound.
+        for entry in peer.lacks.values_mut() {
+            entry.until = Instant::now();
+            entry.backoff = UNAVAILABLE_MAX;
+        }
+        push_once(&lanes, &mut state, &folder, PushMode::Background);
+        let peer = push_peer(&mut state, &folder);
+        assert!(peer.lacks.values().all(|u| u.backoff == UNAVAILABLE_MAX));
+    }
+
+    #[test]
+    fn a_timed_out_store_halves_the_batch_and_answers_grow_it() {
+        let all = objects("slow-link", OBJECT_BATCH);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            stall_above: Some(16),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState {
+            deadline: |_| Duration::from_millis(300),
+            ..PushState::default()
+        };
+        // The full batch times out: nothing is stored, the batch halves, and
+        // the whole endpoint rests (the lane is not answering).
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 0);
+        assert_eq!(outcome.remaining, OBJECT_BATCH);
+        assert!(outcome.error.is_some());
+        assert_eq!(push_peer(&mut state, &folder).batch, OBJECT_BATCH / 2);
+        assert!(push_peer(&mut state, &folder).lacks.is_empty());
+        assert!(state.resting.contains_key(ENDPOINT));
+        // While it rests, nothing is asked. Uncertain: not replayed.
+        let calls = listener.calls().len();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert!(outcome.error.is_none());
+        assert_eq!(listener.calls().len(), calls);
+
+        let end = Instant::now() + Duration::from_secs(30);
+        while listener.stored().len() < OBJECT_BATCH {
+            assert!(Instant::now() < end, "{:?}", listener.calls());
+            state.resting.clear();
+            let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        }
+        // Every store after the timeout was within the halved size, and the
+        // answered ones grew it back.
+        let sizes = lock(&listener.store_sizes).clone();
+        assert_eq!(sizes[0], OBJECT_BATCH);
+        assert_eq!(sizes[1..], [16, 16], "{sizes:?}");
+        assert_eq!(push_peer(&mut state, &folder).batch, 16 + 4 + 5);
+    }
+
+    #[test]
+    fn a_read_cut_to_its_bounds_is_one_store_and_the_rest_is_read_next() {
+        let all = objects("cut", 10);
+        let fake = Arc::new(FakeFolder {
+            held: all[..8].to_vec(),
+            read_cut: Some(3),
+            ..FakeFolder::default()
+        });
+        let folder = SyncFolder {
+            id: "f1".into(),
+            repo: "repo-1".into(),
+            link: fake_worker(fake),
+            demand: Vec::new(),
+        };
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let mut state = PushState::default();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 8);
+        assert_eq!(*lock(&listener.store_sizes), [3, 3, 2]);
+        // Only what was looked at and found absent is lacked.
+        let lacks: BTreeSet<Digest> = push_peer(&mut state, &folder)
+            .lacks
+            .keys()
+            .copied()
+            .collect();
+        let absent: BTreeSet<Digest> = all[8..].iter().map(|o| o.digest).collect();
+        assert_eq!(lacks, absent);
+    }
+
+    #[test]
+    fn a_refused_digest_is_dropped_from_the_round_and_listed_again() {
+        let all = objects("object", 3);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            refuse: [all[1].digest].into(),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 2);
+        assert_eq!(outcome.remaining, 1);
+        assert!(outcome.error.is_none());
+        assert_eq!(*lock(&listener.store_sizes), [3]);
+        let peer = push_peer(&mut state, &folder);
+        assert!(peer.lacks.is_empty());
+        assert_eq!(peer.counters.pushed, 2);
+        assert_eq!(peer.counters.refused, 1);
+        // Still wanted: listed and offered again next round.
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 0);
+        assert_eq!(outcome.remaining, 1);
+        assert_eq!(*lock(&listener.store_sizes), [3, 1]);
+    }
+
+    /// Digests go to the lane their first byte's parity names.
+    struct TwoLanes(Conn, Conn);
+
+    impl Lanes for TwoLanes {
+        fn ready_peers(&self) -> Vec<ReadyPeer> {
+            Vec::new()
+        }
+        fn bulk_endpoints(&self) -> Vec<String> {
+            vec![ENDPOINT.into()]
+        }
+        fn bulk_lane(&self, _: &str, digest: &Digest) -> Option<Conn> {
+            Some(
+                if digest.0[0].is_multiple_of(2) {
+                    &self.0
+                } else {
+                    &self.1
+                }
+                .clone(),
+            )
+        }
+        fn any_bulk_lane(&self, _: &str) -> Option<Conn> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn a_push_stores_each_digest_on_its_lane_with_the_listed_kind_and_demand_first() {
+        let mut all = objects("object", 12);
+        all[0].kind = Kind::Manifest;
+        let owned = |lane: u8, of: &[Object]| -> Vec<Digest> {
+            of.iter()
+                .map(|o| o.digest)
+                .filter(|digest| digest.0[0] % 2 == lane)
+                .collect()
+        };
+        let lists = Arc::new(Listener {
+            demand: wanted_of(&all[..4]),
+            missing: wanted_of(&all[4..]),
+            ..Listener::default()
+        });
+        // Each lane records its own stores; only the first is asked to list.
+        let other = Arc::new(Listener::default());
+        let lanes = TwoLanes(
+            lists.lane_with("lane-0", &[features::CONTENT_PUSH]),
+            other.lane_with("lane-1", &[features::CONTENT_PUSH]),
+        );
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 12);
+        // Demand went first on each lane, in listed order.
+        let expected = |lane| [owned(lane, &all[..4]), owned(lane, &all[4..])].concat();
+        assert_eq!(lists.stored(), expected(0));
+        assert_eq!(other.stored(), expected(1));
+        // The kind the listing gave, not one assumed from the read.
+        let kinds: BTreeMap<Digest, Kind> = lock(&lists.stored)
+            .iter()
+            .chain(lock(&other.stored).iter())
+            .copied()
+            .collect();
+        assert_eq!(kinds[&all[0].digest], Kind::Manifest);
+        assert_eq!(kinds[&all[1].digest], Kind::Chunk);
+    }
+
+    #[test]
+    fn a_repo_the_listener_does_not_publish_rests_alone_and_is_logged_once() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            unpublished: Some("paused-repo".into()),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let paused = pushing_folder("paused-repo", &all);
+        let open = pushing_folder("repo-1", &all);
+        let mut state = PushState::default();
+        for mode in [PushMode::Demand, PushMode::Background] {
+            let outcome = push_once(&lanes, &mut state, &paused, mode);
+            // The first call rests it; the second is not even sent.
+            assert_eq!(outcome.error.is_some(), mode == PushMode::Demand);
+        }
+        assert_eq!(listener.calls(), ["objects.wanted"]);
+        let peer = push_peer(&mut state, &paused);
+        let logged = peer.counters.last_error.clone().unwrap();
+        assert!(logged.contains("REPO_NOT_PUBLISHED"), "{logged}");
+        assert!(!state.resting.contains_key(ENDPOINT));
+
+        // The other folder of that endpoint is not kept from pushing.
+        let outcome = push_once(&lanes, &mut state, &open, PushMode::Background);
+        assert_eq!(outcome.pushed, 1);
+
+        // Its rest ended, it fails alike: the error stays as logged.
+        push_peer(&mut state, &paused).rest_until = None;
+        let outcome = push_once(&lanes, &mut state, &paused, PushMode::Demand);
+        assert_eq!(outcome.error.as_ref(), Some(&logged));
+    }
+
+    #[test]
+    fn a_failing_store_is_not_cleared_by_the_clean_listing_of_a_later_round() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            stall_above: Some(0),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all);
+        let mut state = PushState {
+            deadline: |_| Duration::from_millis(100),
+            ..PushState::default()
+        };
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        let logged = outcome.error.unwrap();
+        state.resting.clear();
+        // A Demand pass with nothing to do lists cleanly.
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Demand);
+        assert!(outcome.error.is_none());
+        let peer = push_peer(&mut state, &folder);
+        assert_eq!(peer.counters.last_error.as_ref(), Some(&logged));
+    }
+
+    #[test]
+    fn what_a_push_remembers_outlasts_a_busy_round_and_not_long_idleness() {
+        let all = objects("object", 1);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let lacking = pushing_folder("lacking", &[]);
+        let other = pushing_folder("other", &all);
+        let mut state = PushState::default();
+        push_once(&lanes, &mut state, &lacking, PushMode::Background);
+        // Another folder's pass, with this one absent, keeps its backoff.
+        push_once(&lanes, &mut state, &other, PushMode::Background);
+        assert_eq!(push_peer(&mut state, &lacking).lacks.len(), 1);
+        // Unused for long, it goes.
+        let long_ago = Instant::now()
+            .checked_sub(UNAVAILABLE_MAX * 2 + Duration::from_secs(1))
+            .expect("the monotonic clock starts early enough");
+        push_peer(&mut state, &lacking).touched = long_ago;
+        push_once(&lanes, &mut state, &other, PushMode::Background);
+        assert!(state.counters(&lacking.id, ENDPOINT).is_none());
+        assert!(state.counters(&other.id, ENDPOINT).is_some());
+    }
+
+    #[test]
+    fn the_push_scan_stays_on_a_stored_page_and_moves_past_any_other() {
+        let all = objects("object", OBJECT_BATCH + 2);
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        // The first page is held whole.
+        let folder = pushing_folder("repo-1", &all[..OBJECT_BATCH]);
+        let mut state = PushState::default();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, OBJECT_BATCH);
+        assert_eq!(push_peer(&mut state, &folder).scan, None);
+        // The next page is short and lacked: the scan reached its end.
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, 0);
+        assert_eq!(outcome.remaining, 2);
+        assert_eq!(push_peer(&mut state, &folder).scan, None);
+        assert_eq!(push_peer(&mut state, &folder).lacks.len(), 2);
+
+        // A full page not wholly stored moves the scan on.
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&all),
+            ..Listener::default()
+        });
+        let lanes = listener.lane();
+        let folder = pushing_folder("repo-1", &all[1..OBJECT_BATCH]);
+        let mut state = PushState::default();
+        let outcome = push_once(&lanes, &mut state, &folder, PushMode::Background);
+        assert_eq!(outcome.pushed, OBJECT_BATCH - 1);
+        assert_eq!(
+            push_peer(&mut state, &folder).scan.as_deref(),
+            Some(OBJECT_BATCH.to_string().as_str())
+        );
     }
 }

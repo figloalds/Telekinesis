@@ -12,6 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 use support::daemon::{TestDaemon, run_tkfs};
+use tkfs::{
+    model::protocol::LaneRole,
+    orchestrator::sync::MissingPage,
+    session::{ConnOptions, Priority},
+};
 
 const LANES_READY: Duration = Duration::from_secs(30);
 const LANES_REVOKED: Duration = Duration::from_secs(15);
@@ -406,8 +411,11 @@ struct Shared {
 /// B with a running headless folder "Shared" holding `files`, and A paired
 /// with B (default pool, lanes Ready) and receiving it, Running.
 fn shared_pair(files: &[(&str, &str)]) -> Result<Shared> {
-    let a = TestDaemon::start()?;
-    let b = TestDaemon::start()?;
+    shared_pair_of(TestDaemon::start()?, TestDaemon::start()?, files)
+}
+
+/// [`shared_pair`] on daemons the test started itself.
+fn shared_pair_of(a: TestDaemon, b: TestDaemon, files: &[(&str, &str)]) -> Result<Shared> {
     let shared = b.manage(&["create", "Shared", "--headless"])?;
     let repo = shared["repo"]
         .as_str()
@@ -579,6 +587,350 @@ fn paused_folder_stops_exchanging_and_resume_catches_up() -> Result<()> {
 
     a.manage(&["resume", "Shared"])?;
     wait_file(&state_a, "second.txt", &second, Duration::from_secs(30))?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+// ---- content moving from dialer to listener ------------------------------
+
+/// How long a 64 MiB file may take to push (debug builds encode every object
+/// as JSON twice).
+const LARGE_PUSH: Duration = Duration::from_secs(600);
+/// Bound of importing a 64 MiB file.
+const LARGE_IMPORT: Duration = Duration::from_secs(180);
+const LARGE: usize = 64 * 1024 * 1024;
+/// A push counts as under way once this many of its bytes reached the packs.
+const UNDER_WAY: u64 = 1024 * 1024;
+
+#[test]
+fn a_file_created_on_the_dialer_becomes_readable_on_the_listener() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair(&[])?;
+    // 2.5 MiB: a manifest and 40 chunks, more than one object batch.
+    let from_a = text(5 * 512 * 1024, 11);
+    import(&a, &state_a, "from-a.txt", &from_a)?;
+    wait_file(&state_b, "from-a.txt", &from_a, REPLICATED)?;
+    // The other direction still works over the same pairing.
+    let from_b = text(1000, 13);
+    import(&b, &state_b, "from-b.txt", &from_b)?;
+    wait_file(&state_a, "from-b.txt", &from_b, REPLICATED)?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+/// Whether the worker of the folder at `state` has every object it needs: its
+/// `objects.missing` scan, asked as the orchestrator asks it, finds none.
+fn nothing_missing(state: &Path) -> Result<bool> {
+    let runtime: Value = serde_json::from_slice(&fs::read(
+        state.join(tkfs::orchestrator::worker::RUNTIME_FILE),
+    )?)?;
+    let token = fs::read_to_string(state.join(tkfs::orchestrator::worker::TOKEN_FILE))?;
+    let conn = tkfs::session::dial_loopback_as(
+        runtime["address"].as_str().context("no address")?,
+        Some(token.trim()),
+        LaneRole::Bulk,
+        ConnOptions::for_role(LaneRole::Bulk),
+    )
+    .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let reply = conn.call(
+        "objects.missing",
+        serde_json::json!({"limit": 1}),
+        Vec::new(),
+        Priority::Data,
+        FOLDER_COMMAND,
+    );
+    conn.close();
+    let reply = reply.map_err(|error| anyhow::anyhow!("{error}"))?;
+    let page: MissingPage = serde_json::from_slice(&reply.body)?;
+    Ok(page.missing.is_empty())
+}
+
+/// Waits until the folder at `state` knows `path` and lacks no object.
+fn wait_settled(state: &Path, path: &str, bound: Duration) -> Result<()> {
+    wait_until(bound, &format!("{path} settled"), || {
+        Ok(folder(state, &["tree"])?.contains(path) && nothing_missing(state)?)
+    })
+}
+
+/// The two heads of the one conflict in `state`, once it lists them, as
+/// (entity, version ids).
+fn wait_conflict(state: &Path) -> Result<(String, Vec<String>)> {
+    let mut found = None;
+    wait_until(REPLICATED, "a conflict with two heads", || {
+        let listed: Value = serde_json::from_str(&folder(state, &["conflicts"])?)?;
+        let Some(conflict) = listed.as_array().and_then(|list| list.first()) else {
+            return Ok(false);
+        };
+        let heads: Vec<String> = conflict["heads"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|head| head["id"].as_str().map(str::to_owned))
+            .collect();
+        if heads.len() != 2 {
+            return Ok(false);
+        }
+        let entity = conflict["entity"].as_str().context("no entity")?.to_owned();
+        found = Some((entity, heads));
+        Ok(true)
+    })?;
+    found.context("the wait ended without a conflict")
+}
+
+/// `preview-version` of `version` in the folder at `state`.
+fn preview(state: &Path, version: &str) -> Result<String> {
+    let reply: Value = serde_json::from_str(&folder(
+        state,
+        &[
+            "rpc",
+            "preview-version",
+            &serde_json::json!({ "version": version }).to_string(),
+        ],
+    )?)?;
+    Ok(reply["preview"].as_str().context("no preview")?.to_owned())
+}
+
+#[test]
+fn edits_converge_and_conflict_versions_survive_their_writer_leaving() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair(&[])?;
+    // Edits on either side reach the other.
+    let first = text(1000, 17);
+    import(&a, &state_a, "doc.txt", &first)?;
+    wait_file(&state_b, "doc.txt", &first, REPLICATED)?;
+    let second = text(1000, 19);
+    import(&b, &state_b, "doc.txt", &second)?;
+    wait_file(&state_a, "doc.txt", &second, REPLICATED)?;
+
+    // Concurrent edits, one on each side, of more than a chunk each.
+    a.manage(&["pause", "Shared"])?;
+    b.manage(&["pause", "Shared"])?;
+    let (ours, theirs) = (text(200 * 1024, 23), text(200 * 1024, 29));
+    import(&a, &state_a, "doc.txt", &ours)?;
+    import(&b, &state_b, "doc.txt", &theirs)?;
+    a.manage(&["resume", "Shared"])?;
+    b.manage(&["resume", "Shared"])?;
+    let (entity, heads) = wait_conflict(&state_b)?;
+
+    // Background transfer settles: nothing has read A's version on B.
+    wait_settled(&state_b, "doc.txt", REPLICATED)?;
+
+    // With A gone, only B's packs can answer.
+    a.shutdown()?;
+    let mut version_a = None;
+    let mut version_b = None;
+    for head in &heads {
+        let shown = preview(&state_b, head)?;
+        if shown.contains(&ours[..1024]) {
+            version_a = Some(head.clone());
+        } else if shown.contains(&theirs[..1024]) {
+            version_b = Some(head.clone());
+        }
+    }
+    let version_a = version_a.context("A's version was not among the previews")?;
+    version_b.context("B's version was not among the previews")?;
+    folder(&state_b, &["resolve", &entity, &version_a])?;
+    let bytes = folder(&state_b, &["cat", "doc.txt"])?;
+    ensure!(bytes == ours, "doc.txt on B is not A's version");
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_listener_read_fails_cleanly_while_the_dialer_is_away_then_succeeds() -> Result<()> {
+    // A behaves as an older peer, so metadata goes over and bytes do not.
+    let a = TestDaemon::start_env(
+        "",
+        &[(
+            "TKFS_FAULT_POINT",
+            tkfs::model::protocol::features::FAULT_NONE,
+        )],
+    )?;
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(a, TestDaemon::start()?, &[])?;
+    let content = text(100 * 1024, 31);
+    import(&a, &state_a, "away.txt", &content)?;
+    wait_until(REPLICATED, "away.txt in B's tree", || {
+        Ok(folder(&state_b, &["tree"])?.contains("away.txt"))
+    })?;
+    let home_a = a.shutdown_keep_home()?;
+
+    let began = Instant::now();
+    let refused = match folder(&state_b, &["cat", "away.txt"]) {
+        Ok(bytes) => anyhow::bail!("read {} bytes with A away", bytes.len()),
+        Err(error) => format!("{error:#}"),
+    };
+    ensure!(refused.contains("OBJECT_MISSING"), "{refused}");
+    let took = began.elapsed();
+    ensure!(took < Duration::from_secs(25), "the read took {took:?}");
+
+    // A returns without the fault: the read succeeds.
+    let a = TestDaemon::start_in(home_a)?;
+    wait_file(&state_b, "away.txt", &content, REPLICATED)?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+/// Imports `content` as `path`, within [`LARGE_IMPORT`].
+fn import_large(daemon: &TestDaemon, state: &Path, path: &str, content: &str) -> Result<()> {
+    let source = daemon.home().join(format!("source-{path}"));
+    fs::write(&source, content)?;
+    let state = state.to_str().context("state path is not UTF-8")?;
+    let source = source.to_str().context("source path is not UTF-8")?;
+    let output = run_tkfs(&["--state", state, "import", path, source], LARGE_IMPORT)?;
+    ensure!(
+        output.code == Some(0),
+        "import {path} exited {:?}: {}",
+        output.code,
+        output.stderr.trim()
+    );
+    Ok(())
+}
+
+/// Waits until a push of `len` bytes is under way into the packs at `state`,
+/// which held `base` bytes before it, and has not finished yet.
+fn wait_push_under_way(state: &Path, base: u64, len: usize) -> Result<()> {
+    wait_until(LARGE_PUSH, "a push under way", || {
+        Ok(pack_bytes(state) >= base + UNDER_WAY)
+    })?;
+    let at = pack_bytes(state);
+    ensure!(
+        at < base + len as u64,
+        "the push had already finished ({at} bytes in the packs)"
+    );
+    Ok(())
+}
+
+/// `path` as a store on disk holds it, with no worker and nobody to fetch from:
+/// every byte must be in its packs.
+fn stored_file(state: &Path, path: &str) -> Result<Vec<u8>> {
+    let engine = tkfs::runtime::Engine::open(state, None)?;
+    let handle = engine.open_file(path, false, false, false)?;
+    let (_, len) = engine.info(handle)?;
+    let mut bytes = vec![0; len as usize];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let read = engine.read(handle, filled as u64, &mut bytes[filled..])?;
+        ensure!(read > 0, "{path} ended at {filled} of {len} bytes");
+        filled += read;
+    }
+    engine.close(handle)?;
+    engine.shutdown()?;
+    Ok(bytes)
+}
+
+#[test]
+fn an_interrupted_push_completes_after_restart() -> Result<()> {
+    // B on a fixed port, so A's lanes find it again after it restarts.
+    let b = TestDaemon::start_listening(&free_address()?, "")?;
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair_of(TestDaemon::start()?, b, &[])?;
+
+    // A, the side pushing, is killed mid-push and comes back.
+    let first = text(LARGE, 37);
+    let base = pack_bytes(&state_b);
+    import_large(&a, &state_a, "first.txt", &first)?;
+    wait_push_under_way(&state_b, base, LARGE)?;
+    let a = TestDaemon::start_in(a.kill_keep_home()?)?;
+    wait_settled(&state_b, "first.txt", LARGE_PUSH)?;
+
+    // B, the side stored into, is killed mid-push and comes back.
+    let second = text(LARGE, 41);
+    let base = pack_bytes(&state_b);
+    import_large(&a, &state_a, "second.txt", &second)?;
+    wait_push_under_way(&state_b, base, LARGE)?;
+    let b = TestDaemon::start_in(b.kill_keep_home()?)?;
+    wait_settled(&state_b, "second.txt", LARGE_PUSH)?;
+
+    // Stopped, B's store holds both files whole.
+    let home_b = b.shutdown_keep_home()?;
+    a.shutdown()?;
+    for (path, content) in [("first.txt", &first), ("second.txt", &second)] {
+        let bytes = stored_file(&state_b, path)?;
+        ensure!(
+            bytes == content.as_bytes(),
+            "{path} differs on B ({} of {} bytes)",
+            bytes.len(),
+            content.len()
+        );
+    }
+    drop(home_b);
+    Ok(())
+}
+
+#[test]
+fn a_zero_byte_file_reaches_the_listener() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair(&[])?;
+    import(&a, &state_a, "empty.txt", "")?;
+    wait_file(&state_b, "empty.txt", "", REPLICATED)?;
+    // The pump is not stuck on it: what comes next still arrives.
+    let next = text(1000, 47);
+    import(&a, &state_a, "next.txt", &next)?;
+    wait_file(&state_b, "next.txt", &next, REPLICATED)?;
+    let log = a.log_text();
+    ensure!(!log.contains("SYNC_PUSH_FAILED"), "A's log:\n{log}");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn a_paused_listener_causes_backoff_and_resumes() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = shared_pair(&[])?;
+    b.manage(&["pause", "Shared"])?;
+    let content = text(2000, 43);
+    import(&a, &state_a, "paused.txt", &content)?;
+    std::thread::sleep(Duration::from_secs(5));
+    let log = a.log_text();
+    let failures = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| {
+            line["code"] == "SYNC_PUSH_FAILED"
+                && line["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("REPO_NOT_PUBLISHED"))
+        })
+        .count();
+    // Once: it did fail, and it did not flood the log.
+    ensure!(failures == 1, "{failures} failures in A's log:\n{log}");
+    b.manage(&["resume", "Shared"])?;
+    wait_file(&state_b, "paused.txt", &content, REPLICATED)?;
     a.shutdown()?;
     b.shutdown()?;
     Ok(())

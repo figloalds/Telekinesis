@@ -796,6 +796,16 @@ impl Network {
             .ready()
     }
 
+    /// Any Ready bulk lane to `endpoint`.
+    pub fn any_bulk_lane(&self, endpoint: &str) -> Option<Conn> {
+        lock(&self.peers)
+            .get(endpoint)?
+            .lanes
+            .iter()
+            .filter(|lane| lane.role == LaneRole::Bulk)
+            .find_map(|lane| lane.ready())
+    }
+
     /// Closes every lane and inbound session, waiting at most `budget` for
     /// lane threads to end and sessions to close.
     pub fn shutdown(&self, budget: Duration) {
