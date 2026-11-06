@@ -424,9 +424,17 @@ impl Service {
         self.demand.arrived(&digests);
         Ok(objects.len())
     }
-    /// The `digests` the packs hold, in request order. Flushed first: an
-    /// object this names survives a crash.
+    /// The `digests` the packs hold, in request order, all of them durable.
     fn have(&self, digests: Vec<Digest>) -> Result<Vec<Digest>> {
+        self.have_with(digests, |_| Ok(()))
+    }
+    /// [`Self::have`], running `before` ahead of each digest's check (a seam
+    /// for tests to write meanwhile).
+    fn have_with(
+        &self,
+        digests: Vec<Digest>,
+        mut before: impl FnMut(&Digest) -> Result<()>,
+    ) -> Result<Vec<Digest>> {
         ensure!(
             digests.len() <= HAVE_BATCH,
             "ARGUMENT_TOO_LARGE: {} digests (at most {HAVE_BATCH})",
@@ -438,6 +446,7 @@ impl Service {
         // reply, whoever else writes meanwhile.
         let mut held = Vec::new();
         for digest in digests {
+            before(&digest)?;
             if packs.contains(digest)? {
                 held.push(digest);
             }
@@ -1979,6 +1988,31 @@ mod tests {
         assert!(
             indexed(home.path(), digest)?,
             "the reply came before the flush"
+        );
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn objects_have_makes_durable_what_a_writer_added_while_it_checked() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+        let packs = engine.working.content().packs.clone();
+        let (a, b) = (Digest::bytes(b"first"), Digest::bytes(b"second"));
+        packs.put(Kind::Chunk, b"first")?;
+        // Another writer puts `b` in just before it is checked.
+        let held = service.have_with(vec![a, b], |digest| {
+            if *digest == b {
+                packs.put(Kind::Chunk, b"second")?;
+            }
+            Ok(())
+        })?;
+        assert_eq!(held, vec![a, b]);
+        assert!(indexed(home.path(), a)?);
+        assert!(
+            indexed(home.path(), b)?,
+            "b was named held but is not durable"
         );
         engine.shutdown()?;
         Ok(())
