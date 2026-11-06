@@ -795,15 +795,16 @@ def scenario_share(s: Session) -> None:
     s.check("no working file is left in the folder", not any(name.startswith(".tkfs-part-") for name in listed),
             sorted(listed))
 
-    # A stream that cannot be read is reported, and nothing is left under any name: the file goes
-    # while the share screen is up, so the grant is good and the open is not.
+    # A file that cannot be saved is reported, and nothing is left under any name: the folder's
+    # worker is stopped while the share screen is up, so the copy fails at its first call. A file
+    # that goes away from under the grant is refused by Android before any copy starts (a toast).
     # Everything above ran without the notification permission, as the job must. This needs it,
     # to read the notification back.
     device.shell("pm", "grant", PACKAGE, "android.permission.POST_NOTIFICATIONS").require_success()
     device.clear_logcat()
-    device.start_share(device.push_download("gone.bin", rng.randbytes(1024)))
+    device.start_share(device.push_download("cannot-save.bin", rng.randbytes(1024)))
     device.wait_screen("the share screen", lambda t: "Save 1 file" in t)
-    device.shell("rm", "-f", "/sdcard/Download/gone.bin")
+    device.shell_manage("force-stop", {"state": folder.id}, bound=SYNC_BOUND)
     device.tap_text("Save 1 file")
 
     def reported() -> bool:
@@ -811,6 +812,9 @@ def scenario_share(s: Session) -> None:
 
     poll(60, "the notification that names the failure", reported, interval=2)
     s.check("a stream that cannot be copied is named in a notification", True)
+    device.shell_manage("start", {"state": folder.id})
+    poll(FOLDER_READY_BOUND, "the folder running again",
+         lambda: device.shell_manage("inspect", {"state": folder.id})["phase"]["phase"] == "Running")
     s.check("and leaves nothing in the folder", set(names()) == set(listed), sorted(names()))
 
     # The PC back: no action on the phone but a trigger of the table.
@@ -833,6 +837,17 @@ def scenario_share(s: Session) -> None:
         deliver(s, folder, name, content, f"{name} from the background", bound=SYNC_BOUND)
         s.check(f"a share reaches the PC from the background, exemption {'on' if exempt else 'off'}", True,
                 device.transfer_log())
+
+        # The same with a write through the provider: the app is cached by the time the job starts,
+        # so this is where a foreground service may be refused to an app that is not exempt.
+        device.clear_logcat()
+        name = f"written-{'exempt' if exempt else 'optimized'}.bin"
+        content = rng.randbytes(2 * MIB)
+        device.content_write(device.create_document(folder.doc(), name), content)
+        deliver(s, folder, name, content, f"{name} from the background", bound=SYNC_BOUND)
+        time.sleep(3)
+        s.check(f"a write reaches the PC from the background, exemption {'on' if exempt else 'off'}", True,
+                device.transfer_log())
     device.battery_exempt(True)
 
     # A force-stop during the push of a large file.
@@ -843,8 +858,8 @@ def scenario_share(s: Session) -> None:
     device.home()
     poll(SHARE_BOUND, "the push under way", lambda: pc_pack_bytes(folder) - before >= 16 * MIB, interval=1)
     gained = pc_pack_bytes(folder) - before
-    s.check("the large file is only partly on the PC when the app is killed",
-            not pc.pc_has(folder.pc_state, "large-push.bin"), f"{gained} pack bytes there")
+    s.check("the large file is only partly on the PC when the app is killed", gained < SHARE_BYTES * 0.9,
+            f"{gained} of {SHARE_BYTES} pack bytes there")
     device.force_stop()
     s.check("force-stop mid-push ended the app", device.app_pid() is None)
     deliver(s, folder, "large-push.bin", large, "the large file after a restart",
