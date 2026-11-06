@@ -48,8 +48,13 @@ class TransferStateTest {
         assertEquals(Next.Stop(Why.NoProgress), progress.after(burst(folder("a", 5), folder("c", 7))))
     }
 
-    @Test fun aFolderInErrorDoesNotKeepTheJobGoing() {
-        assertEquals(Next.Stop(Why.Done), Progress().after(burst(folder("a", 5, error = "PC not reachable"))))
+    @Test fun aFolderInErrorThatPushedNothingDoesNotKeepTheJobGoing() {
+        assertEquals(Next.Stop(Why.NoProgress), Progress().after(burst(folder("a", 5, error = "PC not reachable"))))
+        assertEquals(Next.Stop(Why.NoProgress), Progress().after(burst(folder("a", null, error = "PC not reachable"))))
+    }
+
+    @Test fun aBurstThatRanOutOfTimeButPushedGoesAgain() {
+        assertEquals(Next.Again, Progress().after(burst(folder("a", 12, pushed = 1364, error = "SYNC_NOW_TIMEOUT"))))
     }
 
     @Test fun aFailedCallEndsTheJob() {

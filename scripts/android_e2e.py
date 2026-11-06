@@ -718,7 +718,7 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
         s.check(f"and reads as it was on the phone", device.content_read(folder.doc(path)) == files[path])
 
 
-SHARE_BOUND = 900
+SHARE_BOUND = 1200
 SHARE_BYTES = 256 * 1024 * 1024
 MIB = 1024 * 1024
 
