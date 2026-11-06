@@ -93,6 +93,13 @@ pub enum ManagementCommand {
     },
     /// Forget a paired installation (and ask it to forget this one).
     Unpair { installation: String },
+    /// Move a paired installation to a new address, keeping its credential:
+    /// no pairing code, and no other host is revoked. ENDPOINT must answer as
+    /// that installation.
+    SetEndpoint {
+        installation: String,
+        endpoint: String,
+    },
     /// Paired peers and their lanes.
     Peers,
     /// The folders a paired orchestrator publishes.
@@ -221,6 +228,14 @@ fn request(command: ManagementCommand) -> Result<(&'static str, Value, bool)> {
             )
         }
         C::Unpair { installation } => ("unpair", json!({"installation": installation}), false),
+        C::SetEndpoint {
+            installation,
+            endpoint,
+        } => (
+            "set-endpoint",
+            json!({"installation": installation, "endpoint": endpoint}),
+            false,
+        ),
         C::Peers => ("peers", json!({}), true),
         C::RemoteList { endpoint } => ("remote-list", json!({"endpoint": endpoint}), true),
         C::Receive {

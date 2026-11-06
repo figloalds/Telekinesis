@@ -132,6 +132,7 @@ const MUTATIONS: &[&str] = &[
     "reset-pairing-code",
     "pair",
     "unpair",
+    "set-endpoint",
     "receive",
     "sync-now",
     "reset-cursors",
@@ -847,6 +848,16 @@ impl Daemon {
                     .as_str()
                     .context("ARGUMENT_REQUIRED: installation")?;
                 self.network()?.unpair(installation)?;
+                Ok(json!({}))
+            }
+            "set-endpoint" => {
+                let installation = payload["installation"]
+                    .as_str()
+                    .context("ARGUMENT_REQUIRED: installation")?;
+                let endpoint = payload["endpoint"]
+                    .as_str()
+                    .context("ARGUMENT_REQUIRED: endpoint")?;
+                self.network()?.set_endpoint(installation, endpoint)?;
                 Ok(json!({}))
             }
             "peers" => Ok(self.network()?.peers()),

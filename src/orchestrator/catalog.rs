@@ -441,6 +441,41 @@ impl Catalog {
         Ok(())
     }
 
+    /// Moves `installation` to `endpoint`: its `peers` rows become one row
+    /// there, with the credential and connections of its first row. Its
+    /// pairing, clock and feed cursors are keyed by installation and stay.
+    pub fn set_peer_endpoint(&self, installation: &str, endpoint: &str) -> Result<()> {
+        crate::ws::endpoint_uri(endpoint)?;
+        let db = self.db()?;
+        let tx = db.unchecked_transaction()?;
+        let (credential, connections): (String, Option<usize>) = tx
+            .query_cached(
+                "SELECT credential,connections FROM peers WHERE installation=?1 ORDER BY rowid LIMIT 1",
+                [installation],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .with_context(|| format!("PEER_NOT_FOUND: no peer with installation {installation:?}"))?;
+        let taken: Option<String> = tx
+            .query_cached(
+                "SELECT installation FROM peers WHERE endpoint=?1",
+                [endpoint],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            taken.is_none_or(|owner| owner == installation),
+            "PEER_NOT_AT_ENDPOINT: {endpoint:?} belongs to another peer"
+        );
+        tx.execute_cached("DELETE FROM peers WHERE installation=?1", [installation])?;
+        tx.execute_cached(
+            "INSERT INTO peers VALUES(?1,?2,?3,?4)",
+            params![endpoint, installation, credential, connections],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Inbound enrollment: trust the key without a dialable endpoint. An
     /// installation has one credential, so the `peers` rows this side dials
     /// it with take the new key too (a replaced key would be refused).
@@ -895,6 +930,52 @@ mod tests {
         assert_eq!(catalog.paired_key("b")?, [4; 32]);
         // An inbound-only installation has no rows to update.
         assert_eq!(catalog.save_paired("d", [5; 32])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn set_peer_endpoint_leaves_one_row_with_the_credential_and_connections() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = Catalog::open(home.path())?;
+        catalog.save_peer("ws://old:1", "b", [1; 32], Some(3))?;
+        catalog.save_peer("ws://alias:1", "b", [1; 32], None)?;
+        catalog.save_peer("ws://c:1", "c", [2; 32], None)?;
+        let offset = Offset {
+            offset_ms: 7,
+            rtt_ms: 1,
+        };
+        catalog.set_clock("b", offset, 9)?;
+        catalog.set_peer_endpoint("b", "ws://new:2")?;
+        let rows: Vec<_> = catalog
+            .peers()?
+            .into_iter()
+            .map(|p| (p.endpoint, p.installation, p.connections))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("ws://c:1".to_owned(), "c".to_owned(), None),
+                ("ws://new:2".to_owned(), "b".to_owned(), Some(3)),
+            ]
+        );
+        assert_eq!(catalog.peer("ws://new:2")?.key()?, [1; 32]);
+        assert_eq!(catalog.paired_key("b")?, [1; 32]);
+        assert_eq!(catalog.clock("b")?, Some((offset, 9)));
+        // Moving to where it already is changes nothing.
+        catalog.set_peer_endpoint("b", "ws://new:2")?;
+        assert_eq!(catalog.peers()?.len(), 2);
+        // Another peer's address, an unknown installation and a bad URL change nothing.
+        assert_eq!(
+            code(&catalog.set_peer_endpoint("b", "ws://c:1").unwrap_err()),
+            "PEER_NOT_AT_ENDPOINT"
+        );
+        assert_eq!(
+            code(&catalog.set_peer_endpoint("z", "ws://z:1").unwrap_err()),
+            "PEER_NOT_FOUND"
+        );
+        assert!(catalog.set_peer_endpoint("b", "http://x").is_err());
+        assert_eq!(catalog.peers()?.len(), 2);
+        assert_eq!(catalog.peer("ws://new:2")?.installation, "b");
         Ok(())
     }
 

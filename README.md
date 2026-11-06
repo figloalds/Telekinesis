@@ -231,6 +231,7 @@ tkfs manage remote-list ws://hosta:43180                 # folders host A publis
 tkfs manage receive ws://hosta:43180 REPO_ID Projects --mount X:
 tkfs manage peers
 tkfs manage unpair INSTALLATION_ID
+tkfs manage set-endpoint INSTALLATION_ID ws://newhost:43180   # peer changed address: no code
 ```
 
 One `pair` moves file content both ways. Pair in both directions only
@@ -323,6 +324,7 @@ The desktop app shows the same codes. The code tells you what to do:
 | `SYNC_NOW_TIMEOUT` | `manage sync-now` ran out of time with nothing failing, or a peer's lanes never came up with no failure to report. If something was failing, the reply names that instead. Reported per folder; what was done stays done. | Run it again; check `manage peers`. |
 | `REPO_ALREADY_PRESENT` | This orchestrator already has a folder of that repository. | Use that folder. |
 | `PAIRING_CODE_CHANGED`, `INVALID_PAIRING_CODE`, `PEER_REVOKED` | The peer's code was reset, the code is wrong, or the peer revoked this host. | Get the current code (`reset-pairing-code` there) and `manage pair` again. |
+| `PEER_NOT_AT_ENDPOINT` | `manage set-endpoint`: nothing at that address answers as the installation with its credential (another host, a wrong port, or the peer is down). Nothing was changed. | Check the address and that the peer is running; `manage peers` shows the installation. |
 | `PEER_LANES_SKIPPED` | Logged: the connections to a paired peer could not be set up (for example its credential is missing). | Restart the orchestrator; if it repeats, `manage unpair` and `manage pair` again. |
 | `CLOCK_OFFSET_LARGE` | Logged: a peer's clock differs from this one by more than 5 s. | Fix the clocks (NTP). |
 | `SYNC_PUSH_FAILED` | Logged once per distinct error: pushing objects to a peer failed or timed out. That peer rests briefly and is tried again. | Nothing if it clears. |

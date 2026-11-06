@@ -1808,6 +1808,81 @@ fn reset_cursors_makes_the_next_burst_start_over() -> Result<()> {
     Ok(())
 }
 
+/// `daemon`'s `peers`: exactly one entry, at `endpoint`.
+fn only_peer_at(daemon: &TestDaemon, endpoint: &str) -> Result<Value> {
+    let peers = daemon.manage(&["peers"])?;
+    let list = peers.as_array().context("peers is not a list")?;
+    ensure!(list.len() == 1, "{peers}");
+    ensure!(list[0]["endpoint"] == endpoint, "{peers}");
+    Ok(list[0].clone())
+}
+
+#[test]
+fn set_endpoint_moves_a_peer_with_no_code() -> Result<()> {
+    let (
+        Shared {
+            a,
+            b,
+            state_a,
+            state_b,
+            ..
+        },
+        _first,
+    ) = passive_pair_with_a_long_log()?;
+    sync_now_clean(&a)?;
+    ensure!(folder(&state_a, &["tree"])?.contains("seeded-9999"));
+    let installation_b = installation(&b)?;
+    // The same B at another address, which counts the bytes: the move keeps
+    // the credential, so no code is asked.
+    let second = FaultProxy::try_start(&b.listen_endpoint()?)?;
+    let moved_to = second.endpoint();
+    a.manage(&["set-endpoint", &installation_b, &moved_to])?;
+    a.wait_lanes(&moved_to, 4, "Ready", LANES_READY)?;
+    let row = only_peer_at(&a, &moved_to)?;
+    ensure!(row["installation"] == installation_b.as_str(), "{row}");
+    // The feed cursor survived: a burst at the new address moves a new file
+    // and does not replay the log.
+    import(&b, &state_b, "after-move.txt", "written after the move")?;
+    let before = bytes_moved(&second);
+    sync_now_clean(&a)?;
+    let moved = bytes_moved(&second) - before;
+    ensure!(moved < BURST_BOUND, "the burst moved {moved} bytes");
+    wait_entry(&state_a, "after-move.txt", 22, REPLICATED)?;
+    // And on to the direct address.
+    let direct = b.listen_endpoint()?;
+    a.manage(&["set-endpoint", &installation_b, &direct])?;
+    a.wait_lanes(&direct, 4, "Ready", LANES_READY)?;
+    only_peer_at(&a, &direct)?;
+    import(&a, &state_a, "from-a.txt", "written on A")?;
+    sync_now_clean(&a)?;
+    wait_entry(&state_b, "from-a.txt", 12, REPLICATED)?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn set_endpoint_refuses_a_different_installation() -> Result<()> {
+    let Shared {
+        a, b, endpoint_b, ..
+    } = shared_pair(&[])?;
+    let c = TestDaemon::start()?;
+    let installation_b = installation(&b)?;
+    let refused = error_of(a.manage(&["set-endpoint", &installation_b, &c.listen_endpoint()?]));
+    ensure!(refused.contains("PEER_NOT_AT_ENDPOINT"), "{refused}");
+    let unknown = error_of(a.manage(&["set-endpoint", "no-such-installation", &endpoint_b]));
+    ensure!(unknown.contains("PEER_NOT_FOUND"), "{unknown}");
+    only_peer_at(&a, &endpoint_b)?;
+    ensure!(
+        all_lanes(&a.manage(&["peers"])?, "Ready"),
+        "a lane left Ready"
+    );
+    a.shutdown()?;
+    b.shutdown()?;
+    c.shutdown()?;
+    Ok(())
+}
+
 #[test]
 fn clock_offset_is_measured_and_stored() -> Result<()> {
     let a = TestDaemon::start()?;

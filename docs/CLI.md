@@ -218,6 +218,7 @@ tkfs manage remote-list wss://files.example.com
 tkfs manage receive wss://files.example.com REPO_ID Projects
 tkfs manage receive wss://files.example.com REPO_ID Archive --headless
 tkfs manage unpair INSTALLATION
+tkfs manage set-endpoint INSTALLATION ws://newhost:43180
 ```
 
 - `reset-pairing-code` creates a new pairing code for this orchestrator and
@@ -262,6 +263,13 @@ tkfs manage unpair INSTALLATION
   this one (best effort), then forgets the peer and closes its connections.
   If the other host also dials this one, that pairing is its own: unpair it
   there.
+- `set-endpoint INSTALLATION ENDPOINT` moves a paired peer to a new address
+  (for example when its PC changed address) with the credential it already
+  holds: no pairing code, so no other host that dials the peer is revoked. It
+  first checks that ENDPOINT answers as that installation and accepts the
+  credential, and changes nothing otherwise (`PEER_NOT_AT_ENDPOINT`;
+  `PEER_NOT_FOUND` for an unknown installation). The peer's connections are
+  reopened at the new address; its sync progress is kept.
 
 `ENDPOINT` is `ws://HOST:PORT` or `wss://HOST[:PORT][/PATH]`. `wss://`
 verifies the server certificate and host name with the platform trust store;

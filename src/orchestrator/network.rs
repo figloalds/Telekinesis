@@ -641,6 +641,36 @@ impl Network {
         Ok(())
     }
 
+    /// Moves the peer `installation` to `endpoint` with the credential it
+    /// already holds, so the move needs no pairing code (a new code would
+    /// revoke every host that dials this one). Refused, and nothing changed,
+    /// unless `endpoint` answers as that installation with that credential.
+    pub fn set_endpoint(&self, installation: &str, endpoint: &str) -> Result<()> {
+        crate::ws::endpoint_uri(endpoint)?;
+        ensure!(
+            self.catalog
+                .peers()?
+                .iter()
+                .any(|peer| peer.installation == installation),
+            "PEER_NOT_FOUND: no peer with installation {installation:?}"
+        );
+        let key = self.catalog.paired_key(installation)?;
+        ensure!(
+            self.accepts(endpoint, installation, key),
+            "PEER_NOT_AT_ENDPOINT: nothing at {endpoint:?} answers as installation {installation:?} with its credential"
+        );
+        self.catalog.set_peer_endpoint(installation, endpoint)?;
+        // Inbound sessions, listed digests and counts belong to the
+        // installation, not the address: they stay.
+        self.close_lanes(installation);
+        self.reopen(installation);
+        event!(info, PEER_ENDPOINT_CHANGED, {
+            "installation": installation,
+            "endpoint": endpoint,
+        });
+        Ok(())
+    }
+
     fn revoke(&self, peer: &Peer) -> Result<()> {
         let (conn, temporary) = match self.control_lane(&peer.endpoint) {
             Some(conn) => (conn, false),
@@ -664,6 +694,16 @@ impl Network {
     fn forget(&self, installation: &str, code: &str) {
         self.forget_listed(installation);
         lock(&self.counts).remove(installation);
+        self.close_lanes(installation);
+        for conn in self.sessions() {
+            if conn.peer().installation == installation {
+                conn.goaway(code, "this installation is no longer paired");
+            }
+        }
+    }
+
+    /// Stops and drops the outbound lanes to `installation`.
+    fn close_lanes(&self, installation: &str) {
         let removed: Vec<PeerLanes> = {
             let mut peers = lock(&self.peers);
             let endpoints: Vec<String> = peers
@@ -677,11 +717,6 @@ impl Network {
                 .collect()
         };
         removed.iter().for_each(PeerLanes::stop);
-        for conn in self.sessions() {
-            if conn.peer().installation == installation {
-                conn.goaway(code, "this installation is no longer paired");
-            }
-        }
     }
 
     /// Forgets the digests listed to `installation`: a peer that is revoked
