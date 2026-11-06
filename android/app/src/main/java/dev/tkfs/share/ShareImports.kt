@@ -43,7 +43,7 @@ internal object ShareImports {
                     ledger.swept(orphan)
                 } catch (error: IOException) {
                     // Not there is as good as removed.
-                    if (error.message?.startsWith("FILE_NOT_FOUND") == true) ledger.swept(orphan)
+                    if (isNotFound(error)) ledger.swept(orphan)
                     else Log.w(TAG, "share: sweep ${orphan.path}: ${error.message}")
                 }
             }

@@ -836,7 +836,8 @@ def scenario_share(s: Session) -> None:
     # The Folders screen says so too, until dismissed, and does not depend on the notification permission.
     def strip_is(name: str) -> None:
         device.start_app()
-        device.wait_screen(f"the strip for {name}", lambda t: f"Couldn't save {name}. Share it again." in t)
+        # A copy into a folder whose worker is down waits for it before it fails.
+        device.wait_screen(f"the strip for {name}", lambda t: f"Couldn't save {name}. Share it again." in t, 120)
 
     strip_is("cannot-save.bin")
     s.check("the Folders screen says what could not be saved", True)

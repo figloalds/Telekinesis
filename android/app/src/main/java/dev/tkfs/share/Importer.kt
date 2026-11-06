@@ -59,7 +59,13 @@ internal class Importer(
         val part = DocumentIds.childPath(directory, PART_PREFIX + UUID.randomUUID())
         working(part)
         try {
-            files.create(part)
+            try {
+                files.create(part)
+            } catch (error: IOException) {
+                // It never existed, so there is nothing to delete and nothing for a sweep to find.
+                cleared(part)
+                throw error
+            }
             copy(part, input, progress)
             return rename(part, directory, name).also { cleared(part) }
         } catch (error: Exception) {
@@ -68,7 +74,7 @@ internal class Importer(
                 cleared(part)
             } catch (cleanup: IOException) {
                 // Not there is as good as deleted; any other failure leaves it for the sweep.
-                if (cleanup.message?.startsWith("FILE_NOT_FOUND") == true) cleared(part) else error.addSuppressed(cleanup)
+                if (isNotFound(cleanup)) cleared(part) else error.addSuppressed(cleanup)
             }
             throw error as? ImportFailed ?: ImportFailed(error.message ?: error.javaClass.simpleName, error)
         }
@@ -127,3 +133,6 @@ internal class Importer(
 
 /** The start of a working file's name. The provider does not list these, and a sweep removes what a kill left. */
 internal const val PART_PREFIX = ".tkfs-part-"
+
+/** The engine says a path is not there with this code. */
+internal fun isNotFound(error: IOException): Boolean = error.message?.substringBefore(':') in setOf("NOT_FOUND", "FILE_NOT_FOUND")

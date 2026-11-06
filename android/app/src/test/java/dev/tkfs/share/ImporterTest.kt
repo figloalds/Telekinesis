@@ -156,6 +156,26 @@ class ImporterTest {
         }
     }
 
+    @Test fun aCreateThatFailsLeavesNothingForTheSweep() {
+        val folder = object : FolderFiles by FakeFolder() {
+            override fun create(path: String) = throw IOException("WORKER_NOT_READY: x")
+        }
+        val told = mutableListOf<String>()
+        try {
+            Importer(folder, working = { told += "working" }, cleared = { told += "cleared" })
+                .import("/", "a.bin", ByteArrayInputStream(bytes)) {}
+            fail("the copy should fail")
+        } catch (error: ImportFailed) {
+            assertEquals(listOf("working", "cleared"), told)
+        }
+    }
+
+    @Test fun aWorkingFileThatIsAlreadyGoneCountsAsRemoved() {
+        assertTrue(isNotFound(IOException("NOT_FOUND: /a")))
+        assertTrue(isNotFound(IOException("FILE_NOT_FOUND: /a")))
+        assertFalse(isNotFound(IOException("WORKER_NOT_READY: f")))
+    }
+
     @Test fun anEmptyStreamIsAnEmptyFile() {
         val folder = FakeFolder()
         Importer(folder).import("/", "empty.txt", ByteArrayInputStream(ByteArray(0))) {}
