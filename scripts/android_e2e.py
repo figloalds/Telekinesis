@@ -864,15 +864,32 @@ def scenario_share(s: Session) -> None:
                 device.transfer_log())
     device.battery_exempt(True)
 
-    # A force-stop during the push of a large file.
-    device.clear_logcat()
+    # A force-stop during the push of a large file. The PC is away while it is shared in, so that
+    # the copy is over, and the file whole on the phone, before anything is sent: a burst during
+    # the copy would send its working file and leave no push to interrupt.
     large = random_bytes(rng, SHARE_BYTES)
     reference_repo, reference_state = pc.create_folder("Reference", {"large.bin": large})
     reference = Folder("", "Reference", reference_repo, "", reference_state, {"large.bin": large})
-    before = pc_pack_bytes(folder)
+    failures, summary = pc.stop()
+    s.check("the PC stops cleanly for the large share", not failures, failures or summary)
+    device.clear_logcat()
     share_one(s, "large-push.bin", large)
     device.home()
-    poll(SHARE_BOUND, "the push under way", lambda: pc_pack_bytes(folder) - before >= 16 * MIB, interval=1)
+    poll(SHARE_BOUND, "the large file whole on the phone", lambda: "large-push.bin" in names(), interval=5)
+    s.check("the large file is on the phone, whole",
+            names()["large-push.bin"]["_size"] == str(len(large)), names()["large-push.bin"])
+    pc.start()
+    pc.wait_phase(folder.label, "Running")
+    before = pc_pack_bytes(folder)
+    last = [0.0]
+
+    def under_way() -> bool:
+        if time.monotonic() - last[0] > 30:
+            last[0] = time.monotonic()
+            trigger_foreground(device)
+        return pc_pack_bytes(folder) - before >= 16 * MIB
+
+    poll(SHARE_BOUND, "the push under way", under_way, interval=1)
     gained = pc_pack_bytes(folder) - before
     s.check("the large file is only partly on the PC when the app is killed", gained < SHARE_BYTES * 0.9,
             f"{gained} of {SHARE_BYTES} pack bytes there")
