@@ -48,11 +48,21 @@ data class AppUi(
     /** Null until the first answer from the orchestrator. */
     val snapshot: Snapshot? = null,
     val syncing: Boolean = false,
+    /** What the last action was refused with; cleared by the next action or screen change. */
     val failure: Failure? = null,
+    /** Why the last status poll failed; cleared by the next poll that works. Only Folders shows it. */
+    val pollFailure: Failure? = null,
     val pairing: Pairing = Pairing.Fields,
     val storage: String = "",
     val now: Long = System.currentTimeMillis(),
 )
+
+/** The state after a `status` poll that worked: its answer in, its failure gone. */
+fun AppUi.polled(snapshot: Snapshot, storage: String, now: Long) =
+    copy(snapshot = snapshot, storage = storage, now = now, pollFailure = null)
+
+/** The state after a poll that failed. It is kept apart from an action's `failure`. */
+fun AppUi.pollFailed(failure: Failure) = copy(pollFailure = failure)
 
 private const val POLL_MS = 2_000L
 private const val STORAGE_EVERY = 5
@@ -97,14 +107,14 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         val snapshot = try {
             parseSnapshot(call("status"), bursts)
         } catch (error: IOException) {
-            mutable.update { it.copy(failure = it.failure ?: Failure.of(error)) }
+            mutable.update { it.pollFailed(Failure.of(error)) }
             return
         } catch (error: JSONException) {
-            mutable.update { it.copy(failure = Failure(null, "The app could not read its own status.")) }
+            mutable.update { it.pollFailed(Failure(null, "The app could not read its own status.")) }
             return
         }
         val storage = if (polls++ % STORAGE_EVERY == 0) storageLine() else mutable.value.storage
-        mutable.update { it.copy(snapshot = snapshot, storage = storage, now = System.currentTimeMillis()) }
+        mutable.update { it.polled(snapshot, storage, System.currentTimeMillis()) }
     }
 
     /** One burst for every folder; the errors it reports stay on their folders until the next. */

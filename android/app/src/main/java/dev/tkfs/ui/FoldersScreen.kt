@@ -37,7 +37,7 @@ fun FoldersScreen(ui: AppUi, onSync: () -> Unit, onAddPc: () -> Unit, onSettings
                 snapshot.folders.isEmpty() -> Empty(snapshot, onAddPc)
                 else -> FolderList(snapshot, ui.now, onAddPc)
             }
-            FailureNote(ui.failure)
+            FailureNote(ui.failure ?: ui.pollFailure)
         }
         Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 16.dp)) {
             Button(
