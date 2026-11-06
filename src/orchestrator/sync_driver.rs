@@ -314,6 +314,12 @@ impl Due {
             .filter_map(move |burst| burst.pairs.get_mut(pair))
     }
 
+    /// What every open burst that takes pushes counts for `pair`: a
+    /// metadata-only burst records no push result.
+    fn push_pairs<'a>(&'a mut self, pair: &'a Pair) -> impl Iterator<Item = &'a mut BurstPair> {
+        self.burst_pairs(pair).filter(|state| !state.metadata_only)
+    }
+
     /// `pair` joins `burst`, with everything due.
     /// A metadata-only burst marks the exchange alone.
     fn join_burst(&mut self, burst: u64, pair: Pair, error: Option<String>) {
@@ -1585,7 +1591,7 @@ impl Driver {
             return false;
         }
         let mut rescan = false;
-        for burst in due.burst_pairs(&pair) {
+        for burst in due.push_pairs(&pair) {
             burst.swept = false;
             rescan |= std::mem::take(&mut burst.rescan);
         }
@@ -1635,7 +1641,7 @@ impl Driver {
                 let unsent = outcome.unsent;
                 format!("{code}: {unsent} object(s) this host holds did not get across")
             });
-        for state in due.burst_pairs(pair) {
+        for state in due.push_pairs(pair) {
             state.pushed += outcome.pushed as u64;
             if outcome.swept {
                 state.remaining = Some(outcome.unsent);
@@ -1734,7 +1740,7 @@ impl Driver {
                         .pushed;
                     stored += pushed;
                     let pair = (endpoint.clone(), folder.repo.clone());
-                    for burst in lock(&self.due).burst_pairs(&pair) {
+                    for burst in lock(&self.due).push_pairs(&pair) {
                         burst.pushed += pushed as u64;
                     }
                 }
@@ -4975,6 +4981,43 @@ mod tests {
         // A full burst beside it lifts the hold.
         open_burst(&driver, std::slice::from_ref(&key));
         assert!(!lock(&driver.due).push_held(&key));
+    }
+
+    #[test]
+    fn a_full_burst_beside_a_metadata_only_one_leaves_its_report_alone() {
+        let listener = Arc::new(Listener::default());
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let (driver, _root) = burst_driver(ReadyLanes::one(false, bulk), &[]);
+        let key = pair(ENDPOINT, "repo-1");
+        let meta = open_burst_of(&driver, std::slice::from_ref(&key), BurstMode::MetadataOnly);
+        let full = open_burst(&driver, std::slice::from_ref(&key));
+        let outcome = push::PushOutcome {
+            pushed: 3,
+            remaining: 2,
+            unsent: 2,
+            left: 2,
+            listed: true,
+            swept: true,
+            error: Some(Failure::Error("FATAL_STORE_ERROR: boom".to_owned())),
+            unlisted: Some(push::Unlisted::NoPush),
+            ..push::PushOutcome::default()
+        };
+        driver.background_done(&key, &outcome);
+        for burst in lock(&driver.due).bursts.values_mut() {
+            for state in burst.pairs.values_mut() {
+                state.exchanged = 1;
+            }
+        }
+        exchange_done(&driver);
+        let report = report_now(&driver, meta);
+        assert_eq!(report["pushed"], 0, "{report}");
+        assert!(report["remaining"].is_null(), "{report}");
+        assert!(report["error"].is_null(), "{report}");
+        assert!(settled_now(&driver, meta));
+        let report = report_now(&driver, full);
+        assert_eq!(report["pushed"], 3, "{report}");
+        assert_eq!(report["remaining"], 2, "{report}");
+        assert!(report["error"].is_string(), "{report}");
     }
 
     /// Bulk lanes that look Ready when a round starts and are gone when asked.

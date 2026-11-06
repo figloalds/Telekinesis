@@ -1328,6 +1328,7 @@ log:
         a.log_text()
     );
     ensure!(reply["pushed"] == 0, "{reply}");
+    ensure!(reply["remaining"].is_null(), "{reply}");
     wait_entry(&state_b, "from-a.txt", 18, REPLICATED)?;
     wait_entry(&state_a, "from-b.txt", 18, REPLICATED)?;
     ensure!(
