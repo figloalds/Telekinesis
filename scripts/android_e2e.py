@@ -28,7 +28,7 @@ from typing import Callable
 
 from android_e2e_lib import (BUILD_BOUND, CONTROL_URI, DEFAULT_AVD, DIRECTORY_MIME, PACKAGE, ROOT, ROOTS_URI,
                              ContentError, Device, Emulator, Folder, HarnessError, ManageError, PcHost, Report,
-                             Session, SYNC_BOUND, UI_BOUND, document_uri, poll, run_bounded, sha256, with_parents)
+                             Session, SYNC_BOUND, UI_BOUND, children_uri, document_uri, poll, run_bounded, sha256, with_parents)
 from build_android import APK, find_sdk
 
 # ---- scenarios ----------------------------------------------------------------------------
@@ -300,11 +300,70 @@ def scenario_ui_folders(s: Session) -> None:
     device.screenshot(shots / "folders-paired-again.png")
 
 
+SYNC_APPEARS = 45
+IDLE_SECONDS = 60
+
+
+def requests_to_pc(pc: PcHost) -> int:
+    """What the phone has asked of the PC so far, by the PC's own count."""
+    return sum(peer["requests_served"] for peer in pc.manage("peers"))
+
+
+def exchange_counters(device: Device, folder: Folder) -> dict:
+    """What a burst moves, from `inspect`: per PC, the exchange time and the cursor counts."""
+    sync = device.shell_manage("inspect", {"state": folder.id})["sync"]
+    return {peer: (row["last_exchange_ms"], row["sent"], row["received"]) for peer, row in sync.items()}
+
+
+def scenario_sync(s: Session) -> None:
+    """When syncing happens: a foreground and a stale listing each start a burst behind the
+    answer, the periodic job is scheduled, and an idle minute exchanges nothing."""
+    device, pc = s.device, s.pc
+    folder = s.folder_with({"first.txt": b"Here from the start.\n"})
+    names = lambda: {row["_display_name"] for row in device.content_query(children_uri(folder.doc()))}
+
+    # The foreground: a sync 60 s old is too young for a listing and old enough for the foreground.
+    pc.write_file(folder.pc_state, "from-pc.txt", b"Written on the PC.\n")
+    pc.folder(folder.pc_state, "flush")
+    device.set_last_sync(60)
+    s.check("a listing 60 s after the last sync does not have the new name yet", "from-pc.txt" not in names(), sorted(names()))
+    started = time.monotonic()
+    device.start_app()
+    poll(SYNC_APPEARS, "the new name after the app came to the foreground", lambda: "from-pc.txt" in names())
+    s.check("the foreground started a burst that brought the new name", True,
+            f"{time.monotonic() - started:.1f} s after am start")
+
+    # A listing older than 2 min: answered at once from what is known, with the burst behind it.
+    pc.write_file(folder.pc_state, "from-listing.txt", b"Written on the PC, later.\n")
+    pc.folder(folder.pc_state, "flush")
+    device.set_last_sync(10 * 60)
+    started = time.monotonic()
+    answered = names()
+    took = time.monotonic() - started
+    s.check("the stale listing is answered from what is known", "from-listing.txt" not in answered,
+            f"{took:.1f} s: {sorted(answered)}")
+    poll(SYNC_APPEARS, "the new name after a stale listing", lambda: "from-listing.txt" in names())
+    s.check("and the burst it started brought the new name", True)
+
+    jobs = device.shell("dumpsys", "jobscheduler").out
+    ours = [line for line in jobs.splitlines() if PACKAGE in line and "SystemJobService" in line]
+    s.check("the periodic job is in jobscheduler", bool(ours), ours[:3] or jobs[-300:])
+
+    # Idle: nothing in the app polls, so no exchange and no request to the PC.
+    time.sleep(5)  # Let the bursts above settle.
+    before, asked_before = exchange_counters(device, folder), requests_to_pc(pc)
+    time.sleep(IDLE_SECONDS)
+    after, asked_after = exchange_counters(device, folder), requests_to_pc(pc)
+    s.check(f"an idle {IDLE_SECONDS} s causes no exchange", before == after, f"{before} -> {after}")
+    s.check("and the PC was asked nothing", asked_after == asked_before, f"{asked_before} -> {asked_after}")
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
     "ui_folders": scenario_ui_folders,
     "read": scenario_read,
     "cold_start": scenario_cold_start,
     "harness": scenario_harness,
+    "sync": scenario_sync,
 }
 
 

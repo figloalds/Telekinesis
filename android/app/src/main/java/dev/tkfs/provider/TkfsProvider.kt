@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.os.storage.StorageManager
+import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
@@ -15,6 +16,7 @@ import android.webkit.MimeTypeMap
 import dev.tkfs.BuildConfig
 import dev.tkfs.Native
 import dev.tkfs.R
+import dev.tkfs.sync.SyncCoordinator
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.FileNotFoundException
@@ -49,6 +51,7 @@ class TkfsProvider : DocumentsProvider() {
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val cursor = MatrixCursor(projection ?: rootColumns)
+        cursor.setNotificationUri(resolver(), DocumentsContract.buildRootsUri(AUTHORITY))
         val folders = JSONArray(orNotFound { Native.manage("list", "{}") })
         for (index in 0 until folders.length()) {
             val folder = folders.getJSONObject(index)
@@ -65,6 +68,7 @@ class TkfsProvider : DocumentsProvider() {
 
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
         val cursor = MatrixCursor(projection ?: documentColumns)
+        cursor.setNotificationUri(resolver(), DocumentsContract.buildDocumentUri(AUTHORITY, documentId))
         val (folder, path) = DocumentIds.split(documentId)
         addRow(cursor, documentId, JSONObject(orNotFound { Native.stat(folder, path) }), path)
         return cursor
@@ -76,7 +80,10 @@ class TkfsProvider : DocumentsProvider() {
         sortOrder: String?,
     ): Cursor {
         val cursor = MatrixCursor(projection ?: documentColumns)
+        cursor.setNotificationUri(resolver(), DocumentsContract.buildChildDocumentsUri(AUTHORITY, parentDocumentId))
         val (folder, path) = DocumentIds.split(parentDocumentId)
+        // Answered from what is known; a burst behind it brings what is new and notifies.
+        SyncCoordinator.onListing(requireNotNull(context), folder)
         val entries = JSONArray(orNotFound { Native.list(folder, path) })
         for (index in 0 until entries.length()) {
             val entry = entries.getJSONObject(index)
@@ -106,7 +113,7 @@ class TkfsProvider : DocumentsProvider() {
     /** `DocumentsProvider` handles the `android:` methods; `tkfs.` ones are the harness's. */
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         if (method.startsWith("tkfs.") && ShellControl.admits(BuildConfig.DEBUG, Binder.getCallingUid())) {
-            ShellControl.answer(method, arg, extras)?.let { return it }
+            ShellControl.answer(requireNotNull(context), method, arg, extras)?.let { return it }
         }
         return super.call(method, arg, extras)
     }
@@ -137,7 +144,10 @@ class TkfsProvider : DocumentsProvider() {
         throw FileNotFoundException(error.message)
     }
 
-    private companion object {
-        const val TAG = "tkfs"
+    private fun resolver() = requireNotNull(context).contentResolver
+
+    companion object {
+        const val AUTHORITY = "dev.tkfs.documents"
+        private const val TAG = "tkfs"
     }
 }

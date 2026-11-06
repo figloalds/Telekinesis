@@ -1,5 +1,6 @@
 package dev.tkfs.ui
 
+import dev.tkfs.sync.BurstError
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -37,13 +38,21 @@ class SnapshotTest {
 
     @Test fun aDownLaneIsAnUnreachablePcAndABurstErrorShowsOnItsFolder() {
         val lane = """{"state": "Backoff", "last_error": "WS_CONNECT_FAILED: refused", "error": "x"}"""
-        val snapshot = parseSnapshot(status(lane), mapOf("f1" to "SYNC_NOW_TIMEOUT: late"))
+        val snapshot = parseSnapshot(status(lane), mapOf("f1" to BurstError("SYNC_NOW_TIMEOUT: late", 1000)))
         assertTrue(snapshot.unreachable)
         assertEquals("SYNC_NOW_TIMEOUT: late", snapshot.folders.single().error)
     }
 
-    @Test fun burstErrorsAreReadByFolderId() {
-        val reply = """{"folders": [{"id": "a", "error": null}, {"id": "b", "error": "SYNC_NOW_TIMEOUT: x"}]}"""
-        assertEquals(mapOf("b" to "SYNC_NOW_TIMEOUT: x"), parseBurstErrors(reply))
+    @Test fun aBurstErrorGoesWhenTheFolderReportsANewerExchange() {
+        val lane = """{"state": "Ready", "last_error": null}"""
+        val older = mapOf("f1" to BurstError("SYNC_NOW_TIMEOUT: late", 999))
+        assertEquals(null, parseSnapshot(status(lane), older).folders.single().error)
+        val same = mapOf("f1" to BurstError("SYNC_NOW_TIMEOUT: late", 1000))
+        assertEquals("SYNC_NOW_TIMEOUT: late", parseSnapshot(status(lane), same).folders.single().error)
+    }
+
+    @Test fun exchangesAreReadByFolderId() {
+        val lane = """{"state": "Ready", "last_error": null}"""
+        assertEquals(mapOf("f1" to 1000L), parseExchanges(status(lane)))
     }
 }

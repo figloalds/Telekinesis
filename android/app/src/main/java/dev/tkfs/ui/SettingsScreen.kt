@@ -27,6 +27,8 @@ import androidx.compose.ui.unit.dp
 fun SettingsScreen(
     ui: AppUi,
     onBack: () -> Unit,
+    onSyncOnMobile: (Boolean) -> Unit,
+    onPeriod: (Int) -> Unit,
     onChangeAddress: (installation: String, endpoint: String) -> Unit,
     onUnpair: (installation: String) -> Unit,
 ) {
@@ -36,9 +38,11 @@ fun SettingsScreen(
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
             // The rows below the PCs are the places later tasks fill in.
             Setting("Sync on mobile data", "Off: only file lists update. Files you open still download.") {
-                Switch(checked = false, onCheckedChange = null, enabled = false)
+                Switch(checked = ui.syncOnMobile, onCheckedChange = onSyncOnMobile)
             }
-            Setting("Background check", "Every 30 min")
+            Setting("Background check", "Every ${periodWords(ui.periodMinutes)}") {
+                TextButton(onClick = { onPeriod(nextPeriod(ui.periodMinutes)) }) { Text("Change") }
+            }
             Setting("Keep this much free", "Oldest downloads go first.")
             Setting("Battery", "Allowed to run in the background")
             if (peers.isEmpty()) {
@@ -114,3 +118,10 @@ private fun PcRow(
         )
     }
 }
+
+/** The intervals "Background check" steps through; WorkManager runs a periodic job no more often than 15 min. */
+private val PERIODS = listOf(15, 30, 60, 120)
+
+private fun nextPeriod(current: Int): Int = PERIODS.firstOrNull { it > current } ?: PERIODS.first()
+
+private fun periodWords(minutes: Int): String = if (minutes % 60 == 0 && minutes >= 60) "${minutes / 60} h" else "$minutes min"

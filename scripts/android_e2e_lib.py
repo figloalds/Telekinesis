@@ -342,10 +342,18 @@ class Device:
                                 bound=bound)
         return json.loads(parse_call(called.out or called.err))
 
-    def call_method(self, method: str) -> str:
-        """What `content call` prints for a provider method with no arguments."""
-        called = self._provider(shell_line(["content", "call", "--uri", CONTROL_URI, "--method", method]))
+    def call_method(self, method: str, arg: str | None = None) -> str:
+        """What `content call` prints for a provider method, with its one argument if any."""
+        words = ["content", "call", "--uri", CONTROL_URI, "--method", method]
+        called = self._provider(shell_line(words + (["--arg", arg] if arg is not None else [])))
         return called.out or called.err
+
+    def set_last_sync(self, ago_s: float) -> None:
+        """Makes every folder's sync clock in the app read `ago_s` seconds ago (a debug build)."""
+        wanted = int((time.time() - ago_s) * 1000)
+        reply = self.call_method("tkfs.set_last_sync", str(wanted))
+        if "result=" not in reply:
+            raise HarnessError(f"tkfs.set_last_sync printed: {reply}")
 
     def _provider(self, line: str, bound: float = ADB_BOUND) -> Completed:
         """Runs a `content` command line, again if Android could not bring the provider up.

@@ -12,6 +12,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import dev.tkfs.Native
+import dev.tkfs.sync.SyncCoordinator
 
 /** The app's one window: the screen is a value in the state, with no navigation library. */
 class MainActivity : ComponentActivity() {
@@ -20,6 +21,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Native.ensureStarted(this)
+        SyncCoordinator.schedulePeriodic(this)
         setContent {
             TkfsTheme {
                 Surface(Modifier.fillMaxSize()) {
@@ -42,6 +44,8 @@ class MainActivity : ComponentActivity() {
                         Screen.Settings -> SettingsScreen(
                             ui,
                             onBack = { model.show(Screen.Folders) },
+                            onSyncOnMobile = model::setSyncOnMobile,
+                            onPeriod = model::setPeriodMinutes,
                             onChangeAddress = model::changeAddress,
                             onUnpair = model::unpair,
                         )
@@ -53,6 +57,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
+        SyncCoordinator.onForeground(this)
         model.startPolling()
     }
 

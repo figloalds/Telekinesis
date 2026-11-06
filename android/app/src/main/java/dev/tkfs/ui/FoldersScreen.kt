@@ -13,9 +13,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -26,18 +28,22 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import dev.tkfs.R
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FoldersScreen(ui: AppUi, onSync: () -> Unit, onAddPc: () -> Unit, onSettings: () -> Unit) {
     val snapshot = ui.snapshot
     Column(Modifier.fillMaxSize()) {
         ScreenBar("Telekinesis") { TextButton(onClick = onSettings) { Text("Settings") } }
-        Column(Modifier.weight(1f).padding(horizontal = 16.dp)) {
-            when {
-                snapshot == null -> Text("Starting...", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                snapshot.folders.isEmpty() -> Empty(snapshot, onAddPc)
-                else -> FolderList(snapshot, ui.now, onAddPc)
+        // Pulling down is the same as "Sync now".
+        PullToRefreshBox(isRefreshing = ui.syncing, onRefresh = onSync, modifier = Modifier.weight(1f)) {
+            Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+                when {
+                    snapshot == null -> Text("Starting...", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    snapshot.folders.isEmpty() -> Empty(snapshot, onAddPc)
+                    else -> FolderList(snapshot, ui.now, onAddPc)
+                }
+                FailureNote(ui.failure ?: ui.pollFailure)
             }
-            FailureNote(ui.failure ?: ui.pollFailure)
         }
         Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 16.dp)) {
             Button(

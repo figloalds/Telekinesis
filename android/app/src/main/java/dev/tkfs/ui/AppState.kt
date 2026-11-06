@@ -6,6 +6,11 @@ import android.text.format.Formatter
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.tkfs.Native
+import dev.tkfs.Settings
+import dev.tkfs.sync.BurstError
+import dev.tkfs.sync.Finished
+import dev.tkfs.sync.SyncCoordinator
+import dev.tkfs.sync.Trigger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -54,6 +59,8 @@ data class AppUi(
     val pollFailure: Failure? = null,
     val pairing: Pairing = Pairing.Fields,
     val storage: String = "",
+    val syncOnMobile: Boolean = false,
+    val periodMinutes: Int = 30,
     val now: Long = System.currentTimeMillis(),
 )
 
@@ -79,8 +86,16 @@ class AppModel(application: Application) : AndroidViewModel(application) {
     val state: StateFlow<AppUi> = mutable
 
     private var polling: Job? = null
-    private var bursts: Map<String, String> = emptyMap()
+    private val settings = Settings.of(application)
+    private var bursts: Map<String, BurstError> = emptyMap()
     private var polls = 0
+    private var seen = SyncCoordinator.finished.value?.serial ?: 0L
+
+    init {
+        mutable.update { it.copy(syncOnMobile = settings.syncOnMobile, periodMinutes = settings.periodMinutes) }
+        viewModelScope.launch { SyncCoordinator.running.collect { running -> mutable.update { it.copy(syncing = running) } } }
+        viewModelScope.launch { SyncCoordinator.finished.collect { it?.let { finished -> burstEnded(finished) } } }
+    }
 
     fun startPolling() {
         if (polling?.isActive == true) return
@@ -117,13 +132,33 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.polled(snapshot, storage, System.currentTimeMillis()) }
     }
 
-    /** One burst for every folder; the errors it reports stay on their folders until the next. */
+    /** One burst for every folder. Its errors stay on their folders until a newer exchange. */
     fun syncNow() {
-        viewModelScope.launch {
-            mutable.update { it.copy(failure = null) }
-            runBurst()
-            refresh()
+        mutable.update { it.copy(failure = null) }
+        SyncCoordinator.syncNow(getApplication())
+    }
+
+    /** Any burst, whoever started it, replaces the folders' errors; only the owner's own shows a failure. */
+    private suspend fun burstEnded(finished: Finished) {
+        if (finished.serial <= seen) return
+        seen = finished.serial
+        bursts = finished.result.errors
+        val failure = finished.result.failure
+        if (failure != null && finished.trigger == Trigger.Manual) {
+            mutable.update { it.copy(failure = Failure.of(IOException(failure))) }
         }
+        refresh()
+    }
+
+    fun setSyncOnMobile(on: Boolean) {
+        settings.syncOnMobile = on
+        mutable.update { it.copy(syncOnMobile = on) }
+    }
+
+    fun setPeriodMinutes(minutes: Int) {
+        settings.periodMinutes = minutes
+        mutable.update { it.copy(periodMinutes = minutes) }
+        SyncCoordinator.schedulePeriodic(getApplication(), replace = true)
     }
 
     fun pair(endpoint: String, code: String) {
@@ -137,7 +172,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
                 if (fresh.isEmpty()) {
                     // The same PC again: its folders are already here, and a burst resumes them.
                     mutable.update { it.copy(screen = Screen.Folders, pairing = Pairing.Fields) }
-                    runBurst()
+                    SyncCoordinator.syncNow(getApplication())
                 } else {
                     mutable.update {
                         it.copy(pairing = Pairing.Choose(endpoint, fresh, fresh.map { f -> f.repo }.toSet()))
@@ -169,7 +204,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
                     call("receive", payload)
                 }
                 mutable.update { it.copy(screen = Screen.Folders, pairing = Pairing.Fields) }
-                runBurst()
+                SyncCoordinator.syncNow(getApplication())
             } catch (error: IOException) {
                 mutable.update { it.copy(pairing = pairing, failure = Failure.of(error)) }
             }
@@ -193,16 +228,6 @@ class AppModel(application: Application) : AndroidViewModel(application) {
             }
             refresh()
         }
-    }
-
-    private suspend fun runBurst() {
-        mutable.update { it.copy(syncing = true) }
-        try {
-            bursts = parseBurstErrors(call("sync-now"))
-        } catch (error: IOException) {
-            mutable.update { it.copy(failure = Failure.of(error)) }
-        }
-        mutable.update { it.copy(syncing = false) }
     }
 
     private suspend fun call(action: String, payload: JSONObject = JSONObject()): String =

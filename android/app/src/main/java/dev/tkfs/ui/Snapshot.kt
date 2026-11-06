@@ -1,5 +1,6 @@
 package dev.tkfs.ui
 
+import dev.tkfs.sync.BurstError
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -26,9 +27,10 @@ private val DOWN = setOf("Backoff", "Unauthorized", "Incompatible")
 
 /**
  * The reply of `status`: its `folders` (`folder_entry` in the hub) and its `peers`
- * (`Network::peers`). `bursts` holds the error of each folder's last "Sync now", by folder id.
+ * (`Network::peers`). `bursts` holds the error of each folder's last burst, by folder id; one
+ * goes once the folder reports an exchange newer than the burst's.
  */
-fun parseSnapshot(reply: String, bursts: Map<String, String> = emptyMap()): Snapshot {
+fun parseSnapshot(reply: String, bursts: Map<String, BurstError> = emptyMap()): Snapshot {
     val status = JSONObject(reply)
     val peers = status.optJSONArray("peers").objects().mapNotNull { peer ->
         val endpoint = peer.optStringOrNull("endpoint") ?: return@mapNotNull null
@@ -46,16 +48,15 @@ fun parseSnapshot(reply: String, bursts: Map<String, String> = emptyMap()): Snap
     val folders = status.optJSONArray("folders").objects().map { entry ->
         val record = entry.getJSONObject("record")
         val id = record.getString("id")
-        val exchanges = entry.optJSONObject("sync")?.let { sync ->
-            sync.keys().asSequence().mapNotNull { sync.getJSONObject(it).optLongOrNull("last_exchange_ms") }
-        }
+        val lastSync = lastExchange(entry)
         FolderStatus(
             id = id,
             label = record.getString("label"),
-            error = entry.optStringOrNull("error") ?: revoked ?: bursts[id],
+            error = entry.optStringOrNull("error") ?: revoked
+                ?: bursts[id]?.takeIf { it.stillApplies(lastSync) }?.message,
             conflicts = entry.optInt("conflicts", 0),
             pcReachable = reachable,
-            lastSyncMs = exchanges?.maxOrNull(),
+            lastSyncMs = lastSync,
             repo = record.optString("repo"),
         )
     }
@@ -68,11 +69,15 @@ data class Published(val repo: String, val label: String)
 fun parsePublished(reply: String): List<Published> =
     JSONArray(reply).objects().map { Published(it.getString("repo"), it.getString("label")) }
 
-/** `sync-now`'s `folders[].error` by folder id; folders that synced are left out. */
-fun parseBurstErrors(reply: String): Map<String, String> =
+/** Each folder's newest `last_exchange_ms` in a `status` reply, by folder id; none for a folder with none. */
+fun parseExchanges(reply: String): Map<String, Long> =
     JSONObject(reply).optJSONArray("folders").objects()
-        .mapNotNull { folder -> folder.optStringOrNull("error")?.let { folder.getString("id") to it } }
+        .mapNotNull { entry -> lastExchange(entry)?.let { entry.getJSONObject("record").getString("id") to it } }
         .toMap()
+
+private fun lastExchange(entry: JSONObject): Long? = entry.optJSONObject("sync")?.let { sync ->
+    sync.keys().asSequence().mapNotNull { sync.getJSONObject(it).optLongOrNull("last_exchange_ms") }.maxOrNull()
+}
 
 private fun JSONArray?.objects(): List<JSONObject> =
     if (this == null) emptyList() else (0 until length()).map { getJSONObject(it) }
