@@ -155,16 +155,21 @@ impl Presence {
 }
 /// Most files whose being whole is remembered. A listing of one large folder stays within it.
 const PRESENCE_CACHE_LIMIT: usize = 16_384;
-/// The content that was whole when last looked at, by its digest. A digest names its bytes, so
-/// the answer holds for any file that has them. Only whole files are kept, and the oldest go first.
+/// The content that was whole when last looked at, by its digest, with the pack store's
+/// generation then. A digest names its bytes, so the answer holds for any file that has them,
+/// for as long as nothing was removed from the packs. Only whole files are kept, and the oldest
+/// go first.
 #[derive(Default)]
 struct PresenceCache {
     whole: HashMap<Digest, u64>,
     order: VecDeque<Digest>,
 }
 impl PresenceCache {
-    fn insert(&mut self, digest: Digest, local_bytes: u64) {
-        if self.whole.insert(digest, local_bytes).is_none() {
+    fn is_whole(&self, digest: &Digest, generation: u64) -> bool {
+        self.whole.get(digest) == Some(&generation)
+    }
+    fn insert(&mut self, digest: Digest, generation: u64) {
+        if self.whole.insert(digest, generation).is_none() {
             self.order.push_back(digest);
         }
         while self.whole.len() > PRESENCE_CACHE_LIMIT {
@@ -425,39 +430,37 @@ impl Engine {
             });
         };
         let content = self.working.content();
-        let cached = lock(&self.presence_cache)
-            .whole
-            .get(&reference.digest)
-            .copied();
-        let held = match cached {
-            Some(held) => held,
-            None => {
-                let held = match content.chunks_if_local(reference)? {
-                    None => 0,
-                    Some(chunks) => {
-                        let mut held = 0;
-                        for (index, digest) in chunks.iter().enumerate() {
-                            if content.packs.contains(*digest)? {
-                                held += (reference.total_len - index as u64 * CHUNK_SIZE)
-                                    .min(CHUNK_SIZE);
-                            }
-                        }
-                        held
-                    }
-                };
-                if held == reference.total_len {
-                    lock(&self.presence_cache).insert(reference.digest, held);
+        // Read before looking, so a removal during the look makes the answer stale, not wrong.
+        let generation = content.packs.generation();
+        let cached = lock(&self.presence_cache).is_whole(&reference.digest, generation);
+        let chunk_count = reference.total_len.div_ceil(CHUNK_SIZE).max(1) as usize;
+        let held = if cached {
+            vec![true; chunk_count]
+        } else {
+            let mut held = vec![false; chunk_count];
+            if let Some(chunks) = content.chunks_if_local(reference)? {
+                for (index, digest) in chunks.iter().enumerate() {
+                    held[index] = content.packs.contains(*digest)?;
                 }
-                held
             }
+            held
         };
-        // A draft shows its own length. What it keeps of the file it was made from is here only
-        // if all of that is.
+        let all = held.iter().all(|here| *here);
+        if all && !cached {
+            lock(&self.presence_cache).insert(reference.digest, generation);
+        }
+        // A draft shows its own length. Of the file it was made from it keeps only the part
+        // inside that length, and that is here only if the chunks of that part are.
         let total_bytes = entry.working_len.unwrap_or(reference.total_len);
-        let local_bytes = if held == reference.total_len {
+        let local_bytes = if all {
             total_bytes
         } else {
-            held.min(total_bytes)
+            let visible = total_bytes.min(reference.total_len);
+            held.iter()
+                .enumerate()
+                .filter(|(index, here)| **here && (*index as u64) * CHUNK_SIZE < visible)
+                .map(|(index, _)| (visible - index as u64 * CHUNK_SIZE).min(CHUNK_SIZE))
+                .sum()
         };
         Ok(Presence {
             local_bytes,
@@ -2227,10 +2230,79 @@ mod tests {
     }
 
     #[test]
+    fn presence_drops_when_a_collect_removes_what_it_remembered_whole() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        partly_here(&engine, "/whole", 3, 0, &[0, 1, 2], true)?;
+        assert!(engine.presence("/whole")?.is_whole());
+        assert_eq!(lock(&engine.presence_cache).whole.len(), 1);
+        let content = engine.working.content();
+        let generation = content.packs.generation();
+        // Adding objects removes nothing.
+        content.import(b"another file")?;
+        assert_eq!(content.packs.generation(), generation);
+        assert!(engine.presence("/whole")?.is_whole());
+        // Fill the segment the file is in, so that a collect may drop what is in it.
+        let mut filler = vec![0u8; CHUNK_SIZE as usize];
+        for index in 0..(crate::content::SEGMENT_BYTES / CHUNK_SIZE + 8) {
+            filler[..8].copy_from_slice(&(index + 1_000_000).to_le_bytes());
+            content.packs.put(Kind::Chunk, &filler)?;
+        }
+        content
+            .packs
+            .collect(&std::collections::BTreeSet::new(), 1.0)?;
+        assert_ne!(content.packs.generation(), generation);
+        let presence = engine.presence("/whole")?;
+        assert_eq!(presence.local_bytes, 0, "{presence:?}");
+        assert!(!presence.is_whole());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// The presence of a file of 4 chunks of which `held` are here, as a draft of `len` bytes shows it.
+    fn draft_presence(held: &[u64], len: u64) -> Result<Presence> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        partly_here(&engine, "/f", 4, 0, held, true)?;
+        let mut entry = engine.lookup("/f")?;
+        entry.working_len = Some(len);
+        let presence = engine.entry_presence(&entry)?;
+        engine.shutdown()?;
+        Ok(presence)
+    }
+
+    #[test]
+    fn a_draft_cut_short_is_here_only_if_the_chunks_it_keeps_are() -> Result<()> {
+        // Chunks 2 and 3 are here, and the draft keeps only the first chunk: which is not.
+        let presence = draft_presence(&[2, 3], CHUNK_SIZE)?;
+        assert_eq!(presence.local_bytes, 0);
+        assert!(!presence.is_whole());
+        // The chunk it keeps is here: whole, whatever else is missing.
+        let presence = draft_presence(&[0], CHUNK_SIZE)?;
+        assert!(presence.is_whole());
+        assert_eq!(presence.total_bytes, CHUNK_SIZE);
+        // Two chunks kept, one of them here.
+        let presence = draft_presence(&[0, 2, 3], 2 * CHUNK_SIZE)?;
+        assert_eq!(
+            presence,
+            Presence {
+                local_bytes: CHUNK_SIZE,
+                total_bytes: 2 * CHUNK_SIZE
+            }
+        );
+        // A cut inside a chunk keeps part of it.
+        let presence = draft_presence(&[0], 10)?;
+        assert!(presence.is_whole());
+        let presence = draft_presence(&[1], 10)?;
+        assert_eq!(presence.local_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
     fn the_whole_files_remembered_stay_within_their_bound() {
         let mut cache = PresenceCache::default();
         for index in 0..PRESENCE_CACHE_LIMIT as u64 + 10 {
-            cache.insert(Digest::bytes(&index.to_le_bytes()), index);
+            cache.insert(Digest::bytes(&index.to_le_bytes()), 0);
         }
         assert_eq!(cache.whole.len(), PRESENCE_CACHE_LIMIT);
         assert_eq!(cache.order.len(), PRESENCE_CACHE_LIMIT);

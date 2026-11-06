@@ -103,6 +103,9 @@ struct Inner {
     state: Mutex<State>,
     cache_limit: usize,
     segment_limit: u64,
+    /// Bumped before any object is removed, so an answer about what is here can tell it was
+    /// given before a removal. See [`PackStore::generation`].
+    generation: std::sync::atomic::AtomicU64,
 }
 #[derive(Clone)]
 pub struct PackStore {
@@ -183,6 +186,7 @@ impl PackStore {
             root: root.clone(),
             cache_limit,
             segment_limit,
+            generation: std::sync::atomic::AtomicU64::new(0),
             state: Mutex::new(State {
                 db,
                 segment,
@@ -334,6 +338,7 @@ impl PackStore {
                 .db
                 .execute_cached("DELETE FROM objects WHERE digest=?1", [&digest.0[..]])?;
             state.pending.remove(&digest);
+            self.bump_generation();
             anyhow::bail!("OBJECT_CORRUPT: {digest}");
         }
         state.verified_reads += 1;
@@ -370,6 +375,19 @@ impl PackStore {
             digests,
         }
     }
+    /// A number that changes whenever objects may have been removed (`collect`, or a corrupt object
+    /// dropped). An answer to "is this here" that was true under one generation holds only while it
+    /// stays. Adding objects does not change it.
+    pub fn generation(&self) -> u64 {
+        self.inner
+            .generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn bump_generation(&self) {
+        self.inner
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     pub fn contains(&self, digest: Digest) -> Result<bool> {
         Ok(Self::location(&mut guard(&self.inner.state), digest)?.is_some())
     }
@@ -393,6 +411,9 @@ impl PackStore {
         ensure!((0.0..=1.0).contains(&threshold), "INVALID_GC_THRESHOLD");
         let mut state = guard(&self.inner.state);
         Self::flush_locked(&mut state)?;
+        // Before anything is removed, and whether or not this ends in an error: what was said of
+        // what is here before this is no longer to be believed.
+        self.bump_generation();
         // GC can relocate live entries or delete dead ones. Invalidate before
         // any index mutation so error/partial-completion paths are safe too.
         state.locations.clear();
