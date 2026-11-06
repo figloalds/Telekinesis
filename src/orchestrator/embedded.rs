@@ -223,57 +223,63 @@ impl Launcher for ThreadLauncher {
             workers.push(handle.clone());
         }
         let (ready_tx, ready_rx) = mpsc::channel::<Ready>();
-        {
-            let sink = sink.clone();
-            let handle = handle.clone();
+        // Both threads or neither: on a failure nothing will ever run this
+        // worker, so its engine must not be handed out and it must not look
+        // stranded. (Dropping the closure drops `ready_tx`, ending the other.)
+        let started = (|| -> std::io::Result<()> {
+            let ready_sink = sink.clone();
+            let ready_handle = handle.clone();
             thread::Builder::new()
                 .name("tkfs-embedded-ready".into())
                 .spawn(move || {
                     if let Ok(ready) = ready_rx.recv() {
-                        *lock(&handle.instance) = Some(ready.instance.clone());
-                        let _ = sink.send(ProcessEvent::Ready(ready));
+                        *lock(&ready_handle.instance) = Some(ready.instance.clone());
+                        let _ = ready_sink.send(ProcessEvent::Ready(ready));
                     }
                 })?;
+            let exiting = handle.clone();
+            let (shared, state) = (shared.clone(), state.clone());
+            thread::Builder::new()
+                .name("tkfs-embedded-worker".into())
+                .spawn(move || {
+                    let options = worker::Options {
+                        supervised: false,
+                        mount: None,
+                        on_ready: Some(ready_tx),
+                    };
+                    let result = worker::run(engine, options);
+                    lock(&shared.engines).remove(&state);
+                    exiting.exited.store(true, Ordering::Release);
+                    let code = match result {
+                        Ok(()) => Some(0),
+                        Err(error) => {
+                            let fatal = match error.downcast::<Fatal>() {
+                                Ok(fatal) => fatal,
+                                Err(error) => Fatal::new(
+                                    "WORKER_ERROR",
+                                    format!("{error:#}"),
+                                    worker::EXIT_INTERNAL,
+                                ),
+                            };
+                            let _ = sink.send(ProcessEvent::Fatal {
+                                code: fatal.code.clone(),
+                                message: fatal.message.clone(),
+                            });
+                            Some(fatal.exit)
+                        }
+                    };
+                    let _ = sink.send(ProcessEvent::Exited {
+                        code,
+                        tail: String::new(),
+                    });
+                })?;
+            Ok(())
+        })();
+        if let Err(error) = started {
+            lock(&self.0.engines).remove(&spec.state);
+            handle.exited.store(true, Ordering::Release);
+            return Err(error.into());
         }
-        let exiting = handle.clone();
-        thread::Builder::new()
-            .name("tkfs-embedded-worker".into())
-            .spawn(move || {
-                let options = worker::Options {
-                    supervised: false,
-                    mount: None,
-                    on_ready: Some(ready_tx),
-                };
-                let result = worker::run(engine, options);
-                lock(&shared.engines).remove(&state);
-                exiting.exited.store(true, Ordering::Release);
-                let code = match result {
-                    Ok(()) => Some(0),
-                    Err(error) => {
-                        let fatal = match error.downcast::<Fatal>() {
-                            Ok(fatal) => fatal,
-                            Err(error) => Fatal::new(
-                                "WORKER_ERROR",
-                                format!("{error:#}"),
-                                worker::EXIT_INTERNAL,
-                            ),
-                        };
-                        let _ = sink.send(ProcessEvent::Fatal {
-                            code: fatal.code.clone(),
-                            message: fatal.message.clone(),
-                        });
-                        Some(fatal.exit)
-                    }
-                };
-                let _ = sink.send(ProcessEvent::Exited {
-                    code,
-                    tail: String::new(),
-                });
-            })
-            .inspect_err(|_| {
-                // No thread will ever run it: it must not look stranded.
-                handle.exited.store(true, Ordering::Release);
-            })?;
         Ok(WorkerProcess::embedded(handle))
     }
 
@@ -292,22 +298,14 @@ impl Launcher for ThreadLauncher {
 
     /// A thread cannot be killed: asks it to stop and waits, bounded, so the
     /// store's lock is free before the controller starts the next worker.
-    /// A record naming no known instance means a worker not yet `Ready`: the
-    /// only such worker, if there is exactly one.
+    /// Matches by instance only: a record exists only after `Ready`, and a
+    /// worker that has not reached it is stopped through its
+    /// [`WorkerProcess`] and waited for by [`Host::stop`].
     fn kill_verified(&self, record: &WorkerRecord) -> Result<bool> {
-        let worker = {
-            let workers = lock(&self.0.workers);
-            let named = workers
-                .iter()
-                .find(|worker| lock(&worker.instance).as_deref() == Some(record.instance.as_str()));
-            named.cloned().or_else(|| {
-                let mut unready = workers
-                    .iter()
-                    .filter(|worker| !worker.exited() && lock(&worker.instance).is_none());
-                let only = unready.next()?;
-                unready.next().is_none().then(|| only.clone())
-            })
-        };
+        let worker = lock(&self.0.workers)
+            .iter()
+            .find(|worker| lock(&worker.instance).as_deref() == Some(record.instance.as_str()))
+            .cloned();
         let Some(worker) = worker else {
             return Ok(false);
         };
@@ -328,39 +326,101 @@ impl Launcher for ThreadLauncher {
 mod tests {
     use super::*;
 
-    /// A worker that has not reported `Ready` is registered at spawn, so a
-    /// kill naming it by the record the controller would hold still waits for
-    /// its thread instead of answering `false`.
-    #[test]
-    fn a_kill_before_ready_stops_and_waits_for_the_thread() {
-        let shared = Arc::new(Shared {
+    fn shared() -> Arc<Shared> {
+        Arc::new(Shared {
             daemon: OnceLock::new(),
             failure: Mutex::new(None),
             finished: AtomicBool::new(false),
             engines: Mutex::new(BTreeMap::new()),
             workers: Mutex::new(Vec::new()),
-        });
-        let launcher = ThreadLauncher(shared.clone());
-        let state = tempfile::tempdir().unwrap();
+        })
+    }
+
+    fn spawn(
+        launcher: &ThreadLauncher,
+        dir: &Path,
+        name: &str,
+    ) -> (WorkerProcess, mpsc::Receiver<ProcessEvent>) {
         let spec = LaunchSpec {
             executable: PathBuf::new(),
-            state: state.path().join("folder"),
+            state: dir.join(name),
             mount: None,
         };
-        let (sink, _events) = mpsc::channel();
-        let process = launcher.spawn(&spec, sink).unwrap();
-        let record = WorkerRecord {
+        let (sink, events) = mpsc::channel();
+        (launcher.spawn(&spec, sink).unwrap(), events)
+    }
+
+    fn record(instance: &str) -> WorkerRecord {
+        WorkerRecord {
             format: 1,
-            pid: process.pid,
+            pid: std::process::id(),
             start_ms: 0,
             image: PathBuf::new(),
             version: String::new(),
-            instance: "not-yet-known".into(),
+            instance: instance.into(),
             address: String::new(),
             ipc: 0,
+        }
+    }
+
+    fn wait_exited(process: &WorkerProcess) {
+        let end = Instant::now() + Duration::from_secs(20);
+        while !process.exited().unwrap() {
+            assert!(Instant::now() < end, "worker did not exit");
+            thread::sleep(POLL);
+        }
+    }
+
+    #[test]
+    fn a_record_naming_no_known_instance_stops_no_worker() {
+        let launcher = ThreadLauncher(shared());
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _a_events) = spawn(&launcher, dir.path(), "a");
+        let (b, _b_events) = spawn(&launcher, dir.path(), "b");
+        assert!(!launcher.kill_verified(&record("stale")).unwrap());
+        assert!(!a.exited().unwrap());
+        assert!(!b.exited().unwrap());
+        a.kill().unwrap();
+        b.kill().unwrap();
+        wait_exited(&a);
+        wait_exited(&b);
+    }
+
+    #[test]
+    fn a_ready_named_worker_is_found_and_stopped() {
+        let launcher = ThreadLauncher(shared());
+        let dir = tempfile::tempdir().unwrap();
+        let (a, events) = spawn(&launcher, dir.path(), "a");
+        let (other, _other_events) = spawn(&launcher, dir.path(), "other");
+        let ready = loop {
+            match events.recv_timeout(Duration::from_secs(20)).unwrap() {
+                ProcessEvent::Ready(ready) => break ready,
+                _ => continue,
+            }
         };
-        assert!(launcher.kill_verified(&record).unwrap());
-        assert!(process.exited().unwrap());
+        assert!(launcher.kill_verified(&record(&ready.instance)).unwrap());
+        assert!(a.exited().unwrap());
+        assert!(!other.exited().unwrap(), "an unrelated worker was stopped");
+        other.kill().unwrap();
+        wait_exited(&other);
+    }
+
+    #[test]
+    fn host_stop_waits_for_a_worker_stopped_before_ready() {
+        let shared = shared();
+        // An orchestrator that already ended, so `stop` goes straight to workers.
+        *lock(&shared.failure) = Some("ended".into());
+        shared.finished.store(true, Ordering::Release);
+        let launcher = ThreadLauncher(shared.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (worker, _events) = spawn(&launcher, dir.path(), "a");
+        assert!(worker.kill().unwrap());
+        let host = Host {
+            shared: shared.clone(),
+            orchestrator: Mutex::new(None),
+        };
+        host.stop().unwrap();
+        assert!(worker.exited().unwrap());
         assert!(lock(&shared.workers).iter().all(|worker| worker.exited()));
     }
 }
