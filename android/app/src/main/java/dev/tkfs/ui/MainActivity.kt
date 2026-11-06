@@ -45,13 +45,21 @@ class MainActivity : ComponentActivity() {
                     val choosing = ui.pairing is Pairing.Choose
                     LaunchedEffect(choosing) { if (choosing) askForNotifications() }
                     BackHandler(enabled = ui.screen != Screen.Folders) { model.show(Screen.Folders) }
-                    when (ui.screen) {
+                    when (val screen = ui.screen) {
                         Screen.Folders -> FoldersScreen(
                             ui,
                             onSync = model::syncNow,
                             onAddPc = { model.show(Screen.AddPc) },
                             onSettings = { model.show(Screen.Settings) },
                             onDismissShareFailures = model::dismissShareFailures,
+                            onDismissOpenFailures = model::dismissOpenFailures,
+                            onOpenFolder = { model.show(Screen.Browse(it.id, it.label)) },
+                        )
+                        is Screen.Browse -> BrowseScreen(
+                            screen.folder,
+                            screen.label,
+                            waitingFiles = ui.snapshot?.folders?.firstOrNull { it.id == screen.folder }?.waiting ?: 0,
+                            onBack = { model.show(Screen.Folders) },
                         )
                         Screen.AddPc -> AddPcScreen(
                             ui,

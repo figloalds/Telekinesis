@@ -9,7 +9,12 @@ use tkfs::model::errors::is_known;
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 const SOURCES: &[&str] = &["android/app/src/main/java", "android/native/src"];
 /// Raised by the app and nothing else, so its user meets them nowhere else.
-const ONLY_THE_APP_RAISES: &[&str] = &["INVALID_DOCUMENT_ID", "NATIVE_PANIC", "PHONE_DB_UNAVAILABLE"];
+const ONLY_THE_APP_RAISES: &[&str] = &[
+    "INVALID_DOCUMENT_ID",
+    "NATIVE_PANIC",
+    "PC_UNREACHABLE",
+    "PHONE_DB_UNAVAILABLE",
+];
 
 fn source_files(dir: &Path, found: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap() {

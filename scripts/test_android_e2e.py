@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import android_e2e
 from android_e2e_lib import (Completed, Device, Emulator, GiveUp, HarnessError, ManageError, PcHost, Proc, Report,
                              Session, bounds_center, children_uri, document_uri, emulator_processes, encode_payload,
-                             is_frozen, parse_call, parse_rows, poll, run_bounded, shell_line, split_qr,
+                             is_frozen, parse_call, parse_rows, png_noise, poll, run_bounded, shell_line, size_text, split_qr,
                              watched_processes, with_parents)
 
 
@@ -596,3 +596,29 @@ class OlderPc(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BrowseHelpers(unittest.TestCase):
+    def test_sizes_read_as_the_app_words_them(self):
+        # The same cases as the app's FileRowTest: a row's line is checked against these.
+        cases = {999: "999 B", 1_000: "1.0 kB", 3_400_000: "3.4 MB", 812_000_000: "812 MB",
+                 1_500_000_000: "1.5 GB", 12_300_000_000: "12 GB", 0: "0 B", 999_999: "1.0 MB"}
+        for size, text in cases.items():
+            self.assertEqual(size_text(size), text, size)
+
+    def test_a_noise_png_is_a_png_that_does_not_shrink(self):
+        import struct
+        import zlib
+        data = png_noise(3, 40)
+        self.assertEqual(data[:8], b"\x89PNG\r\n\x1a\n")
+        width, height = struct.unpack(">II", data[16:24])
+        self.assertEqual((width, height), (40, 40))
+        self.assertEqual(data, png_noise(3, 40))
+        self.assertNotEqual(data, png_noise(4, 40))
+        self.assertGreater(len(data), 40 * 40 * 3)
+        idat = data.index(b"IDAT")
+        length = struct.unpack(">I", data[idat - 4:idat])[0]
+        self.assertEqual(len(zlib.decompress(data[idat + 4:idat + 4 + length])), 40 * (1 + 40 * 3))
+
+    def test_the_browse_scenario_is_listed(self):
+        self.assertIn("ui_browse", android_e2e.SCENARIOS)

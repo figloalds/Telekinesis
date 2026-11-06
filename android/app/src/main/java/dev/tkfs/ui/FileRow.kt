@@ -7,7 +7,7 @@ import java.util.Locale
  * phone, or not downloaded. `kept` is true only for a file the owner asked to keep; until then
  * it is always false. `name` is the file's, for a caller that words the line for it.
  */
-@Suppress("UNUSED_PARAMETER")
+@Suppress("unused")
 fun rowLine(name: String, size: Long, localBytes: Long, waiting: Boolean, kept: Boolean): Line {
     val sized = sizeText(size)
     return when {

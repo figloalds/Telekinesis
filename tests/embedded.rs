@@ -440,8 +440,14 @@ const REACH: Duration = Duration::from_millis(600);
 /// Waits, bounded, until the phone has noticed that its PC is gone.
 fn until_unreachable(daemon: &tkfs::orchestrator::hub::Daemon, folder: &str) -> Result<()> {
     let end = Instant::now() + Duration::from_secs(30);
-    while daemon.reach_a_peer(folder, Duration::from_millis(100)).is_ok() {
-        ensure!(Instant::now() < end, "the lane to the stopped PC stayed Ready");
+    while daemon
+        .reach_a_peer(folder, Duration::from_millis(100))
+        .is_ok()
+    {
+        ensure!(
+            Instant::now() < end,
+            "the lane to the stopped PC stayed Ready"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
@@ -453,14 +459,25 @@ fn reach_a_peer_succeeds_at_once_while_a_peer_is_up() -> Result<()> {
     let daemon = phone.host.daemon()?;
     let began = Instant::now();
     daemon.reach_a_peer(&phone.id, Duration::from_secs(3))?;
-    ensure!(began.elapsed() < Duration::from_secs(2), "{:?}", began.elapsed());
+    ensure!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
     phone.stop()
 }
 
 #[test]
 fn reach_a_peer_fails_within_its_bound_with_no_peer_up() -> Result<()> {
     let phone = Phone::with(&[("a.txt", "bytes")])?;
-    let Phone { pc, host, engine, id, _home, .. } = phone;
+    let Phone {
+        pc,
+        host,
+        engine,
+        id,
+        _home,
+        ..
+    } = phone;
     pc.shutdown()?;
     let daemon = host.daemon()?;
     until_unreachable(&daemon, &id)?;
@@ -484,7 +501,14 @@ fn reach_a_peer_redials_a_lane_in_backoff_at_once() -> Result<()> {
     };
     let pc = TestDaemon::start_listening(&format!("127.0.0.1:{port}"), "")?;
     let phone = Phone::with_pc(pc, &[("a.txt", "bytes")])?;
-    let Phone { pc, host, engine, id, _home, .. } = phone;
+    let Phone {
+        pc,
+        host,
+        engine,
+        id,
+        _home,
+        ..
+    } = phone;
     let kept = pc.shutdown_keep_home()?;
     let daemon = host.daemon()?;
     until_unreachable(&daemon, &id)?;
@@ -497,7 +521,10 @@ fn reach_a_peer_redials_a_lane_in_backoff_at_once() -> Result<()> {
         if control["state"] == "Backoff" && control["attempt"].as_u64() >= Some(4) {
             break;
         }
-        ensure!(Instant::now() < end, "the lane never reached its fourth backoff: {peers}");
+        ensure!(
+            Instant::now() < end,
+            "the lane never reached its fourth backoff: {peers}"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     let pc = TestDaemon::start_in(kept)?;

@@ -722,9 +722,10 @@ impl Daemon {
                 .into_iter()
                 .map(|(installation, _)| installation)
                 .collect();
-            let reachable = network.ready_peers().iter().any(|peer| {
-                exchanged.is_empty() || exchanged.contains(&peer.installation)
-            });
+            let reachable = network
+                .ready_peers()
+                .iter()
+                .any(|peer| exchanged.is_empty() || exchanged.contains(&peer.installation));
             if reachable {
                 return Ok(());
             }

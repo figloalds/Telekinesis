@@ -566,11 +566,7 @@ pub extern "system" fn Java_dev_tkfs_Native_confirm(
 /// Waits at most 3 s for a PC that has the folder, and throws `PC_UNREACHABLE` if none is there.
 /// Opening a file the phone does not hold calls this first, so that it fails fast.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tkfs_Native_reachPeer(
-    mut env: JNIEnv,
-    _: JClass,
-    folder: JString,
-) {
+pub extern "system" fn Java_dev_tkfs_Native_reachPeer(mut env: JNIEnv, _: JClass, folder: JString) {
     guard(&mut env, (), |env| {
         let folder = text(env, &folder)?;
         host()?.daemon()?.reach_a_peer(&folder, REACH_WITHIN)
@@ -997,7 +993,11 @@ mod tests {
         assert_eq!(row("near.txt")["size"], 9);
         assert_eq!(row("near.txt")["local_bytes"], 9);
         assert_eq!(row("dir")["local_bytes"], 0);
-        assert!(row("near.txt")["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(
+            row("near.txt")["id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty())
+        );
 
         let stat = entry_json(&engine, &engine.lookup("/far.bin").unwrap());
         assert_eq!(stat["local_bytes"], 0);

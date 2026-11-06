@@ -109,6 +109,19 @@ internal object ShellControl {
             }
             "write" -> write(context, request)
             "changes" -> JSONObject().put("count", heardIn(context, request.getString("id")).get())
+            // What the Files app asks of a listing: a thumbnail for each id, or null where none is offered.
+            "thumbnails" -> {
+                val size = android.graphics.Point(request.getInt("width"), request.getInt("height"))
+                val ids = request.getJSONArray("ids")
+                val found = JSONObject()
+                for (index in 0 until ids.length()) {
+                    val id = ids.getString(index)
+                    val bitmap = DocumentsContract.getDocumentThumbnail(resolver, DocumentsContract.buildDocumentUri(TkfsProvider.AUTHORITY, id), size, null)
+                    found.put(id, bitmap?.let { JSONObject().put("width", it.width).put("height", it.height) } ?: JSONObject.NULL)
+                    bitmap?.recycle()
+                }
+                JSONObject().put("thumbnails", found)
+            }
             else -> throw IOException("UNSUPPORTED_OPERATION: $operation")
         }
     }

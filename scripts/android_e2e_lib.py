@@ -10,15 +10,18 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shlex
 import socket
+import struct
 import subprocess
 import tempfile
 import time
 from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "dev.tkfs"
@@ -487,6 +490,66 @@ class Device:
         x, y = poll(bound, f"a view showing {text!r}", find, interval=1)
         self.shell("input", "tap", x, y).require_success()
         return x, y
+
+    def tap_button(self, text: str, bound: float = UI_BOUND) -> None:
+        """Taps `text` inside an enabled button, once there is one: a dialog's title and its button can say the same.
+        A button's text is its own view, with the clickable view above it."""
+
+        def find():
+            root = self.ui_dump(bound)
+            parents = {child: parent for parent in root.iter() for child in parent}
+            for node in root.iter("node"):
+                if node.get("text") != text:
+                    continue
+                button = node
+                while button is not None and button.get("clickable") != "true":
+                    button = parents.get(button)
+                if button is not None and button.get("enabled") == "true":
+                    return bounds_center(node.get("bounds"))
+            raise HarnessError("no enabled button")
+
+        x, y = poll(bound, f"an enabled button {text!r}", find, interval=1)
+        self.shell("input", "tap", x, y).require_success()
+
+    def long_press_text(self, text: str, bound: float = UI_BOUND, ms: int = 1000) -> None:
+        """Presses the view showing exactly `text` and holds it."""
+
+        def find():
+            for node in self.ui_dump(bound).iter("node"):
+                if text in (node.get("text"), node.get("content-desc")):
+                    return bounds_center(node.get("bounds"))
+            raise HarnessError("not on screen")
+
+        x, y = poll(bound, f"a view showing {text!r}", find, interval=1)
+        self.shell("input", "swipe", x, y, x, y, ms).require_success()
+
+    def is_enabled(self, text: str, last: bool = False) -> bool:
+        """Whether what shows `text` takes taps: no node from it up to the root is disabled. `last` picks the
+        final such view, as a dialog's button follows a title that says the same."""
+        root = self.ui_dump()
+        parents = {child: parent for parent in root.iter() for child in parent}
+        shown = [node for node in root.iter("node") if node.get("text") == text]
+        if not shown:
+            raise HarnessError(f"{text!r} is not on screen")
+        node = shown[-1 if last else 0]
+        while node is not None:
+            if node.get("enabled") == "false":
+                return False
+            node = parents.get(node)
+        return True
+
+    def clear_field(self) -> None:
+        """Empties the focused text field, from wherever its cursor is: enough deletes each way for any name the tests use."""
+        self.shell("input", "keyevent", *["KEYCODE_FORWARD_DEL"] * 40, *["KEYCODE_DEL"] * 40).require_success()
+
+    def thumbnails(self, ids: list[str], width: int, height: int) -> dict[str, dict | None]:
+        """What the Files app gets for each document's thumbnail: its size, or None where none is offered."""
+        return self.document("thumbnails", ids=ids, width=width, height=height)["thumbnails"]
+
+    def rotate(self, landscape: bool) -> None:
+        """Turns the screen, with auto-rotate off so that the turn is the one asked for."""
+        self.shell("settings", "put", "system", "accelerometer_rotation", 0).require_success()
+        self.shell("settings", "put", "system", "user_rotation", 1 if landscape else 0).require_success()
 
     def screen_texts(self) -> list[str]:
         """Every text and description on the screen, in tree order."""
@@ -1086,6 +1149,29 @@ class Session:
                 if row["mime_type"] == DIRECTORY_MIME:
                     pending.append(row["document_id"])
         return found
+
+
+def size_text(size: int) -> str:
+    """The app's `sizeText`: powers of 1000, one decimal below 10 ("3.4 MB", "812 MB")."""
+    units = ["B", "kB", "MB", "GB", "TB"]
+    value, unit = float(size), 0
+    while unit < len(units) - 1 and int(value + 0.5) >= 1000:
+        value /= 1000
+        unit += 1
+    digits = 0 if unit == 0 else (1 if value < 10 else 0)
+    return f"{value:.{digits}f} {units[unit]}"
+
+
+def png_noise(seed: int, side: int = 200) -> bytes:
+    """A real PNG of random pixels: it decodes, and it does not compress, so its size is about `side`² × 3."""
+    rng = random.Random(seed)
+    rows = b"".join(b"\0" + rng.randbytes(side * 3) for _ in range(side))
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+    header = struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
 
 
 def with_parents(paths) -> set[str]:

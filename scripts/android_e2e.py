@@ -30,9 +30,10 @@ import time
 import traceback
 from typing import Callable
 
-from android_e2e_lib import (BUILD_BOUND, CONTROL_URI, DEFAULT_AVD, DIRECTORY_MIME, FOLDER_READY_BOUND, PACKAGE, ROOT, ROOTS_URI,
+from android_e2e_lib import (ADB_BOUND, BUILD_BOUND, CONTROL_URI, DEFAULT_AVD, DIRECTORY_MIME, FOLDER_READY_BOUND, PACKAGE, ROOT, ROOTS_URI,
                              ContentError, Device, Emulator, Folder, HarnessError, ManageError, PcHost, Report,
-                             Session, SYNC_BOUND, UI_BOUND, children_uri, document_uri, poll, run_bounded, sha256, with_parents)
+                             Session, SYNC_BOUND, UI_BOUND, children_uri, document_uri, png_noise, poll, run_bounded, sha256,
+                             size_text, with_parents)
 from build_android import APK, find_sdk
 
 # ---- scenarios ----------------------------------------------------------------------------
@@ -55,7 +56,7 @@ def read_files() -> dict[str, bytes]:
 def scenario_read(s: Session) -> None:
     """Pairs, receives and reads each file through the provider. Listing downloads nothing."""
     device = s.device
-    folder = s.folder_with(read_files())
+    folder = s.folder_with({**read_files(), **image_files()})
 
     before = device.pack_bytes(folder.state)
     s.check("nothing is downloaded before a read", before < len(folder.files["photo.png"]), f"{before} pack bytes")
@@ -75,7 +76,11 @@ def scenario_read(s: Session) -> None:
     s.check("a name with a space, %, #, : and é has its own document",
             [row["_display_name"] for row in hard] == [HARD_NAME], hard)
 
+    # Reading every one of the images through adb would take minutes; two of them are enough to read.
+    opened = ["images/img00.png", "images/img01.png"]
     for path, content in folder.files.items():
+        if path.startswith("images/") and path not in opened:
+            continue
         want = sha256(content)
         on_pc = sha256(s.pc.pc_cat(folder.pc_state, path))
         s.check(f"{path} on the PC has the known SHA-256", on_pc == want, want)
@@ -89,13 +94,14 @@ def scenario_read(s: Session) -> None:
     s.check("reading downloaded the files", downloaded >= before + len(folder.files["photo.png"]),
             f"{before} -> {downloaded} pack bytes")
     check_listing_downloads_nothing(s, folder, "after the reads")
-
+    check_browsing_the_images(s, folder, opened)
     check_cold_start(s, folder, "photo.png")
+    check_offline_listing_is_quick(s, folder)
 
 
 def check_listing_downloads_nothing(s: Session, folder: Folder, when: str) -> dict[str, dict[str, str]]:
     """Acceptance 15, for one listing of every directory. A failed query reads as no rows, so
-    this also needs every name to come back. Thumbnails join this in a later task."""
+    this also needs every name to come back. Thumbnails are checked by `check_browsing_the_images`."""
     before = s.device.pack_bytes(folder.state)
     tree = s.tree(folder)
     s.check(f"listing every directory {when} finds every name", set(tree) == with_parents(folder.files),
@@ -1176,8 +1182,249 @@ def scenario_transfer_timeout(s: Session) -> None:
         device.set_data_sync_timeout(None)
 
 
+IMAGE_COUNT = 50
+# Acceptance 15: browsing may move this much from the PC (events and the like), and no file contents.
+BROWSE_METADATA_BOUND = 64 * 1024
+THUMBNAIL_SIDE = 64
+THUMBNAIL_FLAG = 1  # DocumentsContract.Document.FLAG_SUPPORTS_THUMBNAIL
+
+
+def image_files() -> dict[str, bytes]:
+    """`IMAGE_COUNT` real images, each a few chunks, so that no listing could hide a download."""
+    return {f"images/img{index:02d}.png": png_noise(index) for index in range(IMAGE_COUNT)}
+
+
+def check_browsing_the_images(s: Session, folder: Folder, opened: list[str]) -> None:
+    """Acceptance 15, for a folder of images of which only `opened` were ever read: the listing and a
+    thumbnail request for every image move no file contents, only the opened ones list as on the phone
+    with a thumbnail offered, and the thumbnails are decoded down to the size asked.
+
+    What the PC sent is measured by what reached the phone's packs: that is the one way a PC's file
+    contents get there, and the PC offers no byte counter that does not also count the metadata. The
+    PC's own request count is recorded beside it, for the report, not bounded."""
+    device = s.device
+    packs, requests = device.pack_bytes(folder.state), requests_to_pc(s.pc)
+    tree = s.tree(folder)
+    images = {path: row for path, row in tree.items() if path.startswith("images/") and "." in path}
+    s.check("every image is listed", len(images) == IMAGE_COUNT, len(images))
+    ids = [row["document_id"] for row in images.values()]
+    offered = device.thumbnails(ids, THUMBNAIL_SIDE, THUMBNAIL_SIDE)
+    moved, asked = device.pack_bytes(folder.state) - packs, requests_to_pc(s.pc) - requests
+    s.check("listing and asking for thumbnails of every image sent no file contents",
+            0 <= moved <= BROWSE_METADATA_BOUND, f"{moved} pack bytes, {asked} requests served")
+
+    wrong_summary, wrong_thumbnail, wrong_size = [], [], []
+    for path, row in images.items():
+        local = path in opened
+        if row["summary"] != ("On this phone" if local else "Not downloaded"):
+            wrong_summary.append((path, row["summary"]))
+        flagged = int(row["flags"]) & THUMBNAIL_FLAG != 0
+        got = offered[row["document_id"]]
+        if flagged != local or (got is not None) != local:
+            wrong_thumbnail.append((path, flagged, got))
+        if got is not None and not (THUMBNAIL_SIDE <= got["width"] < 2 * THUMBNAIL_SIDE
+                                    and THUMBNAIL_SIDE <= got["height"] < 2 * THUMBNAIL_SIDE):
+            wrong_size.append((path, got))
+    s.check(f"exactly the {len(opened)} opened images say they are on the phone, and the rest that they are not downloaded",
+            not wrong_summary, wrong_summary)
+    s.check("and only those offer a thumbnail, by flag and by request", not wrong_thumbnail, wrong_thumbnail)
+    s.check("a thumbnail is decoded down to the size asked, not to the full picture", not wrong_size, wrong_size)
+    s.check(f"browsing {IMAGE_COUNT} images, as the PC saw it", True, f"{moved} pack bytes, {asked} requests served")
+
+
+def check_offline_listing_is_quick(s: Session, folder: Folder) -> None:
+    """With the PC gone a listing, a stat and a thumbnail request all answer at once, from what is here."""
+    failures, summary = s.pc.stop()
+    s.check("the PC stops cleanly", not failures, failures or summary)
+    started = time.monotonic()
+    tree = s.tree(folder)
+    offered = s.device.thumbnails([row["document_id"] for path, row in tree.items() if path.startswith("images/") and "." in path],
+                                  THUMBNAIL_SIDE, THUMBNAIL_SIDE)
+    took = time.monotonic() - started
+    s.check("with the PC away every listing and thumbnail request still answers", len(tree) == len(with_parents(folder.files))
+            and len(offered) == IMAGE_COUNT, f"{len(tree)} documents, {len(offered)} thumbnails")
+    # adb's own calls take a second or so each; a fetch that waited for the PC would take 20 s or more each.
+    s.check("and answers at once", took < 20, f"{took:.1f} s")
+
+
+def scenario_ui_browse(s: Session) -> None:
+    """Acceptance 14 and 15 on screen: Browse lists a folder's files with what is on the phone and what
+    waits, a tap opens a file in another app, a long press holds the actions, and a file the phone lacks
+    fails fast and says so with no PC. Screenshots are in this run's `screens` directory."""
+    device, pc = s.device, s.pc
+    shots = s.report.path.parent / "screens"
+    rng = random.Random(16)
+    photo = png_noise(2041)
+    video = rng.randbytes(8_120_000)
+    report_pdf = rng.randbytes(2_300_000)
+    files = {"IMG_2041.png": photo, "video-obra.mp4": video, "notes.txt": b"Notes.\n" * 20, "docs/sub.txt": b"Below a directory.\n"}
+    folder = s.folder_with(files, "Transfer")
+    device.shell("pm", "grant", PACKAGE, "android.permission.POST_NOTIFICATIONS").require_success()
+    s.check("the photo reads on the phone", sha256(device.content_read(folder.doc("IMG_2041.png"))) == sha256(photo))
+
+    def shown(what: str, wanted: Callable[[list[str]], bool], bound: float = UI_BOUND) -> list[str]:
+        return device.wait_screen(what, wanted, bound)
+
+    def has(*texts: str) -> Callable[[list[str]], bool]:
+        return lambda found: all(text in found for text in texts)
+
+    def names() -> set[str]:
+        return {row["_display_name"] for row in device.content_query(children_uri(folder.doc()))}
+
+    def clear_notifications() -> None:
+        device.shell("cmd", "notification", "cancel_all", bound=ADB_BOUND)
+
+    device.start_app()
+    shown("the folder on Folders", has("Transfer"))
+    device.tap_text("Transfer")
+    photo_line = f"On this phone, {size_text(len(photo))}"
+    video_line = f"Not downloaded, {size_text(len(video))}"
+    found = shown("the files with what is on the phone", has("IMG_2041.png", photo_line, "video-obra.mp4", video_line, "docs", "notes.txt"))
+    s.check("a file on the phone says so, and one never opened says it is not downloaded", True, found)
+    device.screenshot(shots / "browse.png")
+
+    # A file made on the phone, with no PC to take it: waiting to send.
+    failures, summary = pc.stop()
+    s.check("the PC stops cleanly", not failures, failures or summary)
+    made = device.create_document(folder.doc(), "relatorio-outubro.pdf", "application/pdf")
+    device.content_write(made, report_pdf)
+    waiting_line = f"Waiting to send, {size_text(len(report_pdf))}"
+    found = shown("the new file waiting to send", has("relatorio-outubro.pdf", waiting_line), 60)
+    s.check("a file made on the phone and not yet sent says it is waiting", True, found)
+    device.screenshot(shots / "browse-waiting.png")
+
+    # The long press: the actions and their wording, two of them not available yet.
+    device.long_press_text("IMG_2041.png")
+    actions = ("Keep on this phone", "Remove download", "Share", "Rename", "Delete everywhere")
+    found = shown("the actions", has("IMG_2041.png", *actions))
+    s.check("the sheet holds the mockup's five actions, in its words", True, found)
+    s.check("Keep on this phone and Remove download are off", not device.is_enabled("Keep on this phone")
+            and not device.is_enabled("Remove download"))
+    s.check("Share, Rename and Delete everywhere are on", all(device.is_enabled(a) for a in actions[2:]))
+    device.screenshot(shots / "browse-sheet.png")
+    device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
+    shown("the sheet gone", lambda t: "Keep on this phone" not in t)
+
+    # A tap opens the file in another app: a viewer's intent, or if the phone has none, a sentence saying so.
+    resolved = device.shell("cmd", "package", "resolve-activity", "--brief", "-a", "android.intent.action.VIEW", "-t", "image/png").out
+    has_viewer = "/" in resolved.splitlines()[-1] if resolved.strip() else False
+    device.tap_text("IMG_2041.png")
+    if has_viewer:
+        def viewed() -> bool:
+            dump = device.shell("dumpsys", "activity", "activities").out
+            return "android.intent.action.VIEW" in dump and "dev.tkfs.documents" in dump
+
+        poll(UI_BOUND, "the viewer's intent", viewed, interval=1)
+        s.check("a tap opens the file in another app, as a VIEW of the provider's URI", True, resolved.strip())
+        device.screenshot(shots / "browse-viewer.png")
+        device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
+    else:
+        found = shown("the sentence for no app", has("No app on this phone can open IMG_2041.png."))
+        s.check("with no app to open a file, the screen says so in words", True, found)
+        device.tap_text("Dismiss")
+    shown("Browse again", has("IMG_2041.png", "docs"))
+
+    # A folder opens in place; a turn of the screen keeps where it is; back goes up.
+    device.tap_text("docs")
+    shown("the inside of docs", has("sub.txt"))
+    device.rotate(landscape=True)
+    shown("docs after the screen turned", has("sub.txt"))
+    s.check("the path survives a rotation", True)
+    device.screenshot(shots / "browse-docs-landscape.png")
+    device.rotate(landscape=False)
+    shown("docs after the screen turned back", has("sub.txt"))
+    # The window is recreated by a turn, and a key sent in the middle of it is lost.
+    time.sleep(2)
+    device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
+    shown("the folder's top level again", has("IMG_2041.png", "video-obra.mp4"))
+    s.check("back goes up a directory before it leaves", True)
+
+    # Rename validates as the provider does.
+    device.long_press_text("notes.txt")
+    shown("the sheet", has("Rename"))
+    device.tap_text("Rename")
+    shown("the Rename dialog", has("Cancel"))
+    device.clear_field()
+    device.shell("input", "text", "a/b").require_success()
+    found = shown("the refusal of a bad name", lambda t: any(text.startswith("A name cannot be empty") for text in t))
+    s.check("a name with a separator is refused on the spot, and cannot be confirmed", not device.is_enabled("Rename", last=True), found)
+    device.screenshot(shots / "browse-rename-refused.png")
+    device.clear_field()
+    device.shell("input", "text", "renamed.txt").require_success()
+    device.tap_button("Rename")
+    shown("the new name", lambda t: "renamed.txt" in t and "notes.txt" not in t)
+    s.check("a rename shows on the screen", True)
+    s.check("and in the provider", "renamed.txt" in names() and "notes.txt" not in names(), sorted(names()))
+
+    # Delete everywhere asks first.
+    device.long_press_text("renamed.txt")
+    shown("the sheet", has("Delete everywhere"))
+    device.tap_text("Delete everywhere")
+    found = shown("the confirmation", has("Delete renamed.txt everywhere?", "Cancel"))
+    device.screenshot(shots / "browse-delete.png")
+    device.tap_text("Cancel")
+    shown("the file still there", has("renamed.txt"))
+    s.check("cancelling the confirmation deletes nothing", "renamed.txt" in names(), sorted(names()))
+    device.long_press_text("renamed.txt")
+    device.tap_text("Delete everywhere")
+    shown("the confirmation", has("Delete renamed.txt everywhere?"))
+    device.tap_button("Delete everywhere")
+    shown("the file gone", lambda t: "renamed.txt" not in t and "IMG_2041.png" in t)
+    s.check("confirming deletes it, here at once", "renamed.txt" not in names(), sorted(names()))
+
+    # A file the phone never opened, with no PC: it fails within the bound and says why, with and
+    # without the notification permission.
+    unreachable = "My PC isn't reachable, so {} can't open yet."
+    clear_notifications()
+    device.shell("pm", "revoke", PACKAGE, "android.permission.POST_NOTIFICATIONS").require_success()
+    # A revoke can end the app's process; the timing is of the open, not of the app's start.
+    device.content_query(ROOTS_URI)
+    started = time.monotonic()
+    refused = refusal(lambda: device.content_read(folder.doc("video-obra.mp4")))
+    took = time.monotonic() - started
+    s.check("opening a file never opened, with no PC, fails with PC_UNREACHABLE", refused.startswith("PC_UNREACHABLE") or "PC_UNREACHABLE" in refused, refused)
+    s.check("and does so within 5 s", took < 5, f"{took:.1f} s")
+    s.check("with the permission denied, no notification said so",
+            "video-obra.mp4 can't open yet" not in device.shell("dumpsys", "notification", "--noredact").out)
+    device.shell("pm", "grant", PACKAGE, "android.permission.POST_NOTIFICATIONS").require_success()
+    started = time.monotonic()
+    refused = refusal(lambda: device.content_read(folder.doc("docs/sub.txt")))
+    took = time.monotonic() - started
+    s.check("a small file never opened fails the same way", "PC_UNREACHABLE" in refused and took < 5, f"{refused} in {took:.1f} s")
+
+    def notified() -> bool:
+        return unreachable.format("sub.txt") in device.shell("dumpsys", "notification", "--noredact").out
+
+    poll(30, "the notification that names the file", notified, interval=1)
+    s.check("a notification names the file: My PC isn't reachable, so sub.txt can't open yet.", True)
+
+    # The Folders screen says so for both, until dismissed, whatever the permission.
+    device.start_app()
+    found = shown("the strip", lambda t: any("video-obra.mp4" in text and "can't open yet" in text for text in t))
+    s.check("the Folders screen names the files that could not open", any("sub.txt" in text for text in found), found)
+    device.screenshot(shots / "folders-open-failed.png")
+    device.tap_text("Dismiss")
+    shown("the strip gone", lambda t: not any("can't open yet" in text for text in t))
+    s.check("and the strip goes when dismissed", True)
+
+    # The PC is back: a burst lists what it has again without leaving the screen.
+    pc.start()
+    pc.wait_phase("Transfer", "Running")
+    pc.write_file(folder.pc_state, "later.txt", b"Written while the screen was open.\n")
+    pc.folder(folder.pc_state, "flush")
+    device.tap_text("Transfer")
+    shown("Browse", has("IMG_2041.png"))
+    s.sync_with_the_pc_back(folder)
+    shown("the file the burst brought", has("later.txt"), SYNC_BOUND)
+    s.check("after a burst the listing shows what it brought", True)
+    device.screenshot(shots / "browse-after-burst.png")
+    video_read = device.content_read(folder.doc("video-obra.mp4"))
+    s.check("with the PC back the file opens and reads whole", sha256(video_read) == sha256(video))
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
     "ui_folders": scenario_ui_folders,
+    "ui_browse": scenario_ui_browse,
     "read": scenario_read,
     "write": scenario_write,
     "share": scenario_share,

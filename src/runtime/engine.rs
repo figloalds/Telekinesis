@@ -425,7 +425,10 @@ impl Engine {
             });
         };
         let content = self.working.content();
-        let cached = lock(&self.presence_cache).whole.get(&reference.digest).copied();
+        let cached = lock(&self.presence_cache)
+            .whole
+            .get(&reference.digest)
+            .copied();
         let held = match cached {
             Some(held) => held,
             None => {
@@ -2184,7 +2187,11 @@ mod tests {
                 total_bytes: 0
             }
         );
-        assert_eq!(asked.0.load(Ordering::SeqCst), 0, "presence asked a fetcher");
+        assert_eq!(
+            asked.0.load(Ordering::SeqCst),
+            0,
+            "presence asked a fetcher"
+        );
         engine.shutdown()?;
         Ok(())
     }
@@ -2228,7 +2235,11 @@ mod tests {
         assert_eq!(cache.whole.len(), PRESENCE_CACHE_LIMIT);
         assert_eq!(cache.order.len(), PRESENCE_CACHE_LIMIT);
         // The oldest went.
-        assert!(!cache.whole.contains_key(&Digest::bytes(&0u64.to_le_bytes())));
+        assert!(
+            !cache
+                .whole
+                .contains_key(&Digest::bytes(&0u64.to_le_bytes()))
+        );
     }
 
     #[test]

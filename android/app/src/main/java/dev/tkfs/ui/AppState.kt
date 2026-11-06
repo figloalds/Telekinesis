@@ -9,6 +9,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.tkfs.Native
 import dev.tkfs.Settings
+import dev.tkfs.provider.OpenNotices
 import dev.tkfs.share.ShareLedger
 import dev.tkfs.sync.BurstError
 import dev.tkfs.sync.Finished
@@ -32,6 +33,9 @@ sealed class Screen {
     data object Folders : Screen()
     data object AddPc : Screen()
     data object Settings : Screen()
+
+    /** A folder's files, by the folder's id. */
+    data class Browse(val folder: String, val label: String) : Screen()
 }
 
 /** An orchestrator refusal: its code and a sentence a person can read. */
@@ -68,6 +72,8 @@ data class AppUi(
     val batteryAllowed: Boolean = true,
     /** Names of files shared in that were not saved, until the owner dismisses them. */
     val shareFailures: List<String> = emptyList(),
+    /** Names of files that could not open because no PC answered, until the owner dismisses them. */
+    val openFailures: List<String> = emptyList(),
     val now: Long = System.currentTimeMillis(),
 )
 
@@ -149,6 +155,11 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(shareFailures = emptyList()) }
     }
 
+    fun dismissOpenFailures() {
+        OpenNotices.of(getApplication()).dismiss()
+        mutable.update { it.copy(openFailures = emptyList()) }
+    }
+
     private suspend fun refresh() {
         val snapshot = try {
             parseSnapshot(call("status"), bursts)
@@ -163,7 +174,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         val allowed = getApplication<Application>().getSystemService(PowerManager::class.java)
             .isIgnoringBatteryOptimizations(getApplication<Application>().packageName)
         val storage = if (polls++ % STORAGE_EVERY == 0) storageLine() else mutable.value.storage
-        mutable.update { it.polled(shown, storage, System.currentTimeMillis()).copy(batteryAllowed = allowed, shareFailures = ShareLedger.of(getApplication()).notices()) }
+        mutable.update { it.polled(shown, storage, System.currentTimeMillis()).copy(batteryAllowed = allowed, shareFailures = ShareLedger.of(getApplication()).notices(), openFailures = OpenNotices.of(getApplication()).names()) }
     }
 
     /** The folders' waiting files, read from the table on disk: no PC is asked. */

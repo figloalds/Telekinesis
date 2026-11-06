@@ -1,6 +1,7 @@
 package dev.tkfs.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,6 +25,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import dev.tkfs.R
@@ -37,6 +39,8 @@ fun FoldersScreen(
     onAddPc: () -> Unit,
     onSettings: () -> Unit,
     onDismissShareFailures: () -> Unit = {},
+    onDismissOpenFailures: () -> Unit = {},
+    onOpenFolder: (FolderStatus) -> Unit = {},
 ) {
     val snapshot = ui.snapshot
     Column(Modifier.fillMaxSize()) {
@@ -45,10 +49,11 @@ fun FoldersScreen(
         PullToRefreshBox(isRefreshing = ui.syncing, onRefresh = onSync, modifier = Modifier.weight(1f)) {
             Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
                 ShareFailureStrip(ui.shareFailures, onDismissShareFailures)
+                OpenFailureStrip(ui.openFailures, onDismissOpenFailures)
                 when {
                     snapshot == null -> Text("Starting...", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     snapshot.folders.isEmpty() -> Empty(snapshot, onAddPc)
-                    else -> FolderList(snapshot, ui.now, onAddPc)
+                    else -> FolderList(snapshot, ui.now, onAddPc, onOpenFolder)
                 }
                 FailureNote(ui.failure ?: ui.pollFailure)
             }
@@ -85,13 +90,13 @@ private fun Empty(snapshot: Snapshot, onAddPc: () -> Unit) {
 }
 
 @Composable
-private fun FolderList(snapshot: Snapshot, now: Long, onAddPc: () -> Unit) {
+private fun FolderList(snapshot: Snapshot, now: Long, onAddPc: () -> Unit, onOpen: (FolderStatus) -> Unit) {
     LazyColumn(Modifier.fillMaxWidth()) {
         item { Strips(snapshot, onAddPc) }
         items(snapshot.folders, key = { it.id }) { folder ->
             val line = folderLine(folder, now)
             Row(
-                Modifier.fillMaxWidth().padding(vertical = 12.dp),
+                Modifier.fillMaxWidth().clickable(role = Role.Button) { onOpen(folder) }.padding(vertical = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -143,6 +148,21 @@ private fun Strips(snapshot: Snapshot, onAddPc: () -> Unit) {
 @Composable
 private fun ShareFailureStrip(names: List<String>, onDismiss: () -> Unit) {
     val text = stripText(names) ?: return
+    Row(
+        Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp)
+            .background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(12.dp))
+            .padding(start = 12.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(text, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        TextButton(onClick = onDismiss) { Text("Dismiss") }
+    }
+}
+
+/** Files that could not open because no PC answered, until dismissed. It does not depend on the notification permission. */
+@Composable
+private fun OpenFailureStrip(names: List<String>, onDismiss: () -> Unit) {
+    val text = openStripText(names) ?: return
     Row(
         Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp)
             .background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(12.dp))
