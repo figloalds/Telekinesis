@@ -750,12 +750,20 @@ def share_one(s: Session, name: str, data: bytes | Path, mime: str = "applicatio
     device.tap_text("Save 1 file")
 
 
-def pc_has_whole(s: Session, folder: Folder, path: str, content: bytes) -> bool:
+def pc_has_whole(s: Session, folder: Folder, path: str, content: bytes | Folder, ref_path: str = "",
+                 packs_before: int = 0) -> bool:
+    """The PC holds `path` with these bytes. Small ones are read back. A large one is compared with a
+    copy of the same bytes imported into another PC folder (`content` is that folder, `ref_path` the
+    file), and counts once the PC's packs have grown by at least the file's size since `packs_before`."""
+    if isinstance(content, Folder):
+        reference = s.pc.pc_content(content.pc_state, ref_path)
+        return (reference is not None and s.pc.pc_content(folder.pc_state, path) == reference
+                and pc_pack_bytes(folder) - packs_before >= len(content.files[ref_path]))
     return s.pc.pc_has(folder.pc_state, path) and sha256(s.pc.pc_cat(folder.pc_state, path)) == sha256(content)
 
 
-def deliver(s: Session, folder: Folder, path: str, content: bytes, what: str, bound: float = SHARE_BOUND,
-            nudge: Callable[[], None] | None = None) -> None:
+def deliver(s: Session, folder: Folder, path: str, content: bytes | Folder, what: str, bound: float = SHARE_BOUND,
+            nudge: Callable[[], None] | None = None, ref_path: str = "", packs_before: int = 0) -> None:
     """Waits for `path` on the PC, asking the phone for nothing but `nudge` (a trigger of the table)."""
     last = [0.0]
 
@@ -763,10 +771,15 @@ def deliver(s: Session, folder: Folder, path: str, content: bytes, what: str, bo
         if nudge and time.monotonic() - last[0] > 30:
             last[0] = time.monotonic()
             nudge()
-        return pc_has_whole(s, folder, path, content)
+        return pc_has_whole(s, folder, path, content, ref_path, packs_before)
 
     poll(bound, f"{what} on the PC", arrived, interval=2)
     s.check(f"{what} is on the PC with identical bytes", True)
+
+
+def wait_transfer_ends(device: Device) -> None:
+    """Until the transfer job has said it is done, so the next step starts a job of its own."""
+    poll(120, "the transfer job to end", lambda: any("Stop(" in line for line in device.transfer_log()))
 
 
 def scenario_share(s: Session) -> None:
@@ -835,6 +848,7 @@ def scenario_share(s: Session) -> None:
         device.home()
         # Nothing here asks the phone anything: the job has to get it across by itself.
         deliver(s, folder, name, content, f"{name} from the background", bound=SYNC_BOUND)
+        wait_transfer_ends(device)
         s.check(f"a share reaches the PC from the background, exemption {'on' if exempt else 'off'}", True,
                 device.transfer_log())
 
@@ -845,7 +859,7 @@ def scenario_share(s: Session) -> None:
         content = rng.randbytes(2 * MIB)
         device.content_write(device.create_document(folder.doc(), name), content)
         deliver(s, folder, name, content, f"{name} from the background", bound=SYNC_BOUND)
-        time.sleep(3)
+        wait_transfer_ends(device)
         s.check(f"a write reaches the PC from the background, exemption {'on' if exempt else 'off'}", True,
                 device.transfer_log())
     device.battery_exempt(True)
@@ -853,6 +867,8 @@ def scenario_share(s: Session) -> None:
     # A force-stop during the push of a large file.
     device.clear_logcat()
     large = random_bytes(rng, SHARE_BYTES)
+    reference_repo, reference_state = pc.create_folder("Reference", {"large.bin": large})
+    reference = Folder("", "Reference", reference_repo, "", reference_state, {"large.bin": large})
     before = pc_pack_bytes(folder)
     share_one(s, "large-push.bin", large)
     device.home()
@@ -862,8 +878,8 @@ def scenario_share(s: Session) -> None:
             f"{gained} of {SHARE_BYTES} pack bytes there")
     device.force_stop()
     s.check("force-stop mid-push ended the app", device.app_pid() is None)
-    deliver(s, folder, "large-push.bin", large, "the large file after a restart",
-            nudge=lambda: trigger_foreground(device))
+    deliver(s, folder, "large-push.bin", reference, "the large file after a restart",
+            nudge=lambda: trigger_foreground(device), ref_path="large.bin", packs_before=before)
 
     # A force-stop during the receive of a large file.
     held = device.pack_bytes(folder.state)

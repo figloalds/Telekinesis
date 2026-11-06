@@ -789,6 +789,16 @@ class PcHost:
         """The file's bytes on the PC. `cat` takes files up to 3 MiB (CAT_MAX_BYTES)."""
         return self.folder(state, "cat", path)
 
+    def pc_content(self, state: str, path: str) -> str | None:
+        """What the PC's entry for `path` says its content is (digest and length), or None if it has none yet.
+        Content is addressed by its bytes, so two files with the same answer hold the same bytes, once
+        their chunks are here: this is how a file past `cat`'s limit is compared."""
+        done = self._tkfs("--state", state, "rpc", "lookup", json.dumps({"path": path}))
+        if done.code != 0:
+            return None
+        content = json.loads(done.out)["entry"].get("content")
+        return None if content is None else json.dumps(content, sort_keys=True)
+
     def state_dir(self, selector: str) -> str:
         return self.manage("inspect", selector)["record"]["state"]
 
