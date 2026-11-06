@@ -833,6 +833,40 @@ def scenario_share(s: Session) -> None:
          lambda: device.shell_manage("inspect", {"state": folder.id})["phase"]["phase"] == "Running")
     s.check("and leaves nothing in the folder", set(names()) == set(listed), sorted(names()))
 
+    # The Folders screen says so too, until dismissed, and does not depend on the notification permission.
+    def strip_is(name: str) -> None:
+        device.start_app()
+        device.wait_screen(f"the strip for {name}", lambda t: f"Couldn't save {name}. Share it again." in t)
+
+    strip_is("cannot-save.bin")
+    s.check("the Folders screen says what could not be saved", True)
+    device.tap_text("Dismiss")
+    device.wait_screen("the strip gone", lambda t: not any(text.startswith("Couldn't save") for text in t))
+    s.check("and the strip goes when dismissed", True)
+
+    # With the permission denied: a failed copy, and a file taken from under its grant.
+    device.shell("pm", "revoke", PACKAGE, "android.permission.POST_NOTIFICATIONS").require_success()
+    device.shell_manage("force-stop", {"state": folder.id}, bound=SYNC_BOUND)
+    device.start_share(device.push_download("cannot-save-two.bin", rng.randbytes(1024)))
+    device.wait_screen("the share screen", lambda t: "Save 1 file" in t)
+    device.tap_text("Save 1 file")
+    strip_is("cannot-save-two.bin")
+    s.check("a failed copy is on the Folders screen with the notification permission denied", True)
+    s.check("and no notification said so", "cannot-save-two.bin could not be saved" not in
+            device.shell("dumpsys", "notification", "--noredact").out)
+    device.tap_text("Dismiss")
+    device.shell_manage("start", {"state": folder.id})
+    poll(FOLDER_READY_BOUND, "the folder running again",
+         lambda: device.shell_manage("inspect", {"state": folder.id})["phase"]["phase"] == "Running")
+
+    device.start_share(device.push_download("gone.bin", rng.randbytes(1024)))
+    device.wait_screen("the share screen", lambda t: "Save 1 file" in t)
+    device.shell("rm", "-f", "/sdcard/Download/gone.bin")
+    device.tap_text("Save 1 file")
+    strip_is("gone.bin")
+    s.check("a file taken from under its grant is on the Folders screen too", True)
+    device.tap_text("Dismiss")
+
     # The PC back: no action on the phone but a trigger of the table.
     pc.start()
     pc.wait_phase(folder.label, "Running")
@@ -866,6 +900,47 @@ def scenario_share(s: Session) -> None:
         s.check(f"a write reaches the PC from the background, exemption {'on' if exempt else 'off'}", True,
                 device.transfer_log())
     device.battery_exempt(True)
+
+    # A force-stop during the copy of a large file shared in. The grant does not survive a kill, so
+    # the share is reported, not resumed: no real name appears, the working file is swept from both
+    # sides, and the Folders screen says what happened.
+    device.battery_exempt(True)
+    device.clear_logcat()
+    killed = random_bytes(rng, 192 * MIB)
+    share_one(s, "kill-mid-copy.bin", killed)
+    device.home()
+
+    def parts() -> list[str]:
+        return [name for name in device.raw_names(folder.id) if name.startswith(".tkfs-part-")]
+
+    poll(SHARE_BOUND, "the working file under way", lambda: bool(parts()), interval=1)
+    s.check("the copy is under way under a working name, not the real one",
+            "kill-mid-copy.bin" not in device.raw_names(folder.id), device.raw_names(folder.id))
+    device.force_stop()
+    s.check("force-stop mid-copy ended the app", device.app_pid() is None)
+    s.check("no real name appears after the kill", "kill-mid-copy.bin" not in names(), sorted(names()))
+    poll(120, "the working file swept from the phone", lambda: not parts(), interval=2)
+    s.check("the working file is swept from the phone at the next start", True)
+    s.check("and the provider never listed it", not any(n.startswith(".tkfs-part-") for n in names()))
+    strip_is("kill-mid-copy.bin")
+    s.check("the Folders screen says what the kill lost", True)
+    device.tap_text("Dismiss")
+
+    def gone_from_pc() -> bool:
+        tree = pc.folder(folder.pc_state, "tree").decode("utf-8", "replace")
+        return ".tkfs-part-" not in tree and "kill-mid-copy.bin" not in tree
+
+    deliver_nothing = lambda: trigger_foreground(device)
+    last_nudge = [0.0]
+
+    def pc_clean() -> bool:
+        if time.monotonic() - last_nudge[0] > 30:
+            last_nudge[0] = time.monotonic()
+            deliver_nothing()
+        return gone_from_pc()
+
+    poll(SYNC_BOUND, "the working file gone from the PC", pc_clean, interval=2)
+    s.check("and its removal reached the PC: no working file and no real name there", True)
 
     # A force-stop during the push of a large file. The PC is away while it is shared in, so that
     # the copy is over, and the file whole on the phone, before anything is sent: a burst during

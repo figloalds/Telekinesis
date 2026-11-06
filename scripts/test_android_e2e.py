@@ -515,6 +515,11 @@ class SharingIn(unittest.TestCase):
         with patch.object(Device, "adb", return_value=Completed([], 0, log.encode(), b"")):
             self.assertEqual(self.device().transfer_log(), ["transfer: foreground", "share: dataSync timed out"])
 
+    def test_the_raw_names_include_the_hidden_working_files(self):
+        reply = Completed([], 0, b'Result: Bundle[{result=[{"name":"a.txt"},{"name":".tkfs-part-1"}]}]', b"")
+        with patch.object(Device, "_provider", return_value=reply):
+            self.assertEqual(self.device().raw_names("F", "/"), ["a.txt", ".tkfs-part-1"])
+
     def test_a_content_summary_of_a_pc_entry_is_its_content_or_none(self):
         pc = PcHost(Path("tkfs"), Path("home"))
         pc._tkfs = MagicMock(return_value=Completed([], 0, b'{"entry":{"content":{"digest":"x","total_len":3}}}', b""))

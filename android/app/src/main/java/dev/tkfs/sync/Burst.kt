@@ -60,7 +60,8 @@ data class BurstResult(
 
 /**
  * At most one app-driven burst at a time. A request that wants nothing more than the running
- * burst is dropped; a full one that arrives during a metadata-only burst waits and runs after it.
+ * burst is dropped; a full one that arrives during a metadata-only burst waits and runs after it,
+ * and two that waited together run once: a burst that began after a request came covers it.
  */
 class Bursts(private val run: (Mode) -> BurstResult) {
     private val lock = Object()
@@ -68,15 +69,24 @@ class Bursts(private val run: (Mode) -> BurstResult) {
     private val busy = MutableStateFlow(false)
     val isRunning: StateFlow<Boolean> get() = busy
 
+    /** Bursts begun so far, and the last that was full: a request that waited is covered by one that began after it came. */
+    private var begun = 0L
+    private var fullBegun = 0L
+
     fun request(mode: Mode): BurstResult {
         if (mode == Mode.Skip) return BurstResult.DROPPED
         synchronized(lock) {
+            val arrived = begun
             while (true) {
+                val covered = if (mode == Mode.Full) fullBegun > arrived else begun > arrived
+                if (covered) return BurstResult.DROPPED
                 val current = running ?: break
                 if (rank(current) >= rank(mode)) return BurstResult.DROPPED
                 lock.wait()
             }
             running = mode
+            begun++
+            if (mode == Mode.Full) fullBegun = begun
             busy.value = true
         }
         try {

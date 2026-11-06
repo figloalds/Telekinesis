@@ -574,6 +574,14 @@ class Device:
             self.shell("device_config", "put", "activity_manager", "data_sync_fgs_timeout_duration",
                        str(ms)).require_success()
 
+    def raw_names(self, folder: str, path: str = "/") -> list[str]:
+        """Every name in a directory of a folder, including the working files of a share that the provider
+        hides (a debug build)."""
+        line = shell_line(["content", "call", "--uri", CONTROL_URI, "--method", "tkfs.list_all", "--arg", folder,
+                           "--extra", "payload:s:" + encode_payload({"path": path})])
+        called = self._provider(line)
+        return [entry["name"] for entry in json.loads(parse_call(called.out or called.err))]
+
     def home(self) -> None:
         self.shell("input", "keyevent", "KEYCODE_HOME").require_success()
 
