@@ -357,6 +357,8 @@ fn in_burst(bursts: &BTreeMap<u64, Burst>, pair: &Pair) -> bool {
 /// One open `sync-now`.
 struct Burst {
     until: Instant,
+    /// `end_bursts` ended it: it wants nothing more, and its `sync_now` returns.
+    ended: bool,
     mode: BurstMode,
     pairs: BTreeMap<Pair, BurstPair>,
 }
@@ -365,6 +367,7 @@ impl Burst {
     /// Whether this burst is open and still wants `pair` synced.
     fn wants(&self, pair: &Pair, now: Instant) -> bool {
         self.until > now
+            && !self.ended
             && self
                 .pairs
                 .get(pair)
@@ -1018,6 +1021,19 @@ impl Driver {
 
     // ---- sync-now --------------------------------------------------------
 
+    /// Ends every open burst now. A passive driver then takes no further step
+    /// for their pairs (`in_burst` is false), and each `sync_now` returns at once
+    /// with `SYNC_NOW_ENDED` for what it had not finished. A step already in
+    /// flight finishes. The phone's transfer job calls this when it is stopped,
+    /// so no bytes move on a network it may no longer use.
+    pub fn end_bursts(&self) {
+        for burst in lock(&self.due).bursts.values_mut() {
+            burst.ended = true;
+        }
+        self.poke.bump();
+        self.wake.nudge();
+    }
+
     /// Syncs `folders` (ids) with every peer now, in either profile, and reports
     /// `{"folders": [{"id", "exchanged", "pushed", "remaining", "error"}]}`.
     /// Lanes in a transient backoff redial at once. It returns when every pair
@@ -1063,6 +1079,7 @@ impl Driver {
                 burst,
                 Burst {
                     until: end,
+                    ended: false,
                     mode,
                     pairs,
                 },
@@ -1084,6 +1101,9 @@ impl Driver {
             };
             if settled && !probing {
                 break None;
+            }
+            if lock(&self.due).bursts.get(&burst).is_none_or(|open| open.ended) {
+                break Some("SYNC_NOW_ENDED: ended by `end-bursts`".to_owned());
             }
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -4588,6 +4608,7 @@ mod tests {
             burst,
             Burst {
                 until,
+                ended: false,
                 mode,
                 pairs: map,
             },
@@ -4784,6 +4805,66 @@ mod tests {
         assert_eq!(folder["remaining"], 0, "{reply}");
         assert!(folder["error"].is_null(), "{reply}");
         assert!(lock(&driver.due).bursts.is_empty());
+    }
+
+    #[test]
+    fn ending_the_bursts_returns_sync_now_at_once() {
+        let (driver, _root) = policy_driver(down_lanes(None), &["repo-1"], passive(SHORT));
+        let waiting = {
+            let driver = driver.clone();
+            thread::spawn(move || {
+                let began = Instant::now();
+                let reply = driver.sync_now(&["repo-1".to_owned()], HOUR, BurstMode::Full);
+                (began.elapsed(), reply)
+            })
+        };
+        while lock(&driver.due).bursts.is_empty() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        driver.end_bursts();
+        let (took, reply) = waiting.join().unwrap();
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        let error = folder_of(&reply)["error"].as_str().unwrap().to_owned();
+        assert!(error.starts_with("SYNC_NOW_ENDED"), "{reply}");
+        assert!(lock(&driver.due).bursts.is_empty());
+    }
+
+    #[test]
+    fn after_ending_a_burst_no_further_push_step_runs() {
+        let held = objects("held", 1);
+        let folder = Arc::new(FakeFolder {
+            held: held.clone(),
+            missing: wanted_of(&objects("there", 1)),
+            ..FakeFolder::default()
+        });
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&held),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let root = tempfile::tempdir().unwrap();
+        let driver = Driver::with_policy(
+            Arc::new(ReadyLanes::one(false, bulk)),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".to_owned(),
+                fake_worker(folder),
+                Vec::new(),
+            )])),
+            Seq::new(),
+            passive(SHORT),
+            Cancel::new(),
+        );
+        let mut state = PumpState::default();
+        let key = pair(ENDPOINT, "repo-1");
+        open_burst(&driver, std::slice::from_ref(&key));
+        let calls = calls_of_round(&driver, &mut state, &listener);
+        assert!(calls_named(&calls, "store") > 0, "the burst pushes: {calls:?}");
+        // Ended while marks are still due: nothing more is pushed.
+        driver.end_bursts();
+        lock(&driver.due).background.insert(key.clone());
+        lock(&driver.due).demand.insert(key);
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
     }
 
     #[test]

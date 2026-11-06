@@ -2,10 +2,10 @@ package dev.tkfs.share
 
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.core.content.IntentCompat
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -110,15 +110,10 @@ class ShareActivity : ComponentActivity() {
         return (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }.distinct()
     }
 
-    @Suppress("DEPRECATION")
-    private fun uri(intent: Intent): Uri? =
-        if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-        else intent.getParcelableExtra(Intent.EXTRA_STREAM)
+    private fun uri(intent: Intent): Uri? = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
 
-    @Suppress("DEPRECATION")
     private fun uriList(intent: Intent): List<Uri> =
-        (if (Build.VERSION.SDK_INT >= 33) intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
-        else intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)).orEmpty()
+        IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
 
     private fun sharedMimeTypes(intent: Intent, uris: List<Uri>): List<String> =
         uris.map { contentResolver.getType(it) ?: intent.type ?: "*/*" }

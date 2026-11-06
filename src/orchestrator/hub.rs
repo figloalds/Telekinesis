@@ -136,6 +136,7 @@ const MUTATIONS: &[&str] = &[
     "configure-mount",
     "folder",
     "reset-pairing-code",
+    "end-bursts",
     "pair",
     "unpair",
     "set-endpoint",
@@ -943,6 +944,13 @@ impl Daemon {
                     BurstMode::Full
                 };
                 Ok(driver.sync_now(&folders, SYNC_NOW_BOUND, mode))
+            }
+            // Ends every open `sync-now` at once (the Android transfer job, when stopped).
+            "end-bursts" => {
+                if let Some(driver) = self.sync.get() {
+                    driver.end_bursts();
+                }
+                Ok(json!({}))
             }
             "reset-cursors" => {
                 self.sync

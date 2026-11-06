@@ -7,7 +7,6 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.os.Build
 import androidx.work.ForegroundInfo
 import dev.tkfs.ui.MainActivity
 
@@ -55,24 +54,18 @@ object Notifications {
 
     private fun builder(context: Context, channel: String): Notification.Builder {
         val manager = context.getSystemService(NotificationManager::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            manager.createNotificationChannel(
-                if (channel == WORKING) {
-                    NotificationChannel(WORKING, "Sending and saving", NotificationManager.IMPORTANCE_LOW)
-                } else {
-                    NotificationChannel(RESULT, "Saved files", NotificationManager.IMPORTANCE_DEFAULT)
-                },
-            )
-        }
+        // minSdk is 26, where channels begin.
+        manager.createNotificationChannel(
+            if (channel == WORKING) {
+                NotificationChannel(WORKING, "Sending and saving", NotificationManager.IMPORTANCE_LOW)
+            } else {
+                NotificationChannel(RESULT, "Saved files", NotificationManager.IMPORTANCE_DEFAULT)
+            },
+        )
         val open = PendingIntent.getActivity(
             context, 0, Intent(context, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
         )
-        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(context, channel)
-        } else {
-            @Suppress("DEPRECATION") Notification.Builder(context)
-        }
-        return builder.setSmallIcon(R.drawable.ic_notification).setContentIntent(open)
+        return Notification.Builder(context, channel).setSmallIcon(R.drawable.ic_notification).setContentIntent(open)
     }
 
     private const val PERCENT = 100

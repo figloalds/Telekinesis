@@ -45,7 +45,12 @@ class BurstsTest {
         assertTrue(entered.await(5, TimeUnit.SECONDS))
         val second = async(bursts, Mode.Full)
         val third = async(bursts, Mode.Full)
-        Thread.sleep(200)
+        // Both are blocked in `request` before anything is released, so "waits" is not a race.
+        listOf(second, third).forEach { blocked ->
+            val end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+            while (blocked.state != Thread.State.WAITING && System.nanoTime() < end) Thread.sleep(5)
+            assertEquals("a full burst waits behind the metadata-only one", Thread.State.WAITING, blocked.state)
+        }
         assertEquals("the full one waits", listOf(Mode.MetadataOnly), started.toList())
         release.countDown()
         listOf(first, second, third).forEach { it.join(5_000) }
