@@ -984,6 +984,15 @@ impl Store {
         self.durable_metadata = Some(stamp);
         Ok(())
     }
+    /// Whether [`Self::sync_metadata`] would have nothing to do: every metadata
+    /// change so far is on disk.
+    #[cfg(test)]
+    pub(crate) fn metadata_is_durable(&self) -> bool {
+        self.db.is_autocommit()
+            && self
+                .metadata_stamp()
+                .is_ok_and(|stamp| self.durable_metadata == Some(stamp))
+    }
     pub fn commit_due(&mut self) -> Result<()> {
         self.checkpoint.check_error()?;
         if self

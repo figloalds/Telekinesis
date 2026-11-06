@@ -44,7 +44,15 @@ CREATE TABLE IF NOT EXISTS peer_meta(
     installation TEXT PRIMARY KEY,
     clock_offset_ms INTEGER NOT NULL,
     clock_rtt_ms INTEGER NOT NULL,
-    clock_measured_at INTEGER NOT NULL);";
+    clock_measured_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS peer_cursors(
+    installation TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    sent INTEGER NOT NULL,
+    received INTEGER NOT NULL,
+    local_journal TEXT NOT NULL,
+    peer_journal TEXT NOT NULL,
+    PRIMARY KEY(installation, repo));";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FolderRecord {
@@ -90,6 +98,17 @@ fn decode_key(credential: &str) -> Result<[u8; 32]> {
     let mut key = [0; 32];
     hex::decode_to_slice(credential, &mut key).context("CREDENTIAL_INVALID")?;
     Ok(key)
+}
+
+/// How far a passive dialer got with one (peer installation, repo), for good:
+/// `sent` of this side's journal and `received` of the peer's, both durable where
+/// they arrived.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SavedCursor {
+    pub sent: u64,
+    pub received: u64,
+    pub local_journal: String,
+    pub peer_journal: String,
 }
 
 pub struct Catalog {
@@ -451,6 +470,10 @@ impl Catalog {
             "DELETE FROM peer_meta WHERE installation=?1",
             [installation],
         )?;
+        tx.execute_cached(
+            "DELETE FROM peer_cursors WHERE installation=?1",
+            [installation],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -510,6 +533,55 @@ impl Catalog {
             )
             .optional()?)
     }
+
+    pub fn feed_cursor(&self, installation: &str, repo: &str) -> Result<Option<SavedCursor>> {
+        Ok(self
+            .db()?
+            .query_cached(
+                "SELECT sent,received,local_journal,peer_journal FROM peer_cursors \
+                 WHERE installation=?1 AND repo=?2",
+                [installation, repo],
+                cursor_row,
+            )
+            .optional()?)
+    }
+
+    pub fn save_feed_cursor(
+        &self,
+        installation: &str,
+        repo: &str,
+        cursor: &SavedCursor,
+    ) -> Result<()> {
+        self.db()?.execute_cached(
+            "INSERT OR REPLACE INTO peer_cursors VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                installation,
+                repo,
+                cursor.sent,
+                cursor.received,
+                cursor.local_journal,
+                cursor.peer_journal
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every saved cursor of `repo`, with its peer installation.
+    pub fn feed_cursors_of_repo(&self, repo: &str) -> Result<Vec<(String, SavedCursor)>> {
+        let db = self.db()?;
+        let mut query = db.prepare_cached(
+            "SELECT sent,received,local_journal,peer_journal,installation FROM peer_cursors \
+             WHERE repo=?1 ORDER BY installation",
+        )?;
+        Ok(query
+            .query_map([repo], |r| Ok((r.get(4)?, cursor_row(r)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn clear_feed_cursors(&self) -> Result<()> {
+        self.db()?.execute_cached("DELETE FROM peer_cursors", [])?;
+        Ok(())
+    }
 }
 
 fn path_text(path: &Path) -> Result<&str> {
@@ -523,6 +595,15 @@ fn peer_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Peer> {
         installation: r.get(1)?,
         credential: r.get(2)?,
         connections: r.get(3)?,
+    })
+}
+
+fn cursor_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SavedCursor> {
+    Ok(SavedCursor {
+        sent: r.get(0)?,
+        received: r.get(1)?,
+        local_journal: r.get(2)?,
+        peer_journal: r.get(3)?,
     })
 }
 
@@ -835,6 +916,61 @@ mod tests {
         );
         assert!(catalog.peers()?.is_empty());
         assert_eq!(catalog.clock("inst")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn feed_cursors_round_trip_and_unpair_removes_them() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let catalog = Catalog::open(home.path())?;
+        let cursor = SavedCursor {
+            sent: 3,
+            received: u64::from(u32::MAX) + 5,
+            local_journal: "here".into(),
+            peer_journal: "there".into(),
+        };
+        let other = SavedCursor {
+            sent: 9,
+            ..cursor.clone()
+        };
+        assert_eq!(catalog.feed_cursor("b", "repo-1")?, None);
+        catalog.save_feed_cursor("b", "repo-1", &cursor)?;
+        catalog.save_feed_cursor("b", "repo-2", &cursor)?;
+        catalog.save_feed_cursor("c", "repo-1", &other)?;
+        assert_eq!(catalog.feed_cursor("b", "repo-1")?, Some(cursor.clone()));
+        assert_eq!(
+            catalog.feed_cursors_of_repo("repo-1")?,
+            [("b".to_owned(), cursor.clone()), ("c".to_owned(), other)]
+        );
+        // A save overwrites, and the rows outlive the catalog being reopened.
+        let moved = SavedCursor {
+            received: 1,
+            peer_journal: "elsewhere".into(),
+            ..cursor.clone()
+        };
+        catalog.save_feed_cursor("b", "repo-1", &moved)?;
+        drop(catalog);
+        let catalog = Catalog::open(home.path())?;
+        assert_eq!(catalog.feed_cursor("b", "repo-1")?, Some(moved));
+        // Unpairing takes that installation's rows, in every repo, and no other's.
+        catalog.save_peer("ws://host:1", "b", [4; 32], None)?;
+        catalog.unpair("b")?;
+        assert_eq!(catalog.feed_cursor("b", "repo-1")?, None);
+        assert_eq!(catalog.feed_cursor("b", "repo-2")?, None);
+        assert_eq!(catalog.feed_cursors_of_repo("repo-1")?.len(), 1);
+        catalog.clear_feed_cursors()?;
+        assert!(catalog.feed_cursors_of_repo("repo-1")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_catalog_from_before_feed_cursors_gains_the_table() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        drop(Catalog::open(home.path())?);
+        rusqlite::Connection::open(home.path().join("folders.sqlite"))?
+            .execute_batch("DROP TABLE peer_cursors;")?;
+        let catalog = Catalog::open(home.path())?;
+        assert_eq!(catalog.feed_cursor("b", "repo-1")?, None);
         Ok(())
     }
 }

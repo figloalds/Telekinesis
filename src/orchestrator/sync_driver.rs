@@ -17,7 +17,8 @@
 //!   `feed.apply` of the reply's events on the worker; then both cursors
 //!   advance, and it repeats at once while either side has `more`. Cursors
 //!   live in memory per (peer, repo) ([`SyncJob`]) and start over when the
-//!   folder's worker or the peer's control session changes.
+//!   folder's worker or the peer's control session changes. A passive driver's
+//!   go on instead: see below.
 //! * **object pump** — one thread for every Running, unpaused folder. Each
 //!   round has two passes (spec §7.8: demand never waits behind background
 //!   traffic). Pass 1 supplies every folder's pending `watch` demand; pass 2
@@ -80,8 +81,22 @@
 //! after [`REPO_WAIT`], since its folder may only be restarting. Any other coded
 //! failure would repeat itself, so it ends the pair. A peer without a folder is
 //! an error only when no peer took it.
+//!
+//! **Saved cursors.** A freeze on a phone ends the session, and a replay on every
+//! session would make each background check read the whole log. So a passive
+//! driver saves its cursors per (peer installation, repo) ([`CursorStore`]) and
+//! starts a new session or worker where they stand. That replay is also what hides
+//! events a crash lost, so a saved cursor passes only what is durable on both
+//! sides: the exchange asks for `durable` on `meta.exchange` and `feed.apply` and
+//! saves after both replied, page by page. Each page names the journal and the top
+//! of its side; a journal that is not the cursor's, or a top below it, means the
+//! cursor stands on nothing, and the exchange starts over from zero. A side that
+//! names no journal is an older one: nothing is saved of it and nothing resumes.
+//! What this cannot detect, such as a host restored from a backup that has since
+//! grown past the cursor, is for `manage reset-cursors`. An active driver neither
+//! loads nor saves nor asks for anything durable.
 use super::{
-    catalog::Catalog,
+    catalog::{Catalog, SavedCursor},
     config::SyncProfile,
     demand::Seq,
     endpoint::REPLY_TIMEOUT,
@@ -181,13 +196,53 @@ const DEMAND_SUPPLIED: Duration = super::worker_client::WATCH_DEADLINE;
 pub(super) type Wanted = Vec<(Digest, Kind)>;
 
 /// How this orchestrator keeps its folders in sync.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct SyncPolicy {
     pub profile: SyncProfile,
     /// The poll of a session that gets no notify, and the length of a round.
     pub interval: Duration,
     /// The poll of a session that gets notified.
     pub backup_poll: Duration,
+    /// Where a passive driver keeps its feed cursors.
+    pub cursors: Arc<dyn CursorStore>,
+}
+
+/// Where a passive driver's feed cursors survive sessions and restarts, per (peer
+/// installation, repo). A failure is the store's to log and goes no further: all it
+/// costs is a replay.
+pub trait CursorStore: Send + Sync {
+    fn load(&self, installation: &str, repo: &str) -> Option<SavedCursor>;
+    fn save(&self, installation: &str, repo: &str, cursor: &SavedCursor);
+    fn clear(&self);
+}
+
+impl CursorStore for Catalog {
+    fn load(&self, installation: &str, repo: &str) -> Option<SavedCursor> {
+        self.feed_cursor(installation, repo)
+            .inspect_err(|error| {
+                event!(warn, FEED_CURSOR_LOAD_FAILED, {
+                    "installation": installation,
+                    "repo": repo,
+                    "error": format!("{error:#}"),
+                });
+            })
+            .ok()
+            .flatten()
+    }
+    fn save(&self, installation: &str, repo: &str, cursor: &SavedCursor) {
+        if let Err(error) = self.save_feed_cursor(installation, repo, cursor) {
+            event!(warn, FEED_CURSOR_SAVE_FAILED, {
+                "installation": installation,
+                "repo": repo,
+                "error": format!("{error:#}"),
+            });
+        }
+    }
+    fn clear(&self) {
+        if let Err(error) = self.clear_feed_cursors() {
+            event!(warn, FEED_CURSOR_CLEAR_FAILED, { "error": format!("{error:#}") });
+        }
+    }
 }
 
 impl SyncPolicy {
@@ -432,6 +487,8 @@ struct Slot {
     link: Weak<WorkerLink>,
     /// The peer control session the cursors were taken on.
     session: String,
+    /// The journals a passive driver's cursor counts in.
+    journals: Journals,
     running: bool,
     /// When its poll comes due.
     next_poll: Option<Instant>,
@@ -440,10 +497,65 @@ struct Slot {
 /// One dispatched exchange.
 struct Task {
     key: (String, String),
+    /// The peer's installation, which its saved cursor goes by.
+    installation: String,
     link: Arc<WorkerLink>,
     conn: Conn,
     session: String,
     cursor: FeedCursor,
+    journals: Journals,
+}
+
+/// The journals a cursor counts in: without them its numbers mean nothing. Empty
+/// where that side has named none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Journals {
+    local: String,
+    peer: String,
+}
+
+/// What a passive driver's exchange has beyond its cursor.
+struct Keeping<'a> {
+    journals: &'a mut Journals,
+    /// Takes a page's cursor once what it passes is durable on both sides.
+    save: &'a dyn Fn(&SavedCursor),
+}
+
+impl Keeping<'_> {
+    /// `cursor` no longer stands: from zero, in no journal. The row is overwritten
+    /// by the first page that can be saved.
+    fn start_over(&mut self, cursor: &mut FeedCursor, repo: &str, side: &str) {
+        event!(info, FEED_CURSOR_STARTED_OVER, {
+            "repo": repo,
+            "side": side,
+            "sent": cursor.sent,
+            "received": cursor.received,
+        });
+        *cursor = FeedCursor::default();
+        *self.journals = Journals::default();
+    }
+
+    /// A page both sides took: `cursor` passes it, from `before`, and these are the
+    /// journals both of them count in.
+    fn page_taken(&mut self, before: FeedCursor, cursor: FeedCursor, journals: Journals) {
+        let changed = cursor != before || journals != *self.journals;
+        if changed && !journals.local.is_empty() && !journals.peer.is_empty() {
+            (self.save)(&SavedCursor {
+                sent: cursor.sent,
+                received: cursor.received,
+                local_journal: journals.local.clone(),
+                peer_journal: journals.peer.clone(),
+            });
+        }
+        *self.journals = journals;
+    }
+}
+
+/// Whether a cursor at `at` in `journal` still stands on a side that names `named`
+/// as its journal and `top` as its latest sequence. One that names none is an older
+/// one, and its top says nothing.
+fn cursor_stands(journal: &str, at: u64, named: &str, top: u64) -> bool {
+    journal == named && (named.is_empty() || top >= at)
 }
 
 #[derive(Default)]
@@ -682,6 +794,7 @@ impl Driver {
             profile: SyncProfile::Active,
             interval,
             backup_poll: interval,
+            cursors: catalog.clone(),
         };
         Self::with_policy(lanes, catalog, folders, wake, policy, cancel)
     }
@@ -785,6 +898,54 @@ impl Driver {
         }
         self.poke.bump();
         self.wake.nudge();
+    }
+
+    /// Forgets every feed cursor, saved and in memory, so that the next exchange of
+    /// each pair starts over. One under way saves nothing more and its results are
+    /// dropped ([`Self::save_cursor`], [`Self::record_finish`]): its session is no
+    /// longer the slot's, which is also what makes the pair due again.
+    pub fn reset_cursors(&self) {
+        let mut jobs = lock(&self.jobs);
+        self.policy.cursors.clear();
+        for slot in jobs.values_mut() {
+            slot.job.cursor = FeedCursor::default();
+            slot.journals = Journals::default();
+            slot.session.clear();
+        }
+    }
+
+    /// Saves `cursor` for `task`'s pair, unless [`Self::reset_cursors`] came since
+    /// it started: under the lock that takes, so nothing it cleared comes back.
+    fn save_cursor(&self, task: &Task, cursor: &SavedCursor) {
+        let jobs = lock(&self.jobs);
+        let current = jobs
+            .get(&task.key)
+            .is_some_and(|slot| slot.session == task.session);
+        if current {
+            self.policy
+                .cursors
+                .save(&task.installation, &task.key.1, cursor);
+        }
+    }
+
+    /// Where a new session or worker starts: from zero, or for a passive driver
+    /// where its saved cursor stands.
+    fn starting_point(&self, installation: &str, repo: &str) -> (FeedCursor, Journals) {
+        let saved = self
+            .passive()
+            .then(|| self.policy.cursors.load(installation, repo))
+            .flatten();
+        saved.map_or_else(Default::default, |saved| {
+            let cursor = FeedCursor {
+                sent: saved.sent,
+                received: saved.received,
+            };
+            let journals = Journals {
+                local: saved.local_journal,
+                peer: saved.peer_journal,
+            };
+            (cursor, journals)
+        })
     }
 
     // ---- sync-now --------------------------------------------------------
@@ -1022,19 +1183,22 @@ impl Driver {
                 },
                 link: Weak::new(),
                 session: String::new(),
+                journals: Journals::default(),
                 running: false,
                 next_poll: None,
             });
             if slot.running {
                 continue;
             }
-            // A restarted worker or a new control session: start over.
+            // A restarted worker or a new control session: start over, or for a
+            // passive driver where its saved cursor stands.
             let new = !Weak::ptr_eq(&slot.link, &Arc::downgrade(&folder.link))
                 || slot.session != peer.session;
             if new {
                 slot.link = Arc::downgrade(&folder.link);
                 slot.session = peer.session.clone();
-                slot.job.cursor = FeedCursor::default();
+                (slot.job.cursor, slot.journals) =
+                    self.starting_point(&peer.installation, &folder.repo);
             }
             // No clock moves a passive driver, even during a burst.
             let polled = !self.passive() && slot.next_poll.is_none_or(|at| at <= now);
@@ -1045,10 +1209,12 @@ impl Driver {
             slot.next_poll = Some(now + self.policy.poll(peer.notify));
             let task = Task {
                 key,
+                installation: peer.installation.clone(),
                 link: folder.link.clone(),
                 conn: peer.control.clone(),
                 session: peer.session.clone(),
                 cursor: slot.job.cursor,
+                journals: slot.journals.clone(),
             };
             slot.running = true;
             self.busy.fetch_add(1, Ordering::AcqRel);
@@ -1067,16 +1233,29 @@ impl Driver {
                 Ok(task) => task,
                 Err(_) => return,
             };
-            let mut cursor = task.cursor;
-            let result = exchange(
-                &task.link,
-                &task.conn,
-                &task.key.1,
-                &mut cursor,
-                &self.cancel,
-            );
-            self.finish(&task, cursor, result);
+            self.run_exchange(task);
         }
+    }
+
+    /// One exchange, start to finish.
+    fn run_exchange(&self, mut task: Task) {
+        let mut cursor = task.cursor;
+        let mut journals = std::mem::take(&mut task.journals);
+        let save = |saved: &SavedCursor| self.save_cursor(&task, saved);
+        let keeping = self.passive().then_some(Keeping {
+            journals: &mut journals,
+            save: &save,
+        });
+        let result = exchange(
+            &task.link,
+            &task.conn,
+            &task.key.1,
+            &mut cursor,
+            keeping,
+            &self.cancel,
+        );
+        task.journals = journals;
+        self.finish(&task, cursor, result);
     }
 
     /// Records an exchange's outcome on its job, unless the job started over
@@ -1101,6 +1280,7 @@ impl Driver {
         }
         // Pages the peer and the worker both took stay taken.
         slot.job.cursor = cursor;
+        slot.journals = task.journals.clone();
         // Events moved: the objects they name may now be wanted, either way.
         let moved = cursor != task.cursor;
         if moved {
@@ -2008,14 +2188,26 @@ pub(super) fn lanes_for(
 }
 
 /// One exchange of `repo` with the peer behind `conn`, repeated while either
-/// side has more. `cursor` advances only past pages both sides took.
+/// side has more. `cursor` advances only past pages both sides took. With
+/// `keeping`, a passive dialer's, it may be a saved one: it starts over if a side's
+/// journal or top says it no longer stands, and each page taken is durable on both
+/// sides before it is saved.
 fn exchange(
     link: &WorkerLink,
     conn: &Conn,
     repo: &str,
     cursor: &mut FeedCursor,
+    mut keeping: Option<Keeping<'_>>,
     cancel: &Cancel,
 ) -> Result<(), Failure> {
+    let (exchange_header, apply_header) = if keeping.is_some() {
+        (
+            json!({"repo": repo, "durable": true}),
+            json!({"durable": true}),
+        )
+    } else {
+        (json!({"repo": repo}), json!({}))
+    };
     loop {
         if cancel.is_cancelled() || conn.closed().is_some() {
             return Err(Failure::LaneLost);
@@ -2026,16 +2218,29 @@ fn exchange(
             .and_then(|value| {
                 serde_json::from_value(value).map_err(|e| worker_failure("feed.outgoing", e))
             })?;
+        if let Some(keeping) = &mut keeping
+            && *cursor != FeedCursor::default()
+            && !cursor_stands(
+                &keeping.journals.local,
+                cursor.sent,
+                &page.journal,
+                page.top,
+            )
+        {
+            keeping.start_over(cursor, repo, "local");
+            continue;
+        }
         let more = page.more;
-        let body = serde_json::to_vec(&FeedRequest {
+        let request = FeedRequest {
             after: cursor.received,
             events: page.events,
-        })
-        .map_err(|error| worker_failure("meta.exchange", error))?;
+        };
+        let body =
+            serde_json::to_vec(&request).map_err(|error| worker_failure("meta.exchange", error))?;
         let reply = conn
             .call_cancellable(
                 "meta.exchange",
-                json!({"repo": repo}),
+                exchange_header.clone(),
                 body,
                 Priority::Control,
                 PEER_DEADLINE,
@@ -2044,14 +2249,42 @@ fn exchange(
             .map_err(|error| peer_failure("meta.exchange", error))?;
         let reply: FeedReply = serde_json::from_slice(&reply.body)
             .map_err(|error| Failure::Error(format!("meta.exchange: malformed reply: {error}")))?;
-        if !reply.events.is_empty() {
-            let events = serde_json::to_vec(&reply.events)
+        if let Some(keeping) = &mut keeping
+            && *cursor != FeedCursor::default()
+            && !cursor_stands(
+                &keeping.journals.peer,
+                cursor.received,
+                &reply.journal,
+                reply.top,
+            )
+        {
+            keeping.start_over(cursor, repo, "peer");
+            continue;
+        }
+        // A saved cursor passes this page's own events as well: `sent` does, and so
+        // does `received` where the peer left out their echo. Applied again they
+        // change nothing, but a durable apply puts them on disk here too.
+        let to_apply = if reply.events.is_empty() && keeping.is_some() {
+            &request.events
+        } else {
+            &reply.events
+        };
+        if !to_apply.is_empty() {
+            let events = serde_json::to_vec(to_apply)
                 .map_err(|error| worker_failure("feed.apply", error))?;
-            link.call("feed.apply", json!({}), events, CALL_DEADLINE)
+            link.call("feed.apply", apply_header.clone(), events, CALL_DEADLINE)
                 .map_err(|error| worker_failure("feed.apply", error))?;
         }
+        let before = *cursor;
         cursor.sent = page.cursor;
         cursor.received = reply.cursor;
+        if let Some(keeping) = &mut keeping {
+            let journals = Journals {
+                local: page.journal,
+                peer: reply.journal,
+            };
+            keeping.page_taken(before, *cursor, journals);
+        }
         if !(more || reply.more) {
             return Ok(());
         }
@@ -2171,13 +2404,15 @@ mod tests {
     use super::*;
     use crate::orchestrator::{
         network::{Refused, StoreReply},
-        sync::{MissingPage, Object, WantedPage},
+        sync::{FEED_PAGE, MissingPage, Object, Service, WantedPage},
     };
     use crate::{
+        core::EntryKind,
         model::{
             errors::ErrorWire,
             protocol::{LaneRole, features},
         },
+        runtime::Engine,
         session::{ConnOptions, Handler, Incoming, PeerInfo, Side},
     };
     use std::{
@@ -2455,9 +2690,13 @@ mod tests {
 
     /// A loopback worker serving `folder`, and its link.
     fn fake_worker(folder: Arc<FakeFolder>) -> Arc<WorkerLink> {
+        worker_serving(Arc::new(FnHandler(move |req: Incoming| folder.serve(req))))
+    }
+
+    /// A loopback worker whose every request goes to `handler`, and its link.
+    fn worker_serving(handler: Arc<dyn Handler>) -> Arc<WorkerLink> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("ws://{}", listener.local_addr().unwrap());
-        let handler: Arc<dyn Handler> = Arc::new(FnHandler(move |req: Incoming| folder.serve(req)));
         thread::spawn(move || {
             let mut conns = Vec::new();
             for stream in listener.incoming() {
@@ -3848,6 +4087,7 @@ mod tests {
             profile: SyncProfile::Active,
             interval,
             backup_poll,
+            cursors: Arc::new(FakeCursors::default()),
         }
     }
 
@@ -4139,6 +4379,7 @@ mod tests {
             profile: SyncProfile::Passive,
             interval,
             backup_poll: interval,
+            cursors: Arc::new(FakeCursors::default()),
         }
     }
 
@@ -6315,5 +6556,634 @@ mod tests {
         driver.pump_round(&mut state, driver.wake.current());
         state.push.rest_endpoint(ENDPOINT);
         close_to(state.push.resting[ENDPOINT], Duration::from_secs(1));
+    }
+
+    // ---- feed cursors that survive ---------------------------------------
+
+    /// The saved cursors of a test, in memory.
+    #[derive(Default)]
+    struct FakeCursors {
+        rows: Mutex<BTreeMap<(String, String), SavedCursor>>,
+        loads: Mutex<usize>,
+        saves: Mutex<usize>,
+        /// Runs at every save, before the row changes.
+        on_save: Mutex<Option<Hook>>,
+    }
+
+    impl FakeCursors {
+        /// The row of the one (installation, repo) these tests use.
+        fn row(&self) -> Option<SavedCursor> {
+            lock(&self.rows)
+                .get(&("peer-b".to_owned(), "repo-1".to_owned()))
+                .cloned()
+        }
+
+        fn set_row(&self, cursor: SavedCursor) {
+            let key = ("peer-b".to_owned(), "repo-1".to_owned());
+            lock(&self.rows).insert(key, cursor);
+        }
+
+        fn loads(&self) -> usize {
+            *lock(&self.loads)
+        }
+
+        fn saves(&self) -> usize {
+            *lock(&self.saves)
+        }
+    }
+
+    impl CursorStore for FakeCursors {
+        fn load(&self, installation: &str, repo: &str) -> Option<SavedCursor> {
+            *lock(&self.loads) += 1;
+            let key = (installation.to_owned(), repo.to_owned());
+            lock(&self.rows).get(&key).cloned()
+        }
+        fn save(&self, installation: &str, repo: &str, cursor: &SavedCursor) {
+            *lock(&self.saves) += 1;
+            if let Some(hook) = &*lock(&self.on_save) {
+                hook();
+            }
+            let key = (installation.to_owned(), repo.to_owned());
+            lock(&self.rows).insert(key, cursor.clone());
+        }
+        fn clear(&self) {
+            lock(&self.rows).clear();
+        }
+    }
+
+    fn policy_with(cursors: Arc<dyn CursorStore>, policy: SyncPolicy) -> SyncPolicy {
+        SyncPolicy { cursors, ..policy }
+    }
+
+    #[test]
+    fn a_passive_driver_resumes_a_saved_cursor_on_a_new_session() {
+        let cursors = Arc::new(FakeCursors::default());
+        let saved = |sent, received| SavedCursor {
+            sent,
+            received,
+            local_journal: "here".into(),
+            peer_journal: "there".into(),
+        };
+        cursors.set_row(saved(3, 4));
+        let (driver, _root, control) = dispatching(policy_with(cursors.clone(), passive(SHORT)));
+        let key = pair(ENDPOINT, "repo-1");
+        open_burst(&driver, std::slice::from_ref(&key));
+        let (tasks, queue) = mpsc::channel();
+        let first = [ready_peer(ENDPOINT, "control", false, &control)];
+        driver.dispatch(1, &first, &tasks);
+        let task = queue.try_recv().unwrap();
+        assert_eq!(
+            task.cursor,
+            FeedCursor {
+                sent: 3,
+                received: 4
+            }
+        );
+        assert_eq!(task.journals.local, "here");
+        assert_eq!(task.journals.peer, "there");
+        let ahead = FeedCursor {
+            sent: 30,
+            received: 40,
+        };
+        driver.finish(&task, ahead, Ok(()));
+        // A next exchange of this session goes on from memory.
+        lock(&driver.due).exchange.insert(key.clone());
+        driver.dispatch(1, &first, &tasks);
+        let task = queue.try_recv().unwrap();
+        assert_eq!(task.cursor, ahead);
+        assert_eq!(cursors.loads(), 1);
+        driver.finish(&task, ahead, Ok(()));
+        // A new session, or a new worker, goes back to what was saved: memory can
+        // hold what no save made it to the row.
+        cursors.set_row(saved(5, 6));
+        let second = [ready_peer(ENDPOINT, "control-again", false, &control)];
+        driver.dispatch(1, &second, &tasks);
+        let task = queue.try_recv().expect("the new session was not due");
+        assert_eq!(
+            task.cursor,
+            FeedCursor {
+                sent: 5,
+                received: 6
+            }
+        );
+        driver.finish(&task, task.cursor, Ok(()));
+        // No row: from the start, as on every session today.
+        lock(&cursors.rows).clear();
+        let third = [ready_peer(ENDPOINT, "control-third", false, &control)];
+        driver.dispatch(1, &third, &tasks);
+        let task = queue.try_recv().expect("the new session was not due");
+        assert_eq!(task.cursor, FeedCursor::default());
+        assert_eq!(task.journals, Journals::default());
+    }
+
+    /// What a listener saw of each `meta.exchange`.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Asked {
+        after: u64,
+        events: usize,
+        durable: bool,
+    }
+
+    /// Requests after which an exchange is taken to be looping.
+    const TOO_MANY_PAGES: usize = 64;
+
+    /// A real listener: the sync service of a real folder, recording what it is
+    /// asked. It holds the service weakly, so the folder closes with its test.
+    struct RealListener {
+        service: Weak<Service>,
+        asked: Mutex<Vec<Asked>>,
+        /// It answers as a listener from before journals did.
+        older: bool,
+        /// `meta.exchange` fails after this many requests.
+        fail_after: Option<usize>,
+        /// Cancelled at [`TOO_MANY_PAGES`], so that a loop fails the test.
+        loop_guard: Cancel,
+    }
+
+    impl Handler for RealListener {
+        fn handle(&self, req: Incoming) {
+            let asked = {
+                let mut asked = lock(&self.asked);
+                let request: FeedRequest = serde_json::from_slice(&req.body).unwrap();
+                asked.push(Asked {
+                    after: request.after,
+                    events: request.events.len(),
+                    durable: req.header["durable"] == true,
+                });
+                asked.len()
+            };
+            if asked >= TOO_MANY_PAGES {
+                self.loop_guard.cancel();
+            }
+            if self.fail_after.is_some_and(|most| asked > most) {
+                req.responder
+                    .error(ErrorWire::coded("BROKEN", "on purpose"));
+                return;
+            }
+            let service = self.service.upgrade().expect("the folder is gone");
+            let (header, body) = service
+                .handle_reply(&req.op, &req.header, &req.body)
+                .unwrap();
+            let body = if self.older {
+                let mut reply: Value = serde_json::from_slice(&body).unwrap();
+                let fields = reply.as_object_mut().unwrap();
+                fields.remove("journal");
+                fields.remove("top");
+                serde_json::to_vec(&reply).unwrap()
+            } else {
+                body
+            };
+            req.responder.reply(header, body);
+        }
+    }
+
+    fn real_service(engine: &Arc<Engine>) -> Arc<Service> {
+        Arc::new(Service {
+            engine: engine.clone(),
+            demand: crate::orchestrator::demand::Demand::new(
+                Seq::new(),
+                engine.working.content().packs.clone(),
+            ),
+        })
+    }
+
+    /// A driver whose one folder (`here`) has a real worker, and a real listener
+    /// (`there`) of the same repo. Nothing runs on its own: a test exchanges.
+    struct RealSides {
+        driver: Arc<Driver>,
+        cursors: Arc<FakeCursors>,
+        here: Arc<Engine>,
+        there: Arc<Engine>,
+        listener: Arc<RealListener>,
+        control: Conn,
+        server: Conn,
+        guard: Cancel,
+        _services: [Arc<Service>; 2],
+        _homes: [tempfile::TempDir; 3],
+    }
+
+    impl RealSides {
+        fn passive(cursors: &Arc<FakeCursors>) -> Self {
+            let policy = policy_with(cursors.clone(), passive(SHORT));
+            Self::new(policy, cursors.clone(), false, None)
+        }
+
+        fn new(
+            policy: SyncPolicy,
+            cursors: Arc<FakeCursors>,
+            older: bool,
+            fail_after: Option<usize>,
+        ) -> Self {
+            let homes = [
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+                tempfile::tempdir().unwrap(),
+            ];
+            let here = Engine::open(homes[0].path(), Some("repo-1")).unwrap();
+            let there = Engine::open(homes[1].path(), Some("repo-1")).unwrap();
+            let (worker, peer) = (real_service(&here), real_service(&there));
+            let serving = Arc::downgrade(&worker);
+            let link = worker_serving(Arc::new(FnHandler(move |req: Incoming| {
+                serving.upgrade().expect("the folder is gone").handle(req);
+            })));
+            let guard = Cancel::new();
+            let listener = Arc::new(RealListener {
+                service: Arc::downgrade(&peer),
+                asked: Mutex::new(Vec::new()),
+                older,
+                fail_after,
+                loop_guard: guard.clone(),
+            });
+            let (control, server) = served(listener.clone());
+            let lanes = ReadyLanes {
+                peers: Vec::new(),
+                control: control.clone(),
+                bulk: None,
+            };
+            let driver = Driver::with_policy(
+                Arc::new(lanes),
+                Catalog::open(homes[2].path()).unwrap(),
+                Arc::new(RepoFolders(vec![("repo-1".into(), link, Vec::new())])),
+                Seq::new(),
+                policy,
+                guard.clone(),
+            );
+            Self {
+                driver,
+                cursors,
+                here,
+                there,
+                listener,
+                control,
+                server,
+                guard,
+                _services: [worker, peer],
+                _homes: homes,
+            }
+        }
+
+        /// One exchange on this control `session`, start to finish, on this thread.
+        fn exchange_on(&self, session: &str) {
+            let key = pair(ENDPOINT, "repo-1");
+            open_burst(&self.driver, std::slice::from_ref(&key));
+            let peers = [ready_peer(ENDPOINT, session, false, &self.control)];
+            let (tasks, queue) = mpsc::channel();
+            self.driver.dispatch(1, &peers, &tasks);
+            let task = queue.try_recv().expect("the pair was not due");
+            self.driver.run_exchange(task);
+            assert!(!self.guard.is_cancelled(), "the exchange did not end");
+        }
+
+        fn cursor(&self) -> FeedCursor {
+            lock(&self.driver.jobs)[&pair(ENDPOINT, "repo-1")]
+                .job
+                .cursor
+        }
+
+        fn error(&self) -> Option<String> {
+            let jobs = lock(&self.driver.jobs);
+            jobs[&pair(ENDPOINT, "repo-1")].job.error.clone()
+        }
+
+        /// What the listener was asked since this was last called.
+        fn asked(&self) -> Vec<Asked> {
+            std::mem::take(&mut *lock(&self.listener.asked))
+        }
+
+        /// A saved cursor at the top of both sides, in both their journals. A
+        /// test that means something else says what.
+        fn caught_up(&self) -> SavedCursor {
+            let (here, there) = (lock(&self.here.store), lock(&self.there.store));
+            SavedCursor {
+                sent: here.feed_position().unwrap(),
+                received: there.feed_position().unwrap(),
+                local_journal: here.device.clone(),
+                peer_journal: there.device.clone(),
+            }
+        }
+
+        fn add_here(&self, name: &str) {
+            let mut store = lock(&self.here.store);
+            store.create(name, EntryKind::File).unwrap();
+        }
+
+        fn add_there(&self, name: &str) {
+            let mut store = lock(&self.there.store);
+            store.create(name, EntryKind::File).unwrap();
+        }
+
+        /// A file on each side that the other does not have.
+        fn one_file_each(&self) {
+            self.add_here("from-here");
+            self.add_there("from-there");
+        }
+
+        fn each_has_the_others_file(&self) -> bool {
+            lock(&self.here.store).lookup("from-there").is_ok()
+                && lock(&self.there.store).lookup("from-here").is_ok()
+        }
+
+        /// After [`Self::one_file_each`] and a row that claims neither file is
+        /// news: only an exchange from zero moves them, and the row is rewritten.
+        fn assert_started_over(&self) {
+            assert_eq!(self.error(), None);
+            assert!(self.each_has_the_others_file());
+            assert_eq!(self.asked().last().unwrap().after, 0);
+            let (row, truth) = (self.cursors.row().unwrap(), self.caught_up());
+            assert_eq!(row.received, truth.received);
+            assert_eq!(row.local_journal, truth.local_journal);
+            assert_eq!(row.peer_journal, truth.peer_journal);
+        }
+    }
+
+    impl Drop for RealSides {
+        fn drop(&mut self) {
+            self.control.close();
+            self.server.close();
+            let _ = self.here.shutdown();
+            let _ = self.there.shutdown();
+        }
+    }
+
+    #[test]
+    fn a_resumed_exchange_asks_only_for_what_is_new() {
+        let cursors = Arc::new(FakeCursors::default());
+        let sides = RealSides::passive(&cursors);
+        sides.one_file_each();
+        // The second sends back what the first brought: all there is to send.
+        sides.exchange_on("session-1");
+        sides.exchange_on("session-2");
+        assert_eq!(sides.error(), None);
+        let saved = cursors.row().expect("nothing was saved");
+        assert_eq!(saved, sides.caught_up());
+        let asked = sides.asked();
+        assert!(asked.iter().all(|asked| asked.durable), "{asked:?}");
+        // The lanes came back: not one event goes again, either way, and an
+        // unchanged folder does not even write its row.
+        let saves = cursors.saves();
+        sides.exchange_on("session-3");
+        assert_eq!(
+            sides.asked(),
+            [Asked {
+                after: saved.received,
+                events: 0,
+                durable: true
+            }]
+        );
+        assert_eq!(cursors.saves(), saves);
+        // Something new goes, and only that.
+        sides.add_here("new");
+        sides.exchange_on("session-4");
+        assert_eq!(
+            sides.asked(),
+            [Asked {
+                after: saved.received,
+                events: 1,
+                durable: true
+            }]
+        );
+        assert!(lock(&sides.there.store).lookup("new").is_ok());
+    }
+
+    #[test]
+    fn a_resumed_exchange_starts_over_when_the_peer_journal_changed() {
+        let cursors = Arc::new(FakeCursors::default());
+        let sides = RealSides::passive(&cursors);
+        sides.one_file_each();
+        cursors.set_row(SavedCursor {
+            peer_journal: "a-journal-since-replaced".into(),
+            ..sides.caught_up()
+        });
+        sides.exchange_on("session-1");
+        sides.assert_started_over();
+    }
+
+    #[test]
+    fn a_resumed_exchange_starts_over_when_the_peer_top_is_below_the_cursor() {
+        let cursors = Arc::new(FakeCursors::default());
+        let sides = RealSides::passive(&cursors);
+        sides.one_file_each();
+        let caught_up = sides.caught_up();
+        cursors.set_row(SavedCursor {
+            received: caught_up.received + 1,
+            ..caught_up
+        });
+        sides.exchange_on("session-1");
+        sides.assert_started_over();
+    }
+
+    #[test]
+    fn a_resumed_exchange_starts_over_when_the_local_journal_changed() {
+        let cursors = Arc::new(FakeCursors::default());
+        let sides = RealSides::passive(&cursors);
+        sides.one_file_each();
+        cursors.set_row(SavedCursor {
+            local_journal: "a-journal-since-replaced".into(),
+            ..sides.caught_up()
+        });
+        sides.exchange_on("session-1");
+        sides.assert_started_over();
+    }
+
+    #[test]
+    fn a_resumed_exchange_starts_over_when_the_local_top_is_below_the_cursor() {
+        let cursors = Arc::new(FakeCursors::default());
+        let sides = RealSides::passive(&cursors);
+        sides.one_file_each();
+        let caught_up = sides.caught_up();
+        cursors.set_row(SavedCursor {
+            sent: caught_up.sent + 1,
+            ..caught_up
+        });
+        sides.exchange_on("session-1");
+        sides.assert_started_over();
+    }
+
+    #[test]
+    fn a_listener_that_lost_events_cannot_hide_it_behind_this_exchange() {
+        // Its top is one short of the cursor, and what this side has to send would
+        // lift it past: the usual case, a phone with something new.
+        let cursors = Arc::new(FakeCursors::default());
+        let sides = RealSides::passive(&cursors);
+        sides.one_file_each();
+        let caught_up = sides.caught_up();
+        sides.add_here("new");
+        cursors.set_row(SavedCursor {
+            received: caught_up.received + 1,
+            ..caught_up
+        });
+        sides.exchange_on("session-1");
+        sides.assert_started_over();
+    }
+
+    #[test]
+    fn an_active_driver_never_saves_a_cursor() {
+        let cursors = Arc::new(FakeCursors::default());
+        let policy = policy_with(cursors.clone(), active(HOUR, HOUR));
+        let sides = RealSides::new(policy, cursors.clone(), false, None);
+        let row = SavedCursor {
+            sent: 7,
+            received: 7,
+            local_journal: "here".into(),
+            peer_journal: "there".into(),
+        };
+        cursors.set_row(row.clone());
+        sides.one_file_each();
+        sides.exchange_on("session-1");
+        sides.exchange_on("session-2");
+        assert_eq!(sides.error(), None);
+        assert_eq!((cursors.loads(), cursors.saves()), (0, 0));
+        assert_eq!(cursors.row(), Some(row));
+        // Every session starts from zero, and it asks nothing durable of anybody.
+        let asked = sides.asked();
+        assert_eq!(asked.last().unwrap().after, 0);
+        assert!(asked.iter().all(|asked| !asked.durable), "{asked:?}");
+        assert!(!lock(&sides.there.store).metadata_is_durable());
+        assert!(!lock(&sides.here.store).metadata_is_durable());
+    }
+
+    #[test]
+    fn a_reply_with_no_journal_saves_nothing() {
+        let cursors = Arc::new(FakeCursors::default());
+        let policy = policy_with(cursors.clone(), passive(SHORT));
+        let sides = RealSides::new(policy, cursors.clone(), true, None);
+        // More than a page: an older listener's reply says nothing of its top, so
+        // its second page must not look like a listener that lost events.
+        for n in 0..=FEED_PAGE {
+            sides.add_there(&format!("file-{n}"));
+        }
+        sides.exchange_on("session-1");
+        assert_eq!(sides.error(), None);
+        assert_eq!(cursors.saves(), 0);
+        assert_eq!(cursors.row(), None);
+        assert_eq!(sides.cursor().received, FEED_PAGE as u64 + 1);
+        sides.asked();
+        // Within the session it goes on from there, as it does today.
+        sides.exchange_on("session-1");
+        assert_eq!(sides.asked()[0].after, FEED_PAGE as u64 + 1);
+        // A new session starts over: nothing resumes.
+        sides.exchange_on("session-2");
+        assert_eq!(sides.asked()[0].after, 0);
+        assert_eq!(cursors.saves(), 0);
+    }
+
+    #[test]
+    fn a_row_saved_with_a_listener_now_of_an_older_version_does_not_resume() {
+        let cursors = Arc::new(FakeCursors::default());
+        let policy = policy_with(cursors.clone(), passive(SHORT));
+        let sides = RealSides::new(policy, cursors.clone(), true, None);
+        sides.one_file_each();
+        let row = sides.caught_up();
+        cursors.set_row(row.clone());
+        sides.exchange_on("session-1");
+        assert_eq!(sides.error(), None);
+        assert!(sides.each_has_the_others_file());
+        assert_eq!(cursors.saves(), 0);
+        assert_eq!(cursors.row(), Some(row));
+    }
+
+    #[test]
+    fn a_saved_cursor_passes_nothing_that_is_not_durable_on_both_sides() {
+        let check = |set_up: &dyn Fn(&RealSides)| {
+            let cursors = Arc::new(FakeCursors::default());
+            let sides = RealSides::passive(&cursors);
+            set_up(&sides);
+            let (here, there) = (sides.here.clone(), sides.there.clone());
+            *lock(&cursors.on_save) = Some(Box::new(move || {
+                assert!(lock(&here.store).metadata_is_durable(), "here");
+                assert!(lock(&there.store).metadata_is_durable(), "there");
+            }));
+            sides.exchange_on("session-1");
+            *lock(&cursors.on_save) = None;
+            assert_eq!(sides.error(), None);
+            assert!(cursors.saves() > 0);
+        };
+        // Only this side has events: the reply leaves out their echoes and carries
+        // nothing to apply, while `sent` and `received` both pass them.
+        check(&|sides| sides.add_here("from-here"));
+        // Only the listener has them: the request carries nothing.
+        check(&|sides| sides.add_there("from-there"));
+        check(&RealSides::one_file_each);
+    }
+
+    #[test]
+    fn a_long_first_sync_keeps_the_pages_it_finished() {
+        let cursors = Arc::new(FakeCursors::default());
+        let policy = policy_with(cursors.clone(), passive(SHORT));
+        let sides = RealSides::new(policy, cursors.clone(), false, Some(1));
+        for n in 0..=FEED_PAGE {
+            sides.add_there(&format!("file-{n}"));
+        }
+        sides.exchange_on("session-1");
+        assert!(sides.error().is_some());
+        let row = cursors.row().expect("the finished page was not saved");
+        assert_eq!((row.sent, row.received), (0, FEED_PAGE as u64));
+        assert_eq!(sides.asked().len(), 2);
+        // It resumes there.
+        sides.exchange_on("session-2");
+        assert_eq!(sides.asked()[0].after, FEED_PAGE as u64);
+    }
+
+    #[test]
+    fn a_cursor_that_cannot_be_saved_costs_only_a_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(root.path()).unwrap();
+        rusqlite::Connection::open(root.path().join("folders.sqlite"))
+            .unwrap()
+            .execute_batch("DROP TABLE peer_cursors;")
+            .unwrap();
+        let policy = policy_with(catalog, passive(SHORT));
+        let sides = RealSides::new(policy, Arc::default(), false, None);
+        sides.one_file_each();
+        sides.exchange_on("session-1");
+        assert_eq!(sides.error(), None);
+        assert!(sides.each_has_the_others_file());
+        assert_ne!(sides.cursor(), FeedCursor::default());
+        // And one that cannot be read is no cursor.
+        sides.exchange_on("session-2");
+        assert_eq!(sides.error(), None);
+        assert_eq!(sides.asked().last().unwrap().after, 0);
+    }
+
+    #[test]
+    fn reset_cursors_forgets_the_saved_rows_and_every_slot() {
+        let cursors = Arc::new(FakeCursors::default());
+        let sides = RealSides::passive(&cursors);
+        sides.one_file_each();
+        sides.exchange_on("session-1");
+        assert!(cursors.row().is_some());
+        assert_ne!(sides.cursor(), FeedCursor::default());
+        sides.asked();
+        sides.driver.reset_cursors();
+        assert_eq!(cursors.row(), None);
+        assert_eq!(sides.cursor(), FeedCursor::default());
+        // The same session: the next exchange starts over, and saves again.
+        sides.exchange_on("session-1");
+        assert_eq!(sides.asked()[0].after, 0);
+        assert_eq!(cursors.row(), Some(sides.caught_up()));
+    }
+
+    #[test]
+    fn an_exchange_under_way_does_not_undo_a_reset() {
+        let cursors = Arc::new(FakeCursors::default());
+        let sides = RealSides::passive(&cursors);
+        sides.one_file_each();
+        let key = pair(ENDPOINT, "repo-1");
+        open_burst(&sides.driver, std::slice::from_ref(&key));
+        let peers = [ready_peer(ENDPOINT, "session-1", false, &sides.control)];
+        let (tasks, queue) = mpsc::channel();
+        sides.driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().unwrap();
+        // Reset with it on its way: what it learns is dropped, row and memory.
+        sides.driver.reset_cursors();
+        sides.driver.run_exchange(task);
+        assert_eq!(cursors.row(), None);
+        assert_eq!(sides.cursor(), FeedCursor::default());
+        // The burst is not stranded: the pair is due again, from the start.
+        sides.driver.dispatch(1, &peers, &tasks);
+        let task = queue.try_recv().expect("the pair was not due again");
+        assert_eq!(task.cursor, FeedCursor::default());
+        sides.driver.run_exchange(task);
+        assert_eq!(cursors.row(), Some(sides.caught_up()));
     }
 }

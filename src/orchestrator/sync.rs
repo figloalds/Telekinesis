@@ -5,8 +5,11 @@
 //!
 //! Ops (header = JSON payload; body = JSON):
 //! - `feed.outgoing {after}` → [`FeedPage`] of at most [`FEED_PAGE`] events.
-//! - `feed.apply {}`, body `Vec<Event>` → `{"applied": usize}`.
-//! - `meta.exchange {repo}`, body [`FeedRequest`] → [`FeedReply`].
+//! - `feed.apply {durable?}`, body `Vec<Event>` → `{"applied": usize}`.
+//! - `meta.exchange {repo, durable?}`, body [`FeedRequest`] → [`FeedReply`].
+//!   With `durable`, what the two of them carried is on disk before the reply, so
+//!   a passive dialer can save a cursor past it. What carried nothing commits
+//!   nothing, so a burst over an unchanged folder stays one cheap request.
 //! - `objects.missing {limit, exclude?, after?}` → [`MissingPage`]
 //!   `{missing: Vec<(Digest, Kind)>, cursor}`: `limit` ≤ [`BATCH`], skipping
 //!   the digests of `exclude` (≤ [`MAX_EXCLUDE`]). The scan is resumable:
@@ -126,6 +129,15 @@ pub struct FeedReply {
     // and more still describe the complete scanned page, including omissions.
     pub events: Vec<Event>,
     pub more: bool,
+    /// The store's `device`: what `cursor` counts in. Empty from an older peer,
+    /// which then says nothing of `top` either.
+    #[serde(default)]
+    pub journal: String,
+    /// The journal's latest sequence when the request came, before what it
+    /// carried: a store that lost events must not hide that behind the very
+    /// request that would show it.
+    #[serde(default)]
+    pub top: u64,
 }
 /// One `objects.missing` page. `cursor` resumes the scan after this page
 /// (opaque; `None` when the scan reached its end).
@@ -181,6 +193,12 @@ pub struct FeedPage {
     pub cursor: u64,
     pub events: Vec<Event>,
     pub more: bool,
+    /// The store's `device`: what `cursor` counts in. Empty from an older worker.
+    #[serde(default)]
+    pub journal: String,
+    /// The journal's latest sequence.
+    #[serde(default)]
+    pub top: u64,
 }
 pub struct Service {
     pub engine: Arc<Engine>,
@@ -194,17 +212,28 @@ impl Service {
         op.starts_with("feed.") || op == "meta.exchange" || op.starts_with("objects.")
     }
     fn page(&self, after: u64) -> Result<FeedPage> {
-        let rows = lock(&self.engine.store).events_after(after, FEED_PAGE)?;
+        let store = lock(&self.engine.store);
+        let rows = store.events_after(after, FEED_PAGE)?;
         Ok(FeedPage {
             cursor: rows.last().map(|(n, _)| *n).unwrap_or(after),
             more: rows.len() == FEED_PAGE,
             events: rows.into_iter().map(|(_, event)| event).collect(),
+            journal: store.device.clone(),
+            top: store.feed_position()?,
         })
     }
-    fn feed_reply(&self, request: FeedRequest) -> Result<FeedReply> {
+    fn feed_reply(&self, request: FeedRequest, durable: bool) -> Result<FeedReply> {
         ensure!(request.events.len() <= FEED_PAGE, "FEED_BATCH_TOO_LARGE");
+        let top = lock(&self.engine.store).feed_position()?;
         self.engine.apply_remote(&request.events)?;
         let page = self.page(request.after)?;
+        // What the request carried, even if an attempt whose reply was lost already
+        // applied it, since the dialer counts it as sent; and what the page hands
+        // out, since a cursor saved past an event this side then loses would skip
+        // whatever takes that sequence next. Read first, so this covers the page.
+        if durable && !(request.events.is_empty() && page.events.is_empty()) {
+            lock(&self.engine.store).sync_metadata()?;
+        }
         // Validate/apply first, including collisions and unresolved parents.
         // Knowledge is limited to this request's exact bodies: author-based
         // filtering would lose unknown self-authored history after recovery.
@@ -225,6 +254,8 @@ impl Service {
                 })
                 .collect(),
             more: page.more,
+            journal: page.journal,
+            top,
         })
     }
     /// Content objects of live entries in the current projection, and of the
@@ -415,11 +446,15 @@ impl Service {
                 let events: Vec<Event> = serde_json::from_slice(body)?;
                 ensure!(events.len() <= MAX_APPLY, "FEED_BATCH_TOO_LARGE");
                 let applied = self.engine.apply_remote(&events)?.len();
+                if asks_durable(header) && !events.is_empty() {
+                    lock(&self.engine.store).sync_metadata()?;
+                }
                 Ok(serde_json::to_vec(&json!({"applied":applied}))?)
             }
             "meta.exchange" => {
                 let request: FeedRequest = serde_json::from_slice(body)?;
-                Ok(serde_json::to_vec(&self.feed_reply(request)?)?)
+                let reply = self.feed_reply(request, asks_durable(header))?;
+                Ok(serde_json::to_vec(&reply)?)
             }
             "objects.missing" => {
                 let (limit, after) = scan_arguments(header)?;
@@ -447,6 +482,10 @@ impl Service {
         };
         Ok((json!({}), body?))
     }
+}
+/// Whether the request wants what it carried on disk before its reply.
+fn asks_durable(header: &Value) -> bool {
+    header["durable"].as_bool().unwrap_or(false)
 }
 /// The `limit` and `after` of `objects.missing` and `objects.wanted`.
 fn scan_arguments(header: &Value) -> Result<(usize, Option<ScanAt>)> {
@@ -535,10 +574,13 @@ mod tests {
         }
         let events = journal(&source)?;
         let service = service(&target);
-        let first = service.feed_reply(FeedRequest {
-            after: 0,
-            events: events[..256].to_vec(),
-        })?;
+        let first = service.feed_reply(
+            FeedRequest {
+                after: 0,
+                events: events[..256].to_vec(),
+            },
+            false,
+        )?;
         assert!(
             first.events.is_empty(),
             "the request already carries these exact events"
@@ -548,25 +590,34 @@ mod tests {
             first.more,
             "pagination is based on scanned rows, not filtered replies"
         );
-        let last = service.feed_reply(FeedRequest {
-            after: first.cursor,
-            events: events[256..].to_vec(),
-        })?;
+        let last = service.feed_reply(
+            FeedRequest {
+                after: first.cursor,
+                events: events[256..].to_vec(),
+            },
+            false,
+        )?;
         assert!(last.events.is_empty());
         assert_eq!(last.cursor, 257);
         assert!(!last.more);
         assert_eq!(journal(&target)?, events);
-        let replay = service.feed_reply(FeedRequest {
-            after: 0,
-            events: Vec::new(),
-        })?;
+        let replay = service.feed_reply(
+            FeedRequest {
+                after: 0,
+                events: Vec::new(),
+            },
+            false,
+        )?;
         assert_eq!(replay.events, events[..256]);
         assert_eq!(replay.cursor, 256);
         assert!(replay.more);
-        let tail = service.feed_reply(FeedRequest {
-            after: replay.cursor,
-            events: Vec::new(),
-        })?;
+        let tail = service.feed_reply(
+            FeedRequest {
+                after: replay.cursor,
+                events: Vec::new(),
+            },
+            false,
+        )?;
         assert_eq!(tail.events, events[256..]);
         assert_eq!(tail.cursor, 257);
         assert!(!tail.more);
@@ -586,20 +637,26 @@ mod tests {
         let source_events = journal(&source)?;
         let independent = journal(&target)?;
         let service = service(&target);
-        let reply = service.feed_reply(FeedRequest {
-            after: 0,
-            events: source_events.clone(),
-        })?;
+        let reply = service.feed_reply(
+            FeedRequest {
+                after: 0,
+                events: source_events.clone(),
+            },
+            false,
+        )?;
         assert_eq!(reply.events, independent);
         assert_eq!(reply.cursor, 2);
         assert!(!reply.more);
         let mut forged = source_events[0].clone();
         forged.state.name = "forged".into();
         let error = service
-            .feed_reply(FeedRequest {
-                after: 0,
-                events: vec![forged],
-            })
+            .feed_reply(
+                FeedRequest {
+                    after: 0,
+                    events: vec![forged],
+                },
+                false,
+            )
             .err()
             .unwrap();
         assert!(error.to_string().contains("EVENT_ID_COLLISION"));
@@ -637,26 +694,35 @@ mod tests {
         assert_eq!(events.len(), 2);
         let target = Engine::open(target_home.path(), Some("repo"))?;
         let service = service(&target);
-        let waiting = service.feed_reply(FeedRequest {
-            after: 0,
-            events: vec![events[1].clone()],
-        })?;
+        let waiting = service.feed_reply(
+            FeedRequest {
+                after: 0,
+                events: vec![events[1].clone()],
+            },
+            false,
+        )?;
         assert!(waiting.events.is_empty());
         assert_eq!(waiting.cursor, 0);
         assert!(journal(&target)?.is_empty());
-        let resolved = service.feed_reply(FeedRequest {
-            after: 0,
-            events: vec![events[0].clone()],
-        })?;
+        let resolved = service.feed_reply(
+            FeedRequest {
+                after: 0,
+                events: vec![events[0].clone()],
+            },
+            false,
+        )?;
         assert_eq!(resolved.events, vec![events[1].clone()]);
         assert_eq!(resolved.cursor, 2);
         let restored = Engine::open(restored_home.path(), None)?;
         assert_eq!(lock(&restored.store).device, lock(&source.store).device);
         assert!(journal(&restored)?.is_empty());
-        let recovery = service.feed_reply(FeedRequest {
-            after: 0,
-            events: journal(&restored)?,
-        })?;
+        let recovery = service.feed_reply(
+            FeedRequest {
+                after: 0,
+                events: journal(&restored)?,
+            },
+            false,
+        )?;
         assert!(
             recovery
                 .events
@@ -682,14 +748,203 @@ mod tests {
         lock(&source.store).create("file", crate::core::EntryKind::File)?;
         let service = service(&target);
         let error = service
-            .feed_reply(FeedRequest {
-                after: 0,
-                events: vec![journal(&source)?[0].clone(); 257],
-            })
+            .feed_reply(
+                FeedRequest {
+                    after: 0,
+                    events: vec![journal(&source)?[0].clone(); 257],
+                },
+                false,
+            )
             .err()
             .unwrap();
         assert!(error.to_string().contains("FEED_BATCH_TOO_LARGE"));
         assert!(journal(&target)?.is_empty());
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    /// Two empty folders of one repo.
+    fn two_folders() -> Result<(
+        tempfile::TempDir,
+        Arc<Engine>,
+        tempfile::TempDir,
+        Arc<Engine>,
+    )> {
+        let source_home = tempfile::tempdir()?;
+        let target_home = tempfile::tempdir()?;
+        let source = Engine::open(source_home.path(), Some("repo"))?;
+        let target = Engine::open(target_home.path(), Some("repo"))?;
+        Ok((source_home, source, target_home, target))
+    }
+
+    fn exchange_body(after: u64, events: Vec<Event>) -> Result<Vec<u8>> {
+        Ok(serde_json::to_vec(&FeedRequest { after, events })?)
+    }
+
+    #[test]
+    fn a_durable_exchange_commits_before_replying() -> Result<()> {
+        let (_source_home, source, _target_home, target) = two_folders()?;
+        lock(&source.store).create("sent", EntryKind::File)?;
+        let served = service(&target);
+        let durable = json!({"repo": "repo", "durable": true});
+        assert!(!lock(&target.store).metadata_is_durable());
+        call(
+            &served,
+            "meta.exchange",
+            durable,
+            &exchange_body(0, journal(&source)?)?,
+        )?;
+        assert!(lock(&target.store).metadata_is_durable());
+        // The same of an apply.
+        lock(&source.store).create("applied", EntryKind::File)?;
+        call(
+            &served,
+            "feed.apply",
+            json!({"durable": true}),
+            &serde_json::to_vec(&journal(&source)?)?,
+        )?;
+        assert!(lock(&target.store).metadata_is_durable());
+        assert_eq!(journal(&target)?.len(), 2);
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_durable_retry_commits_what_an_earlier_attempt_only_applied() -> Result<()> {
+        // The reply to the first attempt was lost. The retry applies nothing new,
+        // and its reply is what lets the dialer count these events as sent.
+        let (_source_home, source, _target_home, target) = two_folders()?;
+        lock(&source.store).create("sent", EntryKind::File)?;
+        let served = service(&target);
+        let body = exchange_body(0, journal(&source)?)?;
+        call(&served, "meta.exchange", json!({"repo": "repo"}), &body)?;
+        assert!(!lock(&target.store).metadata_is_durable());
+        call(
+            &served,
+            "meta.exchange",
+            json!({"repo": "repo", "durable": true}),
+            &body,
+        )?;
+        assert!(lock(&target.store).metadata_is_durable());
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_durable_exchange_commits_what_its_reply_hands_out() -> Result<()> {
+        // A dialer that saves its cursor past an event this side then loses would
+        // skip whatever takes that sequence next.
+        let (_source_home, source, _target_home, target) = two_folders()?;
+        lock(&target.store).create("local", EntryKind::File)?;
+        let served = service(&target);
+        let reply: FeedReply = serde_json::from_slice(&call(
+            &served,
+            "meta.exchange",
+            json!({"repo": "repo", "durable": true}),
+            &exchange_body(0, Vec::new())?,
+        )?)?;
+        assert_eq!(reply.events.len(), 1);
+        assert!(lock(&target.store).metadata_is_durable());
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_durable_exchange_with_nothing_to_carry_does_not_commit() -> Result<()> {
+        // What a burst over an unchanged folder asks: it must stay this cheap.
+        let (_source_home, source, _target_home, target) = two_folders()?;
+        lock(&target.store).create("local", EntryKind::File)?;
+        let top = lock(&target.store).feed_position()?;
+        let served = service(&target);
+        call(
+            &served,
+            "meta.exchange",
+            json!({"repo": "repo", "durable": true}),
+            &exchange_body(top, Vec::new())?,
+        )?;
+        assert!(!lock(&target.store).metadata_is_durable());
+        call(
+            &served,
+            "feed.apply",
+            json!({"durable": true}),
+            &serde_json::to_vec(&Vec::<Event>::new())?,
+        )?;
+        assert!(!lock(&target.store).metadata_is_durable());
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_plain_exchange_does_not_force_a_commit() -> Result<()> {
+        let (_source_home, source, _target_home, target) = two_folders()?;
+        lock(&source.store).create("sent", EntryKind::File)?;
+        let served = service(&target);
+        call(
+            &served,
+            "meta.exchange",
+            json!({"repo": "repo"}),
+            &exchange_body(0, journal(&source)?)?,
+        )?;
+        assert!(!lock(&target.store).metadata_is_durable());
+        lock(&source.store).create("applied", EntryKind::File)?;
+        call(
+            &served,
+            "feed.apply",
+            json!({}),
+            &serde_json::to_vec(&journal(&source)?)?,
+        )?;
+        assert!(!lock(&target.store).metadata_is_durable());
+        assert_eq!(journal(&target)?.len(), 2);
+        source.shutdown()?;
+        target.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn feed_replies_name_their_journal_and_top() -> Result<()> {
+        let (_source_home, source, _target_home, target) = two_folders()?;
+        {
+            let mut store = lock(&target.store);
+            store.create("one", EntryKind::File)?;
+            store.create("two", EntryKind::File)?;
+        }
+        lock(&source.store).create("sent", EntryKind::File)?;
+        let device = lock(&target.store).device.clone();
+        let served = service(&target);
+        // Whatever the page holds, its top is the journal's.
+        let page: FeedPage =
+            serde_json::from_slice(&call(&served, "feed.outgoing", json!({"after": 2}), &[])?)?;
+        assert!(page.events.is_empty());
+        assert_eq!((page.journal.as_str(), page.top), (device.as_str(), 2));
+        // A reply's top is from before the request's events: a store that lost
+        // events must not hide that behind the very request that would show it.
+        let reply: FeedReply = serde_json::from_slice(&call(
+            &served,
+            "meta.exchange",
+            json!({"repo": "repo"}),
+            &exchange_body(0, journal(&source)?)?,
+        )?)?;
+        assert_eq!((reply.journal.as_str(), reply.top), (device.as_str(), 2));
+        assert_eq!(lock(&target.store).feed_position()?, 3);
+        let reply: FeedReply = serde_json::from_slice(&call(
+            &served,
+            "meta.exchange",
+            json!({"repo": "repo"}),
+            &exchange_body(3, Vec::new())?,
+        )?)?;
+        assert_eq!(reply.top, 3);
+        // The other way, what an older peer sends parses as no journal.
+        let older: FeedReply =
+            serde_json::from_value(json!({"cursor": 7, "events": [], "more": false}))?;
+        assert_eq!((older.journal.as_str(), older.top), ("", 0));
+        let older: FeedPage =
+            serde_json::from_value(json!({"cursor": 7, "events": [], "more": false}))?;
+        assert_eq!((older.journal.as_str(), older.top), ("", 0));
         source.shutdown()?;
         target.shutdown()?;
         Ok(())
@@ -1352,6 +1607,8 @@ mod tests {
             cursor: u64::MAX,
             events: page,
             more: true,
+            journal: crate::core::id(),
+            top: u64::MAX,
         })?;
         assert!(
             reply.len() <= session_limit("feed.outgoing"),

@@ -117,6 +117,10 @@ pub enum ManagementCommand {
         #[arg(value_name = "STATE")]
         folder: Option<String>,
     },
+    /// Forget how far each folder got with each peer, so that the next sync
+    /// starts over: for what a passive host cannot detect itself, such as a peer
+    /// restored from an old backup.
+    ResetCursors,
     /// Stop every folder and the orchestrator.
     Shutdown,
 }
@@ -232,6 +236,7 @@ fn request(command: ManagementCommand) -> Result<(&'static str, Value, bool)> {
             false,
         ),
         C::SyncNow { folder } => ("sync-now", json!({"state": folder}), false),
+        C::ResetCursors => ("reset-cursors", json!({}), false),
         C::Shutdown => ("shutdown", json!({}), false),
     })
 }
@@ -364,6 +369,14 @@ mod tests {
         assert_eq!(payload, json!({"state": "P", "wait": false}));
         assert!(request(ManagementCommand::Status).unwrap().2);
         assert!(!request(ManagementCommand::Shutdown).unwrap().2);
+    }
+
+    #[test]
+    fn reset_cursors_is_a_mutation_of_its_own() {
+        assert_eq!(
+            request(ManagementCommand::ResetCursors).unwrap(),
+            ("reset-cursors", json!({}), false)
+        );
     }
 
     #[test]

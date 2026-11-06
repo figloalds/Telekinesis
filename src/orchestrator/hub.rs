@@ -134,6 +134,7 @@ const MUTATIONS: &[&str] = &[
     "unpair",
     "receive",
     "sync-now",
+    "reset-cursors",
 ];
 /// Worker ops the `folder` action forwards.
 pub const FOLDER_OPS: &[&str] = &[
@@ -618,6 +619,7 @@ impl Daemon {
                 profile: self.config.network.sync_profile,
                 interval: Duration::from_millis(self.config.network.sync_interval_ms),
                 backup_poll: Duration::from_millis(self.config.network.backup_poll_ms),
+                cursors: self.catalog.clone(),
             },
             self.stopping.child(),
         )?;
@@ -858,6 +860,16 @@ impl Daemon {
                     .get()
                     .context("NETWORK_UNAVAILABLE: the peer network is not running")?;
                 Ok(driver.sync_now(&folders, SYNC_NOW_BOUND))
+            }
+            "reset-cursors" => {
+                self.sync
+                    .get()
+                    .context("NETWORK_UNAVAILABLE: the peer network is not running")?
+                    .reset_cursors();
+                // The driver's store only logs a failure; this one is the caller's
+                // to see. No exchange saves anything past that reset.
+                self.catalog.clear_feed_cursors()?;
+                Ok(json!({}))
             }
             "receive" => self.receive(payload),
             "remote-list" => {

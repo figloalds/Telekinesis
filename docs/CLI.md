@@ -327,6 +327,22 @@ error of one peer ends with `(peer ENDPOINT)`. The `error` of a folder is:
 
 With no peer to dial there is nothing to do, and it is `null`.
 
+A passive host remembers how far each folder got with each peer, across
+reconnects and restarts, so a `sync-now` of an unchanged folder is one small
+request however long its history is. It remembers only what is safely on disk on
+both sides. It starts over by itself when either side's journal was replaced or
+ends before where it got to, and when a peer is too old to say. An active host
+keeps none of this and starts over on every connection.
+
+```sh
+tkfs manage reset-cursors
+```
+
+`reset-cursors` forgets all of that, so the next sync of every folder with every
+peer starts over and sends and receives its whole history again. It is for what a
+passive host cannot detect, such as a peer restored from an old backup that has
+since grown past where it got to. It prints `{}`.
+
 ### Shutdown
 
 ```sh

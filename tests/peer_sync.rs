@@ -11,7 +11,10 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use support::daemon::{TestDaemon, run_tkfs};
+use support::{
+    FaultProxy,
+    daemon::{TestDaemon, run_tkfs},
+};
 use tkfs::{
     model::protocol::LaneRole,
     orchestrator::sync::MissingPage,
@@ -417,6 +420,17 @@ fn shared_pair(files: &[(&str, &str)]) -> Result<Shared> {
 
 /// [`shared_pair`] on daemons the test started itself.
 fn shared_pair_of(a: TestDaemon, b: TestDaemon, files: &[(&str, &str)]) -> Result<Shared> {
+    let endpoint_b = b.listen_endpoint()?;
+    shared_pair_via(a, b, files, &endpoint_b)
+}
+
+/// [`shared_pair_of`] with A dialing B at `endpoint_b`, which leads to it.
+fn shared_pair_via(
+    a: TestDaemon,
+    b: TestDaemon,
+    files: &[(&str, &str)],
+    endpoint_b: &str,
+) -> Result<Shared> {
     let shared = b.manage(&["create", "Shared", "--headless"])?;
     let repo = shared["repo"]
         .as_str()
@@ -431,17 +445,16 @@ fn shared_pair_of(a: TestDaemon, b: TestDaemon, files: &[(&str, &str)]) -> Resul
         .as_str()
         .context("no code")?
         .to_string();
-    let endpoint_b = b.listen_endpoint()?;
-    a.manage(&["pair", &endpoint_b, "--code", &code])?;
-    a.wait_lanes(&endpoint_b, 4, "Ready", LANES_READY)?;
-    let received = a.manage(&["receive", &endpoint_b, &repo, "Shared", "--headless"])?;
+    a.manage(&["pair", endpoint_b, "--code", &code])?;
+    a.wait_lanes(endpoint_b, 4, "Ready", LANES_READY)?;
+    let received = a.manage(&["receive", endpoint_b, &repo, "Shared", "--headless"])?;
     ensure!(received["repo"] == repo.as_str(), "{received}");
     a.wait_phase("Shared", "Running", REPLICATED)?;
     let state_a = a.state_dir("Shared")?;
     Ok(Shared {
         a,
         b,
-        endpoint_b,
+        endpoint_b: endpoint_b.to_owned(),
         state_a,
         state_b,
     })
@@ -1631,6 +1644,122 @@ fn sync_now_works_on_an_active_dialer() -> Result<()> {
     let reply = sync_now_clean(&a)?;
     ensure!(reply["remaining"] == 0, "{reply}");
     arrives_within(&state_b, "from-a.txt", &from_a, NOTIFIED)?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+// ---- a passive dialer's feed cursors --------------------------------------
+
+/// How many events make a replay unmistakable: megabytes, against [`BURST_BOUND`].
+const LONG_LOG: usize = 10_000;
+/// What a burst over an unchanged folder may move, both ways, whatever its history.
+const BURST_BOUND: u64 = 64 * 1024;
+
+/// Stops `daemon`'s folder "Shared" at `state`, adds `count` empty files to its
+/// journal in this process, and starts it again.
+fn seed_events(daemon: &TestDaemon, state: &Path, count: usize) -> Result<()> {
+    daemon.manage(&["stop", "Shared"])?;
+    let engine = tkfs::runtime::Engine::open(state, None)?;
+    {
+        let mut store = engine.store.lock().unwrap();
+        for n in 0..count {
+            store.create(&format!("seeded-{n}"), tkfs::core::EntryKind::File)?;
+        }
+        store.sync_metadata()?;
+    }
+    engine.shutdown()?;
+    drop(engine);
+    daemon.manage(&["start", "Shared"])?;
+    daemon.wait_phase("Shared", "Running", REPLICATED)?;
+    Ok(())
+}
+
+/// A passive A dialing B through a proxy that counts the bytes, with
+/// [`LONG_LOG`] events in B's journal and A not yet told of them.
+fn passive_pair_with_a_long_log() -> Result<(Shared, FaultProxy)> {
+    let a = TestDaemon::start_with(PASSIVE)?;
+    let b = TestDaemon::start()?;
+    let proxy = FaultProxy::try_start(&b.listen_endpoint()?)?;
+    let shared = shared_pair_via(a, b, &[], &proxy.endpoint())?;
+    seed_events(&shared.b, &shared.state_b, LONG_LOG)?;
+    Ok((shared, proxy))
+}
+
+fn bytes_moved(proxy: &FaultProxy) -> u64 {
+    proxy.bytes_up() + proxy.bytes_down()
+}
+
+#[test]
+fn a_passive_burst_after_a_restart_does_not_replay_the_log() -> Result<()> {
+    let (
+        Shared {
+            a,
+            b,
+            endpoint_b,
+            state_a,
+            ..
+        },
+        proxy,
+    ) = passive_pair_with_a_long_log()?;
+    sync_now_clean(&a)?;
+    let tree = folder(&state_a, &["tree"])?;
+    ensure!(tree.contains("seeded-9999"), "the log did not arrive");
+    let a = TestDaemon::start_in(a.shutdown_keep_home()?)?;
+    a.wait_lanes(&endpoint_b, 4, "Ready", LANES_READY)?;
+    a.wait_phase("Shared", "Running", REPLICATED)?;
+    let before = bytes_moved(&proxy);
+    sync_now_clean(&a)?;
+    let moved = bytes_moved(&proxy) - before;
+    ensure!(moved < BURST_BOUND, "the burst moved {moved} bytes");
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn killing_the_listener_after_a_reply_loses_no_event_counted_as_sent() -> Result<()> {
+    // B on a fixed port, so A's lanes find it again after it restarts.
+    let a = TestDaemon::start_with(PASSIVE)?;
+    let b = TestDaemon::start_listening(&free_address()?, "")?;
+    let Shared {
+        a,
+        b,
+        endpoint_b,
+        state_a,
+        state_b,
+    } = shared_pair_of(a, b, &[])?;
+    let first = text(1000, 131);
+    import(&a, &state_a, "first.txt", &first)?;
+    sync_now_clean(&a)?;
+    let b = TestDaemon::start_in(b.kill_keep_home()?)?;
+    b.wait_phase("Shared", "Running", REPLICATED)?;
+    let tree = folder(&state_b, &["tree"])?;
+    ensure!(tree.contains("first.txt"), "lost by the kill: {tree}");
+    // A goes on from its saved cursor, and what it says next gets there too.
+    a.wait_lanes(&endpoint_b, 4, "Ready", LANES_READY)?;
+    let second = text(1000, 137);
+    import(&a, &state_a, "second.txt", &second)?;
+    sync_now_clean(&a)?;
+    wait_entry(&state_b, "second.txt", second.len(), NOTIFIED)?;
+    a.shutdown()?;
+    b.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn reset_cursors_makes_the_next_burst_start_over() -> Result<()> {
+    let (Shared { a, b, .. }, proxy) = passive_pair_with_a_long_log()?;
+    sync_now_clean(&a)?;
+    let before = bytes_moved(&proxy);
+    sync_now_clean(&a)?;
+    let moved = bytes_moved(&proxy) - before;
+    ensure!(moved < BURST_BOUND, "an idle burst moved {moved} bytes");
+    a.manage(&["reset-cursors"])?;
+    let before = bytes_moved(&proxy);
+    sync_now_clean(&a)?;
+    let moved = bytes_moved(&proxy) - before;
+    ensure!(moved > BURST_BOUND, "the burst moved only {moved} bytes");
     a.shutdown()?;
     b.shutdown()?;
     Ok(())

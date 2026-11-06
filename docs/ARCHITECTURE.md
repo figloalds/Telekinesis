@@ -76,5 +76,16 @@ host, for a battery or a metered link, keeps its connections open and
 serves its readers but exchanges and pushes only during `manage sync-now`. See
 [the two-way content design](superpowers/specs/2026-11-04-two-way-content-design.md).
 
+An active dialer replays a folder's feed on every new session, and that replay
+hides events a crash lost. A passive one must not, since each background check
+would read the whole log, so it saves its feed cursors per (peer installation,
+repo) in the catalog. It asks for a `durable` exchange and apply, and saves a page
+only after both replied, so a saved cursor never passes an event that is not on
+disk on both sides. Replies name the store's journal and its top sequence, the
+latter from before the request's events are applied. A journal that is not the
+cursor's, or a top below it, starts the exchange over from zero, and `manage
+reset-cursors` does so for what that cannot detect. See
+[the Android client design](superpowers/specs/2026-11-05-android-client-design.md).
+
 There is no private write database, overlay map, save pipeline, object admission
 outbox, per-reference grant, lease generation or pool-fencing engine.
