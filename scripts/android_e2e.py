@@ -222,6 +222,9 @@ def scenario_ui_folders(s: Session) -> None:
     shown("the Add a PC screen", has("Scan QR code", "PC address", "Pairing code"))
     device.screenshot(shots / "add-pc.png")
     pair_with_fields(pc.pairing_code())
+    # The first PC is the moment the app asks to show notifications (Android 13 and later).
+    shown("the notification permission request", has("Allow Telekinesis to send you notifications?", "Allow"))
+    device.tap_text("Allow")
     found = shown("the PC's folders", has("Receive 1 folder"))
     s.check("pairing lists the PC's folder with a checkbox", "Documents" in found, found)
     device.screenshot(shots / "add-pc-choose.png")
