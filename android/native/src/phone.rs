@@ -65,6 +65,9 @@ pub struct Confirmed {
     /// Of those, the ones a peer that has their events could not be asked about, because it
     /// predates `objects.have`. Only updating the PC can clear them.
     pub unsupported: usize,
+    /// The table is still catching up with a long journal: the count is of what was reached so far,
+    /// so it says nothing about the rest.
+    pub scanning: bool,
 }
 
 pub struct Phone {
@@ -78,7 +81,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Own events taken into the table at a time, and the journal pages read for them.
 const SCAN_BATCH: usize = 512;
+const SCAN_PAGES: usize = 8;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS scanned(
@@ -120,11 +125,14 @@ enum Blocked {
 
 impl Phone {
     pub fn open(path: &Path) -> Result<Phone> {
-        let db = Connection::open(path)
-            .with_context(|| format!("PHONE_DB_UNAVAILABLE: {}", path.display()))?;
-        // A write that returns is on disk: the app may be killed right after.
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
-        db.execute_batch(SCHEMA)?;
+        let opened = (|| -> Result<Connection> {
+            let db = Connection::open(path)?;
+            // A write that returns is on disk: the app may be killed right after.
+            db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")?;
+            db.execute_batch(SCHEMA)?;
+            Ok(db)
+        })();
+        let db = opened.with_context(|| format!("PHONE_DB_UNAVAILABLE: {}", path.display()))?;
         Ok(Phone {
             db: Mutex::new(db),
             confirming: Mutex::new(()),
@@ -137,11 +145,23 @@ impl Phone {
         self
     }
 
-    /// Takes this device's events since the last scan into the table. A folder whose journal is
-    /// not the one scanned (it started over) loses its rows and is scanned again from the start,
-    /// since positions in one journal mean nothing in another.
+    /// Takes all of this device's events since the last scan into the table.
     pub fn scan(&self, folder: &str, engine: &Engine) -> Result<()> {
+        self.scan_until(folder, engine, Instant::now() + Duration::from_secs(86_400))?;
+        Ok(())
+    }
+
+    /// Takes this device's events since the last scan into the table, until `deadline`. False when
+    /// that came first: the table is behind, and the position reached is kept for the next call.
+    ///
+    /// Only events the journal has made durable are taken (the store keeps recent ones in an open
+    /// transaction that a kill takes back, and their sequences are then used again), and never
+    /// those past the `top` read first. A saved position beyond `top` is of a journal that lost
+    /// events: the folder starts over, as it does when its journal is another one, since positions
+    /// in one journal mean nothing in another.
+    pub fn scan_until(&self, folder: &str, engine: &Engine, deadline: Instant) -> Result<bool> {
         let journal = lock(&engine.store).device.clone();
+        let top = engine.durable_position()?;
         let mut position = {
             let db = lock(&self.db);
             let saved: Option<(String, u64)> = db
@@ -152,7 +172,7 @@ impl Phone {
                 )
                 .optional()?;
             match saved {
-                Some((saved, position)) if saved == journal => position,
+                Some((saved, position)) if saved == journal && position <= top => position,
                 Some(_) => {
                     db.execute("DELETE FROM unconfirmed WHERE folder=?1", [folder])?;
                     db.execute("DELETE FROM scanned WHERE folder=?1", [folder])?;
@@ -161,19 +181,18 @@ impl Phone {
                 None => 0,
             }
         };
-        loop {
-            // Read before the events: all of them up to here are looked at, whatever comes later.
-            let top = lock(&engine.store).feed_position()?;
-            let batch = engine.own_events_after(position, SCAN_BATCH)?;
-            let full = batch.len() == SCAN_BATCH;
-            let next = match batch.last() {
-                Some((last, _)) if full => *last,
-                Some((last, _)) => top.max(*last),
-                None => top,
-            };
+        while position < top {
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            let read = engine.own_events_between(position, top, SCAN_BATCH, SCAN_PAGES)?;
+            if read.reached <= position {
+                // No progress is no reason to loop: the next call asks again.
+                return Ok(false);
+            }
             let paths: Vec<String> = {
                 let store = lock(&engine.store);
-                batch
+                read.events
                     .iter()
                     .map(|(_, event)| {
                         store
@@ -185,28 +204,28 @@ impl Phone {
             };
             let db = lock(&self.db);
             let tx = db.unchecked_transaction()?;
-            for ((seq, event), path) in batch.iter().zip(&paths) {
+            for ((seq, event), path) in read.events.iter().zip(&paths) {
                 // A newer event of the same entity starts it over: it is a different thing to send.
                 tx.execute(
-                    "INSERT INTO unconfirmed(folder,entity,seq,path) VALUES(?1,?2,?3,?4) \
-                     ON CONFLICT(folder,entity) DO UPDATE SET \
-                        seq=excluded.seq, path=excluded.path, peer='', checked=0, total=0 \
-                     WHERE excluded.seq > unconfirmed.seq",
+                    "INSERT INTO unconfirmed(folder,entity,seq,path) VALUES(?1,?2,?3,?4)                      ON CONFLICT(folder,entity) DO UPDATE SET                         seq=excluded.seq, path=excluded.path, peer='', checked=0, total=0                      WHERE excluded.seq > unconfirmed.seq",
                     params![folder, event.entity, seq, path],
                 )?;
             }
             tx.execute(
-                "INSERT INTO scanned(folder,journal,position) VALUES(?1,?2,?3) \
-                 ON CONFLICT(folder) DO UPDATE SET journal=excluded.journal, position=excluded.position",
-                params![folder, journal, next],
+                "INSERT INTO scanned(folder,journal,position) VALUES(?1,?2,?3)                  ON CONFLICT(folder) DO UPDATE SET journal=excluded.journal, position=excluded.position",
+                params![folder, journal, read.reached],
             )?;
             tx.commit()?;
             drop(db);
-            if !full {
-                return Ok(());
-            }
-            position = next;
+            position = read.reached;
         }
+        // An empty journal still has a position to keep.
+        let db = lock(&self.db);
+        db.execute(
+            "INSERT INTO scanned(folder,journal,position) VALUES(?1,?2,?3)              ON CONFLICT(folder) DO UPDATE SET journal=excluded.journal, position=excluded.position",
+            params![folder, journal, position],
+        )?;
+        Ok(true)
     }
 
     fn rows(&self, folder: &str) -> Result<Vec<Row>> {
@@ -277,7 +296,13 @@ impl Phone {
         let _one = lock(&self.confirming);
         let deadline = Instant::now() + self.budget.time;
         let mut left = self.budget.digests;
-        self.scan(folder, engine)?;
+        if !self.scan_until(folder, engine, deadline)? {
+            return Ok(Confirmed {
+                waiting: self.waiting(folder)?.len(),
+                unsupported: 0,
+                scanning: true,
+            });
+        }
         let rows = self.rows(folder)?;
         self.refresh_paths(folder, &rows, engine)?;
         let sent = peers.sent(repo);
@@ -304,8 +329,14 @@ impl Phone {
             } else {
                 match engine.head_closure(&row.entity) {
                     Ok(closure) => closure.digests,
-                    // Not knowing what the head needs is not a reason to say it was sent.
-                    Err(_) => continue,
+                    // Not knowing what the head needs is not a reason to say it was sent. But an
+                    // event the journal no longer holds (taken back by a kill) is nothing to send.
+                    Err(_) => {
+                        if matches!(engine.has_event(row.seq, &row.entity), Ok(false)) {
+                            cleared.push((row.entity.clone(), row.seq));
+                        }
+                        continue;
+                    }
                 }
             };
             if digests.is_empty() {
@@ -364,7 +395,14 @@ impl Phone {
         }
         // An edit made while the PC was being asked has a newer event now. The scan finds it
         // and the guard on the sequence keeps its row: the answers above were about the old one.
-        self.scan(folder, engine)?;
+        // If it cannot finish, nothing is cleared: an event it did not reach could be newer.
+        if !self.scan_until(folder, engine, Instant::now() + self.budget.time)? {
+            return Ok(Confirmed {
+                waiting: self.waiting(folder)?.len(),
+                unsupported: 0,
+                scanning: true,
+            });
+        }
         {
             let db = lock(&self.db);
             let tx = db.unchecked_transaction()?;
@@ -385,6 +423,7 @@ impl Phone {
         Ok(Confirmed {
             waiting: waiting.len(),
             unsupported,
+            scanning: false,
         })
     }
 
@@ -449,7 +488,7 @@ mod tests {
     use super::*;
     use std::{cell::RefCell, sync::Arc};
     use tkfs::{
-        core::Operation,
+        core::{EntryKind, Operation},
         model::content::{CHUNK_SIZE, ContentKind, FileContentRef},
         orchestrator::catalog::SavedCursor,
     };
@@ -610,7 +649,8 @@ mod tests {
             f.confirm(),
             Confirmed {
                 waiting: 1,
-                unsupported: 0
+                unsupported: 0,
+                scanning: false,
             }
         );
         assert_eq!(f.paths(), ["/a.txt"]);
@@ -691,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rename_of_a_file_whose_manifest_is_not_here_asks_for_the_manifest_only() {
+    fn a_rename_of_a_file_whose_bytes_a_peer_wrote_needs_the_exchange_only() {
         let f = fixture();
         // A file the PC made, known here by name only: its manifest was never downloaded, and
         // the PC is the one that holds it.
@@ -715,10 +755,9 @@ mod tests {
         }
         f.rename("/theirs.bin", "/mine.bin");
         f.peers.sent(PC, f.top());
-        // The head is this device's rename, and the manifest is all that can be asked about.
-        assert_eq!(f.confirm().waiting, 1);
-        f.peers.holds(PC, &[absent.digest]);
+        // The head is this device's rename, over bytes the PC wrote: nothing here to hold.
         assert_eq!(f.confirm().waiting, 0);
+        assert_eq!(f.peers.calls(), 0);
     }
 
     #[test]
@@ -730,6 +769,31 @@ mod tests {
         // The PC holds none of this phone's bytes, and is not asked.
         assert_eq!(f.confirm().waiting, 0);
         assert_eq!(f.peers.calls(), 0);
+    }
+
+    #[test]
+    fn a_peers_rename_over_bytes_only_this_phone_has_does_not_clear_the_file() {
+        // A metered network: the file's event reached the PC and its bytes did not, and the
+        // owner renamed it on the PC. That event carries this phone's content.
+        let f = fixture();
+        f.write("/shared.bin", b"only the phone has these bytes");
+        let digests = f.digests("/shared.bin");
+        let id = f.engine.lookup("/shared.bin").unwrap().id;
+        let mut event = {
+            let mut store = f.engine.store.lock().unwrap();
+            let mut state = store.entry(&id).unwrap();
+            state.name = "renamed.bin".into();
+            let heads = store.projection().heads[&id].iter().cloned().collect();
+            let branch = store.active.clone();
+            store.event(&branch, state, heads, Operation::Rename)
+        };
+        event.author = "the pc".into();
+        f.engine.apply_remote(&[event]).unwrap();
+        f.peers.sent(PC, f.top());
+        assert_eq!(f.confirm().waiting, 1, "the PC does not hold the bytes");
+        assert_eq!(f.paths(), ["/renamed.bin"]);
+        f.peers.holds(PC, &digests);
+        assert_eq!(f.confirm().waiting, 0);
     }
 
     #[test]
@@ -758,7 +822,8 @@ mod tests {
             confirmed,
             Confirmed {
                 waiting: 1,
-                unsupported: 1
+                unsupported: 1,
+                scanning: false,
             }
         );
         assert_eq!(f.paths(), ["/a.txt"]);
@@ -786,7 +851,8 @@ mod tests {
             confirmed,
             Confirmed {
                 waiting: 1,
-                unsupported: 0
+                unsupported: 0,
+                scanning: false,
             }
         );
     }
@@ -926,10 +992,111 @@ mod tests {
                 time: Duration::ZERO,
             });
         f.write("/a.txt", b"hello");
+        f.phone.scan(FOLDER, &f.engine).unwrap();
         f.peers.sent(PC, f.top());
         f.peers.holds(PC, &f.digests("/a.txt"));
         assert_eq!(f.confirm().waiting, 1);
         assert_eq!(f.peers.calls(), 0);
+    }
+
+    #[test]
+    fn a_table_still_catching_up_says_so_and_clears_nothing() {
+        let mut f = fixture();
+        f.phone = Phone::open(&f._home.path().join("phone.sqlite"))
+            .unwrap()
+            .with_budget(Budget {
+                digests: 100,
+                time: Duration::ZERO,
+            });
+        f.write("/a.txt", b"hello");
+        f.peers.sent(PC, f.top());
+        f.peers.holds(PC, &f.digests("/a.txt"));
+        let confirmed = f.confirm();
+        assert!(confirmed.scanning);
+        assert_eq!(f.peers.calls(), 0);
+        // With time to finish it counts everything, and the file is what it says.
+        f.phone = Phone::open(&f._home.path().join("phone.sqlite")).unwrap();
+        let confirmed = f.confirm();
+        assert!(!confirmed.scanning);
+        assert_eq!(confirmed.waiting, 0);
+    }
+
+    #[test]
+    fn a_long_journal_is_taken_in_steps_that_resume() {
+        let f = fixture();
+        {
+            let mut store = f.engine.store.lock().unwrap();
+            for index in 0..1500 {
+                store
+                    .create(&format!("/d{index}"), EntryKind::Directory)
+                    .unwrap();
+            }
+        }
+        let past = Instant::now() - Duration::from_secs(1);
+        // No time at all: nothing is read, and it says so.
+        assert!(!f.phone.scan_until(FOLDER, &f.engine, past).unwrap());
+        assert!(f.phone.waiting(FOLDER).unwrap().is_empty());
+        f.phone.scan(FOLDER, &f.engine).unwrap();
+        assert_eq!(f.phone.waiting(FOLDER).unwrap().len(), 1500);
+    }
+
+    #[test]
+    fn a_position_beyond_the_journal_starts_the_folder_over() {
+        // Events taken back by a kill: their sequences are used again by what comes next.
+        let f = fixture();
+        f.write("/a.txt", b"hello");
+        f.write("/b.txt", b"there");
+        f.phone.scan(FOLDER, &f.engine).unwrap();
+        let top = f.top();
+        lock(&f.phone.db)
+            .execute(
+                "UPDATE scanned SET position=?2 WHERE folder=?1",
+                params![FOLDER, top + 10],
+            )
+            .unwrap();
+        f.phone.scan(FOLDER, &f.engine).unwrap();
+        let mut paths = f.paths();
+        paths.sort();
+        assert_eq!(paths, ["/a.txt", "/b.txt"]);
+        let position: u64 = lock(&f.phone.db)
+            .query_row(
+                "SELECT position FROM scanned WHERE folder=?1",
+                [FOLDER],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(position, top);
+    }
+
+    #[test]
+    fn a_row_for_an_event_the_journal_lost_clears_and_one_for_a_live_event_does_not() {
+        let f = fixture();
+        f.write("/a.txt", b"hello");
+        f.phone.scan(FOLDER, &f.engine).unwrap();
+        // A ghost: an entity and sequence that never were, as after a rolled-back create.
+        lock(&f.phone.db)
+            .execute(
+                "INSERT INTO unconfirmed(folder,entity,seq,path) VALUES(?1,'no-such-entity',1,'/ghost')",
+                [FOLDER],
+            )
+            .unwrap();
+        f.peers.sent(PC, f.top());
+        let confirmed = f.confirm();
+        assert_eq!(f.paths(), ["/a.txt"]);
+        assert_eq!(confirmed.waiting, 1);
+    }
+
+    #[test]
+    fn a_database_that_cannot_open_fails_with_its_code() {
+        let home = tempfile::tempdir().unwrap();
+        // A directory where the file should be.
+        let error = Phone::open(home.path())
+            .err()
+            .expect("a directory is not a database");
+        assert_eq!(
+            tkfs::model::errors::ErrorWire::from_error(&error).code,
+            "PHONE_DB_UNAVAILABLE"
+        );
     }
 
     #[test]

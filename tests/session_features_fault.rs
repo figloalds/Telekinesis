@@ -1,7 +1,11 @@
 //! The `session.features.none` fault, in a test binary of its own: the fault
 //! state is process-global, so arming it must not share a process with other
-//! tests. One test only.
-use std::{net::TcpListener, sync::Arc, thread};
+//! tests, so its tests take turns.
+use std::{
+    net::TcpListener,
+    sync::{Arc, Mutex},
+    thread,
+};
 use tkfs::{
     model::protocol::{LaneRole, features},
     pairing_code::Verifier,
@@ -11,6 +15,8 @@ use tkfs::{
     },
     util::fault::{self, FaultAction, FaultConfig},
 };
+
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 struct Policy(Verifier);
 
@@ -32,6 +38,7 @@ impl AcceptPolicy for Policy {
 
 #[test]
 fn the_fault_is_evaluated_once_per_side_and_agrees_with_what_each_side_sent() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
     let (code, verifier) = Verifier::generate();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -71,6 +78,46 @@ fn the_fault_is_evaluated_once_per_side_and_agrees_with_what_each_side_sent() {
     // The dialer fired: sent empty, and records nothing although the
     // server advertised features.
     assert!(client.peer().features.is_empty());
+    client.close();
+    server_conn.close();
+}
+
+#[test]
+fn the_no_content_have_fault_drops_only_that_feature_from_the_listener() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+    let (code, verifier) = Verifier::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let policy: Arc<dyn AcceptPolicy> = Arc::new(Policy(verifier));
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        session::accept(stream, policy, ConnOptions::default())
+    });
+    fault::configure(Some(FaultConfig::new(
+        features::FAULT_NO_HAVE,
+        FaultAction::Fail,
+    )));
+    let mut hello = handshake::client_hello("client", LaneRole::Control, None, 3);
+    hello.features = vec![features::NOTIFY.into()];
+    let (client, server_hello) = session::dial(
+        &endpoint,
+        hello,
+        &CodeAuth { code },
+        None,
+        ConnOptions::default(),
+    )
+    .unwrap();
+    let (server_conn, _) = server.join().unwrap().unwrap();
+    fault::configure(None);
+    assert_eq!(
+        server_hello.features,
+        vec![
+            features::CONTENT_PUSH.to_string(),
+            features::NOTIFY.to_string()
+        ]
+    );
+    assert!(!client.peer().has_feature(features::CONTENT_HAVE));
+    assert!(client.peer().has_feature(features::CONTENT_PUSH));
     client.close();
     server_conn.close();
 }

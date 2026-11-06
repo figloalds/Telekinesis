@@ -22,6 +22,8 @@ data class FolderStatus(
     val waiting: Int = 0,
     val repo: String = "",
     val unsupported: Int = 0,
+    /** What waits is not known yet: the table is still being filled from the journal. */
+    val waitingUnknown: Boolean = false,
 )
 
 private const val REVOKED = "PEER_REVOKED"
@@ -37,6 +39,7 @@ fun folderLine(s: FolderStatus, now: Long, zone: ZoneId = ZoneId.systemDefault()
         plural(s.waiting, "file", "files") + " waiting to send" + if (s.unsupported > 0) ". Update the PC." else "",
         Tone.Waiting,
     )
+    s.waitingUnknown -> Line("Checking what is waiting to send", Tone.Waiting)
     s.lastSyncMs == null -> Line("Not synced yet", Tone.Quiet)
     !s.pcReachable -> Line("Synced at " + clock(s.lastSyncMs, zone), Tone.Quiet)
     else -> Line("Synced " + ago(now - s.lastSyncMs), Tone.Ok)
@@ -58,6 +61,7 @@ fun errorInWords(error: String): String = when (val code = codeOf(error)) {
     "WS_CONNECT_FAILED" -> "Could not reach My PC."
     "SYNC_NOW_TIMEOUT" -> "Syncing took too long. Try again."
     "WORKER_NOT_RUNNING" -> "This folder is not running."
+    "PHONE_DB_UNAVAILABLE" -> "Could not check what is waiting to send."
     // Nothing of this phone's can go to it, and it cannot say what it holds either.
     "PEER_PUSH_UNAVAILABLE" -> "My PC is too old to take files from this phone. Update the PC."
     else -> if (code == null) error else error.substringAfter(':').trim().ifEmpty { error }

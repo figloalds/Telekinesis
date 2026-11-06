@@ -83,7 +83,11 @@ fn confirm(folder: &str) -> Result<Value> {
         journal: &journal,
     };
     let confirmed = phone()?.confirm(&record.id, &record.repo, &engine, &peers)?;
-    Ok(json!({"waiting": confirmed.waiting, "unsupported": confirmed.unsupported}))
+    Ok(json!({
+        "waiting": confirmed.waiting,
+        "unsupported": confirmed.unsupported,
+        "scanning": confirmed.scanning,
+    }))
 }
 
 fn engine(folder: &str) -> Result<Arc<Engine>> {

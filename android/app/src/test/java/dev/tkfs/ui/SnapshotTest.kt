@@ -65,19 +65,39 @@ class SnapshotTest {
     @Test fun waitingFilesAreShownAndAFailedReadIsNeverAClear() {
         val lane = """{"state": "Ready", "last_error": null}"""
         val polled = parseSnapshot(status(lane))
-        val first = polled.withWaiting(mapOf("f1" to 2), null, mapOf("f1" to Confirmed(2, 5)))
+        val first = polled.withWaiting(mapOf("f1" to 2), emptyMap(), null, mapOf("f1" to Confirmed(2, 5)))
         assertEquals(2, first.folders.single().waiting)
         // Never more files unsupported than there are waiting.
         assertEquals(2, first.folders.single().unsupported)
         // The next read failed: the folder keeps what it was said to have, not zero.
-        val failed = polled.withWaiting(emptyMap(), first, emptyMap())
+        val failed = polled.withWaiting(emptyMap(), emptyMap(), first, emptyMap())
         assertEquals(2, failed.folders.single().waiting)
         assertEquals(0, failed.folders.single().unsupported)
         // A read that worked and found none clears, and the old confirmation says nothing then.
-        val cleared = polled.withWaiting(mapOf("f1" to 0), failed, mapOf("f1" to Confirmed(2, 2)))
+        val cleared = polled.withWaiting(mapOf("f1" to 0), emptyMap(), failed, mapOf("f1" to Confirmed(2, 2)))
         assertEquals(0, cleared.folders.single().waiting)
         assertEquals(0, cleared.folders.single().unsupported)
         // Before anything is known, nothing is claimed either way.
-        assertEquals(0, polled.withWaiting(emptyMap(), null, emptyMap()).folders.single().waiting)
+        assertEquals(0, polled.withWaiting(emptyMap(), emptyMap(), null, emptyMap()).folders.single().waiting)
+    }
+
+    @Test fun aFailedReadIsShownAsAnErrorNotAsSynced() {
+        val lane = """{"state": "Ready", "last_error": null}"""
+        val polled = parseSnapshot(status(lane)).let { it.copy(folders = it.folders.map { f -> f.copy(conflicts = 0) }) }
+        val shown = polled.withWaiting(emptyMap(), mapOf("f1" to "PHONE_DB_UNAVAILABLE: /x/phone.sqlite"), null, emptyMap())
+        val line = folderLine(shown.folders.single(), 2000)
+        assertEquals(Line("Could not check what is waiting to send.", Tone.Bad), line)
+        // Another error on the folder is not hidden by it.
+        val other = parseSnapshot(status(lane), mapOf("f1" to BurstError("SYNC_NOW_TIMEOUT: late", 1000)))
+        assertEquals("SYNC_NOW_TIMEOUT: late", other.withWaiting(emptyMap(), mapOf("f1" to "X_ERROR: y"), null, emptyMap()).folders.single().error)
+    }
+
+    @Test fun aTableStillCatchingUpIsNotSynced() {
+        val lane = """{"state": "Ready", "last_error": null}"""
+        val polled = parseSnapshot(status(lane)).let { it.copy(folders = it.folders.map { f -> f.copy(conflicts = 0) }) }
+        val shown = polled.withWaiting(mapOf("f1" to 0), emptyMap(), null, mapOf("f1" to Confirmed(0, 0, true)))
+        assertEquals(Line("Checking what is waiting to send", Tone.Waiting), folderLine(shown.folders.single(), 2000))
+        assertEquals(Confirmed(0, 0, true), parseConfirmed("""{"waiting": 0, "unsupported": 0, "scanning": true}"""))
+        assertEquals(Confirmed(1, 0, false), parseConfirmed("""{"waiting": 1, "unsupported": 0}"""))
     }
 }

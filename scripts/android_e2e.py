@@ -914,10 +914,11 @@ def scenario_share(s: Session) -> None:
     # Once the PC holds the bytes and has the events, they are no longer waiting.
     check_nothing_waits(s, folder, "the shares the PC took")
 
-    # An older PC cannot say what it holds, so the file stays waiting and the app says to update the PC.
+    # A PC that takes pushes but cannot say what it holds (no `content-have`): the file stays waiting even
+    # once its bytes are there, and the app says to update the PC.
     failures, summary = pc.stop()
-    s.check("the PC stops cleanly to become an older one", not failures, failures or summary)
-    pc.extra_env = {"TKFS_FAULT_POINT": "session.features.none"}
+    s.check("the PC stops cleanly to become one without content-have", not failures, failures or summary)
+    pc.extra_env = {"TKFS_FAULT_POINT": "session.features.no-content-have"}
     pc.start()
     pc.wait_phase(folder.label, "Running")
     old_pc = rng.randbytes(1 * MIB)
@@ -931,11 +932,21 @@ def scenario_share(s: Session) -> None:
         return any("Update the PC" in shown for shown in device.screen_texts())
 
     poll(SYNC_BOUND, "the Folders screen to say to update the PC", says_update, interval=2)
-    shown = [text for text in device.screen_texts() if "Update the PC" in text]
-    s.check("an unsent file shows 'Update the PC' against a PC without content-have", bool(shown), shown)
+    shown = [text for text in device.screen_texts() if "waiting to send" in text]
+    s.check("an unsent file shows 'Update the PC' against a PC without content-have",
+            shown == ["1 file waiting to send. Update the PC."], shown)
+    def bytes_arrived() -> bool:
+        if time.monotonic() - nudged[0] > 30:
+            nudged[0] = time.monotonic()
+            trigger_foreground(device)
+        return pc_has_whole(s, folder, "old-pc.bin", old_pc)
+
+    poll(SYNC_BOUND, "the bytes on the PC that cannot say it has them", bytes_arrived, interval=2)
+    s.check("the PC has the bytes, and the file still waits because it cannot say so",
+            [file["path"] for file in device.waiting_files(folder.id)] == ["/old-pc.bin"])
     s.check("and is named in the table", [file["path"] for file in device.waiting_files(folder.id)] == ["/old-pc.bin"])
     failures, summary = pc.stop()
-    s.check("the older PC stops cleanly", not failures, failures or summary)
+    s.check("the PC without content-have stops cleanly", not failures, failures or summary)
     pc.extra_env = {}
     pc.start()
     pc.wait_phase(folder.label, "Running")
@@ -1223,6 +1234,9 @@ def run_scenario(name: str, device: Device, report: Report, run_dir: Path, reset
         device.clear_logcat()
         if reset:
             device.reset_app()
+        # `metered` leaves the system's own judgment of the network in place; an earlier run that was
+        # cut short may not have. A metered network would hold back every push in the scenario.
+        device.set_metered(False)
         pc.start()
         session = Session(device, pc, report)
         session.check_pairing_qr()

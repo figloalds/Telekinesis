@@ -939,6 +939,7 @@ fn server_auth(
     // Once per handshake: under the `session.features.none` fault this side
     // behaves as an older peer, advertising and recording no features.
     let older = fault::hit(features::FAULT_NONE).is_some();
+    let without_have = fault::hit(features::FAULT_NO_HAVE).is_some();
     let server = ServerHello {
         protocol: PROTOCOL_NAME.to_owned(),
         version: PROTOCOL_VERSION,
@@ -950,11 +951,15 @@ fn server_auth(
         features: if older {
             Vec::new()
         } else {
-            vec![
-                features::CONTENT_PUSH.into(),
-                features::CONTENT_HAVE.into(),
-                features::NOTIFY.into(),
+            [
+                features::CONTENT_PUSH,
+                features::CONTENT_HAVE,
+                features::NOTIFY,
             ]
+            .into_iter()
+            .filter(|feature| !(without_have && *feature == features::CONTENT_HAVE))
+            .map(String::from)
+            .collect()
         },
         limits,
     };

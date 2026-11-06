@@ -136,19 +136,24 @@ object SyncCoordinator {
 
     /**
      * Asks the PCs which of each folder's waiting files they hold, on this thread. A folder that
-     * fails keeps its files waiting: only a PC's answer clears one.
+     * fails keeps its files waiting: only a PC's answer clears one. True when every folder answered.
      */
-    fun confirm(folders: Collection<String>) {
+    fun confirm(folders: Collection<String>): Boolean {
+        var all = true
         for (id in folders) {
             try {
                 val answer = parseConfirmed(Native.confirm(id))
                 confirmed.update { it + (id to answer) }
+                Log.i(TAG, "confirm $id: $answer")
             } catch (error: IOException) {
+                all = false
                 Log.i(TAG, "confirm $id: ${error.message}")
             } catch (error: JSONException) {
+                all = false
                 Log.i(TAG, "confirm $id: unreadable answer: ${error.message}")
             }
         }
+        return all
     }
 
     /** The burst `trigger` calls for, on this thread. `decided` is a mode the caller already chose. */

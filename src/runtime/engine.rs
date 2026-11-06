@@ -1197,36 +1197,75 @@ pub struct HeadClosure {
 impl Engine {
     /// This device's own events with a sequence after `after`, oldest first, at most `limit`.
     pub fn own_events_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Event)>> {
+        Ok(self
+            .own_events_between(after, u64::MAX, limit, usize::MAX)?
+            .events)
+    }
+
+    /// This device's own events with a sequence in `after..=upto`, oldest first, at most `limit`
+    /// of them, from at most `pages` pages of the journal. The store is locked one page at a time,
+    /// so a long journal does not stall the sealer, the feed or the provider. `reached` is how far
+    /// the journal was read: the position to resume from.
+    pub fn own_events_between(
+        &self,
+        after: u64,
+        upto: u64,
+        limit: usize,
+        pages: usize,
+    ) -> Result<OwnEvents> {
         const PAGE: usize = 1024;
-        let store = lock(&self.store);
-        let mut own = Vec::new();
-        let mut at = after;
-        while own.len() < limit {
-            let page = store.events_after(at, PAGE)?;
-            let Some((last, _)) = page.last() else {
-                break;
-            };
-            at = *last;
+        let mut found = OwnEvents {
+            events: Vec::new(),
+            reached: after,
+        };
+        for _ in 0..pages {
+            let store = lock(&self.store);
+            let page = store.events_after(found.reached, PAGE)?;
             let full = page.len() == PAGE;
             for (seq, event) in page {
+                if seq > upto {
+                    found.reached = upto;
+                    return Ok(found);
+                }
+                found.reached = seq;
                 if event.author == store.device {
-                    own.push((seq, event));
-                    if own.len() == limit {
-                        return Ok(own);
+                    found.events.push((seq, event));
+                    if found.events.len() == limit {
+                        return Ok(found);
                     }
                 }
             }
             if !full {
-                break;
+                found.reached = found.reached.max(upto.min(store.feed_position()?));
+                return Ok(found);
             }
         }
-        Ok(own)
+        Ok(found)
+    }
+
+    /// The journal's latest sequence after making what it holds durable. The metadata store keeps
+    /// recent events in an open transaction that a kill takes back, and their sequences are then
+    /// used again. A position taken before this may name events that never were.
+    pub fn durable_position(&self) -> Result<u64> {
+        let mut store = lock(&self.store);
+        store.sync_metadata()?;
+        store.feed_position()
+    }
+
+    /// Whether the journal holds an event of `entity` at `seq`: false for a sequence that was taken
+    /// back, or that is another entity's now.
+    pub fn has_event(&self, seq: u64, entity: &str) -> Result<bool> {
+        let store = lock(&self.store);
+        Ok(store
+            .events_after(seq.saturating_sub(1), 1)?
+            .first()
+            .is_some_and(|(at, event)| *at == seq && event.entity == entity))
     }
 
     /// The bytes a peer must hold for `entity`'s current head. It never fetches: what the local
     /// packs do not have is not asked for from anyone.
     pub fn head_closure(&self, entity: &str) -> Result<HeadClosure> {
-        let (device, deleted, heads) = {
+        let (deleted, heads) = {
             let store = lock(&self.store);
             let projection = store.projection();
             let versions = projection
@@ -1234,25 +1273,32 @@ impl Engine {
                 .get(entity)
                 .filter(|versions| !versions.is_empty())
                 .with_context(|| format!("NOT_FOUND: no head for {entity}"))?;
-            let heads = versions
-                .iter()
-                .map(|version| {
-                    store
-                        .version(version)?
-                        .with_context(|| format!("NOT_FOUND: head {version} of {entity}"))
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let mut heads = Vec::new();
+            for version in versions {
+                let head = store
+                    .version(version)?
+                    .with_context(|| format!("NOT_FOUND: head {version} of {entity}"))?;
+                let bytes_here = content_written_here(&store, &head)?;
+                heads.push((head, bytes_here));
+            }
             let deleted = projection.entries.get(entity).is_some_and(|e| e.deleted);
-            (store.device.clone(), deleted, heads)
+            (deleted, heads)
         };
         let content = self.working.content();
+        let device = lock(&self.store).device.clone();
         let mut closure = HeadClosure {
             deleted,
             ..HeadClosure::default()
         };
-        for head in heads.iter().filter(|head| head.author == device) {
-            closure.written_here = true;
-            let Some(reference) = head.state.content.as_ref().filter(|_| !head.state.deleted)
+        for (head, bytes_here) in &heads {
+            closure.written_here |= head.author == device || *bytes_here;
+            // A deleted head has no bytes to hold, and one that only a peer's bytes are under is
+            // the peer's to hold. A live head beside a deleted one still needs its own.
+            let Some(reference) = head
+                .state
+                .content
+                .as_ref()
+                .filter(|_| *bytes_here && !head.state.deleted)
             else {
                 continue;
             };
@@ -1266,11 +1312,49 @@ impl Engine {
         }
         let mut seen = std::collections::BTreeSet::new();
         closure.digests.retain(|digest| seen.insert(*digest));
-        if closure.deleted {
-            closure.digests.clear();
-        }
         Ok(closure)
     }
+}
+
+/// How many events [`content_written_here`] reads before it gives up and says yes.
+const ORIGIN_WALK_LIMIT: usize = 4096;
+
+/// Whether this device wrote the bytes `head` holds: the event that introduced its content is
+/// found by walking parents while the content stays the same (a rename, a times change or a peer's
+/// metadata edit over the same bytes does not change who wrote them). A parent that is not here,
+/// or a walk too long to finish, says yes: bytes this device may have written are never skipped.
+fn content_written_here(store: &Store, head: &Event) -> Result<bool> {
+    let mut pending = vec![head.clone()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(event) = pending.pop() {
+        if !seen.insert(event.id.clone()) {
+            continue;
+        }
+        if seen.len() > ORIGIN_WALK_LIMIT {
+            return Ok(true);
+        }
+        let mut introduced = true;
+        for parent in &event.parents {
+            match store.version(parent)? {
+                Some(parent) if parent.state.content == head.state.content => {
+                    introduced = false;
+                    pending.push(parent);
+                }
+                Some(_) => {}
+                None => return Ok(true),
+            }
+        }
+        if introduced && event.author == store.device {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// What [`Engine::own_events_between`] read.
+pub struct OwnEvents {
+    pub events: Vec<(u64, Event)>,
+    pub reached: u64,
 }
 
 #[cfg(test)]
@@ -1379,6 +1463,127 @@ mod tests {
         assert_eq!(closure, HeadClosure::default());
 
         assert!(engine.head_closure("no such entity").is_err());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_peers_metadata_event_over_bytes_written_here_still_needs_them() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        seed_cached_file(&engine, "mine", b"bytes only this device has")?;
+        let id = engine.lookup("mine")?.id;
+        let before = engine.head_closure(&id)?;
+        assert_eq!(before.digests.len(), 1);
+        // The PC renames it: its event carries this device's content, and only the name changed.
+        let renamed = peer_edit(&engine, &id, |state| state.name = "renamed".into())?;
+        assert_eq!(renamed.state.content, engine.lookup("renamed")?.content);
+        let after = engine.head_closure(&id)?;
+        assert!(after.written_here);
+        assert_eq!(after.digests, before.digests);
+        // And once more, a second metadata event on top of that one.
+        peer_edit(&engine, &id, |state| state.attributes = 0x20)?;
+        assert_eq!(engine.head_closure(&id)?.digests, before.digests);
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_peers_metadata_event_over_a_peers_bytes_needs_none() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        seed_cached_file(&engine, "file", b"mine first")?;
+        let id = engine.lookup("file")?.id;
+        let theirs = engine.working.content().import(b"the peer wrote these")?;
+        peer_edit(&engine, &id, |state| state.content = Some(theirs))?;
+        peer_edit(&engine, &id, |state| state.name = "renamed".into())?;
+        let closure = engine.head_closure(&id)?;
+        assert!(closure.digests.is_empty() && !closure.written_here);
+        // Then this device renames it: the bytes are still the peer's.
+        let token = engine.open_native_file("renamed", false, false, false, None, true)?;
+        engine.rename(token, "again", false)?;
+        engine.close(token)?;
+        let closure = engine.head_closure(&id)?;
+        assert!(closure.written_here && closure.digests.is_empty());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_live_head_beside_a_peers_delete_still_needs_its_bytes() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        seed_cached_file(&engine, "file", b"first version")?;
+        let id = engine.lookup("file")?.id;
+        let first = lock(&engine.store).projection().heads[&id]
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        // A draft is open on it when the PC's delete of the version it was made from arrives; the
+        // draft then seals beside the delete, which stays what shows: two heads.
+        let writer = engine.open_file("file", false, false, true)?;
+        engine.truncate(writer, 0, false)?;
+        engine.write(writer, 0, b"an edit the PC never saw", false, false)?;
+        let mut deletion = {
+            let mut store = lock(&engine.store);
+            let mut state = store.entry(&id)?;
+            state.deleted = true;
+            store.event(MAIN, state, first, Operation::Delete)
+        };
+        deletion.author = "a peer".into();
+        engine.apply_remote(std::slice::from_ref(&deletion))?;
+        engine.flush(Some(writer))?;
+        engine.close(writer)?;
+        assert_eq!(lock(&engine.store).projection().heads[&id].len(), 2);
+        let closure = engine.head_closure(&id)?;
+        // The delete is what shows, as in the review's case.
+        assert!(closure.deleted, "the test needs the delete to be visible");
+        assert!(closure.written_here);
+        assert!(
+            !closure.digests.is_empty(),
+            "the live head's bytes exist only here: {closure:?}"
+        );
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn own_events_are_read_a_page_at_a_time_and_never_past_a_position() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        {
+            let mut store = lock(&engine.store);
+            for index in 0..2100 {
+                store.create(&format!("d{index}"), EntryKind::Directory)?;
+            }
+        }
+        let first = engine.own_events_between(0, u64::MAX, usize::MAX, 1)?;
+        assert_eq!((first.events.len(), first.reached), (1024, 1024));
+        let second = engine.own_events_between(first.reached, u64::MAX, usize::MAX, 1)?;
+        assert_eq!(second.reached, 2048);
+        let third = engine.own_events_between(second.reached, u64::MAX, usize::MAX, 1)?;
+        assert_eq!((third.events.len(), third.reached), (52, 2100));
+        let capped = engine.own_events_between(0, 10, usize::MAX, usize::MAX)?;
+        assert_eq!((capped.events.len(), capped.reached), (10, 10));
+        let limited = engine.own_events_between(0, u64::MAX, 3, usize::MAX)?;
+        assert_eq!((limited.events.len(), limited.reached), (3, 3));
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_durable_position_and_a_sequences_event_are_known() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        seed_cached_file(&engine, "file", b"x")?;
+        let id = engine.lookup("file")?.id;
+        let top = engine.durable_position()?;
+        assert!(lock(&engine.store).metadata_is_durable());
+        assert_eq!(top, lock(&engine.store).feed_position()?);
+        let (seq, _) = *engine.own_events_after(0, 100)?.last().unwrap();
+        assert!(engine.has_event(seq, &id)?);
+        assert!(!engine.has_event(seq, "another entity")?);
+        assert!(!engine.has_event(top + 50, &id)?);
         engine.shutdown()?;
         Ok(())
     }

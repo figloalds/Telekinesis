@@ -85,6 +85,9 @@ pub mod features {
     /// Fault point: both sides send and record an empty feature list, which
     /// simulates a peer that predates feature negotiation.
     pub const FAULT_NONE: &str = "session.features.none";
+    /// Fault point: a listener advertises everything but `content-have`, which
+    /// simulates a peer between pushes and `objects.have`.
+    pub const FAULT_NO_HAVE: &str = "session.features.no-content-have";
 }
 
 pub mod ops {

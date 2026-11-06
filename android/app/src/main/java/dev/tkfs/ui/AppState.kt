@@ -4,6 +4,7 @@ import android.app.Application
 import android.os.PowerManager
 import android.os.StatFs
 import android.text.format.Formatter
+import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.tkfs.Native
@@ -79,6 +80,8 @@ fun AppUi.pollFailed(failure: Failure) = copy(pollFailure = failure)
 
 private const val POLL_MS = 2_000L
 private const val STORAGE_EVERY = 5
+private const val CONFIRM_ATTEMPTS = 3
+private const val CONFIRM_RETRY_MS = 5_000L
 
 /**
  * What the screens show, refreshed from `status` every 2 s while one is showing and after
@@ -119,11 +122,15 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /** A cold app may not have answered `status` yet, or its worker may not be up: try again a few times. */
     private suspend fun confirmWhatIsShown() {
-        val folders = mutable.value.snapshot?.folders.orEmpty().map { it.id }
-        if (folders.isEmpty()) return
-        withContext(Dispatchers.IO) { SyncCoordinator.confirm(folders) }
-        refresh()
+        repeat(CONFIRM_ATTEMPTS) {
+            val folders = mutable.value.snapshot?.folders.orEmpty().map { it.id }
+            val answered = folders.isNotEmpty() && withContext(Dispatchers.IO) { SyncCoordinator.confirm(folders) }
+            refresh()
+            if (answered) return
+            delay(CONFIRM_RETRY_MS)
+        }
     }
 
     fun stopPolling() {
@@ -161,18 +168,22 @@ class AppModel(application: Application) : AndroidViewModel(application) {
 
     /** The folders' waiting files, read from the table on disk: no PC is asked. */
     private suspend fun withWaiting(snapshot: Snapshot): Snapshot {
-        val counted = withContext(Dispatchers.IO) {
-            snapshot.folders.mapNotNull { folder ->
+        val counted = HashMap<String, Int>()
+        val failed = HashMap<String, String>()
+        withContext(Dispatchers.IO) {
+            for (folder in snapshot.folders) {
                 try {
-                    folder.id to parseWaiting(Native.waiting(folder.id))
+                    counted[folder.id] = parseWaiting(Native.waiting(folder.id))
                 } catch (error: IOException) {
-                    null
+                    Log.w("tkfs", "waiting ${folder.id}: ${error.message}")
+                    failed[folder.id] = error.message ?: "UNKNOWN_ERROR: the waiting files could not be read"
                 } catch (error: JSONException) {
-                    null
+                    Log.w("tkfs", "waiting ${folder.id}: unreadable: ${error.message}")
+                    failed[folder.id] = "The app could not read what is waiting to send."
                 }
-            }.toMap()
+            }
         }
-        return snapshot.withWaiting(counted, mutable.value.snapshot, SyncCoordinator.confirmations.value)
+        return snapshot.withWaiting(counted, failed, mutable.value.snapshot, SyncCoordinator.confirmations.value)
     }
 
     /** One burst for every folder. Its errors stay on their folders until a newer exchange. */

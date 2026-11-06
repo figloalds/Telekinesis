@@ -71,23 +71,34 @@ fun parsePublished(reply: String): List<Published> =
 
 /**
  * The snapshot with each folder's waiting files. `counted` has the folders whose list could be read
- * now; one that could not keeps what the last poll said, so a failed read is never a clear. Of
- * `confirmations`, only what still waits is shown.
+ * now. One that could not (`failed`, with why) keeps what the last poll said and shows that error,
+ * so a failed read is never "Synced". A folder whose table is still catching up with its journal is
+ * `waitingUnknown`: nothing waiting yet says nothing. Of `confirmations`, only what still waits is shown.
  */
-fun Snapshot.withWaiting(counted: Map<String, Int>, last: Snapshot?, confirmations: Map<String, Confirmed>): Snapshot =
-    copy(folders = folders.map { folder ->
-        val waiting = counted[folder.id] ?: last?.folders?.firstOrNull { it.id == folder.id }?.waiting ?: 0
-        folder.copy(waiting = waiting, unsupported = minOf(waiting, confirmations[folder.id]?.unsupported ?: 0))
-    })
+fun Snapshot.withWaiting(
+    counted: Map<String, Int>,
+    failed: Map<String, String>,
+    last: Snapshot?,
+    confirmations: Map<String, Confirmed>,
+): Snapshot = copy(folders = folders.map { folder ->
+    val waiting = counted[folder.id] ?: last?.folders?.firstOrNull { it.id == folder.id }?.waiting ?: 0
+    val confirmed = confirmations[folder.id]
+    folder.copy(
+        waiting = waiting,
+        unsupported = minOf(waiting, confirmed?.unsupported ?: 0),
+        waitingUnknown = confirmed?.scanning == true,
+        error = folder.error ?: failed[folder.id],
+    )
+})
 
 /** How many files `Native.waiting` lists. */
 fun parseWaiting(reply: String): Int = JSONArray(reply).length()
 
 /** What `Native.confirm` answered: files still waiting, and those a too-old PC could not be asked about. */
-data class Confirmed(val waiting: Int, val unsupported: Int)
+data class Confirmed(val waiting: Int, val unsupported: Int, val scanning: Boolean = false)
 
 fun parseConfirmed(reply: String): Confirmed =
-    JSONObject(reply).let { Confirmed(it.getInt("waiting"), it.getInt("unsupported")) }
+    JSONObject(reply).let { Confirmed(it.getInt("waiting"), it.getInt("unsupported"), it.optBoolean("scanning", false)) }
 
 /** Each folder's newest `last_exchange_ms` in a `status` reply, by folder id; none for a folder with none. */
 fun parseExchanges(reply: String): Map<String, Long> =
