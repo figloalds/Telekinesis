@@ -33,7 +33,7 @@ from typing import Callable
 from android_e2e_lib import (ADB_BOUND, BUILD_BOUND, CONTROL_URI, DEFAULT_AVD, DIRECTORY_MIME, FOLDER_READY_BOUND, PACKAGE, ROOT, ROOTS_URI,
                              ContentError, Device, Emulator, Folder, HarnessError, ManageError, PcHost, Report,
                              Session, SYNC_BOUND, UI_BOUND, children_uri, document_uri, png_noise, poll, run_bounded, sha256,
-                             size_text, with_parents)
+                             bounds_center, size_text, with_parents)
 from build_android import APK, find_sdk
 
 # ---- scenarios ----------------------------------------------------------------------------
@@ -1422,9 +1422,116 @@ def scenario_ui_browse(s: Session) -> None:
     s.check("with the PC back the file opens and reads whole", sha256(video_read) == sha256(video))
 
 
+def conflict_heads(rows: list[dict]) -> list[str]:
+    """The unresolved conflicts' entities, from the rows of a `conflicts` op."""
+    return [row["entity"] for row in rows if not row.get("resolved")]
+
+
+def phone_conflicts(s: Session, folder: Folder) -> list[dict]:
+    return s.device.shell_manage("folder", {"state": folder.id, "op": "conflicts", "payload": {}})
+
+
+def pc_conflicts(s: Session, folder: Folder) -> list[dict]:
+    return json.loads(s.pc.folder(folder.pc_state, "conflicts"))
+
+
+def tap_below(device: Device, line: str, button: str, bound: float = UI_BOUND) -> None:
+    """Taps the first `button` under the view whose text starts with `line`: each version of a conflict has its own."""
+
+    def find():
+        nodes = list(device.ui_dump(bound).iter("node"))
+        above = [bounds_center(n.get("bounds"))[1] for n in nodes if (n.get("text") or "").startswith(line)]
+        below = [bounds_center(n.get("bounds")) for n in nodes if n.get("text") == button
+                 and above and bounds_center(n.get("bounds"))[1] > above[0]]
+        if not below:
+            raise HarnessError(f"no {button!r} under {line!r}")
+        return min(below, key=lambda point: point[1])
+
+    x, y = poll(bound, f"{button!r} under {line!r}", find, interval=1)
+    device.shell("input", "tap", x, y).require_success()
+
+
+def scenario_conflicts(s: Session) -> None:
+    """Acceptance 18: a file edited on the PC and on the phone between bursts is a conflict. The phone says
+    "1 conflict to settle", the Conflicts screen shows both versions and previews each, and keeping one settles
+    it on both sides after a burst, with the chosen bytes. Screenshots are in this run's `screens` directory."""
+    device, pc = s.device, s.pc
+    shots = s.report.path.parent / "screens"
+    base = b"Agreed text.\n" * 50
+    pc_bytes = b"Edited on the PC.\n" * 50
+    phone_bytes = b"Edited on the phone, differently.\n" * 60
+    folder = s.folder_with({"contrato.txt": base, "quieto.txt": b"Never edited.\n"}, "Contracts")
+    s.check("the phone reads the file before either side edits it", device.content_read(folder.doc("contrato.txt")) == base)
+    s.check("no conflict to begin with", not conflict_heads(phone_conflicts(s, folder)) and not conflict_heads(pc_conflicts(s, folder)))
+
+    # Both sides edit between bursts: the PC through its folder, the phone through the provider.
+    pc.write_file(folder.pc_state, "contrato.txt", pc_bytes)
+    pc.folder(folder.pc_state, "flush")
+    device.content_write(folder.doc("contrato.txt"), phone_bytes)
+
+    def both_see_it() -> bool:
+        s.sync_now(folder)
+        return bool(conflict_heads(phone_conflicts(s, folder))) and bool(conflict_heads(pc_conflicts(s, folder)))
+
+    poll(SYNC_BOUND, "the conflict on both sides", both_see_it, interval=2)
+    s.check("after a burst each side holds the conflict", True)
+
+    def shown(what: str, wanted: Callable[[list[str]], bool], bound: float = UI_BOUND) -> list[str]:
+        return device.wait_screen(what, wanted, bound)
+
+    def has(*texts: str) -> Callable[[list[str]], bool]:
+        return lambda found: all(text in found for text in texts)
+
+    device.start_app()
+    found = shown("the conflicts line", has("Contracts", "1 conflict to settle"))
+    s.check("the Folders screen says 1 conflict to settle", True, found)
+    device.screenshot(shots / "conflicts-folders.png")
+    device.tap_text("1 conflict to settle")
+    found = shown("both versions", has("Both versions stay until you choose.", "contrato.txt"))
+    phone_line = f"This phone, Today at"
+    s.check("the screen names the file and both versions", sum(text.startswith(("This phone, Today", "My PC, Today")) for text in found) == 2, found)
+    s.check("with the sizes of each", any(text.endswith(size_text(len(phone_bytes))) for text in found)
+            and any(text.endswith(size_text(len(pc_bytes))) for text in found), found)
+    device.screenshot(shots / "conflicts.png")
+
+    # Preview the PC's version: its first bytes are fetched, off the main thread, and read in a dialog.
+    tap_below(device, "My PC, Today", "Preview")
+    found = shown("the preview", lambda t: any("Edited on the PC." in text for text in t))
+    s.check("the preview of the PC's version shows its text", True)
+    device.screenshot(shots / "conflicts-preview.png")
+    device.tap_text("Close")
+    shown("the preview closed", lambda t: "Close" not in t)
+    s.check("nothing is settled by previewing", bool(conflict_heads(phone_conflicts(s, folder))))
+
+    # Keep the phone's version.
+    tap_below(device, phone_line, "Keep this one")
+
+    def settled() -> bool:
+        return not conflict_heads(phone_conflicts(s, folder))
+
+    poll(UI_BOUND, "the phone to settle", settled, interval=1)
+    s.check("keeping a version settles the conflict on the phone", True)
+    s.check("and the file holds the chosen bytes there", device.content_read(folder.doc("contrato.txt")) == phone_bytes)
+
+    def pc_settled() -> bool:
+        s.sync_now(folder)
+        return not conflict_heads(pc_conflicts(s, folder)) and pc.pc_cat(folder.pc_state, "contrato.txt") == phone_bytes
+
+    poll(SYNC_BOUND, "the choice on the PC", pc_settled, interval=2)
+    s.check("after a burst the PC has the chosen bytes and no conflict", True)
+    s.check("and the phone still has none", not conflict_heads(phone_conflicts(s, folder)))
+    found = shown("nothing left to settle", lambda t: "Nothing to settle in Contracts." in t, 60)
+    s.check("the screen says nothing is left", True, found)
+    device.screenshot(shots / "conflicts-settled.png")
+    device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
+    found = shown("Folders without the line", lambda t: "Contracts" in t and not any("conflict" in text for text in t), 60)
+    s.check("and the Folders screen no longer shows a conflict", True, found)
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
     "ui_folders": scenario_ui_folders,
     "ui_browse": scenario_ui_browse,
+    "conflicts": scenario_conflicts,
     "read": scenario_read,
     "write": scenario_write,
     "share": scenario_share,

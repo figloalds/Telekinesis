@@ -36,6 +36,9 @@ sealed class Screen {
 
     /** A folder's files, by the folder's id. */
     data class Browse(val folder: String, val label: String) : Screen()
+
+    /** A folder's conflicts, by the folder's id. */
+    data class Conflicts(val folder: String, val label: String) : Screen()
 }
 
 /** An orchestrator refusal: its code and a sentence a person can read. */

@@ -41,6 +41,7 @@ fun FoldersScreen(
     onDismissShareFailures: () -> Unit = {},
     onDismissOpenFailures: () -> Unit = {},
     onOpenFolder: (FolderStatus) -> Unit = {},
+    onOpenConflicts: (FolderStatus) -> Unit = {},
 ) {
     val snapshot = ui.snapshot
     Column(Modifier.fillMaxSize()) {
@@ -53,7 +54,7 @@ fun FoldersScreen(
                 when {
                     snapshot == null -> Text("Starting...", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     snapshot.folders.isEmpty() -> Empty(snapshot, onAddPc)
-                    else -> FolderList(snapshot, ui.now, onAddPc, onOpenFolder)
+                    else -> FolderList(snapshot, ui.now, onAddPc, onOpenFolder, onOpenConflicts)
                 }
                 FailureNote(ui.failure ?: ui.pollFailure)
             }
@@ -90,7 +91,13 @@ private fun Empty(snapshot: Snapshot, onAddPc: () -> Unit) {
 }
 
 @Composable
-private fun FolderList(snapshot: Snapshot, now: Long, onAddPc: () -> Unit, onOpen: (FolderStatus) -> Unit) {
+private fun FolderList(
+    snapshot: Snapshot,
+    now: Long,
+    onAddPc: () -> Unit,
+    onOpen: (FolderStatus) -> Unit,
+    onOpenConflicts: (FolderStatus) -> Unit,
+) {
     LazyColumn(Modifier.fillMaxWidth()) {
         item { Strips(snapshot, onAddPc) }
         items(snapshot.folders, key = { it.id }) { folder ->
@@ -108,7 +115,16 @@ private fun FolderList(snapshot: Snapshot, now: Long, onAddPc: () -> Unit, onOpe
                 )
                 Column(Modifier.weight(1f)) {
                     Text(folder.label, style = MaterialTheme.typography.bodyLarge, maxLines = 1)
-                    Text(line.text, color = toneColor(line.tone), style = MaterialTheme.typography.bodyMedium)
+                    // The conflicts line is the way to settle them; any other line opens the folder.
+                    val settling = folder.error == null && folder.conflicts > 0
+                    Text(
+                        line.text,
+                        color = toneColor(line.tone),
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = if (settling) {
+                            Modifier.heightIn(min = 44.dp).clickable(role = Role.Button) { onOpenConflicts(folder) }
+                        } else Modifier,
+                    )
                 }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)

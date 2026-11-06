@@ -54,11 +54,19 @@ class MainActivity : ComponentActivity() {
                             onDismissShareFailures = model::dismissShareFailures,
                             onDismissOpenFailures = model::dismissOpenFailures,
                             onOpenFolder = { model.show(Screen.Browse(it.id, it.label)) },
+                            onOpenConflicts = { model.show(Screen.Conflicts(it.id, it.label)) },
                         )
                         is Screen.Browse -> BrowseScreen(
                             screen.folder,
                             screen.label,
                             waitingFiles = ui.snapshot?.folders?.firstOrNull { it.id == screen.folder }?.waiting ?: 0,
+                            onBack = { model.show(Screen.Folders) },
+                        )
+                        is Screen.Conflicts -> ConflictsScreen(
+                            screen.folder,
+                            screen.label,
+                            pcs = ui.snapshot?.peers?.size ?: 1,
+                            now = ui.now,
                             onBack = { model.show(Screen.Folders) },
                         )
                         Screen.AddPc -> AddPcScreen(
