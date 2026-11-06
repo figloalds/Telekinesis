@@ -248,10 +248,13 @@ request per burst, however long its history is.
 - `sent` is saved only after the listener has made those events durable. Applied events are not
   fsynced before the `meta.exchange` reply today, which is harmless while everything is replayed
   but would lose events once it is not. A passive dialer asks for a durable apply, and the
-  listener runs `sync_metadata` before replying, only when the request carried new events.
-- Replies carry the identity of that store's journal and its top sequence. If the identity
-  differs, or the top is below `received`, the phone starts over from zero, which is what happens
-  on every session today.
+  listener runs `sync_metadata` before replying whenever the request carried events or the reply
+  hands out events, since a sequence number it hands out could otherwise roll back. The dialer also
+  durably re-applies its own page when the reply left out the echoes.
+- Replies carry the identity of that store's journal and its top sequence, read before the
+  request's events apply so a rollback cannot hide behind them. If the identity differs, or the top
+  is below the cursor on either side, the phone starts over from zero, which is what happens on
+  every session today.
 - Settings has "Resync from the start" for what that cannot detect, such as a PC restored from an
   old backup that has since grown past the cursor.
 - Active dialers keep today's behaviour, so the desktop is not affected.
