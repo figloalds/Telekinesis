@@ -795,10 +795,15 @@ def scenario_share(s: Session) -> None:
     s.check("no working file is left in the folder", not any(name.startswith(".tkfs-part-") for name in listed),
             sorted(listed))
 
-    # A stream that cannot be read is reported, and nothing is left under any name.
+    # A stream that cannot be read is reported, and nothing is left under any name: the file goes
+    # while the share screen is up, so the grant is good and the open is not.
+    # Everything above ran without the notification permission, as the job must. This needs it,
+    # to read the notification back.
+    device.shell("pm", "grant", PACKAGE, "android.permission.POST_NOTIFICATIONS").require_success()
     device.clear_logcat()
-    device.start_share("content://media/external/file/987654321")
+    device.start_share(device.push_download("gone.bin", rng.randbytes(1024)))
     device.wait_screen("the share screen", lambda t: "Save 1 file" in t)
+    device.shell("rm", "-f", "/sdcard/Download/gone.bin")
     device.tap_text("Save 1 file")
 
     def reported() -> bool:

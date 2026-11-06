@@ -70,9 +70,14 @@ class ShareActivity : ComponentActivity() {
                             val settings = Settings.of(this)
                             settings.lastShareFolder = target.id
                             settings.lastSharePath = directory
-                            ShareImportService.start(this, target.id, target.label, directory, uris)
-                            Toast.makeText(this, "Saving ${uris.size} ${if (uris.size == 1) "file" else "files"}", Toast.LENGTH_SHORT).show()
-                            finish()
+                            try {
+                                ShareImportService.start(this, target.id, target.label, directory, uris)
+                                Toast.makeText(this, "Saving ${uris.size} ${if (uris.size == 1) "file" else "files"}", Toast.LENGTH_SHORT).show()
+                                finish()
+                            } catch (error: SecurityException) {
+                                // The sender gave this screen no right to read them, so none can be handed on.
+                                Toast.makeText(this, "Telekinesis cannot read what was shared.", Toast.LENGTH_LONG).show()
+                            }
                         },
                         onOpenApp = {
                             startActivity(Intent(this, MainActivity::class.java))

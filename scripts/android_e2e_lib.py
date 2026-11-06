@@ -554,10 +554,12 @@ class Device:
         return poll(ADB_BOUND, f"{name} scanned", scanned, interval=1)
 
     def start_share(self, uri: str, mime: str = "application/octet-stream") -> None:
-        """Another app sharing one stream: ACTION_SEND to ShareActivity, with the read grant."""
+        """Another app sharing one stream: ACTION_SEND to ShareActivity. `am` does not move
+        EXTRA_STREAM into ClipData as an app's startActivity does, so the grant rides on the intent's
+        data, which it does honor."""
         self.shell("am", "start", "-W", "-a", "android.intent.action.SEND", "-t", mime, "-n",
                    f"{PACKAGE}/.share.ShareActivity", "--eu", "android.intent.extra.STREAM", uri,
-                   "--grant-read-uri-permission").require_success()
+                   "-d", uri, "--grant-read-uri-permission").require_success()
 
     def battery_exempt(self, exempt: bool) -> None:
         """The battery-optimization exemption the owner gives in Settings, set from outside."""
