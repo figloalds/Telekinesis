@@ -66,7 +66,7 @@ use crate::{
         conn::{Event, Incoming, Lane, Reply, Responder, Serving, Shared, Side, after, ms},
         frame::{FrameRef, decode_ref, encode_with},
     },
-    util::time::now_ms,
+    util::{fault, time::now_ms},
 };
 use polling::{Event as Readiness, Events};
 use serde_json::Value;
@@ -549,6 +549,9 @@ struct Io {
     /// Last time the socket took bytes from us: a flush that got everything
     /// out, or writable readiness after a blocked write.
     last_write_progress: Instant,
+    /// When the last I/O turn reached its timers. A gap far beyond the
+    /// wake-up cadence means this thread did not run (a frozen process).
+    last_turn: Instant,
     last_heartbeat: Instant,
     heartbeat_seq: u64,
     /// A HEARTBEAT is queued and not yet written.
@@ -598,6 +601,7 @@ impl Io {
             last_rx: now,
             last_tx: now,
             last_write_progress: now,
+            last_turn: now,
             last_heartbeat: now,
             heartbeat_seq: 0,
             heartbeat_queued: false,
@@ -1613,8 +1617,17 @@ impl Io {
     }
 
     fn timers(&mut self) -> Result<(), Stop> {
+        // Qualification: a frozen process stops this thread between turns.
+        fault::hang("session.io.turn");
         let now = Instant::now();
         let options = self.shared.options;
+        if now.duration_since(self.last_turn) >= options.dead_after / 2 {
+            // Wake-ups come by `heartbeat`, far inside this gap, so this
+            // thread did not run: the silence is ours, not the peer's.
+            self.last_rx = now;
+            self.last_write_progress = now;
+        }
+        self.last_turn = now;
         if self.tx_held {
             // Reading stopped because the peer leaves our replies unread; it
             // is dead once it has taken nothing from us for `dead_after`.
