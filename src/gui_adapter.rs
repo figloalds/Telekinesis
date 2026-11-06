@@ -918,6 +918,8 @@ fn wire(ui: &AppWindow, tx: mpsc::SyncSender<Message>, polls: mpsc::Sender<Poll>
         if let Some(ui) = weak.upgrade() {
             ui.set_code("".into());
             ui.set_pairing_code("".into());
+            ui.set_pairing_qr(slint::Image::default());
+            ui.set_pairing_note("".into());
         }
     });
     let weak = ui.as_weak();

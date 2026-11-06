@@ -5,7 +5,7 @@
 //! lost, the banner offers to start it again.
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
-use slint::{ComponentHandle, ModelRc, VecModel, Weak};
+use slint::{ComponentHandle, Image, ModelRc, Rgb8Pixel, SharedPixelBuffer, VecModel, Weak};
 use std::{
     path::{Path, PathBuf},
     sync::mpsc,
@@ -14,7 +14,7 @@ use std::{
 use tkfs::{
     core::Conflict,
     desktop::{Client, explain, mount_choice, pairing_code},
-    orchestrator::{config::Config, launcher::Started, process::LOG_FILE},
+    orchestrator::{config::Config, launcher::Started, pairing_link, process::LOG_FILE},
     util::log::daemon_log_path,
 };
 slint::include_modules!();
@@ -64,8 +64,43 @@ struct Done {
     select: Option<String>,
     close: bool,
     code: Option<String>,
+    /// The QR of the pairing link, with the note for a link without an address.
+    /// It holds the code, so it is shown and cleared with it and never logged.
+    qr: Option<PairingQr>,
     remote: Option<Vec<Value>>,
     preview: Option<String>,
+}
+
+struct PairingQr {
+    pixels: SharedPixelBuffer<Rgb8Pixel>,
+    note: String,
+}
+
+/// The QR of a `reset-pairing-code` reply's link, drawn crisp: whole pixels per
+/// module.
+fn pairing_qr(reply: &Value) -> Result<PairingQr> {
+    const TARGET: usize = 240;
+    let link = reply["link"]
+        .as_str()
+        .context("the reply carries no link")?;
+    let (size, modules) = pairing_link::qr_modules(link)?;
+    let scale = (TARGET / size).max(1);
+    let side = size * scale;
+    let mut pixels = SharedPixelBuffer::<Rgb8Pixel>::new(side as u32, side as u32);
+    for (index, pixel) in pixels.make_mut_slice().iter_mut().enumerate() {
+        let (row, column) = (index / side / scale, index % side / scale);
+        let shade = if modules[row * size + column] { 0 } else { 255 };
+        *pixel = Rgb8Pixel::new(shade, shade, shade);
+    }
+    let note = if reply["endpoint"].is_null() {
+        "This PC has no address a phone can reach, so the QR holds only the code. Type the address into the phone, and set network.listen (or advertise) so it is reachable."
+    } else {
+        ""
+    };
+    Ok(PairingQr {
+        pixels,
+        note: note.to_owned(),
+    })
 }
 
 fn done(message: impl Into<String>) -> Done {
@@ -295,6 +330,7 @@ fn perform(
             let reply = client.act("reset-pairing-code", json!({}))?;
             Done {
                 code: Some(text(&reply, "code")),
+                qr: Some(pairing_qr(&reply)?),
                 ..done("New pairing code generated")
             }
         }
@@ -559,6 +595,10 @@ fn finish(
                 && ui.get_dialog() == "host"
                 && current
             {
+                if let Some(qr) = done.qr {
+                    ui.set_pairing_qr(Image::from_rgb8(qr.pixels));
+                    ui.set_pairing_note(qr.note.into());
+                }
                 ui.set_pairing_code(code.into());
             }
             if let Some(preview) = done.preview
@@ -683,6 +723,24 @@ mod tests {
         assert!(!failed.running);
         assert_eq!(failed.life.text, "Failed");
         assert_eq!(failed.error_title, "WORKER_EXITED: exit 3");
+    }
+
+    #[test]
+    fn the_pairing_qr_is_a_crisp_square_and_notes_a_missing_address() {
+        let code = "ab".repeat(32);
+        let reply = |endpoint: Value| {
+            let link = pairing_link::link(endpoint.as_str(), &code);
+            json!({"code": code, "link": link, "endpoint": endpoint})
+        };
+        let with = pairing_qr(&reply(json!("ws://192.168.1.20:43180"))).unwrap();
+        assert!(with.note.is_empty());
+        assert_eq!(with.pixels.width(), with.pixels.height());
+        let pixels = with.pixels.as_slice();
+        assert!(pixels.iter().any(|p| p.r == 0), "dark modules");
+        assert!(pixels.iter().any(|p| p.r == 255), "light modules");
+        assert!(pixels[0].r == 255, "quiet zone");
+        let without = pairing_qr(&reply(Value::Null)).unwrap();
+        assert!(without.note.contains("no address"), "{}", without.note);
     }
 
     #[test]

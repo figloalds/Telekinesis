@@ -224,6 +224,7 @@ app, `create` without `--mount` runs the folder headless.
 ```sh
 # Host A: set [network] listen = "0.0.0.0:43180", restart, then:
 tkfs manage reset-pairing-code                          # prints the code once
+tkfs manage reset-pairing-code --qr                     # also a QR code for a phone
 
 # Host B:
 echo "$CODE" | tkfs manage pair ws://hosta:43180         # code read from stdin

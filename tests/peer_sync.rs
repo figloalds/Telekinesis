@@ -95,6 +95,12 @@ fn pair_opens_control_and_bulk_lanes_and_reset_code_revokes() -> Result<()> {
     // A reset on B revokes A: its lanes fall to Unauthorized and stay there.
     let rotated = b.manage(&["reset-pairing-code"])?;
     assert_ne!(rotated["code"], code.as_str());
+    // The link carries the code and, over a loopback listener, no endpoint.
+    assert_eq!(
+        rotated["link"].as_str(),
+        Some(format!("tkfs://pair?code={}", rotated["code"].as_str().unwrap()).as_str())
+    );
+    assert!(rotated["endpoint"].is_null(), "{rotated}");
     a.wait_lanes(&endpoint_b, 2, "Unauthorized", LANES_REVOKED)?;
     let peers_b = b.manage(&["peers"])?;
     assert_eq!(peers_b.as_array().map(Vec::len), Some(0), "{peers_b}");

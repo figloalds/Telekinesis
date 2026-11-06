@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicUsize, Ordering},
@@ -425,6 +425,10 @@ pub struct Network {
     sync_profile: SyncProfile,
     /// The endpoint peers are told in `peer.enroll`.
     advertise: Option<String>,
+    /// What a pairing link may carry: the configured advertise address, else
+    /// the listener's address (see [`endpoint_for`]).
+    configured_advertise: Option<String>,
+    listen: Option<SocketAddr>,
     folders: Arc<dyn FolderDirectory>,
     peers: Mutex<BTreeMap<String, PeerLanes>>,
     /// Admitted inbound sessions (closed ones are pruned on use).
@@ -466,6 +470,8 @@ pub fn start(
         pool: config.pool().min(MAX_POOL),
         sync_profile: config.network.sync_profile,
         advertise,
+        configured_advertise: config.advertise().map(str::to_owned),
+        listen,
         folders,
         peers: Mutex::new(BTreeMap::new()),
         inbound: Mutex::new(Vec::new()),
@@ -785,6 +791,16 @@ impl Network {
         closed.values().for_each(PeerLanes::stop);
         event!(info, PAIRING_CODE_RESET, { "outbound_closed": closed.len() });
         Ok(code)
+    }
+
+    /// The address a phone should dial to pair with this PC, or `None` when
+    /// none is known (a loopback or absent listener and no `advertise`).
+    pub fn pairing_endpoint(&self) -> Option<String> {
+        endpoint_for(
+            self.configured_advertise.as_deref(),
+            self.listen,
+            lan_address,
+        )
     }
 
     /// The folders `endpoint` publishes (`catalog.list`), over its control
@@ -1262,6 +1278,40 @@ fn send_notify(counts: &Counts, conn: &Conn, notify: &Notify) {
 
 /// Accepts peer connections until the network is gone; each handshake runs
 /// on its own thread, at most [`PRE_AUTH_CAP`] at once.
+/// The endpoint for a pairing link. A configured `advertise` wins. A loopback
+/// listener cannot be reached by a phone, so it gives none. An unspecified
+/// address (`0.0.0.0`) takes the LAN address from `lan`.
+fn endpoint_for(
+    advertise: Option<&str>,
+    listen: Option<SocketAddr>,
+    lan: impl FnOnce(bool) -> Option<IpAddr>,
+) -> Option<String> {
+    if let Some(advertise) = advertise {
+        return Some(advertise.to_owned());
+    }
+    let listen = listen?;
+    let ip = match listen.ip() {
+        ip if ip.is_loopback() => return None,
+        ip if ip.is_unspecified() => lan(ip.is_ipv6())?,
+        ip => ip,
+    };
+    Some(format!("ws://{}", SocketAddr::new(ip, listen.port())))
+}
+
+/// This host's outbound address: a connected UDP socket's local address,
+/// which sends nothing.
+fn lan_address(ipv6: bool) -> Option<IpAddr> {
+    let (bind, probe) = if ipv6 {
+        ("[::]:0", "[2001:db8::1]:9")
+    } else {
+        ("0.0.0.0:0", "192.0.2.1:9")
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(probe).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    Some(ip).filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+}
+
 fn accept_loop(network: Weak<Network>, listener: TcpListener) {
     for stream in listener.incoming() {
         let Some(network) = network.upgrade() else {
@@ -1764,6 +1814,57 @@ mod tests {
         config.network.listen = String::new();
         let catalog = Catalog::open(&config.data_directory).unwrap();
         start(&config, catalog, Arc::new(NoFolders), Cancel::new(), None).unwrap()
+    }
+
+    #[test]
+    fn pairing_endpoint_prefers_advertise() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::initialize(&root.path().join("orchestrator.toml")).unwrap();
+        config.network.listen = String::new();
+        config.network.advertise = "wss://files.example.com".into();
+        let catalog = Catalog::open(&config.data_directory).unwrap();
+        let network = start(&config, catalog, Arc::new(NoFolders), Cancel::new(), None).unwrap();
+        assert_eq!(
+            network.pairing_endpoint().as_deref(),
+            Some("wss://files.example.com")
+        );
+        // Also over a loopback listener: the advertised address still wins.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let catalog = Catalog::open(&config.data_directory).unwrap();
+        let network = start(
+            &config,
+            catalog,
+            Arc::new(NoFolders),
+            Cancel::new(),
+            Some(listener),
+        )
+        .unwrap();
+        assert_eq!(
+            network.pairing_endpoint().as_deref(),
+            Some("wss://files.example.com")
+        );
+    }
+
+    #[test]
+    fn pairing_endpoint_is_none_for_a_loopback_or_empty_listener() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(network(root.path()).pairing_endpoint(), None);
+        let loopback: SocketAddr = "127.0.0.1:43180".parse().unwrap();
+        assert_eq!(endpoint_for(None, Some(loopback), |_| None), None);
+        let v6: SocketAddr = "[::1]:43180".parse().unwrap();
+        assert_eq!(endpoint_for(None, Some(v6), |_| None), None);
+        // An unspecified address takes the LAN address; none found: none.
+        let any: SocketAddr = "0.0.0.0:43180".parse().unwrap();
+        assert_eq!(
+            endpoint_for(None, Some(any), |_| Some("192.168.1.20".parse().unwrap())).as_deref(),
+            Some("ws://192.168.1.20:43180")
+        );
+        assert_eq!(endpoint_for(None, Some(any), |_| None), None);
+        let lan: SocketAddr = "192.168.1.9:43180".parse().unwrap();
+        assert_eq!(
+            endpoint_for(None, Some(lan), |_| None).as_deref(),
+            Some("ws://192.168.1.9:43180")
+        );
     }
 
     fn ws_pair() -> (Ws, Ws) {

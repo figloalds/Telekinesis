@@ -3896,6 +3896,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5143,6 +5149,7 @@ dependencies = [
  "libc",
  "native-tls",
  "polling",
+ "qrcode",
  "rand 0.8.6",
  "rusqlite",
  "rustls",

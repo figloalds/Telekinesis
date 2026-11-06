@@ -371,6 +371,11 @@ export component AppWindow inherits Window {
     in property <[RemoteRow]> remote-folders;
     in-out property <string> selected-repo;
     in-out property <string> pairing-code;
+    // The QR of the pairing link (it holds the code) and what to tell when the
+    // link has no address. Both live exactly as long as pairing-code.
+    in-out property <image> pairing-qr;
+    in-out property <string> pairing-note;
+    in property <image> no-image;
     in-out property <string> endpoint;
     in-out property <string> folder-name;
     in-out property <string> mount-path;
@@ -431,6 +436,12 @@ export component AppWindow inherits Window {
         if root.dialog == "create" || root.dialog == "connect" {
             root.headless = false;
             root.remote-mount = "";
+        }
+    }
+    changed pairing-code => {
+        if root.pairing-code == "" {
+            root.pairing-qr = root.no-image;
+            root.pairing-note = "";
         }
     }
     changed selected-state => {
@@ -859,6 +870,13 @@ export component AppWindow inherits Window {
                     if root.pairing-code != "": HorizontalLayout { alignment: start;
                         Button { small: true; text: "Copy"; clicked => { root.copy-code(); } }
                     }
+                    if root.pairing-code != "": Muted { text: "Scan this QR with the phone's Add a PC screen."; wrap: word-wrap; }
+                    if root.pairing-code != "": HorizontalLayout { alignment: start;
+                        Rectangle { width: 220px; height: 220px; background: #ffffff;
+                            Image { source: root.pairing-qr; width: 100%; height: 100%; image-fit: contain; image-rendering: pixelated; }
+                        }
+                    }
+                    if root.pairing-code != "" && root.pairing-note != "": Muted { text: root.pairing-note; wrap: word-wrap; }
                     if root.pairing-code != "": Muted { text: "Shown once: copy it now. It is cleared when this dialog closes."; wrap: word-wrap; }
                     Muted { text: "Closing this window leaves the orchestrator and its folders running."; wrap: word-wrap; }
                     HorizontalLayout { spacing: 8px;

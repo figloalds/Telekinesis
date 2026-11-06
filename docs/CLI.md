@@ -210,6 +210,7 @@ Both are persisted.
 
 ```sh
 tkfs manage reset-pairing-code
+tkfs manage reset-pairing-code --qr
 tkfs manage pair ws://files.example.com:43180
 printf '%s\n' "$PAIRING_CODE" | tkfs manage pair wss://files.example.com --connections 6
 tkfs manage pair ws://files.example.com:43180 --code PAIRING_CODE
@@ -222,7 +223,13 @@ tkfs manage set-endpoint INSTALLATION ws://newhost:43180
 ```
 
 - `reset-pairing-code` creates a new pairing code for this orchestrator and
-  prints it once (`{"code": …}`); only a salted verifier is stored. It
+  prints it once (`{"code", "link", "endpoint"}`); only a salted verifier is
+  stored. `link` is `tkfs://pair?endpoint=<encoded>&code=<code>` for a phone,
+  and `--qr` also draws it as a QR code. `endpoint` is `[network] advertise`,
+  else the address of `listen` (the LAN address when it is `0.0.0.0`), and
+  `null` for a loopback or absent listener: the link then holds only the code,
+  and the phone needs the address typed. The link contains the code, so treat
+  it as the code: it is never logged. It
   revokes every pairing made with the old code: sessions that used it are
   closed within a second and the hosts that dial this one must pair again
   with the new code.

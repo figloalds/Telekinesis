@@ -79,8 +79,12 @@ pub enum ManagementCommand {
         folder: String,
     },
     /// Rotate this orchestrator's pairing code: every pairing made with the
-    /// old one is revoked. Prints the new code.
-    ResetPairingCode,
+    /// old one is revoked. Prints the new code and its `tkfs://pair` link.
+    ResetPairingCode {
+        /// Also draw the link as a QR code for a phone to scan.
+        #[arg(long)]
+        qr: bool,
+    },
     /// Pair with the orchestrator at ENDPOINT (`ws://host:port`); the code is
     /// read from stdin unless `--code` is given.
     Pair {
@@ -152,6 +156,7 @@ pub fn run(config_path: &Path, command: ManagementCommand, json: bool) -> Result
             std::thread::sleep(WATCH_INTERVAL);
         }
     }
+    let qr = matches!(command, ManagementCommand::ResetPairingCode { qr: true });
     let (action, payload, read) = request(command)?;
     let reply = if read {
         client.request_read(action, payload)?
@@ -174,7 +179,31 @@ pub fn run(config_path: &Path, command: ManagementCommand, json: bool) -> Result
     } else {
         println!("{}", serde_json::to_string_pretty(&reply)?);
     }
+    if qr {
+        print_qr(&reply)?;
+    }
     Ok(())
+}
+
+/// Draws a `reset-pairing-code` reply's link as a QR code on stdout.
+#[cfg(not(target_os = "android"))]
+fn print_qr(reply: &Value) -> Result<()> {
+    use anyhow::Context as _;
+    let link = reply["link"]
+        .as_str()
+        .context("the reply carries no link")?;
+    if reply["endpoint"].is_null() {
+        println!(
+            "This PC has no address a phone can reach: the QR holds only the code. Type the              address into the phone, and set [network] listen (or advertise) so it is reachable."
+        );
+    }
+    println!("{}", super::pairing_link::qr_text(link)?);
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn print_qr(_: &Value) -> Result<()> {
+    anyhow::bail!("QR_UNAVAILABLE: --qr is not available on Android")
 }
 
 /// The action, payload and whether it is read-only (retried once).
@@ -211,7 +240,7 @@ fn request(command: ManagementCommand) -> Result<(&'static str, Value, bool)> {
         C::Retry { folder } => ("retry", json!({"state": folder}), false),
         C::Pause { folder } => ("pause", json!({"state": folder}), false),
         C::Resume { folder } => ("resume", json!({"state": folder}), false),
-        C::ResetPairingCode => ("reset-pairing-code", json!({}), false),
+        C::ResetPairingCode { .. } => ("reset-pairing-code", json!({}), false),
         C::Pair {
             endpoint,
             connections,
@@ -440,7 +469,9 @@ rest"[..]
             ("remote-list", json!({"endpoint": "ws://h:1"}), true)
         );
         assert_eq!(
-            request(ManagementCommand::ResetPairingCode).unwrap().0,
+            request(ManagementCommand::ResetPairingCode { qr: false })
+                .unwrap()
+                .0,
             "reset-pairing-code"
         );
         assert_eq!(

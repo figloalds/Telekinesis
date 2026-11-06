@@ -24,6 +24,7 @@ tungstenite = { version = "=0.28.0", default-features = false, features = ["hand
 # OpenSSL does not cross-build from Windows, so Android uses
 # rustls with bundled roots. Every other target keeps the platform trust store.
 [target.'cfg(not(target_os = "android"))'.dependencies]
+qrcode = { version = "0.14.1", default-features = false }
 tungstenite = { version = "=0.28.0", default-features = false, features = ["native-tls"] }
 
 [target.'cfg(target_os = "android")'.dependencies]

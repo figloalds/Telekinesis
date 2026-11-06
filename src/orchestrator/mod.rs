@@ -14,6 +14,7 @@ pub mod hub;
 pub mod launcher;
 pub mod manage;
 pub mod network;
+pub mod pairing_link;
 pub mod process;
 pub mod push;
 pub mod settings;

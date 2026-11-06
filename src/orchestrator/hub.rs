@@ -52,6 +52,7 @@ use super::{
         StopOutcome,
     },
     network::{self, FolderDirectory, Network},
+    pairing_link,
     process::{self, READY_TIMEOUT},
     signals,
     sync_driver::{self, BurstMode, Driver, SYNC_NOW_BOUND, SyncFolder, SyncFolders, SyncPolicy},
@@ -823,7 +824,14 @@ impl Daemon {
             }
             "configure-mount" => self.configure_mount(&selector()?, payload),
             "folder" => self.folder(&selector()?, payload),
-            "reset-pairing-code" => Ok(json!({"code": self.network()?.reset_pairing_code()?})),
+            "reset-pairing-code" => {
+                let network = self.network()?;
+                let code = network.reset_pairing_code()?;
+                let endpoint = network.pairing_endpoint();
+                // The link holds the code: it is returned, never logged.
+                let link = pairing_link::link(endpoint.as_deref(), &code);
+                Ok(json!({"code": code, "link": link, "endpoint": endpoint}))
+            }
             "pair" => {
                 let endpoint = payload["endpoint"]
                     .as_str()
