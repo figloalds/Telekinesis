@@ -63,6 +63,7 @@ fn the_fault_is_evaluated_once_per_side_and_agrees_with_what_each_side_sent() {
         server_hello.features,
         vec![
             features::CONTENT_PUSH.to_string(),
+            features::CONTENT_HAVE.to_string(),
             features::NOTIFY.to_string()
         ]
     );

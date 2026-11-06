@@ -950,7 +950,11 @@ fn server_auth(
         features: if older {
             Vec::new()
         } else {
-            vec![features::CONTENT_PUSH.into(), features::NOTIFY.into()]
+            vec![
+                features::CONTENT_PUSH.into(),
+                features::CONTENT_HAVE.into(),
+                features::NOTIFY.into(),
+            ]
         },
         limits,
     };

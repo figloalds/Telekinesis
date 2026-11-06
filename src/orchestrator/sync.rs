@@ -26,6 +26,9 @@
 //!   (see [`Fetched`]): its header is `{truncated_at, oversized}`.
 //! - `objects.write {repo}`, body `Vec<Object>` → `{"stored": usize}`, at
 //!   most [`OBJECT_BATCH`] objects.
+//! - `objects.have {repo}`, body `Vec<Digest>` → [`HaveReply`], at most
+//!   [`HAVE_BATCH`] digests: the ones the packs hold, durably (they are
+//!   flushed before the reply).
 //!
 //! Object bytes travel as JSON number arrays (up to 4 bytes per byte), so the
 //! batch bounds are set to what fits `protocol::max_body` of each op.
@@ -60,6 +63,9 @@ pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_REPLY_JSON: usize = 15 * 1024 * 1024;
 /// The JSON of one object beyond its byte array (digest, kind, keys).
 const OBJECT_JSON_OVERHEAD: usize = 128;
+/// Most digests one `objects.have` asks about: about 300 KiB of JSON, within
+/// the default body bound of the op.
+pub const HAVE_BATCH: usize = 4096;
 pub const FETCH_OP: &str = "objects.fetch";
 /// Events per `feed.outgoing` page and per `meta.exchange` request or reply.
 pub const FEED_PAGE: usize = 256;
@@ -418,6 +424,24 @@ impl Service {
         self.demand.arrived(&digests);
         Ok(objects.len())
     }
+    /// The `digests` the packs hold, in request order. Flushed first: an
+    /// object this names survives a crash.
+    fn have(&self, digests: Vec<Digest>) -> Result<Vec<Digest>> {
+        ensure!(
+            digests.len() <= HAVE_BATCH,
+            "ARGUMENT_TOO_LARGE: {} digests (at most {HAVE_BATCH})",
+            digests.len()
+        );
+        let packs = &self.engine.working.content().packs;
+        packs.flush()?;
+        let mut held = Vec::new();
+        for digest in digests {
+            if packs.contains(digest)? {
+                held.push(digest);
+            }
+        }
+        Ok(held)
+    }
     /// Runs one op; the reply body on success.
     pub fn handle_request(&self, op: &str, header: &Value, body: &[u8]) -> Result<Vec<u8>> {
         self.handle_reply(op, header, body).map(|(_, body)| body)
@@ -426,7 +450,7 @@ impl Service {
     pub fn handle_reply(&self, op: &str, header: &Value, body: &[u8]) -> Result<(Value, Vec<u8>)> {
         if matches!(
             op,
-            "meta.exchange" | FETCH_OP | "objects.write" | "objects.wanted"
+            "meta.exchange" | FETCH_OP | "objects.write" | "objects.wanted" | "objects.have"
         ) {
             let repo = lock(&self.engine.store).repo.clone();
             ensure!(
@@ -478,10 +502,18 @@ impl Service {
             "objects.write" => Ok(serde_json::to_vec(
                 &json!({"stored":self.write(serde_json::from_slice(body)?)?}),
             )?),
+            "objects.have" => Ok(serde_json::to_vec(&HaveReply {
+                held: self.have(serde_json::from_slice(body)?)?,
+            })?),
             _ => anyhow::bail!("UNSUPPORTED_OPERATION"),
         };
         Ok((json!({}), body?))
     }
+}
+/// The reply to `objects.have`: the digests that are durable here.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HaveReply {
+    pub held: Vec<Digest>,
 }
 /// Whether the request wants what it carried on disk before its reply.
 fn asks_durable(header: &Value) -> bool {
@@ -1896,6 +1928,76 @@ mod tests {
         let error = call(&service, "feed.nothing", json!({}), &[]).unwrap_err();
         assert_eq!(code(&error), "UNSUPPORTED_OPERATION");
         engine.shutdown()?;
+        Ok(())
+    }
+
+    fn ask_have(service: &Service, digests: &[Digest]) -> Result<Vec<Digest>> {
+        let reply = call(
+            service,
+            "objects.have",
+            json!({"repo":"repo"}),
+            &serde_json::to_vec(digests)?,
+        )?;
+        Ok(serde_json::from_slice::<HaveReply>(&reply)?.held)
+    }
+
+    #[test]
+    fn objects_have_names_only_what_the_packs_hold() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+        let packs = engine.working.content().packs.clone();
+        let (one, two) = (Digest::bytes(b"one"), Digest::bytes(b"two"));
+        let absent = Digest::bytes(b"absent");
+        packs.put(Kind::Chunk, b"one")?;
+        packs.put(Kind::Chunk, b"two")?;
+        assert_eq!(ask_have(&service, &[two, absent, one])?, vec![two, one]);
+        assert_eq!(ask_have(&service, &[absent])?, vec![]);
+        assert_eq!(ask_have(&service, &[])?, vec![]);
+        let error = call(&service, "objects.have", json!({"repo":"other"}), b"[]").unwrap_err();
+        assert_eq!(code(&error), "REPOSITORY_MISMATCH", "{error:#}");
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn objects_have_flushes_before_replying() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+        let digest = Digest::bytes(b"pending");
+        engine
+            .working
+            .content()
+            .packs
+            .put(Kind::Chunk, b"pending")?;
+        assert!(!indexed(home.path(), digest)?, "put alone is not durable");
+        assert_eq!(ask_have(&service, &[digest])?, vec![digest]);
+        assert!(
+            indexed(home.path(), digest)?,
+            "the reply came before the flush"
+        );
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn objects_have_refuses_an_oversized_list() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+        let digest = Digest::bytes(b"x");
+        packs_put(&engine, b"x")?;
+        let full = vec![digest; HAVE_BATCH];
+        assert_eq!(ask_have(&service, &full)?.len(), HAVE_BATCH);
+        let error = ask_have(&service, &vec![digest; HAVE_BATCH + 1]).unwrap_err();
+        assert_eq!(code(&error), "ARGUMENT_TOO_LARGE", "{error:#}");
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    fn packs_put(engine: &Engine, bytes: &[u8]) -> Result<()> {
+        engine.working.content().packs.put(Kind::Chunk, bytes)?;
         Ok(())
     }
 

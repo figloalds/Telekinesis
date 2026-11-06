@@ -5,7 +5,7 @@
 //! lane's op policy; the link also refuses object ops on the control lane
 //! itself, before anything is sent.
 use super::{
-    sync::{Fetched, MissingPage, OBJECT_BATCH, Object, WantedPage},
+    sync::{Fetched, HAVE_BATCH, HaveReply, MissingPage, OBJECT_BATCH, Object, WantedPage},
     worker::Ready,
 };
 use crate::{
@@ -206,6 +206,30 @@ impl WorkerLink {
             .as_u64()
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| bad_reply("objects.write", "no stored count"))
+    }
+
+    /// `objects.have {repo}` on the first bulk lane (it carries no ownership):
+    /// which of `digests` (at most `sync::HAVE_BATCH`) the worker holds, its
+    /// packs flushed first.
+    pub fn have(&self, digests: &[Digest]) -> Result<Vec<Digest>, CallError> {
+        if digests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if digests.len() > HAVE_BATCH {
+            return Err(CallError::Remote(ErrorWire::coded(
+                "ARGUMENT_TOO_LARGE",
+                format!("{} digests exceed the batch of {HAVE_BATCH}", digests.len()),
+            )));
+        }
+        let body = encode("objects.have", &digests)?;
+        let reply = self.bulk[0].call(
+            "objects.have",
+            json!({"repo": self.ready.repo}),
+            body,
+            Priority::Data,
+            CALL_DEADLINE,
+        )?;
+        parse::<HaveReply>("objects.have", &reply.body).map(|reply| reply.held)
     }
 
     /// The bulk lane that carries objects batched behind `digest`.

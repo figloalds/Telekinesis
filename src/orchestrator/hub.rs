@@ -55,13 +55,18 @@ use super::{
     pairing_link,
     process::{self, READY_TIMEOUT},
     signals,
+    sync::{HAVE_BATCH, HaveReply},
     sync_driver::{self, BurstMode, Driver, SYNC_NOW_BOUND, SyncFolder, SyncFolders, SyncPolicy},
     worker::{EXIT_CONFIG, RECORD_FILE, WorkerRecord},
     worker_client::{CALL_DEADLINE, WorkerLink},
 };
 use crate::{
-    model::protocol::frame::NotifyReason,
+    model::{
+        content::Digest,
+        protocol::{features, frame::NotifyReason},
+    },
     runtime::Engine,
+    session::{CallError, Priority},
     util::{
         cancel::Cancel,
         lock::lock,
@@ -72,7 +77,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -641,6 +646,60 @@ impl Daemon {
         self.network
             .get()
             .context("NETWORK_UNAVAILABLE: the peer network is not running")
+    }
+
+    /// Which of `digests` the peer `installation` durably holds for `folder`
+    /// (`objects.have`, paged by [`HAVE_BATCH`]). A peer that is not Ready on
+    /// a bulk lane is `Unreachable`, and one that predates the op `NoFeature`:
+    /// neither says anything of the digests. A digest the peer lacks is simply
+    /// not in `Known`.
+    pub fn held_by(&self, folder: &str, installation: &str, digests: &[Digest]) -> Result<Held> {
+        let repo = self.catalog.resolve(folder)?.repo;
+        let network = self.network()?;
+        let endpoint = match network
+            .ready_peers()
+            .into_iter()
+            .find(|peer| peer.installation == installation)
+        {
+            Some(peer) => peer.endpoint,
+            None => self
+                .catalog
+                .peers()?
+                .into_iter()
+                .find(|peer| peer.installation == installation)
+                .map(|peer| peer.endpoint)
+                .with_context(|| format!("PEER_NOT_FOUND: no peer {installation:?}"))?,
+        };
+        let Some(lane) = network.any_bulk_lane(&endpoint) else {
+            let why = network
+                .lane_error(&endpoint)
+                .unwrap_or_else(|| "no lane to the peer is ready".to_owned());
+            return Ok(Held::Unreachable(why));
+        };
+        if !lane.peer().has_feature(features::CONTENT_HAVE) {
+            return Ok(Held::NoFeature);
+        }
+        let mut known = BTreeSet::new();
+        for page in digests.chunks(HAVE_BATCH) {
+            let body = serde_json::to_vec(page)?;
+            let reply = lane.call(
+                "objects.have",
+                json!({"repo": repo}),
+                body,
+                Priority::Data,
+                CALL_DEADLINE,
+            );
+            let reply = match reply {
+                Ok(reply) => reply,
+                Err(CallError::Remote(error)) => bail!("{error}"),
+                Err(other) => return Ok(Held::Unreachable(other.to_string())),
+            };
+            let reply: HaveReply = serde_json::from_slice(&reply.body)
+                .context("PROTOCOL_VIOLATION: malformed objects.have reply")?;
+            // Only what was asked about counts.
+            known.extend(reply.held.into_iter().filter(|held| page.contains(held)));
+        }
+        Ok(Held::Known(known))
     }
 
     /// The endpoint's address, once (`endpoint::serve`).
@@ -1231,6 +1290,17 @@ impl Timings {
             settle: self.settle,
         }
     }
+}
+
+/// What a peer answered to "which of these do you hold".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// The digests the peer holds durably; the others it lacks.
+    Known(BTreeSet<Digest>),
+    /// The peer predates `objects.have`.
+    NoFeature,
+    /// No Ready lane (the last lane error), or the call was lost.
+    Unreachable(String),
 }
 
 /// The daemon's folders as the peer network sees them. Controllers hold it from

@@ -5,10 +5,11 @@
 mod support;
 
 use anyhow::{Context, Result, ensure};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use support::{
@@ -16,8 +17,12 @@ use support::{
     daemon::{TestDaemon, run_tkfs},
 };
 use tkfs::{
-    model::protocol::LaneRole,
-    orchestrator::sync::MissingPage,
+    model::{content::Digest, protocol::LaneRole},
+    orchestrator::{
+        embedded::Host,
+        hub::{Daemon, Held},
+        sync::MissingPage,
+    },
     session::{ConnOptions, Priority},
     util::time::now_ms,
 };
@@ -2077,4 +2082,137 @@ fn peers_and_sync_views_report_features_profile_and_pushes() -> Result<()> {
     a.shutdown()?;
     b.shutdown()?;
     Ok(())
+}
+
+/// An embedded host (the phone's side) paired with `pc`, which publishes the
+/// folder "Shared", receiving it.
+struct Dialer {
+    _home: tempfile::TempDir,
+    host: Arc<Host>,
+    daemon: Arc<Daemon>,
+    folder: String,
+    pc: String,
+}
+
+impl Dialer {
+    fn pair_with(pc: &TestDaemon) -> Result<Self> {
+        let shared = pc.manage(&["create", "Shared", "--headless"])?;
+        let repo = shared["repo"].as_str().context("no repo")?.to_owned();
+        pc.wait_phase("Shared", "Running", REPLICATED)?;
+        let code = pc.manage(&["reset-pairing-code"])?["code"]
+            .as_str()
+            .context("no code")?
+            .to_owned();
+        let endpoint = pc.listen_endpoint()?;
+        let home = tempfile::tempdir()?;
+        let config = home.path().join("orchestrator.toml");
+        fs::write(
+            &config,
+            "format_version = 2
+data_directory = \"data\"
+             default_mount_directory = \"mounts\"
+
+[network]
+             listen = \"\"
+sync_profile = \"passive\"
+",
+        )?;
+        let host = Host::start(config);
+        let daemon = host.daemon()?;
+        daemon.execute(
+            "pair",
+            &json!({"endpoint": endpoint, "code": code, "connections": 2}),
+        )?;
+        let received = daemon.execute(
+            "receive",
+            &json!({"endpoint": endpoint, "repo": repo, "label": "Shared", "mount": null}),
+        )?;
+        let folder = received["id"].as_str().context("no folder id")?.to_owned();
+        Ok(Self {
+            _home: home,
+            host,
+            daemon,
+            folder,
+            pc: installation(pc)?,
+        })
+    }
+
+    /// Writes `content` to `path` in the folder and returns its chunk digests.
+    fn write(&self, path: &str, content: &str) -> Result<Vec<Digest>> {
+        let engine = self.host.engine(&self.folder)?;
+        let token = engine.open_file(path, true, false, true)?;
+        engine.write(token, 0, content.as_bytes(), false, false)?;
+        engine.flush(Some(token))?;
+        engine.close(token)?;
+        let reference = engine
+            .lookup(path)?
+            .content
+            .context("the file has no content")?;
+        engine.working.content().chunks(&reference)
+    }
+
+    fn held(&self, digests: &[Digest]) -> Result<Held> {
+        self.daemon.held_by(&self.folder, &self.pc, digests)
+    }
+
+    fn stop(self) -> Result<()> {
+        self.host.stop()
+    }
+}
+
+#[test]
+fn held_by_confirms_a_pushed_file_and_not_an_unknown_digest() -> Result<()> {
+    let pc = TestDaemon::start()?;
+    let phone = Dialer::pair_with(&pc)?;
+    let chunks = phone.write("/from-phone.bin", &text(200 * 1024, 301))?;
+    ensure!(chunks.len() >= 3, "{} chunks", chunks.len());
+    let unknown = Digest::bytes(b"nobody holds this");
+    let mut asked = chunks.clone();
+    asked.push(unknown);
+    // Nothing was pushed yet: the PC holds none of it.
+    let Held::Known(before) = phone.held(&asked)? else {
+        anyhow::bail!("the PC should be reachable");
+    };
+    ensure!(before.is_empty(), "held before any push: {before:?}");
+    let synced = phone
+        .daemon
+        .execute("sync-now", &json!({"state": phone.folder}))?;
+    ensure!(synced["folders"][0]["error"].is_null(), "{synced}");
+    wait_until(REPLICATED, "the PC to confirm the pushed chunks", || {
+        Ok(matches!(phone.held(&asked)?, Held::Known(held)
+            if held == chunks.iter().copied().collect()))
+    })?;
+    phone.stop()?;
+    pc.shutdown()
+}
+
+#[test]
+fn held_by_reports_a_peer_without_the_feature() -> Result<()> {
+    let pc = TestDaemon::start_env("", &[OLDER])?;
+    let phone = Dialer::pair_with(&pc)?;
+    let digest = Digest::bytes(b"anything");
+    ensure!(
+        phone.held(&[digest])? == Held::NoFeature,
+        "an older PC should be NoFeature"
+    );
+    phone.stop()?;
+    pc.shutdown()
+}
+
+#[test]
+fn held_by_reports_an_unreachable_peer() -> Result<()> {
+    let pc = TestDaemon::start()?;
+    let phone = Dialer::pair_with(&pc)?;
+    let digest = Digest::bytes(b"anything");
+    ensure!(matches!(phone.held(&[digest])?, Held::Known(_)));
+    pc.shutdown()?;
+    let mut last = None;
+    wait_until(LANES_REVOKED, "the lanes to the PC to drop", || {
+        let held = phone.held(&[digest])?;
+        let gone = matches!(&held, Held::Unreachable(why) if !why.is_empty());
+        last = Some(held);
+        Ok(gone)
+    })
+    .with_context(|| format!("last answer: {last:?}"))?;
+    phone.stop()
 }

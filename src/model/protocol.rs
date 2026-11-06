@@ -75,6 +75,8 @@ pub mod features {
     /// The listener takes content its dialer pushes: `objects.wanted` and
     /// `objects.store`, requests the dialer makes.
     pub const CONTENT_PUSH: &str = "content-push";
+    /// The listener answers `objects.have`: which digests it durably holds.
+    pub const CONTENT_HAVE: &str = "content-have";
     /// The listener sends `notify` to the dialer when its folders change.
     pub const NOTIFY: &str = "notify";
     /// The dialer makes no sync requests of its own unless asked to, and wants
@@ -440,6 +442,8 @@ mod tests {
         assert!(op_allowed("meta.exchange", LaneRole::Control));
         assert!(op_allowed("clock.probe", LaneRole::Control));
         assert!(op_allowed("objects.fetch", LaneRole::Bulk));
+        assert!(op_allowed("objects.have", LaneRole::Bulk));
+        assert!(!op_allowed("objects.have", LaneRole::Control));
         assert!(!op_allowed("meta.exchange", LaneRole::Bulk));
         assert!(op_allowed("clock.probe", LaneRole::Probe));
         assert!(!op_allowed("meta.exchange", LaneRole::Probe));
@@ -468,5 +472,7 @@ mod tests {
         assert_eq!(max_body("feed.apply"), 16 * 1024 * 1024);
         assert_eq!(max_body("feed.outgoing"), 16 * 1024 * 1024);
         assert_eq!(max_body("objects.missing"), 1024 * 1024);
+        // 4096 digests of about 70 bytes each.
+        assert_eq!(max_body("objects.have"), 1024 * 1024);
     }
 }

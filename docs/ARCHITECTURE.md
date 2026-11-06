@@ -64,10 +64,18 @@ then sends them with `objects.store`. The listener takes only objects it listed
 and verifies each digest (`OBJECT_NOT_WANTED`, `INVALID_PEER_OBJECT`), so a
 pair made by `pair` then `receive` is two-way. A listener hints at a change
 with a `notify` frame; this is the only message it originates, and it carries
-no data. Both sides negotiate features in the handshake: `content-push`
-(listener), `notify` (active dialer) and `profile-passive` (passive dialer). A
-peer that advertises none is an older one: it is pulled from, never pushed to,
-and polled every `sync_interval_ms`.
+no data. Both sides negotiate features in the handshake: `content-push` and
+`content-have` (listener), `notify` (active dialer) and `profile-passive`
+(passive dialer). A peer that advertises none is an older one: it is pulled
+from, never pushed to, and polled every `sync_interval_ms`.
+
+A dialer that needs to know the listener durably holds some objects (to free
+its own copy, or to say a file was sent) asks `objects.have {repo}` with a
+list of at most 4096 digests on a bulk lane. The listener has the same
+`require_paired` and folder lookup as `objects.fetch`, flushes its packs, and
+replies `{held}`, the digests it has. `Daemon::held_by` pages the list and
+answers `Known`, `NoFeature` (an older listener, which cannot confirm
+anything) or `Unreachable` (no Ready bulk lane, or the call was lost).
 
 A host notices its own changes within about a second. Profiles set how it
 keeps up with the rest: an active host exchanges on notify, with a slow

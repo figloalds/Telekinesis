@@ -42,7 +42,7 @@ use super::{
     catalog::Peer,
     config::{Config, SyncProfile},
     demand::{Seq, SeqMark},
-    sync::{MAX_BATCH_BYTES, OBJECT_BATCH, Object},
+    sync::{HaveReply, MAX_BATCH_BYTES, OBJECT_BATCH, Object},
     worker_client::WorkerLink,
 };
 use crate::{
@@ -1503,7 +1503,8 @@ fn run_lane(lane: &Lane, target: &Target, cancel: &Cancel) {
 
 /// Serves one inbound session. Ops by the session's role: `objects.*` on
 /// bulk lanes only (`objects.store` accepts only digests that `objects.wanted`
-/// listed to that peer for that repo), `meta.exchange` on the control lane only, `catalog.list`,
+/// listed to that peer for that repo; `objects.have` names what the folder
+/// holds durably), `meta.exchange` on the control lane only, `catalog.list`,
 /// `peer.enroll`, `peer.revoke`, `ping` and `clock.probe` on probe and
 /// control lanes; anything else is refused with `OP_NOT_ALLOWED`. The
 /// session layer enforces the same policy (`protocol::op_allowed`).
@@ -1714,6 +1715,14 @@ impl PeerService {
                     &listed,
                 );
                 Ok((json!({}), encode(&page)?))
+            }
+            "objects.have" => {
+                self.require_paired()?;
+                let link = self.link(header)?;
+                let digests: Vec<Digest> = serde_json::from_slice(&body)
+                    .map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))?;
+                let held = link.have(&digests).map_err(|error| error.to_wire())?;
+                Ok((json!({}), encode(&HaveReply { held })?))
             }
             "objects.store" => {
                 self.require_paired()?;
@@ -2449,6 +2458,37 @@ mod tests {
             let refused = ask(&client, op, header, body.clone());
             assert_eq!(refused.err().unwrap(), "PEER_REVOKED", "{op}");
         }
+    }
+
+    fn have(client: &Conn, digests: &[Digest]) -> std::result::Result<Vec<Digest>, String> {
+        ask(
+            client,
+            "objects.have",
+            json!({"repo": "r1"}),
+            serde_json::to_vec(digests).unwrap(),
+        )
+        .map(|body| serde_json::from_slice::<HaveReply>(&body).unwrap().held)
+    }
+
+    #[test]
+    fn unpaired_and_unpublished_have_are_refused() {
+        let listener = listener();
+        let body = serde_json::to_vec(&[listener.objects[0].digest]).unwrap();
+        let client = bulk(&listener);
+        let refused = ask(
+            &client,
+            "objects.have",
+            json!({"repo": "nope"}),
+            body.clone(),
+        );
+        assert_eq!(refused.err().unwrap(), "REPO_NOT_PUBLISHED");
+        let refused = ask(&client, "objects.have", json!({}), body);
+        assert_eq!(refused.err().unwrap(), "INVALID_REQUEST");
+        // Paired and published, it answers for any digest it is asked about.
+        let digest = listener.objects[0].digest;
+        assert_eq!(have(&client, &[digest]).unwrap(), vec![]);
+        listener.network.catalog.unpair("peer-a").unwrap();
+        assert_eq!(have(&client, &[digest]).unwrap_err(), "PEER_REVOKED");
     }
 
     #[test]
