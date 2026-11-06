@@ -21,10 +21,7 @@
 //!   go on instead: see below.
 //! * **object pump** — one thread for every Running, unpaused folder. Each
 //!   round has two passes (spec §7.8: demand never waits behind background
-//!   traffic). Pass 1 supplies every folder's pending `watch` demand, then at
-//!   most one batch of what its readers hinted, so that a read that begins
-//!   waiting meanwhile, or a handle that closes, counts after one batch and not
-//!   after a whole read-ahead window; pass 2
+//!   traffic). Pass 1 supplies every folder's pending `watch` demand; pass 2
 //!   prefetches `objects.missing {limit: OBJECT_BATCH, exclude, after}` per
 //!   folder — a resumable scan: a page not wholly stored moves the folder's
 //!   cursor past it, so every missing object is eventually listed — and is
@@ -46,11 +43,16 @@
 //!   lane sits out the next round, and a coded failure rests only that (folder,
 //!   peer), as a push failure does. A reader's fetch gives a peer [`DEMAND_TRY`]
 //!   while another could answer, with a peer known not to answer asked last, and
-//!   the last peer asked gets its whole deadline, even at rest: a phone's one PC
-//!   must not be locked out by its own slow link. The
+//!   a peer that is the only one to ask gets its whole deadline, even at rest: a
+//!   phone's one PC must not be locked out by its own slow link. The
 //!   pump never blocks the scheduler. After each pass it also
 //!   pushes ([`push`]), so a round runs: this side's demand, the listeners'
-//!   demand, background pull, background push. The background push stops
+//!   demand, read-ahead, background pull, background push. Read-ahead is one
+//!   `objects.fetch` per folder of what its readers hinted, of a peer not at rest,
+//!   within [`DEMAND_TRY`]: it is listed afresh each round, so a read that begins
+//!   waiting, or a handle that closes, counts after that call. No reader waits for
+//!   a hint, so a hint that times out only makes the next batch smaller. The
+//!   background push stops
 //!   before its next call on a demand wake-up, as pass 2 does. Only a reader
 //!   waiting is such a wake-up: its own side's demand, or a demand notify for a
 //!   repo synced here. What marks work for later (a local change, an exchange
@@ -163,7 +165,8 @@ pub const UNAVAILABLE_MAX: Duration = Duration::from_secs(300);
 const DUE_CHECK: Duration = Duration::from_millis(500);
 /// How long a reader's `objects.fetch` waits for a peer when another could answer,
 /// so that one that hangs does not use up the reader's own wait
-/// (`Demand::FETCH_WAIT`).
+/// (`Demand::FETCH_WAIT`). A batch of hints gets no longer, whoever is asked: a read
+/// that begins waiting meanwhile waits for it.
 const DEMAND_TRY: Duration = Duration::from_secs(3);
 /// After a sweep that stored nothing, the pair's next poll is at least this many
 /// times as long as the sweep took. A short one changes nothing. A long one is
@@ -708,6 +711,21 @@ impl PumpState {
 pub(super) struct Unavailable {
     pub(super) until: Instant,
     pub(super) backoff: Duration,
+}
+
+/// Who a [`Driver::supply`] fetches for.
+#[derive(Clone, Copy)]
+enum Asking {
+    /// A reader waits. A peer gets [`DEMAND_TRY`] while another is still to be
+    /// asked, or when it is at rest and another was asked. The only peer to ask
+    /// gets its whole deadline.
+    Reader,
+    /// A reader will want these soon and nobody waits. A peer gets [`DEMAND_TRY`],
+    /// and a batch that does not fit says nothing against it.
+    Hints,
+    /// Nobody asked: stops once the wake moved past `seen`, cancelling the call in
+    /// flight. No failure, and what it asked stays missing and is listed again.
+    Background { seen: u64 },
 }
 
 /// What one [`Driver::supply`] did.
@@ -1683,7 +1701,8 @@ impl Driver {
     }
 
     /// One round, in a fixed order. Pass 1 supplies every folder's pending
-    /// demand, then the push pass serves the listeners' demand; pass 2 is the
+    /// demand, then the push pass serves the listeners' demand, then read-ahead
+    /// ([`Self::supply_hints`]); pass 2 is the
     /// background `objects.missing` work, then the background push. The push
     /// steps run only for the pairs that are due. Both background passes are
     /// abandoned before their next call as soon as the wake moves past `seen`
@@ -1717,36 +1736,23 @@ impl Driver {
             .supplied
             .retain(|_, at| now.saturating_duration_since(*at) < DEMAND_SUPPLIED);
         let mut stored = 0;
-        // Pass 1: what readers wait for, then one batch of what they hinted: the
-        // next round lists afresh. A digest just written may still be listed until
-        // the worker's next `watch`: it is not fetched again.
+        // Pass 1: what readers wait for. A digest just written may still be
+        // listed until the worker's next `watch`: it is not fetched again.
         for folder in &folders {
-            let unsupplied = |listed: &[(Digest, Kind)]| -> Vec<(Digest, Kind)> {
-                listed
-                    .iter()
-                    .filter(|(digest, _)| {
-                        !state.supplied.contains_key(&(folder.id.clone(), *digest))
-                    })
-                    .copied()
-                    .collect()
-            };
-            let demand = unsupplied(&folder.demand);
-            let mut hints = unsupplied(&folder.hints);
-            hints.truncate(OBJECT_BATCH);
-            if (demand.is_empty() && hints.is_empty())
-                || endpoints.is_empty()
-                || self.cancel.is_cancelled()
-            {
-                continue;
-            }
-            // A peer known not to answer is asked last: it may be the only
-            // one that holds this, so it is not passed over.
-            let mut asked = state.askable(&endpoints, &folder.id);
-            asked.sort_by_key(|endpoint| state.push.endpoint_rests(endpoint, now));
-            for wanted in [demand, hints] {
-                if !wanted.is_empty() {
-                    stored += self.supply(state, &asked, folder, wanted, None).stored;
-                }
+            let demand: Vec<(Digest, Kind)> = folder
+                .demand
+                .iter()
+                .filter(|(digest, _)| !state.supplied.contains_key(&(folder.id.clone(), *digest)))
+                .copied()
+                .collect();
+            if !demand.is_empty() && !endpoints.is_empty() && !self.cancel.is_cancelled() {
+                // A peer known not to answer is asked last: it may be the only
+                // one that holds this, so it is not passed over.
+                let mut asked = state.askable(&endpoints, &folder.id);
+                asked.sort_by_key(|endpoint| state.push.endpoint_rests(endpoint, now));
+                stored += self
+                    .supply(state, &asked, folder, demand, Asking::Reader)
+                    .stored;
             }
         }
         // What the listeners' readers wait for. A failure needs no mark: their
@@ -1768,6 +1774,7 @@ impl Driver {
                 }
             }
         }
+        stored += self.supply_hints(state, &endpoints, &folders, seen);
         // Pass 2: background prefetch. With every endpoint resting a page would
         // be passed over unasked. A passive driver downloads only what is read.
         for folder in &folders {
@@ -1792,7 +1799,7 @@ impl Driver {
             let supplied = if wanted.is_empty() {
                 Supplied::default()
             } else {
-                self.supply(state, &asked, folder, wanted, Some(seen))
+                self.supply(state, &asked, folder, wanted, Asking::Background { seen })
             };
             stored += supplied.stored;
             if supplied.interrupted {
@@ -1832,6 +1839,87 @@ impl Driver {
             }
         }
         stored
+    }
+
+    /// Read-ahead, after all that anyone waits for: one batch per folder, the folders
+    /// taking turns to go first. A read that begins waiting comes before the next
+    /// folder's batch, and is looked at again next round. The number of objects
+    /// stored.
+    fn supply_hints(
+        &self,
+        state: &mut PumpState,
+        endpoints: &[String],
+        folders: &[SyncFolder],
+        seen: u64,
+    ) -> usize {
+        let turn = state.round as usize % folders.len().max(1);
+        let mut stored = 0;
+        let mut asked_one = false;
+        for folder in folders[turn..].iter().chain(&folders[..turn]) {
+            if self.cancel.is_cancelled() || (asked_one && self.wake.current() != seen) {
+                break;
+            }
+            if folder.hints.is_empty() {
+                continue;
+            }
+            // A peer that rests is not asked for what no reader waits for.
+            let now = Instant::now();
+            let Some(endpoint) = state
+                .askable(endpoints, &folder.id)
+                .into_iter()
+                .find(|endpoint| !state.push.endpoint_rests(endpoint, now))
+            else {
+                continue;
+            };
+            let batch = self.hint_batch(state, folder, &endpoint, now);
+            if !batch.is_empty() {
+                asked_one = true;
+                stored += self
+                    .supply(
+                        state,
+                        std::slice::from_ref(&endpoint),
+                        folder,
+                        batch,
+                        Asking::Hints,
+                    )
+                    .stored;
+            }
+        }
+        stored
+    }
+
+    /// The hints of `folder` to ask `endpoint` for in one call: the nearest one and
+    /// the next on its lane, as many as that peer takes per fetch now. Not what was
+    /// just written, which may still be listed, and not what no peer had lately.
+    fn hint_batch(
+        &self,
+        state: &PumpState,
+        folder: &SyncFolder,
+        endpoint: &str,
+        now: Instant,
+    ) -> Wanted {
+        let unavailable = state.unavailable.get(&folder.id);
+        let hints: Wanted = folder
+            .hints
+            .iter()
+            .filter(|(digest, _)| {
+                !state.supplied.contains_key(&(folder.id.clone(), *digest))
+                    && unavailable
+                        .and_then(|unavailable| unavailable.get(digest))
+                        .is_none_or(|entry| entry.until <= now)
+            })
+            .copied()
+            .collect();
+        let Some(nearest) = hints.first() else {
+            return Vec::new();
+        };
+        let mut batch = lanes_for(self.lanes.as_ref(), endpoint, &hints)
+            .into_iter()
+            .map(|(_, batch)| batch)
+            .find(|batch| batch.first() == Some(nearest))
+            .unwrap_or_default();
+        batch.truncate(state.batch_size(&folder.id, endpoint));
+        batch
     }
 
     /// A push step of `folder` to `endpoint`.
@@ -1920,17 +2008,14 @@ impl Driver {
     /// every asked peer omitted (none failing) is unavailable for a backoff
     /// (5 s doubling to 5 min). A peer whose lane is unusable sits out the next
     /// round, and one that gave a coded failure does so for this folder alone.
-    /// With `interrupt`, stops once the wake moved past it, cancelling the call in
-    /// flight: no failure, and what it asked stays missing and is listed again.
-    /// Without it a reader is waiting or about to, so a peer gets [`DEMAND_TRY`]
-    /// while another could answer, and the last one its whole deadline.
+    /// [`Asking`] says how long a peer gets and what stops this.
     fn supply(
         &self,
         state: &mut PumpState,
         endpoints: &[String],
         folder: &SyncFolder,
         wanted: Vec<(Digest, Kind)>,
-        interrupt: Option<u64>,
+        asking: Asking,
     ) -> Supplied {
         let mut remaining = wanted;
         let mut asked = BTreeSet::new();
@@ -1947,7 +2032,15 @@ impl Driver {
                 continue;
             }
             let logged = format!("{endpoint} {}", folder.id);
-            let hurried = interrupt.is_none() && index + 1 < endpoints.len();
+            let hurried = match asking {
+                Asking::Reader => {
+                    index + 1 < endpoints.len()
+                        || (endpoints.len() > 1
+                            && state.push.endpoint_rests(endpoint, Instant::now()))
+                }
+                Asking::Hints => true,
+                Asking::Background { .. } => false,
+            };
             for (conn, batch) in lanes_for(self.lanes.as_ref(), endpoint, &remaining) {
                 // Objects of unknown size (manifests) first, in their own
                 // small batches; then the chunks.
@@ -1959,7 +2052,8 @@ impl Driver {
                     .collect();
                 let stop = || {
                     self.cancel.is_cancelled()
-                        || interrupt.is_some_and(|seen| self.wake.current() != seen)
+                        || matches!(asking, Asking::Background { seen }
+                            if self.wake.current() != seen)
                 };
                 while let Some(&(_, kind)) = queue.front() {
                     if stop() {
@@ -1997,6 +2091,10 @@ impl Driver {
                             failed.extend(chunk.iter().map(|(digest, _)| *digest));
                             if timed_out {
                                 state.shrink(&folder.id, endpoint, chunk.len());
+                            }
+                            // No reader waited, and the next batch is smaller.
+                            if timed_out && matches!(asking, Asking::Hints) {
+                                continue 'peers;
                             }
                             // The lane is unusable, for the other folders and for
                             // pushes too. A coded failure is this folder's alone.
@@ -5767,6 +5865,9 @@ mod tests {
         }
     }
 
+    /// How long a reader waits.
+    const FETCH_WAIT: Duration = super::super::demand::Demand::FETCH_WAIT;
+
     fn calls_named(calls: &[String], name: &str) -> usize {
         calls.iter().filter(|call| *call == name).count()
     }
@@ -6715,26 +6816,341 @@ mod tests {
         assert!(!state.push.endpoint_rests(ENDPOINT, Instant::now()));
     }
 
-    /// One folder whose readers wait for `reads` and hint `hints`.
+    #[test]
+    fn a_peer_at_rest_stays_capped_while_another_could_answer() {
+        // The first peer answers at once and lacks it. The last, at rest, hangs, and
+        // may be the only one that holds it: it is asked, and does not use up the
+        // reader's wait.
+        let wanted = objects("wanted", 1);
+        let without = Arc::new(Listener::default());
+        let hung = Arc::new(Listener {
+            hang: true,
+            ..Listener::default()
+        });
+        let root = tempfile::tempdir().unwrap();
+        let driver = Driver::with_policy(
+            Arc::new(Endpoints(vec![
+                ("ws://without".into(), without.lane_with("w", &[])),
+                ("ws://hung".into(), hung.lane_with("x", &[])),
+            ])),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".into(),
+                fake_worker(Arc::new(FakeFolder::default())),
+                wanted_of(&wanted),
+            )])),
+            Seq::new(),
+            active(HOUR, HOUR),
+            Cancel::new(),
+        );
+        let mut state = PumpState::default();
+        state.push.rest_endpoint("ws://hung");
+        let began = Instant::now();
+        driver.pump_round(&mut state, driver.wake.current());
+        let took = began.elapsed();
+        assert_eq!(calls_named(&hung.calls(), "objects.fetch"), 1);
+        assert!(took < DEMAND_TRY + Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn a_peer_at_rest_with_no_other_left_to_ask_keeps_its_full_deadline() {
+        // Two peers are known, and the other sits out this round.
+        let wanted = objects("wanted", 1);
+        let slow = Arc::new(Listener {
+            held: wanted.clone(),
+            during_fetch: Some(Box::new(|| {
+                thread::sleep(DEMAND_TRY + Duration::from_millis(300))
+            })),
+            ..Listener::default()
+        });
+        let other = Arc::new(Listener::default());
+        let fake = Arc::new(FakeFolder::default());
+        let root = tempfile::tempdir().unwrap();
+        let driver = Driver::with_policy(
+            Arc::new(Endpoints(vec![
+                ("ws://slow".into(), slow.lane_with("s", &[])),
+                ("ws://other".into(), other.lane_with("o", &[])),
+            ])),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(RepoFolders(vec![(
+                "repo-1".into(),
+                fake_worker(fake.clone()),
+                wanted_of(&wanted),
+            )])),
+            Seq::new(),
+            active(HOUR, HOUR),
+            Cancel::new(),
+        );
+        let mut state = PumpState::default();
+        state.resting.insert("ws://other".into(), u64::MAX);
+        state.push.rest_endpoint("ws://slow");
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(fake.written(), [wanted[0].digest]);
+    }
+
+    /// A folder whose readers wait for `reads` and hint `hints`.
     struct HintingFolder {
+        id: String,
         link: Arc<WorkerLink>,
         reads: Mutex<Wanted>,
         hints: Mutex<Wanted>,
     }
 
-    impl SyncFolders for HintingFolder {
+    impl HintingFolder {
+        fn new(id: &str, fake: &Arc<FakeFolder>, hints: &[Object]) -> Self {
+            Self {
+                id: id.into(),
+                link: fake_worker(fake.clone()),
+                reads: Mutex::new(Vec::new()),
+                hints: Mutex::new(wanted_of(hints)),
+            }
+        }
+    }
+
+    struct HintingFolders(Vec<HintingFolder>);
+
+    impl SyncFolders for HintingFolders {
         fn syncing(&self) -> Vec<SyncFolder> {
-            vec![SyncFolder {
-                id: "f1".into(),
-                repo: "repo-1".into(),
-                link: self.link.clone(),
-                demand: lock(&self.reads).clone(),
-                hints: lock(&self.hints).clone(),
-            }]
+            self.0
+                .iter()
+                .map(|folder| SyncFolder {
+                    id: folder.id.clone(),
+                    repo: "repo-1".into(),
+                    link: folder.link.clone(),
+                    demand: lock(&folder.reads).clone(),
+                    hints: lock(&folder.hints).clone(),
+                })
+                .collect()
         }
         fn knows(&self, repo: &str) -> bool {
             repo == "repo-1"
         }
+    }
+
+    /// Folder `f1` hinting `hints`, its worker, and a driver over a lane to `listener`.
+    fn hinting(
+        listener: &Arc<Listener>,
+        hints: &[Object],
+    ) -> (
+        Arc<Driver>,
+        tempfile::TempDir,
+        Arc<FakeFolder>,
+        Arc<HintingFolders>,
+    ) {
+        let fake = Arc::new(FakeFolder::default());
+        let folders = Arc::new(HintingFolders(vec![HintingFolder::new("f1", &fake, hints)]));
+        let (driver, root) = driver(listener.lane(), folders.clone(), Seq::new());
+        (driver, root, fake, folders)
+    }
+
+    #[test]
+    fn a_hint_batch_that_would_outlast_a_readers_wait_gives_way_in_time() {
+        // The first reply would take longer than a reader waits, as 32 chunks do on
+        // a slow link. What is asked after it is answered at once.
+        let hints = objects("hint", OBJECT_BATCH);
+        let read = objects("read", 1);
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let listener = Arc::new(Listener {
+            held: [hints.clone(), read.clone()].concat(),
+            during_fetch: Some(Box::new(move || {
+                if first.swap(false, Ordering::SeqCst) {
+                    thread::sleep(FETCH_WAIT + Duration::from_secs(2));
+                }
+            })),
+            ..Listener::default()
+        });
+        let (driver, _root, fake, folders) = hinting(&listener, &hints);
+        let mut state = PumpState::default();
+        let began = Instant::now();
+        assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 0);
+        let gave_way = began.elapsed();
+        assert!(
+            gave_way < DEMAND_TRY + Duration::from_secs(2),
+            "{gave_way:?}"
+        );
+        assert_eq!(state.batch_size("f1", ENDPOINT), OBJECT_BATCH / 2);
+
+        // A reader that began waiting meanwhile is served within its wait, and the
+        // next batch is the smaller one, grown by what was answered since.
+        *lock(&folders.0[0].reads) = wanted_of(&read);
+        driver.pump_round(&mut state, driver.wake.current());
+        let served = began.elapsed();
+        assert!(served < FETCH_WAIT, "{served:?}");
+        let written = fake.written();
+        assert_eq!(written[0], read[0].digest);
+        assert_eq!(written.len(), 1 + grown_batch(OBJECT_BATCH / 2));
+    }
+
+    #[test]
+    fn hints_leave_a_peer_at_rest_alone() {
+        let hints = objects("hint", 1);
+        let listener = Arc::new(Listener {
+            held: hints.clone(),
+            ..Listener::default()
+        });
+        let (driver, _root, fake, _folders) = hinting(&listener, &hints);
+        let mut state = PumpState::default();
+        state.push.rest_endpoint(ENDPOINT);
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 0);
+        // The rest over, nothing was passed over.
+        state.push.resting.clear();
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(fake.written(), [hints[0].digest]);
+    }
+
+    #[test]
+    fn a_hint_timeout_rests_nothing_and_the_next_reader_is_asked() {
+        let hints = objects("hint", OBJECT_BATCH);
+        let read = objects("read", 1);
+        let listener = Arc::new(Listener {
+            hang_fetch: true,
+            ..Listener::default()
+        });
+        let (mut driver, _root, _fake, folders) = hinting(&listener, &hints);
+        Arc::get_mut(&mut driver).unwrap().fetch_deadline = |_| Duration::from_millis(100);
+        let mut state = PumpState::default();
+        assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 0);
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 1);
+        assert_eq!(state.batch_size("f1", ENDPOINT), OBJECT_BATCH / 2);
+        assert!(!state.resting.contains_key(ENDPOINT));
+        assert!(!state.push.endpoint_rests(ENDPOINT, Instant::now()));
+
+        // So a reader's fetch goes out in the very next round, and its own timeout
+        // does count against the peer: no more is asked of it.
+        *lock(&folders.0[0].reads) = wanted_of(&read);
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 2);
+        assert!(state.resting.contains_key(ENDPOINT));
+        assert!(state.push.endpoint_rests(ENDPOINT, Instant::now()));
+    }
+
+    #[test]
+    fn a_read_in_a_later_folder_goes_before_the_hints_of_an_earlier_one() {
+        let hints = objects("hint", 1);
+        let read = objects("read", 1);
+        let listener = Arc::new(Listener {
+            held: [hints.clone(), read.clone()].concat(),
+            ..Listener::default()
+        });
+        let (first, second) = (
+            Arc::new(FakeFolder::default()),
+            Arc::new(FakeFolder::default()),
+        );
+        let folders = Arc::new(HintingFolders(vec![
+            HintingFolder::new("f1", &first, &hints),
+            HintingFolder::new("f2", &second, &[]),
+        ]));
+        *lock(&folders.0[1].reads) = wanted_of(&read);
+        let (driver, _root) = driver(listener.lane(), folders, Seq::new());
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        let read_at = second.written_at(&read[0].digest).expect("no read");
+        let hint_at = first.written_at(&hints[0].digest).expect("no hint");
+        assert!(read_at < hint_at);
+    }
+
+    #[test]
+    fn the_listeners_demand_goes_before_hints() {
+        let hints = objects("hint", 1);
+        let wanted_there = objects("wanted-there", 1);
+        let listener = Arc::new(Listener {
+            demand: wanted_of(&wanted_there),
+            held: hints.clone(),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder {
+            held: wanted_there,
+            ..FakeFolder::default()
+        });
+        let folders = Arc::new(HintingFolders(vec![HintingFolder::new(
+            "f1", &fake, &hints,
+        )]));
+        let (driver, _root) = driver(listener.lane(), folders, Seq::new());
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(listener.calls()[..3], ["wanted/0", "store", "fetch"]);
+    }
+
+    /// Two bulk lanes to one peer, each owning the digests of its parity.
+    struct ParityLanes(Conn, Conn);
+
+    impl Lanes for ParityLanes {
+        fn ready_peers(&self) -> Vec<ReadyPeer> {
+            Vec::new()
+        }
+        fn bulk_endpoints(&self) -> Vec<String> {
+            vec![ENDPOINT.into()]
+        }
+        fn bulk_lane(&self, _: &str, digest: &Digest) -> Option<Conn> {
+            Some(if digest.0[0].is_multiple_of(2) {
+                self.0.clone()
+            } else {
+                self.1.clone()
+            })
+        }
+        fn any_bulk_lane(&self, _: &str) -> Option<Conn> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn read_ahead_asks_one_lane_a_round_from_the_nearest_hint() {
+        // One call in flight at a time is what bounds how long a read waits behind
+        // hints, and the lane of the nearest hint is the one a reader needs next.
+        let hints = objects("hint", 16);
+        let parity = |object: &&Object| object.digest.0[0] % 2 == hints[0].digest.0[0] % 2;
+        let same: Vec<Digest> = hints.iter().filter(parity).map(|o| o.digest).collect();
+        let other: Vec<Digest> = hints
+            .iter()
+            .filter(|object| !parity(object))
+            .map(|o| o.digest)
+            .collect();
+        assert!(!other.is_empty());
+        let listener = Arc::new(Listener {
+            held: hints.clone(),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder::default());
+        let root = tempfile::tempdir().unwrap();
+        let driver = Driver::with_policy(
+            Arc::new(ParityLanes(
+                listener.lane_with("even", &[]),
+                listener.lane_with("odd", &[]),
+            )),
+            Catalog::open(root.path()).unwrap(),
+            Arc::new(HintingFolders(vec![HintingFolder::new(
+                "f1", &fake, &hints,
+            )])),
+            Seq::new(),
+            active(HOUR, HOUR),
+            Cancel::new(),
+        );
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 1);
+        assert_eq!(fake.written(), same);
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 2);
+        assert_eq!(fake.written()[same.len()..], other);
+    }
+
+    #[test]
+    fn hints_no_peer_had_lately_are_not_asked_for_again() {
+        let hints = objects("hint", 1);
+        let listener = Arc::new(Listener::default());
+        let (driver, _root, _fake, _folders) = hinting(&listener, &hints);
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 1);
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 1);
+        // Its backoff over, it is asked for again.
+        for entry in state.unavailable.get_mut("f1").unwrap().values_mut() {
+            entry.until = Instant::now();
+        }
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(calls_named(&listener.calls(), "fetch"), 2);
     }
 
     #[test]
@@ -6746,13 +7162,7 @@ mod tests {
             held: [all.clone(), read.clone()].concat(),
             ..Listener::default()
         });
-        let fake = Arc::new(FakeFolder::default());
-        let folders = Arc::new(HintingFolder {
-            link: fake_worker(fake.clone()),
-            reads: Mutex::new(Vec::new()),
-            hints: Mutex::new(wanted_of(&all)),
-        });
-        let (driver, _root) = driver(listener.lane(), folders.clone(), Seq::new());
+        let (driver, _root, fake, folders) = hinting(&listener, &all);
         let digests = |objects: &[Object]| objects.iter().map(|o| o.digest).collect::<Vec<_>>();
         let mut state = PumpState::default();
 
@@ -6766,7 +7176,7 @@ mod tests {
 
         // A reader starts waiting. It is asked for by itself and before the rest,
         // so whatever is slow about the rest does not count against it.
-        *lock(&folders.reads) = wanted_of(&read);
+        *lock(&folders.0[0].reads) = wanted_of(&read);
         let fetches = calls_named(&listener.calls(), "fetch");
         assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 9);
         assert_eq!(calls_named(&listener.calls(), "fetch"), fetches + 2);
@@ -6784,17 +7194,11 @@ mod tests {
             held: all.clone(),
             ..Listener::default()
         });
-        let fake = Arc::new(FakeFolder::default());
-        let folders = Arc::new(HintingFolder {
-            link: fake_worker(fake.clone()),
-            reads: Mutex::new(Vec::new()),
-            hints: Mutex::new(wanted_of(&all)),
-        });
-        let (driver, _root) = driver(listener.lane(), folders.clone(), Seq::new());
+        let (driver, _root, fake, folders) = hinting(&listener, &all);
         let mut state = PumpState::default();
         driver.pump_round(&mut state, driver.wake.current());
         assert_eq!(fake.written().len(), OBJECT_BATCH);
-        lock(&folders.hints).clear();
+        lock(&folders.0[0].hints).clear();
         assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 0);
         assert_eq!(fake.written().len(), OBJECT_BATCH);
     }

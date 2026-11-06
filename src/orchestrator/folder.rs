@@ -239,8 +239,9 @@ struct WatchThread {
 impl WatchThread {
     /// Loops `link.watch(after)` and sends every result; ends once the stop
     /// flag is set, the link is closed or the receiver is gone. Each result's
-    /// demand replaces `demand` and its hints `hints`; a change of either to a
-    /// non-empty set bumps the wake.
+    /// demand replaces `demand` and its hints `hints`. A change of the demand to a
+    /// non-empty set bumps the wake; one of the hints only rouses a sleeping pump,
+    /// since no reader is waiting for them.
     fn start(
         link: Arc<WorkerLink>,
         demand: Arc<Mutex<Vec<(Digest, Kind)>>>,
@@ -264,11 +265,12 @@ impl WatchThread {
                         let hinted = replaced(&hints, &watch.hints);
                         let wanted = !watch.demand.is_empty() || !watch.hints.is_empty();
                         idle_demand = wanted && watch.seq == after && !changed && !hinted;
-                        if ((changed && !watch.demand.is_empty())
-                            || (hinted && !watch.hints.is_empty()))
-                            && let Some(wake) = &listeners.wake
-                        {
-                            wake.bump();
+                        if let Some(wake) = &listeners.wake {
+                            if changed && !watch.demand.is_empty() {
+                                wake.bump();
+                            } else if hinted && !watch.hints.is_empty() {
+                                wake.nudge();
+                            }
                         }
                         listeners.watched(watch, changed, &mut feed, &mut told);
                         after = watch.seq;
@@ -1244,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    fn the_watch_thread_keeps_hints_wakes_the_pump_and_tells_no_peer() {
+    fn the_watch_thread_keeps_hints_rouses_the_pump_and_tells_no_peer() {
         let hinted = vec![(Digest::bytes(b"chunk"), Kind::Chunk)];
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("ws://{}", listener.local_addr().unwrap());
@@ -1279,15 +1281,21 @@ mod tests {
             Arc::new(Mutex::new(Vec::new())),
         );
         let (told, listeners, wake) = told_listeners();
+        let since = wake.mark();
         let watch = WatchThread::start(link.clone(), demand.clone(), hints.clone(), listeners);
         let watch = watch.unwrap();
-        assert_eq!(wake.wait_past(0, Duration::from_secs(5)), 1);
+        // A sleeping pump is roused. No reader is waiting, so nothing that compares
+        // the counter takes this for one.
+        wake.wait_moved(since, Duration::from_secs(5));
+        let roused = wake.mark();
+        assert_ne!(roused, since);
+        assert_eq!(wake.current(), 0);
         assert_eq!(*lock(&hints), hinted);
         assert!(lock(&demand).is_empty());
-        // The same hints again: no further wake, paced watches, and no reader is
-        // waiting, so no peer is told of any.
+        // The same hints again: not roused again, paced watches, and no peer is told
+        // of any.
         thread::sleep(Duration::from_millis(600));
-        assert_eq!(wake.current(), 1);
+        assert_eq!(wake.mark(), roused);
         let count = *lock(&watches);
         assert!((2..=12).contains(&count), "{count} watches in 600 ms");
         assert!(lock(&told.demanding).is_empty());

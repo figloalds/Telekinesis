@@ -381,6 +381,17 @@ class CommandLine(unittest.TestCase):
         self.assertTrue(android_e2e.parse_args(["--release-pc"]).release_pc)
 
 
+class WhichScenarios(unittest.TestCase):
+    def test_all_leaves_out_speed_until_binary_object_bodies(self):
+        chosen = android_e2e.chosen_scenarios("all")
+        self.assertNotIn("speed", chosen)
+        self.assertIn("read", chosen)
+
+    def test_speed_still_runs_by_name(self):
+        self.assertEqual(android_e2e.parse_args(["--scenario", "speed"]).scenario, "speed")
+        self.assertEqual(android_e2e.chosen_scenarios("speed"), ["speed"])
+
+
 class WhichTkfs(unittest.TestCase):
     def test_the_speed_scenario_always_measures_a_release_pc(self):
         self.assertTrue(android_e2e.uses_release_pc("speed", False))

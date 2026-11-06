@@ -183,11 +183,6 @@ fn embedded_host_pairs_receives_and_reads_through_the_engine() -> Result<()> {
     phone.pc.shutdown()
 }
 
-/// What an unoptimized build gets is the number-array JSON of each chunk, about
-/// 57 ms a chunk here: its pump is the limit, not the wake-ups. So only an
-/// optimized build shows the whole gain.
-const FASTER_THAN_PLAIN: f64 = if cfg!(debug_assertions) { 1.3 } else { 5.0 };
-
 const READ_BUFFER: usize = 128 * 1024;
 
 /// How long `read` takes through a file of `content`, checking what it gets.
@@ -222,7 +217,22 @@ fn mib_per_second(bytes: usize, took: Duration) -> f64 {
 }
 
 #[test]
+fn a_sequential_read_gets_the_bytes_of_a_file_past_its_first_window() -> Result<()> {
+    let content = text(READ_AHEAD as usize + 4 * 1024 * 1024, 29);
+    let phone = Phone::with(&[("big.bin", &content)])?;
+    let token = phone.open("/big.bin")?;
+    time_reading(&phone.engine, token, Engine::read_sequential, &content)?;
+    phone.engine.close(token)?;
+    phone.stop()
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "the JSON of an unoptimized build is its limit, not wake-ups: use --release"
+)]
 fn a_sequential_first_read_is_at_least_five_times_faster_than_plain_reads() -> Result<()> {
+    const FASTER_THAN_PLAIN: f64 = 5.0;
     const LEN: usize = 32 * 1024 * 1024;
     let (plain, sequential) = (text(LEN, 31), text(LEN, 37));
     let phone = Phone::with(&[("plain.bin", &plain), ("sequential.bin", &sequential)])?;
