@@ -219,6 +219,7 @@ pub const TRANSIENT_DEFAULT_CODES: &[&str] = &[
     "FILE_TOO_LARGE",
     "FOLDER_MOUNT_REQUIRED",
     "FOLDER_NOT_FOUND",
+    "FOLDER_NOT_RUNNING",
     "FOLDER_UNAVAILABLE",
     "FUSE_CALLBACK_PANIC",
     "FUSE_COMMFD",
@@ -267,6 +268,7 @@ pub const TRANSIENT_DEFAULT_CODES: &[&str] = &[
     "INVALID_PARAMETER",
     "INVALID_PEER_OBJECT",
     "INVALID_RECOVERY_PATH",
+    "INVALID_RESOLUTION",
     "INVALID_REPLY",
     "INVALID_REQUEST",
     "INVALID_REQUEST_ID",
@@ -378,6 +380,8 @@ pub const TRANSIENT_DEFAULT_CODES: &[&str] = &[
     "UNSUPPORTED_POSIX_OPERATION",
     "UNSUPPORTED_POSIX_OWNERSHIP",
     "UNSUPPORTED_RENAME_FLAGS",
+    "VERSION_MISSING",
+    "VERSION_NOT_FOUND",
     // A handshake watchdog could not shut its socket down (WP1.10, logged
     // only; found by CCR-WP0.INT-4 item 7's `event!` identifier scan).
     "WATCHDOG_SHUTDOWN_FAILED",

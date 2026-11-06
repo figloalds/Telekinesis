@@ -47,9 +47,13 @@ private sealed class Loaded {
 
 /** A version's preview: being read (the first 64 KiB, fetched if the phone lacks them), read, or why not. */
 private sealed class Previewing {
-    data class Reading(val name: String) : Previewing()
-    data class Text(val name: String, val text: String) : Previewing()
-    data class Failed(val name: String, val failure: Failure) : Previewing()
+    /** Which version the dialog is for, and the line that names it: the owner picks by this text. */
+    abstract val version: String
+    abstract val title: String
+
+    data class Reading(override val version: String, override val title: String) : Previewing()
+    data class Text(override val version: String, override val title: String, val text: String) : Previewing()
+    data class Failed(override val version: String, override val title: String, val failure: Failure) : Previewing()
 }
 
 private fun folderOp(folder: String, op: String, payload: JSONObject = JSONObject()): String =
@@ -82,25 +86,27 @@ fun ConflictsScreen(folder: String, label: String, pcs: Int, now: Long, onBack: 
         }
     }
 
-    fun preview(name: String, version: VersionEvent) {
-        previewing = Previewing.Reading(name)
+    fun preview(title: String, version: VersionEvent) {
+        previewing = Previewing.Reading(version.id, title)
         scope.launch {
             val shown = withContext(Dispatchers.IO) {
                 try {
                     val reply = folderOp(folder, "preview-version", JSONObject().put("version", version.id))
-                    Previewing.Text(name, parsePreview(reply))
+                    Previewing.Text(version.id, title, parsePreview(reply))
                 } catch (error: IOException) {
-                    Previewing.Failed(name, Failure.of(error))
+                    Previewing.Failed(version.id, title, Failure.of(error))
                 } catch (error: JSONException) {
-                    Previewing.Failed(name, Failure(null, "The app could not read the preview."))
+                    Previewing.Failed(version.id, title, Failure(null, "The app could not read the preview."))
                 }
             }
-            // Closed while it was being read: leave it closed.
-            if (previewing != null) previewing = shown
+            // Closed, or another version opened, while this was being read: drop it.
+            if (previewing?.version == version.id) previewing = shown
         }
     }
 
     fun keep(conflict: FileConflict, version: VersionEvent) {
+        // A second tap before the first is done would resolve what is already settled.
+        if (working) return
         working = true
         failure = null
         scope.launch {
@@ -141,13 +147,21 @@ fun ConflictsScreen(folder: String, label: String, pcs: Int, now: Long, onBack: 
                                 modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
                             )
                             for (version in conflict.versions) {
-                                val pc = if (pcs <= 1) "My PC" else version.author.take(8)
+                                val line = versionLine(version, rows.device, now, versionAuthor(version.author, rows.device, pcs))
                                 Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
-                                    Text(versionLine(version, rows.device, now, pc), style = MaterialTheme.typography.bodyMedium)
+                                    Text(line, style = MaterialTheme.typography.bodyMedium)
+                                    if (version.deleted) {
+                                        Text(
+                                            "The file will be removed from this phone and " + if (pcs <= 1) "My PC." else "the other devices.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
                                     Row(Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                         if (!version.deleted) {
                                             OutlinedButton(
-                                                onClick = { preview(conflict.name, version) },
+                                                onClick = { preview(line, version) },
+                                                enabled = !working,
                                                 modifier = Modifier.heightIn(min = 44.dp),
                                             ) { Text("Preview") }
                                         }
@@ -155,7 +169,7 @@ fun ConflictsScreen(folder: String, label: String, pcs: Int, now: Long, onBack: 
                                             onClick = { keep(conflict, version) },
                                             enabled = !working,
                                             modifier = Modifier.heightIn(min = 44.dp),
-                                        ) { Text("Keep this one") }
+                                        ) { Text(if (version.deleted) "Delete the file" else "Keep this one") }
                                     }
                                 }
                             }
@@ -170,11 +184,11 @@ fun ConflictsScreen(folder: String, label: String, pcs: Int, now: Long, onBack: 
     previewing?.let { shown ->
         AlertDialog(
             onDismissRequest = { previewing = null },
-            title = { Text("Preview") },
+            title = { Column { Text("Preview"); Text(shown.title, style = MaterialTheme.typography.bodyMedium) } },
             text = {
                 Column(Modifier.verticalScroll(rememberScrollState())) {
                     when (shown) {
-                        is Previewing.Reading -> Text("Reading ${shown.name}...")
+                        is Previewing.Reading -> Text("Reading...")
                         is Previewing.Text -> Text(shown.text, style = MaterialTheme.typography.bodySmall)
                         is Previewing.Failed -> FailureNote(shown.failure)
                     }

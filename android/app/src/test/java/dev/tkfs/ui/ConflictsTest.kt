@@ -54,4 +54,14 @@ class ConflictsTest {
         assertEquals(listOf(false, true), parsed[0].versions.map { it.deleted })
         assertEquals(5L, parsed[0].versions[0].size)
     }
+
+    @Test fun refusalsOfResolveAndPreviewAreInWordsNotCodes() {
+        val settled = "This was already settled. Showing what is left."
+        assertEquals(settled, errorInWords("INVALID_RESOLUTION"))
+        assertEquals(settled, errorInWords("CONFLICT_NOT_FOUND"))
+        assertEquals("This version is no longer here. Showing what is left.", errorInWords("VERSION_NOT_FOUND"))
+        assertEquals("This version is no longer here. Showing what is left.", errorInWords("VERSION_MISSING"))
+        assertEquals("This folder is not running.", errorInWords("FOLDER_NOT_RUNNING: Contracts has no running worker"))
+        assertEquals("INVALID_RESOLUTION", codeOf("INVALID_RESOLUTION"))
+    }
 }

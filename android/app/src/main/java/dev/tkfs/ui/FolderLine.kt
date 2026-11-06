@@ -62,6 +62,10 @@ fun errorInWords(error: String): String = when (val code = codeOf(error)) {
     "SYNC_NOW_TIMEOUT" -> "Syncing took too long. Try again."
     "WORKER_NOT_RUNNING" -> "This folder is not running."
     "PHONE_DB_UNAVAILABLE" -> "Could not check what is waiting to send."
+    // Choosing between versions: a stale list or a second tap meets these.
+    "INVALID_RESOLUTION", "CONFLICT_NOT_FOUND" -> "This was already settled. Showing what is left."
+    "VERSION_NOT_FOUND", "VERSION_MISSING" -> "This version is no longer here. Showing what is left."
+    "FOLDER_NOT_RUNNING" -> "This folder is not running."
     // Nothing of this phone's can go to it, and it cannot say what it holds either.
     "PEER_PUSH_UNAVAILABLE" -> "My PC is too old to take files from this phone. Update the PC."
     else -> if (code == null) error else error.substringAfter(':').trim().ifEmpty { error }
@@ -69,7 +73,7 @@ fun errorInWords(error: String): String = when (val code = codeOf(error)) {
 
 /** The leading CODE of `CODE: detail`, or null. */
 fun codeOf(error: String): String? {
-    val code = error.substringBefore(':', "")
+    val code = error.substringBefore(':')
     return code.takeIf { it.length >= 4 && it.all { c -> c.isUpperCase() || c.isDigit() || c == '_' } }
 }
 
