@@ -71,6 +71,14 @@ impl Manifest {
     }
 }
 
+/// Which old segments a rewrite takes.
+#[derive(Clone, Copy)]
+enum Rewriting<'a> {
+    /// Those with less than this share of their bytes live.
+    BelowShare(f64),
+    /// Those that would lose one of these.
+    Losing(&'a BTreeSet<Digest>),
+}
 #[derive(Clone, Copy)]
 struct Location {
     segment: u64,
@@ -334,7 +342,7 @@ impl PackStore {
         Ok(Self::location(&mut guard(&self.inner.state), digest)?.map(|location| location.kind))
     }
     /// Closes the open segment if any of `digests` is in it, since a collect passes over the open
-    /// one. Returns the number for [`Self::collect_before`]: whatever is written from now on is in
+    /// one. Returns the number for [`Self::collect_named`]: whatever is written from now on is in
     /// that segment or a later one.
     pub fn close_segment_holding(&self, digests: &BTreeSet<Digest>) -> Result<u64> {
         let mut state = guard(&self.inner.state);
@@ -482,18 +490,27 @@ impl PackStore {
     /// Caller supplies transitive snapshot reachability; open handles pin their
     /// entire content closure. Index commit precedes removal of old segments.
     pub fn collect(&self, live: &BTreeSet<Digest>, threshold: f64) -> Result<usize> {
-        self.collect_before(live, threshold, u64::MAX)
+        ensure!((0.0..=1.0).contains(&threshold), "INVALID_GC_THRESHOLD");
+        self.rewrite(live, u64::MAX, Rewriting::BelowShare(threshold))
     }
-    /// [`Self::collect`] of the segments below `before`, from [`Self::close_segment_holding`] before
-    /// `live` was worked out. What was written since stays, whether or not `live` names it. An
-    /// error leaves every object readable, and what it had not reached where it was.
-    pub fn collect_before(
+    /// Removes `named`, keeping what `live` or a pin names. Only the segments below `before` that
+    /// lose one of them are rewritten, so the cost goes by what was asked for and not by how much
+    /// of the store is dead. A segment with nothing to keep is removed with no copying, and what
+    /// is dead in one being rewritten is not copied. What is dead elsewhere waits for a collect.
+    /// `before` comes from [`Self::close_segment_holding`] before `live` was worked out, so what
+    /// was written since stays, whether or not `live` names it.
+    pub fn collect_named(
         &self,
+        named: &BTreeSet<Digest>,
         live: &BTreeSet<Digest>,
-        threshold: f64,
         before: u64,
     ) -> Result<usize> {
-        ensure!((0.0..=1.0).contains(&threshold), "INVALID_GC_THRESHOLD");
+        self.rewrite(live, before, Rewriting::Losing(named))
+    }
+    /// Rewrites the segments below `before` that `which` takes. An error leaves every object
+    /// readable. One segment that fails does not stop the others, and the first error is returned
+    /// once they are done.
+    fn rewrite(&self, live: &BTreeSet<Digest>, before: u64, which: Rewriting) -> Result<usize> {
         let mut state = guard(&self.inner.state);
         Self::flush_locked(&mut state)?;
         // Before anything is removed, and whether or not this ends in an error: what was said of
@@ -506,7 +523,7 @@ impl PackStore {
         let mut live = live.clone();
         live.extend(state.pins.keys());
         let before = before.min(state.segment);
-        let removed = self.rewrite_segments(&mut state, &live, threshold, before);
+        let removed = self.rewrite_segments(&mut state, &live, which, before);
         // Cached dead objects must not turn a miss into a successful read, even if the rewrite
         // stopped partway. One still in the packs is only read from there the next time.
         let dead: Vec<_> = state
@@ -526,7 +543,7 @@ impl PackStore {
         &self,
         state: &mut State,
         live: &BTreeSet<Digest>,
-        threshold: f64,
+        which: Rewriting,
         before: u64,
     ) -> Result<usize> {
         let rows = {
@@ -568,23 +585,36 @@ impl PackStore {
                 .filter(|(d, _)| live.contains(d))
                 .map(|(_, l)| l.len.max(1))
                 .sum::<usize>();
-            if kept as f64 / total as f64 >= threshold {
-                continue;
+            let taken = match which {
+                Rewriting::BelowShare(threshold) => (kept as f64 / total as f64) < threshold,
+                Rewriting::Losing(named) => entries
+                    .iter()
+                    .any(|(d, _)| named.contains(d) && !live.contains(d)),
+            };
+            if taken {
+                rewrites.push((kept, segment, entries));
             }
-            rewrites.push((kept, segment, entries));
         }
         // Least to copy first: with little room left, what needs none is freed whatever comes of
         // the rest, and it makes room for them.
         rewrites.sort_by_key(|(kept, segment, _)| (*kept, *segment));
         let mut removed = 0;
+        let mut failure = None;
         for (_, segment, entries) in rewrites {
-            removed += self.rewrite_segment(state, segment, &entries, live)?;
+            match self.rewrite_segment(state, segment, &entries, live) {
+                Ok(count) => removed += count,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
         }
-        Ok(removed)
+        failure.map_or(Ok(removed), Err)
     }
     /// Moves the live objects of one old segment to the open one and removes it. The old segment
-    /// and the index stay as they are until the copies are safe on disk, so a failure on the way
-    /// loses nothing, and what was copied is taken back to leave the room it took.
+    /// and the index stay as they are until the commit, so no failure loses anything. One before
+    /// the commit takes back what was copied, to leave the room it took. One of the commit leaves
+    /// the copies where they went: it may have gone through for all this can tell, and then the
+    /// index names them. They take room until their segment is rewritten.
     fn rewrite_segment(
         &self,
         state: &mut State,
@@ -623,15 +653,24 @@ impl PackStore {
             }
         };
         let new_segment = state.segment;
-        let tx = state.db.transaction()?;
-        tx.execute_cached("DELETE FROM objects WHERE segment=?1", [segment])?;
-        for (digest, offset, loc) in updates {
-            tx.execute_cached(
-                "INSERT INTO objects VALUES(?1,?2,?3,?4,?5)",
-                params![&digest.0[..], new_segment, offset, loc.len, loc.kind as u8],
-            )?;
+        let committed = (|| -> Result<rusqlite::Result<()>> {
+            let tx = state.db.transaction()?;
+            tx.execute_cached("DELETE FROM objects WHERE segment=?1", [segment])?;
+            for (digest, offset, loc) in updates {
+                tx.execute_cached(
+                    "INSERT INTO objects VALUES(?1,?2,?3,?4,?5)",
+                    params![&digest.0[..], new_segment, offset, loc.len, loc.kind as u8],
+                )?;
+            }
+            Ok(tx.commit())
+        })();
+        match committed {
+            Ok(commit) => commit?,
+            Err(error) => {
+                self.cut_open_segment(state, start);
+                return Err(error);
+            }
         }
-        tx.commit()?;
         state.readers.remove(&segment);
         drop(old);
         fs::remove_file(segment_path(&self.inner.root, segment))?;
@@ -1017,15 +1056,175 @@ mod tests {
         let also = store.put(Kind::Chunk, b"arrives2")?;
         let last = store.put(Kind::Chunk, b"arrives3")?;
         assert!(open_segment(&store) > before);
+        let named = BTreeSet::from([named]);
         assert_eq!(
-            store.collect_before(&BTreeSet::from([kept]), 1.0, before)?,
+            store.collect_named(&named, &BTreeSet::from([kept]), before)?,
             1
         );
-        assert!(!store.contains(named)?);
+        assert!(!store.contains(*named.first().unwrap())?);
         assert_eq!(store.get(kept)?.as_slice(), b"kept!!!!");
         assert_eq!(store.get(arriving)?.as_slice(), b"arrives!");
         assert_eq!(store.get(also)?.as_slice(), b"arrives2");
         assert_eq!(store.get(last)?.as_slice(), b"arrives3");
+        Ok(())
+    }
+    /// Freeing one small file must not copy most of the store. A segment that loses nothing named
+    /// is not looked at, whatever is dead in it, and that waits for a collect.
+    #[test]
+    fn collect_named_touches_only_the_segments_that_lose_one() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 24)?;
+        // All dead, and nothing in it named.
+        let others = [b"other 1!", b"other 2!", b"other 3!"]
+            .map(|bytes| store.put(Kind::Chunk, bytes).unwrap());
+        // One named, one dead that is not, one live.
+        let named = store.put(Kind::Chunk, b"named 1!")?;
+        let dead = store.put(Kind::Chunk, b"dead 1!!")?;
+        let live = store.put(Kind::Chunk, b"live 1!!")?;
+        // Nothing but what is named.
+        let alone = [b"named 2!", b"named 3!", b"named 4!"]
+            .map(|bytes| store.put(Kind::Chunk, bytes).unwrap());
+        // One named that a handle pins, and the rest live: nothing here can go.
+        let pinned = store.put(Kind::Chunk, b"pinned!!")?;
+        let beside = [b"beside1!", b"beside2!"].map(|bytes| store.put(Kind::Chunk, bytes).unwrap());
+        let open_object = store.put(Kind::Chunk, b"in open!")?;
+        store.flush()?;
+        let _pin = store.pin([pinned]);
+        let open = open_segment(&store);
+        assert_eq!(open, 4);
+
+        let mut names = BTreeSet::from([named, pinned]);
+        names.extend(alone);
+        let before = store.close_segment_holding(&names)?;
+        assert_eq!(before, open, "nothing named is in the open segment");
+        let mut keep = BTreeSet::from([live, open_object]);
+        keep.extend(beside);
+        assert_eq!(store.collect_named(&names, &keep, before)?, 5);
+
+        for digest in others {
+            assert!(store.contains(digest)?, "a dead object nobody named went");
+        }
+        assert_eq!(segment_len(&store, 0)?, 24);
+        // Not copied: it would be taking room to keep what no one wants.
+        assert!(!store.contains(named)? && !store.contains(dead)?);
+        assert!(!segment_path(&store.inner.root, 1).exists());
+        assert_eq!(store.get(live)?.as_slice(), b"live 1!!");
+        for digest in alone {
+            assert!(!store.contains(digest)?);
+        }
+        assert!(!segment_path(&store.inner.root, 2).exists());
+        assert_eq!(segment_len(&store, 3)?, 24, "nothing there could go");
+        assert_eq!(store.get(pinned)?.as_slice(), b"pinned!!");
+        // All that was copied is the one live object, after what the open segment held.
+        assert_eq!(segment_len(&store, open)?, 16);
+        assert_eq!(store.get(open_object)?.as_slice(), b"in open!");
+        Ok(())
+    }
+    /// Overwrites the start of an object where it lies, as bit rot does.
+    fn corrupt(store: &PackStore, digest: Digest) -> Result<()> {
+        let location = PackStore::location(&mut guard(&store.inner.state), digest)?.unwrap();
+        let file = OpenOptions::new()
+            .write(true)
+            .open(segment_path(&store.inner.root, location.segment))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileExt;
+            file.seek_write(b"!", location.offset)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            file.write_at(b"!", location.offset)?;
+        }
+        Ok(())
+    }
+    /// A corrupt object in one segment says nothing of the others, which still go.
+    #[test]
+    fn a_segment_that_fails_does_not_stop_the_rest() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 16)?;
+        // As much to copy as the next, and older, so it comes first.
+        let spoiled = store.put(Kind::Chunk, b"spoiled!")?;
+        let dead_beside = store.put(Kind::Chunk, b"dead one")?;
+        let fine = store.put(Kind::Chunk, b"fine one")?;
+        let dead = store.put(Kind::Chunk, b"dead two")?;
+        store.put(Kind::Chunk, b"rolls on")?;
+        store.flush()?;
+        corrupt(&store, spoiled)?;
+        let failed = store
+            .collect(&BTreeSet::from([spoiled, fine]), 1.0)
+            .unwrap_err();
+        assert!(
+            failed.to_string().contains("OBJECT_CORRUPT_DURING_GC"),
+            "{failed:#}"
+        );
+        assert!(!store.contains(dead)?, "the failure stopped the rest");
+        assert_eq!(store.get(fine)?.as_slice(), b"fine one");
+        assert!(store.contains(dead_beside)?);
+        Ok(())
+    }
+    /// Three objects in a closed segment, of which the first two are to be kept.
+    fn a_segment_to_rewrite(store: &PackStore) -> Result<[Digest; 3]> {
+        let one = store.put(Kind::Chunk, b"live one")?;
+        let two = store.put(Kind::Chunk, b"live two")?;
+        let dead = store.put(Kind::Chunk, b"dead one")?;
+        store.put(Kind::Chunk, b"rolls on")?;
+        store.flush()?;
+        Ok([one, two, dead])
+    }
+    #[test]
+    fn a_failure_before_the_commit_takes_the_copies_back() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 24)?;
+        let [one, two, dead] = a_segment_to_rewrite(&store)?;
+        let open = open_segment(&store);
+        let len = segment_len(&store, open)?;
+        guard(&store.inner.state).db.execute_batch(
+            "CREATE TRIGGER no_room BEFORE INSERT ON objects
+             BEGIN SELECT RAISE(ABORT,'no room'); END;",
+        )?;
+        assert!(store.collect(&BTreeSet::from([one, two]), 1.0).is_err());
+        assert_eq!(segment_len(&store, open)?, len, "what it copied stayed");
+        guard(&store.inner.state)
+            .db
+            .execute_batch("DROP TRIGGER no_room;")?;
+        assert_eq!(store.get(one)?.as_slice(), b"live one");
+        assert_eq!(store.get(two)?.as_slice(), b"live two");
+        assert_eq!(store.get(dead)?.as_slice(), b"dead one");
+        let after = store.put(Kind::Chunk, b"afterward")?;
+        store.flush()?;
+        assert_eq!(store.get(after)?.as_slice(), b"afterward");
+        Ok(())
+    }
+    /// A commit that fails may have gone through, for all this can tell. Cutting the copies off
+    /// could leave the index naming bytes that are gone, so they stay, at the cost of their room.
+    #[test]
+    fn a_failed_commit_leaves_the_copies_where_they_went() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 24)?;
+        let [one, two, dead] = a_segment_to_rewrite(&store)?;
+        let open = open_segment(&store);
+        let len = segment_len(&store, open)?;
+        // A deferred constraint is looked at only by the commit.
+        guard(&store.inner.state).db.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE parent(id INTEGER PRIMARY KEY);
+             CREATE TABLE child(id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER late AFTER INSERT ON objects
+             BEGIN INSERT INTO child VALUES(1); END;",
+        )?;
+        assert!(store.collect(&BTreeSet::from([one, two]), 1.0).is_err());
+        assert_eq!(segment_len(&store, open)?, len + 16, "the copies were cut");
+        guard(&store.inner.state)
+            .db
+            .execute_batch("DROP TRIGGER late;")?;
+        assert_eq!(store.get(one)?.as_slice(), b"live one");
+        assert_eq!(store.get(two)?.as_slice(), b"live two");
+        assert_eq!(store.get(dead)?.as_slice(), b"dead one");
+        // What comes next goes after them, where the index says.
+        let after = store.put(Kind::Chunk, b"afterward")?;
+        store.flush()?;
+        assert_eq!(store.get(after)?.as_slice(), b"afterward");
         Ok(())
     }
     #[test]

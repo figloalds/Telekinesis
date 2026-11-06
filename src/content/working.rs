@@ -766,6 +766,12 @@ impl WorkingLayer {
         self.reap(true)
     }
     fn reap(&self, at_once: bool) -> Result<()> {
+        let retired = self.retire(at_once);
+        Self::remove_retired(retired)
+    }
+    /// Takes what can go out of the layer, for [`Self::remove_retired`]. An open from here on does
+    /// not find it, however it looks, and starts a draft of its own.
+    fn retire(&self, at_once: bool) -> Vec<Arc<Mutex<Scratch>>> {
         lock(&self.opening).retain(|_, gate| gate.strong_count() != 0);
         lock(&self.bindings).retain(|_, file| file.strong_count() != 0);
         lock(&self.latest).retain(|_, file| file.strong_count() != 0);
@@ -790,7 +796,14 @@ impl WorkingLayer {
         for key in keys {
             retired.push(files.remove(&key).unwrap());
         }
-        drop(files);
+        // Still under `files`, which an open holds while it looks. What is retired stays alive
+        // until its files are gone, so these would still find it, and it may go by several names.
+        let gone: BTreeSet<_> = retired.iter().map(Arc::as_ptr).collect();
+        lock(&self.bindings).retain(|_, file| !gone.contains(&file.as_ptr()));
+        lock(&self.latest).retain(|_, file| !gone.contains(&file.as_ptr()));
+        retired
+    }
+    fn remove_retired(retired: Vec<Arc<Mutex<Scratch>>>) -> Result<()> {
         for scratch in retired {
             let s = lock(&scratch);
             if s.file.is_some() {
@@ -1299,6 +1312,65 @@ mod tests {
                 .dirty_for_entity("other-branch", "replacement")
                 .is_empty()
         );
+        Ok(())
+    }
+    /// An open that comes after a draft is retired and before its files go must not take it up
+    /// again. It is in nothing a flush looks at any more, and what was written to it would be in a
+    /// file with no name, lost to a kill though the write was answered.
+    #[test]
+    fn an_open_after_a_draft_is_retired_starts_its_own() -> Result<()> {
+        // However it came to be reaped, and however it would be found again.
+        for (at_once, bound) in [(true, false), (true, true), (false, false), (false, true)] {
+            let root = tempfile::tempdir()?;
+            let content = LocalContent::open(root.path())?;
+            let basis = Basis {
+                entity: "file".into(),
+                branch: "main".into(),
+                version: "v1".into(),
+                anchor: "v1".into(),
+                content: content.import(b"base bytes")?,
+            };
+            // The same draft by a second name: a version that changed only metadata.
+            let mut later = basis.clone();
+            later.version = "v2".into();
+            let layer = WorkingLayer::new(root.path(), content.clone())?;
+            let old_path = {
+                let old = layer.open(basis.clone(), true)?;
+                lock(&old).materialize()?;
+                let also = layer.open(later.clone(), false)?;
+                assert!(Arc::ptr_eq(&old, &also));
+                layer.close(&also, false);
+                layer.close(&old, true);
+                let mut scratch = lock(&old);
+                if !at_once {
+                    scratch.idle_at = Instant::now() - Duration::from_secs(31);
+                }
+                scratch.path.clone()
+            };
+            let retired = layer.retire(at_once);
+            assert_eq!(retired.len(), 1);
+            let writer = if bound {
+                layer.open_bound(later, true)?
+            } else {
+                layer.open(basis, true)?
+            };
+            lock(&writer).write(&content, 0, b"edit", false, false)?;
+            WorkingLayer::remove_retired(retired)?;
+            assert!(!old_path.exists(), "the retired draft stayed");
+            let path = lock(&writer).path.clone();
+            assert!(
+                path.exists() && path.with_extension("json").exists(),
+                "at_once {at_once} bound {bound}: an answered write has no draft on disk"
+            );
+            assert!(
+                layer.pending(true).iter().any(|f| Arc::ptr_eq(f, &writer)),
+                "at_once {at_once} bound {bound}: a flush would pass over this draft"
+            );
+            let mut bytes = [0; 10];
+            lock(&writer).read(&content, 0, &mut bytes)?;
+            assert_eq!(&bytes, b"edit bytes");
+            layer.close(&writer, true);
+        }
         Ok(())
     }
     #[test]

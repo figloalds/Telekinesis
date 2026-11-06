@@ -2813,14 +2813,17 @@ fn evict_keeps_the_basis_of_a_draft_kept_for_a_retry() -> Result<()> {
     use crate::runtime::{Engine, Evicted};
     use std::collections::BTreeSet;
     let root = tempfile::tempdir()?;
-    let first = {
+    let (first, other) = {
         let mut metadata = Store::open(root.path(), None)?;
         // The cut keeps the first chunk as it is, and needs the bytes of the second, not here.
         let (entity, chunks) = seed_file_on_a_peer(&mut metadata, "big", 4, 1, true)?;
         let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
         let cut = layer.open(metadata.basis(&entity)?, true)?;
         lock(&cut).truncate(CHUNK_SIZE + 17)?;
-        Digest::bytes(&chunks[0])
+        // In the same segment as the first chunk, so that freeing this rewrites that.
+        let other = metadata.content.import(b"the peer's bytes")?;
+        metadata.content.packs.flush()?;
+        (Digest::bytes(&chunks[0]), other)
     };
     let engine = Engine::open(root.path(), None)?;
     assert_eq!(drafts_on_disk(root.path())?, 1);
@@ -2836,7 +2839,6 @@ fn evict_keeps_the_basis_of_a_draft_kept_for_a_retry() -> Result<()> {
     assert!(content.packs.contains(first)?);
     // No head names it now, and this evict is of something else entirely.
     let entity = engine.lookup("big")?.id;
-    let other = content.import(b"the peer's bytes")?;
     {
         let mut store = lock(&engine.store);
         let mut state = store.entry(&entity)?;

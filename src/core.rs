@@ -1452,11 +1452,13 @@ impl Store {
     pub fn content_closure(&self, references: &[FileContentRef]) -> Result<BTreeSet<Digest>> {
         self.closure(references.iter().map(content_root).collect())
     }
-    /// These objects and all they name that is here.
+    /// These objects and all they name that is here. A chunk names nothing, so none is read: a
+    /// store has very many, and this runs with the store locked. A corrupt one is found when it is
+    /// read or moved.
     fn closure(&self, mut pending: Vec<(Digest, ObjectKind)>) -> Result<BTreeSet<Digest>> {
         let mut live = BTreeSet::new();
         while let Some((digest, kind)) = pending.pop() {
-            if !live.insert(digest) {
+            if !live.insert(digest) || kind == ObjectKind::Chunk {
                 continue;
             }
             if !self.content.packs.contains(digest)? {

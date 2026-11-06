@@ -1288,8 +1288,9 @@ const HYDRATE_WINDOW: usize = (READ_AHEAD / CHUNK_SIZE) as usize;
 impl Engine {
     /// Removes `digests` from the packs, except what this store must keep: a manifest or a tree, a
     /// version of an unresolved conflict, what a draft was made from, and what an open handle pins.
-    /// Deciding that the rest can be got back is the caller's. Whatever else is dead in a segment
-    /// this rewrites goes too, as with [`Self::collect`].
+    /// Deciding that the rest can be got back is the caller's. Only segments that lose one of
+    /// `digests` are touched. What else is dead in one of those is not copied, and what is dead
+    /// anywhere else waits for [`Self::collect`].
     pub fn evict(&self, digests: &BTreeSet<Digest>) -> Result<Evicted> {
         // A seal writes its objects and the event that names them under this lock, so nothing
         // here is taken for dead on its way to being named.
@@ -1338,7 +1339,7 @@ impl Engine {
         // Not only what `live_objects` names: a draft's basis may be no head any more.
         live.extend(protected);
         live.retain(|digest| !removable.contains(digest));
-        packs.collect_before(&live, 1.0, before)?;
+        packs.collect_named(&removable, &live, before)?;
         // What is still here is pinned, or has just arrived again.
         let mut removed = 0;
         for digest in &removable {
@@ -1411,16 +1412,58 @@ impl Engine {
         }
         Ok(())
     }
-    /// The chunks of the head of the file `entity`, in order and without repeats. It asks no one for
-    /// anything: `None` says its manifest is not here, so they are not known.
+    /// The chunks of the head of the file `entity`, in order and without repeats. A delete is a
+    /// head like any other, and what it holds is still here until something frees it. It asks no one
+    /// for anything: `None` says its manifest is not here, so they are not known.
     pub fn head_chunks(&self, entity: &str) -> Result<Option<Vec<Digest>>> {
-        let (_, reference) = self.file_head(entity)?;
+        let entry = lock(&self.store).entry(entity)?;
+        let reference = entry.content.context("IS_A_DIRECTORY")?;
         let Some(mut chunks) = self.working.content().chunks_if_local(&reference)? else {
             return Ok(None);
         };
         let mut seen = BTreeSet::new();
         chunks.retain(|digest| seen.insert(*digest));
         Ok(Some(chunks))
+    }
+    /// At most `limit` entities whose only head is a delete with some of its chunks still here:
+    /// bytes no file shows, for [`Self::head_chunks`] and [`Self::evict`] to free. A delete beside
+    /// another head is a conflict, not one of these. It asks no one for anything, and one freed
+    /// leaves this list.
+    pub fn deleted_heads(&self, limit: usize) -> Result<Vec<String>> {
+        let deleted: Vec<(String, FileContentRef)> = {
+            let store = lock(&self.store);
+            let projection = store.projection();
+            projection
+                .heads
+                .iter()
+                .filter(|(_, heads)| heads.len() == 1)
+                .filter_map(|(entity, _)| {
+                    let entry = projection.entries.get(entity).filter(|e| e.deleted)?;
+                    Some((entity.clone(), entry.content.clone()?))
+                })
+                .collect()
+        };
+        let content = self.working.content();
+        let mut found = Vec::new();
+        for (entity, reference) in deleted {
+            if found.len() == limit {
+                break;
+            }
+            // The empty file's one chunk is pinned for good, and freeing it frees nothing.
+            if reference.total_len == 0 {
+                continue;
+            }
+            let Some(chunks) = content.chunks_if_local(&reference)? else {
+                continue;
+            };
+            for digest in chunks {
+                if content.packs.contains(digest)? {
+                    found.push(entity);
+                    break;
+                }
+            }
+        }
+        Ok(found)
     }
     /// The file `entity` as it shows now, with what it holds.
     fn file_head(&self, entity: &str) -> Result<(Entry, FileContentRef)> {
@@ -3169,7 +3212,6 @@ mod tests {
         lock(&engine.store).delete(&gone)?;
         for (entity, expected) in [
             (directory.as_str(), "IS_A_DIRECTORY"),
-            (gone.as_str(), "NOT_FOUND"),
             ("no such entity", "NOT_FOUND"),
         ] {
             let failed = engine.hydrate(entity, &|| false).unwrap_err();
@@ -3177,6 +3219,161 @@ mod tests {
             let failed = engine.head_chunks(entity).unwrap_err();
             assert_eq!(code(&failed), expected, "{failed:#}");
         }
+        // A deleted file is nothing to download, and its bytes are still something to free.
+        let failed = engine.hydrate(&gone, &|| false).unwrap_err();
+        assert_eq!(code(&failed), "NOT_FOUND", "{failed:#}");
+        assert_eq!(
+            engine.head_chunks(&gone)?,
+            Some(vec![Digest::bytes(b"gone")])
+        );
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// A delete leaves the content on its head, and `live_objects` keeps what that names. If
+    /// nothing could name it to evict, these bytes would never leave the phone.
+    #[test]
+    fn deleted_heads_lists_what_only_a_delete_keeps_here() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let peer = Peer::attached(&engine);
+        let delete = |path: &str| -> Result<String> {
+            let id = engine.lookup(path)?.id;
+            lock(&engine.store).delete(&id)?;
+            Ok(id)
+        };
+        // Still a file.
+        written(&engine, "live", 1, 1)?;
+        // Deleted, with its bytes here, in a manifest or in the one chunk, or some of them.
+        let (_, chunks) = written(&engine, "whole", 2, 2)?;
+        let whole = delete("whole")?;
+        seed_cached_file(&engine, "small", b"a small file")?;
+        let small = delete("small")?;
+        peer.file(&engine, "partly", 3, 4, 1, true)?;
+        let partly = delete("partly")?;
+        // Deleted, and nothing of it to free: no chunk here, or no manifest to say what they are.
+        peer.file(&engine, "no-chunks", 4, 4, 0, true)?;
+        delete("no-chunks")?;
+        peer.file(&engine, "no-manifest", 5, 4, 0, false)?;
+        let never = delete("no-manifest")?;
+        // The empty file's one chunk stays here for good, and frees nothing.
+        seed_cached_file(&engine, "empty", b"")?;
+        delete("empty")?;
+        lock(&engine.store).create("directory", EntryKind::Directory)?;
+        delete("directory")?;
+
+        let listed: BTreeSet<String> = engine.deleted_heads(100)?.into_iter().collect();
+        assert_eq!(
+            listed,
+            BTreeSet::from([whole.clone(), small.clone(), partly.clone()])
+        );
+        assert_eq!(engine.deleted_heads(2)?.len(), 2);
+        assert!(engine.deleted_heads(0)?.is_empty());
+        assert_eq!(engine.head_chunks(&never)?, None);
+
+        // What it names can be freed, which takes it off the list and leaves its manifest.
+        let named: BTreeSet<Digest> = engine.head_chunks(&whole)?.unwrap().into_iter().collect();
+        assert_eq!(named, chunks);
+        assert_eq!(engine.evict(&named)?.removed, named.len());
+        let listed: BTreeSet<String> = engine.deleted_heads(100)?.into_iter().collect();
+        assert_eq!(listed, BTreeSet::from([small, partly]));
+        let manifest = lock(&engine.store).entry(&whole)?.content.unwrap().digest;
+        assert!(engine.working.content().packs.contains(manifest)?);
+        assert!(peer.fetched().is_empty(), "it asked a peer for something");
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// A delete beside another head is a conflict the owner has yet to settle. Its bytes can be
+    /// named, and stay.
+    #[test]
+    fn a_conflict_behind_a_delete_stays_until_it_is_settled() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (_, first) = written(&engine, "file", 1, 2)?;
+        let id = engine.lookup("file")?.id;
+        let parents = lock(&engine.store).projection().heads[&id]
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let writer = engine.open_file("file", false, false, true)?;
+        engine.truncate(writer, 0, false)?;
+        engine.write(writer, 0, &distinct_bytes(2, 2), false, false)?;
+        let mut deletion = {
+            let mut store = lock(&engine.store);
+            let mut state = store.entry(&id)?;
+            state.deleted = true;
+            store.event(MAIN, state, parents, Operation::Delete)
+        };
+        deletion.author = "a peer".into();
+        engine.apply_remote(std::slice::from_ref(&deletion))?;
+        engine.flush(Some(writer))?;
+        engine.close(writer)?;
+        assert_eq!(lock(&engine.store).projection().heads[&id].len(), 2);
+        assert!(lock(&engine.store).entry(&id)?.deleted, "the delete shows");
+
+        assert!(engine.deleted_heads(10)?.is_empty());
+        let named: BTreeSet<Digest> = engine.head_chunks(&id)?.unwrap().into_iter().collect();
+        assert_eq!(named, first);
+        assert_eq!(
+            engine.evict(&named)?,
+            Evicted {
+                removed: 0,
+                refused: named.len()
+            }
+        );
+        // Settled for the delete, they are a deleted file's like any other.
+        engine.resolve(&id, &deletion.id)?;
+        assert_eq!(engine.deleted_heads(10)?, vec![id.clone()]);
+        assert_eq!(engine.evict(&named)?.removed, named.len());
+        assert!(engine.deleted_heads(10)?.is_empty());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// Chunks name nothing, so there is no call to read them to know what is live. A store has very
+    /// many, and everything waits on this while the store is locked.
+    #[test]
+    fn evict_reads_no_chunk_to_know_what_is_live() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (_, chunks) = written(&engine, "freed", 1, 2)?;
+        let (_, others) = written(&engine, "other", 2, 64)?;
+        let packs = &engine.working.content().packs;
+        let reads = packs.verified_reads();
+        assert_eq!(engine.evict(&chunks)?.removed, chunks.len());
+        let reads = packs.verified_reads() - reads;
+        // At most a manifest each, and those are in the cache by now.
+        assert!(
+            reads <= 2,
+            "{reads} reads, with {} live chunks",
+            others.len()
+        );
+        assert_eq!(held(&engine, &others)?, others.len());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// Freeing a file touches the segments that file is in. What is dead elsewhere waits for a gc.
+    #[test]
+    fn evict_leaves_a_segment_with_only_other_dead_objects_untouched() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (_, superseded) = written(&engine, "old", 1, 2)?;
+        let id = engine.lookup("old")?.id;
+        let content = engine.working.content();
+        let later = content.import(b"a later version")?;
+        peer_edit(&engine, &id, |state| state.content = Some(later))?;
+        content.packs.close_segment_holding(&superseded)?;
+        let (_, chunks) = written(&engine, "freed", 2, 2)?;
+        assert_eq!(engine.evict(&chunks)?.removed, chunks.len());
+        assert_eq!(
+            held(&engine, &superseded)?,
+            superseded.len(),
+            "an evict of another file collected these"
+        );
+        assert!(engine.collect()? > 0);
+        assert_eq!(held(&engine, &superseded)?, 0);
         engine.shutdown()?;
         Ok(())
     }
