@@ -440,8 +440,8 @@ class Device:
     def write_document(self, doc: str, mode: str, data: bytes, offset: int = 0, fsync: bool = False,
                        close: bool = True) -> int:
         """One write through a descriptor opened in `mode`. With `close` false the descriptor
-        stays open, for a kill to find or the document's next write to use. How many bytes it
-        wrote."""
+        stays open, for a kill to find or the document's next write to use. `data` goes on a
+        command line, so keep it to a few KiB. How many bytes it wrote."""
         return self.document("write", id=doc, mode=mode, offset=offset, fsync=fsync, close=close,
                              data=base64.b64encode(data).decode("ascii"))["written"]
 

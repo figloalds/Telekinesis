@@ -679,7 +679,7 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
 
     # What was done with the PC away survives a restart too, sealed or not. The second file's
     # draft has no release and its old manifest was never here, and the folder must still open.
-    new_killed = random.Random(16).randbytes(LARGE_FILE_BYTES // 3)
+    new_killed = random.Random(16).randbytes(8 * 1024)
     device.write_document(folder.doc("killed-away.bin"), "wt", new_killed, close=False)
     device.force_stop()
     s.check("force-stop with the PC away and a writer open ended the app", device.app_pid() is None)
