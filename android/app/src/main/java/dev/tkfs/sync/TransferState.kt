@@ -52,6 +52,9 @@ class TransferGate {
         queued = false
     }
 
+    /** Whether a job is enqueued and has not started. */
+    @Synchronized fun waiting(): Boolean = queued && !working
+
     @Synchronized fun started() {
         queued = false
         working = true

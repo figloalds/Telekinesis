@@ -22,4 +22,9 @@ class AppUiTest {
         // A good poll leaves the action's failure for its own screen to clear.
         assertEquals(refused, failed.polled(empty, "", 5).failure)
     }
+
+    @Test fun theBatteryRowSaysWhetherTheAppMayRunInTheBackground() {
+        assertEquals("Allowed to run in the background", batteryLine(true))
+        assertEquals("Not allowed. Sending files can wait until the phone is in use.", batteryLine(false))
+    }
 }

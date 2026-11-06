@@ -31,6 +31,7 @@ fun SettingsScreen(
     onPeriod: (Int) -> Unit,
     onChangeAddress: (installation: String, endpoint: String) -> Unit,
     onUnpair: (installation: String) -> Unit,
+    onAllowBattery: () -> Unit = {},
 ) {
     val peers = ui.snapshot?.peers.orEmpty()
     Column(Modifier.fillMaxSize()) {
@@ -44,7 +45,9 @@ fun SettingsScreen(
                 TextButton(onClick = { onPeriod(nextPeriod(ui.periodMinutes)) }) { Text("Change") }
             }
             Setting("Keep this much free", "Oldest downloads go first.")
-            Setting("Battery", "Allowed to run in the background")
+            Setting("Battery", batteryLine(ui.batteryAllowed)) {
+                if (!ui.batteryAllowed) TextButton(onClick = onAllowBattery) { Text("Allow") }
+            }
             if (peers.isEmpty()) {
                 Setting("My PC", "No PC is paired.")
             }
@@ -125,3 +128,7 @@ private val PERIODS = listOf(15, 30, 60, 120)
 private fun nextPeriod(current: Int): Int = PERIODS.firstOrNull { it > current } ?: PERIODS.first()
 
 private fun periodWords(minutes: Int): String = if (minutes % 60 == 0 && minutes >= 60) "${minutes / 60} h" else "$minutes min"
+
+/** What the Battery row says; when it is not allowed, Android may hold syncing back until the phone is awake. */
+internal fun batteryLine(allowed: Boolean): String =
+    if (allowed) "Allowed to run in the background" else "Not allowed. Sending files can wait until the phone is in use."

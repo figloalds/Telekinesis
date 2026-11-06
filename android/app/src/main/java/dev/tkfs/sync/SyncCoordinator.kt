@@ -6,7 +6,10 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import dev.tkfs.Native
@@ -15,9 +18,9 @@ import dev.tkfs.provider.TkfsProvider
 import dev.tkfs.ui.parseExchanges
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -37,7 +40,8 @@ object SyncCoordinator {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val bursts = Bursts(::runNative)
     private val done = MutableStateFlow<Finished?>(null)
-    private var debounce: Job? = null
+    /** What `onLocalChange` and the transfer job agree on. */
+    internal val gate = TransferGate()
     @Volatile private var lastListingBurstMs = 0L
 
     val running: StateFlow<Boolean> get() = bursts.isRunning
@@ -64,16 +68,40 @@ object SyncCoordinator {
         scope.launch { runTrigger(app, Trigger.Listing, mode) }
     }
 
-    /** A file was written, created, renamed, deleted or shared in. Task 14 hands this to the transfer job. */
+    /**
+     * A file was written, created, renamed, deleted or shared in: the transfer job sends it. The
+     * job is WorkManager's, not a timer here, because a cached app is frozen and a timer in it
+     * would not run. The job waits out the 5 s debounce itself.
+     */
     fun onLocalChange(ctx: Context) {
         val app = ctx.applicationContext
-        synchronized(this) {
-            debounce?.cancel()
-            debounce = scope.launch {
-                delay(SyncPolicy.LOCAL_CHANGE_DEBOUNCE_MS)
-                runTrigger(app, Trigger.LocalChange)
-            }
+        if (!gate.changed(System.currentTimeMillis())) return
+        try {
+            enqueueTransfer(app, ExistingWorkPolicy.APPEND_OR_REPLACE)
+        } catch (error: RuntimeException) {
+            gate.notQueued()
+            throw error
         }
+    }
+
+    /** "Sync on mobile data" changed: a job still waiting for a network takes the new requirement. */
+    fun onMobileSettingChanged(ctx: Context) {
+        if (gate.waiting()) enqueueTransfer(ctx.applicationContext, ExistingWorkPolicy.REPLACE)
+    }
+
+    private fun enqueueTransfer(app: Context, policy: ExistingWorkPolicy) {
+        val network = if (Settings.of(app).syncOnMobile) NetworkType.CONNECTED else NetworkType.UNMETERED
+        val request = OneTimeWorkRequestBuilder<TransferWorker>()
+            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+            .setConstraints(Constraints.Builder().setRequiredNetworkType(network).build())
+            .build()
+        WorkManager.getInstance(app).enqueueUniqueWork(TRANSFER, policy, request)
+    }
+
+    /** A full burst for the transfer job, which can stop waiting for it: the burst itself cannot be interrupted. */
+    internal fun transferBurst(ctx: Context): Deferred<BurstResult> {
+        val app = ctx.applicationContext
+        return scope.async { runTrigger(app, Trigger.LocalChange, Mode.Full) }
     }
 
     /** One burst in `mode`, now, on this thread. */
@@ -149,4 +177,5 @@ object SyncCoordinator {
     }
 
     private const val PERIODIC = "periodic-burst"
+    const val TRANSFER = "transfer"
 }

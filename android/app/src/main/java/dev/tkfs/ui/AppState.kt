@@ -1,6 +1,7 @@
 package dev.tkfs.ui
 
 import android.app.Application
+import android.os.PowerManager
 import android.os.StatFs
 import android.text.format.Formatter
 import androidx.lifecycle.AndroidViewModel
@@ -61,6 +62,8 @@ data class AppUi(
     val storage: String = "",
     val syncOnMobile: Boolean = false,
     val periodMinutes: Int = 30,
+    /** Whether Android lets the app run while the phone is idle (the battery-optimization exemption). */
+    val batteryAllowed: Boolean = true,
     val now: Long = System.currentTimeMillis(),
 )
 
@@ -128,8 +131,10 @@ class AppModel(application: Application) : AndroidViewModel(application) {
             mutable.update { it.pollFailed(Failure(null, "The app could not read its own status.")) }
             return
         }
+        val allowed = getApplication<Application>().getSystemService(PowerManager::class.java)
+            .isIgnoringBatteryOptimizations(getApplication<Application>().packageName)
         val storage = if (polls++ % STORAGE_EVERY == 0) storageLine() else mutable.value.storage
-        mutable.update { it.polled(snapshot, storage, System.currentTimeMillis()) }
+        mutable.update { it.polled(snapshot, storage, System.currentTimeMillis()).copy(batteryAllowed = allowed) }
     }
 
     /** One burst for every folder. Its errors stay on their folders until a newer exchange. */
@@ -153,6 +158,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
     fun setSyncOnMobile(on: Boolean) {
         settings.syncOnMobile = on
         mutable.update { it.copy(syncOnMobile = on) }
+        SyncCoordinator.onMobileSettingChanged(getApplication())
     }
 
     fun setPeriodMinutes(minutes: Int) {
