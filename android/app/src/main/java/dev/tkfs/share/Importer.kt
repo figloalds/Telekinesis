@@ -59,13 +59,13 @@ internal class Importer(
         val part = DocumentIds.childPath(directory, PART_PREFIX + UUID.randomUUID())
         working(part)
         try {
-            try {
-                files.create(part)
-            } catch (error: IOException) {
-                // It never existed, so there is nothing to delete and nothing for a sweep to find.
-                cleared(part)
-                throw error
-            }
+            files.create(part)
+        } catch (error: IOException) {
+            // It never existed, so there is nothing to delete and nothing for a sweep to find.
+            cleared(part)
+            throw ImportFailed(error.message ?: error.javaClass.simpleName, error)
+        }
+        try {
             copy(part, input, progress)
             return rename(part, directory, name).also { cleared(part) }
         } catch (error: Exception) {

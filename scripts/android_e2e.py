@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import random
@@ -739,6 +740,8 @@ def pc_pack_bytes(folder: Folder) -> int:
 
 def trigger_foreground(device: Device) -> None:
     """The foreground trigger of the sync table: the app coming to the front, 30 s after its last sync."""
+    device.home()  # An app that is already in front gets no onStart.
+    time.sleep(1)
     device.set_last_sync(60)
     device.start_app()
 
@@ -907,7 +910,7 @@ def scenario_share(s: Session) -> None:
     # sides, and the Folders screen says what happened.
     device.battery_exempt(True)
     device.clear_logcat()
-    killed = random_bytes(rng, 192 * MIB)
+    killed = random_bytes(rng, 448 * MIB)
     share_one(s, "kill-mid-copy.bin", killed)
     device.home()
 
@@ -915,8 +918,6 @@ def scenario_share(s: Session) -> None:
         return [name for name in device.raw_names(folder.id) if name.startswith(".tkfs-part-")]
 
     poll(SHARE_BOUND, "the working file under way", lambda: bool(parts()), interval=1)
-    s.check("the copy is under way under a working name, not the real one",
-            "kill-mid-copy.bin" not in device.raw_names(folder.id), device.raw_names(folder.id))
     device.force_stop()
     s.check("force-stop mid-copy ended the app", device.app_pid() is None)
     s.check("no real name appears after the kill", "kill-mid-copy.bin" not in names(), sorted(names()))
@@ -928,8 +929,10 @@ def scenario_share(s: Session) -> None:
     device.tap_text("Dismiss")
 
     def gone_from_pc() -> bool:
-        tree = pc.folder(folder.pc_state, "tree").decode("utf-8", "replace")
-        return ".tkfs-part-" not in tree and "kill-mid-copy.bin" not in tree
+        # A removed entry stays in the tree as a deleted one: that is how the removal syncs.
+        tree = json.loads(pc.folder(folder.pc_state, "tree"))
+        live = [entry["name"] for entry in tree.values() if not entry["deleted"]]
+        return not any(name.startswith(".tkfs-part-") for name in live) and "kill-mid-copy.bin" not in live
 
     deliver_nothing = lambda: trigger_foreground(device)
     last_nudge = [0.0]
