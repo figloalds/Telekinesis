@@ -194,7 +194,7 @@ fn print_qr(reply: &Value) -> Result<()> {
         .context("the reply carries no link")?;
     if reply["endpoint"].is_null() {
         println!(
-            "This PC has no address a phone can reach: the QR holds only the code. Type the              address into the phone, and set [network] listen (or advertise) so it is reachable."
+            "This PC has no address a phone can reach: the QR holds only the code. Type the address into the phone, and set [network] listen (or advertise) so it is reachable."
         );
     }
     println!("{}", super::pairing_link::qr_text(link)?);

@@ -1276,8 +1276,6 @@ fn send_notify(counts: &Counts, conn: &Conn, notify: &Notify) {
         .notifies_sent += 1;
 }
 
-/// Accepts peer connections until the network is gone; each handshake runs
-/// on its own thread, at most [`PRE_AUTH_CAP`] at once.
 /// The endpoint for a pairing link. A configured `advertise` wins. A loopback
 /// listener cannot be reached by a phone, so it gives none. An unspecified
 /// address (`0.0.0.0`) takes the LAN address from `lan`.
@@ -1312,6 +1310,8 @@ fn lan_address(ipv6: bool) -> Option<IpAddr> {
     Some(ip).filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
 }
 
+/// Accepts peer connections until the network is gone; each handshake runs
+/// on its own thread, at most [`PRE_AUTH_CAP`] at once.
 fn accept_loop(network: Weak<Network>, listener: TcpListener) {
     for stream in listener.incoming() {
         let Some(network) = network.upgrade() else {
