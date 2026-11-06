@@ -986,8 +986,7 @@ impl Store {
     }
     /// Whether [`Self::sync_metadata`] would have nothing to do: every metadata
     /// change so far is on disk.
-    #[cfg(test)]
-    pub(crate) fn metadata_is_durable(&self) -> bool {
+    pub fn metadata_is_durable(&self) -> bool {
         self.db.is_autocommit()
             && self
                 .metadata_stamp()

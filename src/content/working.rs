@@ -412,6 +412,16 @@ impl Scratch {
     }
 }
 
+/// What to do when an open finds no draft of the file.
+enum NoDraft {
+    /// Open without one.
+    Leave,
+    /// Start one over the file's contents, keeping them here while it lasts.
+    Start,
+    /// Start one that its caller cuts to nothing at once, so no contents are needed.
+    StartToReplace,
+}
+
 type ScratchFiles = BTreeMap<(String, String, String), Arc<Mutex<Scratch>>>;
 type LatestFiles = BTreeMap<(String, String), Weak<Mutex<Scratch>>>;
 type BoundFiles = BTreeMap<(String, String, String), Weak<Mutex<Scratch>>>;
@@ -448,24 +458,30 @@ impl WorkingLayer {
         lock(&self.sealing)
     }
     pub fn open(&self, basis: Basis, writable: bool) -> Result<Arc<Mutex<Scratch>>> {
-        self.open_impl(basis, writable, false, true)?
+        self.open_impl(basis, writable, false, NoDraft::Start)?
+            .context("SCRATCH_NOT_CREATED")
+    }
+    /// A writer's [`Self::open`] for a caller that truncates the draft to 0 at once. It works
+    /// on a file whose manifest has never been here, with no peer to ask.
+    pub fn open_to_replace(&self, basis: Basis) -> Result<Arc<Mutex<Scratch>>> {
+        self.open_impl(basis, true, false, NoDraft::StartToReplace)?
             .context("SCRATCH_NOT_CREATED")
     }
     pub fn open_bound(&self, basis: Basis, writable: bool) -> Result<Arc<Mutex<Scratch>>> {
-        self.open_impl(basis, writable, true, true)?
+        self.open_impl(basis, writable, true, NoDraft::Start)?
             .context("SCRATCH_NOT_CREATED")
     }
     /// Attach an existing draft for an attribute-only native open, without
     /// materializing bytes or fetching a missing manifest just to stat a file.
     pub fn existing(&self, basis: Basis) -> Result<Option<Arc<Mutex<Scratch>>>> {
-        self.open_impl(basis, false, false, false)
+        self.open_impl(basis, false, false, NoDraft::Leave)
     }
     fn open_impl(
         &self,
         basis: Basis,
         writable: bool,
         bound: bool,
-        create_missing: bool,
+        no_draft: NoDraft,
     ) -> Result<Option<Arc<Mutex<Scratch>>>> {
         let key = (
             basis.branch.clone(),
@@ -513,12 +529,13 @@ impl WorkingLayer {
             return Ok(Some(existing.clone()));
         }
         drop(files);
-        if !create_missing {
-            return Ok(None);
-        }
+        let pin = match no_draft {
+            NoDraft::Leave => return Ok(None),
+            NoDraft::Start => self.content.pin(&basis.content)?,
+            NoDraft::StartToReplace => self.content.pin_visible(&basis.content, 0)?,
+        };
         let operation = Uuid::new_v4().to_string();
         let path = self.root.join(format!("{operation}.scratch"));
-        let pin = self.content.pin(&basis.content)?;
         let hydrated = BTreeSet::new();
         let scratch = Scratch {
             record: ScratchRecord {

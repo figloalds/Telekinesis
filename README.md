@@ -306,8 +306,9 @@ The desktop app shows the same codes. The code tells you what to do:
 | `ORCHESTRATOR_FAILED`, `ORCHESTRATOR_NOT_READY` | The Android app's embedded orchestrator ended with an error, or did not take requests within 15 s of starting. | Read the error text; restart the app. |
 | `WORKER_NOT_READY` | The embedded worker of a folder did not come up within 15 s. | Retry; look at the folder's `manage inspect` phase. |
 | `STRANDED_WORKER` | An embedded worker thread (or the embedded orchestrator) did not stop within its bound. | Restart the app process. |
-| `READ_ONLY` | An app asked the Android provider to open a file for writing, and this build only reads. | Change the file on the PC. |
 | `INVALID_DOCUMENT_ID` | An app asked the Android provider for a document id that is not `FOLDER_ID:/path`. | Pick the file again in the Files app. |
+| `ALREADY_EXISTS` | A rename or move would land on a name that is taken. Names that differ only in case or Unicode form are the same name. | Pick another name. |
+| `ROOT_IMMUTABLE` | Something asked to rename or delete a folder's root. | Rename or delete what is inside it. |
 | `NATIVE_PANIC` | A call into the Android app's native code hit a bug. The call failed and the app kept running. The panic is in logcat under the tag `tkfs`. | Retry; if it repeats, report it with `adb logcat -s tkfs`. |
 | `WORKER_LIMIT` | `maximum_running` folders already have a worker. | Stop one, or raise `maximum_running` and restart. |
 | `FOLDER_REQUIRED` | A folder command has neither `--state` nor `--runtime`. | Give `--state DIR` or `--runtime STATE/runtime.json`. |

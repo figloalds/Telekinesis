@@ -11,10 +11,10 @@ use std::{
     any::Any,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    sync::{Arc, Once, OnceLock},
+    sync::{Arc, Once, OnceLock, PoisonError},
 };
 use tkfs::{
-    core::EntryKind,
+    core::{EntryKind, ROOT},
     model::errors::{ErrorWire, UNKNOWN_CODE},
     orchestrator::embedded::Host,
     runtime::Engine,
@@ -48,12 +48,67 @@ fn entry_json(entry: &tkfs::core::Entry) -> Value {
     json!({"name": entry.name, "directory": directory, "size": size, "modified_ms": modified})
 }
 
-fn list(folder: &str, path: &str) -> Result<Value> {
-    let engine = engine(folder)?;
+fn list(engine: &Engine, path: &str) -> Result<Value> {
     let token = engine.open_file(path, false, true, false)?;
     let entries = engine.children(token, true);
     engine.close(token)?;
     Ok(Value::Array(entries?.iter().map(entry_json).collect()))
+}
+
+/// A handle that attaches to any draft of the file but needs none of its contents, so these work
+/// on a file the phone never downloaded, with no PC to ask.
+fn open_metadata(engine: &Engine, path: &str) -> Result<u64> {
+    engine.open_native_file(path, false, false, false, None, true)
+}
+
+/// Makes what the namespace calls just did durable. They leave it for the sealer thread to commit
+/// a moment later, and by then that thread may be frozen and the process killed. No file's draft
+/// comes along, as a half-written file is its own writer's to seal.
+fn sync_namespace(engine: &Engine) -> Result<()> {
+    engine
+        .store
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .sync_metadata()
+}
+
+fn create(engine: &Engine, path: &str, directory: bool) -> Result<()> {
+    let token = engine.open_file(path, true, directory, false)?;
+    engine.close(token)?;
+    sync_namespace(engine)
+}
+
+fn rename(engine: &Engine, from: &str, to: &str) -> Result<()> {
+    let token = open_metadata(engine, from)?;
+    let renamed = engine.rename(token, to, false);
+    let closed = engine.close(token);
+    renamed.and(closed)?;
+    sync_namespace(engine)
+}
+
+fn delete(engine: &Engine, path: &str) -> Result<()> {
+    delete_tree(engine, path)?;
+    sync_namespace(engine)
+}
+
+/// Android's Files app asks once for a directory, and expects what it holds to go with it.
+fn delete_tree(engine: &Engine, path: &str) -> Result<()> {
+    let token = open_metadata(engine, path)?;
+    let deleted = (|| {
+        let (entry, _) = engine.info(token)?;
+        ensure!(entry.id != ROOT, "ROOT_IMMUTABLE");
+        if entry.kind == EntryKind::Directory {
+            for child in engine.children(token, true)?.iter() {
+                delete_tree(
+                    engine,
+                    &format!("{}/{}", path.trim_end_matches('/'), child.name),
+                )?;
+            }
+        }
+        engine.cleanup(token, true)
+    })();
+    let closed = engine.close(token);
+    deleted.and(closed)
 }
 
 fn text(env: &mut JNIEnv, value: &JString) -> Result<String> {
@@ -191,7 +246,7 @@ pub extern "system" fn Java_dev_tkfs_Native_list(
     guard_string(&mut env, |env| {
         let folder = text(env, &folder)?;
         let path = text(env, &path)?;
-        Ok(list(&folder, &path)?.to_string())
+        Ok(list(&*engine(&folder)?, &path)?.to_string())
     })
 }
 
@@ -224,6 +279,20 @@ pub extern "system" fn Java_dev_tkfs_Native_open(
     })
 }
 
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_openToReplace(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    path: JString,
+) -> jlong {
+    guard(&mut env, -1, |env| {
+        let folder = text(env, &folder)?;
+        let path = text(env, &path)?;
+        Ok(engine(&folder)?.open_to_replace(&path)? as jlong)
+    })
+}
+
 /// Reads into `out`; hydrates missing chunks and blocks while it does, and asks for
 /// the chunks after them before the reader gets there.
 #[unsafe(no_mangle)]
@@ -249,6 +318,128 @@ pub extern "system" fn Java_dev_tkfs_Native_read(
         let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<i8>(), count) };
         env.set_byte_array_region(&out, 0, bytes)?;
         Ok(count as jint)
+    })
+}
+
+/// Writes from `data`. Writing part of a chunk that is not here hydrates it first, and fails with
+/// nothing changed if it cannot.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_write(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    token: jlong,
+    offset: jlong,
+    data: JByteArray,
+    size: jint,
+    append: jboolean,
+) -> jint {
+    guard(&mut env, -1, |env| {
+        let length = env.get_array_length(&data)?;
+        ensure!(
+            offset >= 0 && (0..=length).contains(&size),
+            "INVALID_PARAMETER: a write of {size} bytes at {offset} from {length}"
+        );
+        let folder = text(env, &folder)?;
+        let mut buffer = vec![0i8; size as usize];
+        env.get_byte_array_region(&data, 0, &mut buffer)?;
+        // SAFETY: i8 and u8 have the same layout, and this is all of `buffer`.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len()) };
+        let engine = engine(&folder)?;
+        Ok(engine.write(
+            token as u64,
+            offset as u64,
+            bytes,
+            append != JNI_FALSE,
+            false,
+        )? as jint)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_length(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    token: jlong,
+) -> jlong {
+    guard(&mut env, -1, |env| {
+        let folder = text(env, &folder)?;
+        Ok(engine(&folder)?.info(token as u64)?.1 as jlong)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_truncate(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    token: jlong,
+    size: jlong,
+) {
+    guard(&mut env, (), |env| {
+        ensure!(size >= 0, "INVALID_PARAMETER: a truncate to {size}");
+        let folder = text(env, &folder)?;
+        engine(&folder)?.truncate(token as u64, size as u64, false)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_sync(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    token: jlong,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        engine(&folder)?.flush(Some(token as u64))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_create(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    path: JString,
+    directory: jboolean,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        let path = text(env, &path)?;
+        create(&*engine(&folder)?, &path, directory != JNI_FALSE)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_rename(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    from: JString,
+    to: JString,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        let from = text(env, &from)?;
+        let to = text(env, &to)?;
+        rename(&*engine(&folder)?, &from, &to)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_delete(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    path: JString,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        let path = text(env, &path)?;
+        delete(&*engine(&folder)?, &path)
     })
 }
 
@@ -279,6 +470,7 @@ pub extern "system" fn Java_dev_tkfs_Native_faultForTest(mut env: JNIEnv, _: JCl
 mod tests {
     use super::*;
     use jni::{InitArgsBuilder, JNIVersion, JavaVM};
+    use tkfs::model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef};
 
     fn vm() -> &'static JavaVM {
         static VM: OnceLock<JavaVM> = OnceLock::new();
@@ -436,6 +628,193 @@ mod tests {
                 assert!(pending.contains("ORCHESTRATOR_NOT_READY"), "{pending}");
             }
         });
+    }
+
+    #[test]
+    fn a_write_outside_its_buffer_is_refused_before_anything_else() {
+        with_env(|env| {
+            for (offset, size) in [(0, 9), (0, -1), (-1, 8), (i64::MIN, 0), (0, i32::MAX)] {
+                let class = env.find_class("java/lang/Object").unwrap();
+                let folder = env.new_string("F").unwrap();
+                let data = env.new_byte_array(8).unwrap();
+                let value = Java_dev_tkfs_Native_write(
+                    unsafe { env.unsafe_clone() },
+                    class,
+                    folder,
+                    1,
+                    offset,
+                    data,
+                    size,
+                    JNI_FALSE,
+                );
+                assert_eq!(value, -1);
+                let pending = thrown(env);
+                assert!(
+                    pending.starts_with("java.io.IOException: INVALID_PARAMETER"),
+                    "{pending}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_write_of_the_whole_buffer_is_not_refused() {
+        with_env(|env| {
+            for size in [0, 8] {
+                let class = env.find_class("java/lang/Object").unwrap();
+                let folder = env.new_string("F").unwrap();
+                let data = env.new_byte_array(8).unwrap();
+                Java_dev_tkfs_Native_write(
+                    unsafe { env.unsafe_clone() },
+                    class,
+                    folder,
+                    1,
+                    0,
+                    data,
+                    size,
+                    JNI_FALSE,
+                );
+                // Past the check: this test process has no host.
+                let pending = thrown(env);
+                assert!(pending.contains("ORCHESTRATOR_NOT_READY"), "{pending}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_negative_truncate_is_refused_before_anything_else() {
+        with_env(|env| {
+            let class = env.find_class("java/lang/Object").unwrap();
+            let folder = env.new_string("F").unwrap();
+            Java_dev_tkfs_Native_truncate(unsafe { env.unsafe_clone() }, class, folder, 1, -1);
+            let pending = thrown(env);
+            assert!(
+                pending.starts_with("java.io.IOException: INVALID_PARAMETER"),
+                "{pending}"
+            );
+        });
+    }
+
+    /// An engine of its own, with no fetcher, so a call that needs a file's contents fails.
+    fn test_engine() -> (tempfile::TempDir, Arc<Engine>) {
+        let home = tempfile::tempdir().unwrap();
+        let engine = Engine::open(home.path(), None).unwrap();
+        (home, engine)
+    }
+
+    /// A large file the phone knows by name and never downloaded, not even its manifest.
+    fn never_downloaded(engine: &Engine, path: &str) {
+        let mut store = engine.store.lock().unwrap();
+        let mut state = store.create(path, EntryKind::File).unwrap();
+        let parent = store.projection().visible[&state.id].clone();
+        state.content = Some(
+            FileContentRef::new(
+                ContentKind::Manifest,
+                Digest::bytes(b"never here"),
+                4 * CHUNK_SIZE,
+            )
+            .unwrap(),
+        );
+        let branch = store.active.clone();
+        let event = store.event(&branch, state, vec![parent], tkfs::core::Operation::Content);
+        store.apply(&[event]).unwrap();
+    }
+
+    fn names(engine: &Engine, path: &str) -> Vec<String> {
+        let mut names: Vec<_> = list(engine, path)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap().to_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn code(error: anyhow::Error) -> String {
+        ErrorWire::from_error(&error).code
+    }
+
+    #[test]
+    fn a_namespace_change_is_durable_when_its_call_returns() {
+        let (_home, engine) = test_engine();
+        let durable = |engine: &Engine| engine.store.lock().unwrap().metadata_is_durable();
+        create(&engine, "/a b%#:é", true).unwrap();
+        assert!(durable(&engine));
+        create(&engine, "/a b%#:é/f.txt", false).unwrap();
+        assert!(durable(&engine));
+        rename(&engine, "/a b%#:é/f.txt", "/g.txt").unwrap();
+        assert!(durable(&engine));
+        delete(&engine, "/g.txt").unwrap();
+        assert!(durable(&engine));
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn create_refuses_a_name_that_is_taken_whatever_its_case() {
+        let (_home, engine) = test_engine();
+        create(&engine, "/Notes.txt", false).unwrap();
+        for path in ["/Notes.txt", "/NOTES.TXT"] {
+            assert_eq!(
+                code(create(&engine, path, false).unwrap_err()),
+                "ALREADY_EXISTS"
+            );
+        }
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_file_never_downloaded_renames_moves_and_deletes_with_no_one_to_ask() {
+        let (_home, engine) = test_engine();
+        never_downloaded(&engine, "/big.bin");
+        create(&engine, "/sub", true).unwrap();
+        rename(&engine, "/big.bin", "/renamed.bin").unwrap();
+        rename(&engine, "/renamed.bin", "/sub/renamed.bin").unwrap();
+        assert_eq!(names(&engine, "/"), ["sub"]);
+        assert_eq!(names(&engine, "/sub"), ["renamed.bin"]);
+        delete(&engine, "/sub/renamed.bin").unwrap();
+        assert!(names(&engine, "/sub").is_empty());
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn deleting_a_directory_takes_what_it_holds() {
+        let (_home, engine) = test_engine();
+        create(&engine, "/d", true).unwrap();
+        create(&engine, "/d/e", true).unwrap();
+        create(&engine, "/d/e/f.txt", false).unwrap();
+        never_downloaded(&engine, "/d/big.bin");
+        create(&engine, "/keep.txt", false).unwrap();
+        delete(&engine, "/d").unwrap();
+        assert_eq!(names(&engine, "/"), ["keep.txt"]);
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn the_root_is_not_deleted_and_nothing_in_it_goes_on_the_way() {
+        let (_home, engine) = test_engine();
+        create(&engine, "/keep.txt", false).unwrap();
+        assert_eq!(code(delete(&engine, "/").unwrap_err()), "ROOT_IMMUTABLE");
+        assert_eq!(names(&engine, "/"), ["keep.txt"]);
+        assert_eq!(
+            code(rename(&engine, "/", "/elsewhere").unwrap_err()),
+            "ROOT_IMMUTABLE"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
+    fn a_rename_onto_a_name_that_is_taken_changes_nothing() {
+        let (_home, engine) = test_engine();
+        create(&engine, "/a", false).unwrap();
+        create(&engine, "/b", false).unwrap();
+        assert_eq!(
+            code(rename(&engine, "/a", "/B").unwrap_err()),
+            "ALREADY_EXISTS"
+        );
+        assert_eq!(names(&engine, "/"), ["a", "b"]);
+        engine.shutdown().unwrap();
     }
 
     #[test]

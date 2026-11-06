@@ -403,14 +403,65 @@ class Device:
         finally:
             self.shell("rm", "-f", remote)
 
-    def content_write(self, doc: str, local_file: Path, bound: float = PROVIDER_BOUND) -> None:
-        """Replaces the document's bytes with `local_file`'s, through the provider."""
+    def content_write(self, doc: str, data: bytes, bound: float = PROVIDER_BOUND) -> None:
+        """Replaces the document's bytes with `data`, through the provider. `content write`
+        copies its stdin, which is the device's, so the bytes go there first."""
         remote = f"{REMOTE_TMP}/tkfs_e2e_upload"
-        self.adb("push", local_file, remote, bound=bound).require_success()
+        with tempfile.TemporaryDirectory(prefix="tkfs-e2e-") as local:
+            source = Path(local) / "upload"
+            source.write_bytes(data)
+            self.adb("push", source, remote, bound=bound).require_success()
         done = self._provider(f"content write --uri {shlex.quote(document_uri(doc))} < {remote}", bound=bound)
         self.shell("rm", "-f", remote)
         if done.code != 0 or done.err or done.out:
             raise ContentError(f"content write {doc}: {done.err or done.out}")
+
+    def document(self, operation: str, **request) -> dict:
+        """A document operation `content` has no way to ask for, done inside the app through
+        Android's own API, as another app would (debug builds only). The provider's refusal
+        raises ManageError, starting with its code."""
+        line = shell_line(["content", "call", "--uri", CONTROL_URI, "--method", "tkfs.document", "--arg", operation,
+                           "--extra", "payload:s:" + encode_payload(request)])
+        called = self._provider(line, bound=PROVIDER_BOUND)
+        return json.loads(parse_call(called.out or called.err))
+
+    def create_document(self, parent: str, name: str, mime: str = "application/octet-stream") -> str:
+        return self.document("create", parent=parent, name=name, mime=mime)["id"]
+
+    def rename_document(self, doc: str, name: str) -> str:
+        return self.document("rename", id=doc, name=name)["id"]
+
+    def move_document(self, doc: str, source_parent: str, target_parent: str) -> str:
+        return self.document("move", id=doc, **{"from": source_parent, "to": target_parent})["id"]
+
+    def delete_document(self, doc: str) -> None:
+        self.document("delete", id=doc)
+
+    def write_document(self, doc: str, mode: str, data: bytes, offset: int = 0, fsync: bool = False,
+                       close: bool = True) -> int:
+        """One write through a descriptor opened in `mode`. With `close` false the descriptor
+        stays open, for a kill to find or the document's next write to use. How many bytes it
+        wrote."""
+        return self.document("write", id=doc, mode=mode, offset=offset, fsync=fsync, close=close,
+                             data=base64.b64encode(data).decode("ascii"))["written"]
+
+    def changes_heard(self, directory: str) -> int:
+        """How many times Android told an observer of `directory`'s listing that it changed,
+        since the first time this asked. An open Files window is such an observer."""
+        return self.document("changes", id=directory)["count"]
+
+    def provider_log(self) -> list[str]:
+        """What the provider has logged since the last `clear_logcat`, a message per line."""
+        logged = self.adb("logcat", "-d", "-v", "raw", "-s", "tkfs:I").require_success().out
+        return logged.splitlines()
+
+    def releases(self, doc: str) -> int:
+        """How many descriptors of `doc` have been sealed and closed. A descriptor's close
+        returns to its owner before its release, which runs later in the provider."""
+        return self.provider_log().count(f"released {doc}")
+
+    def wait_release(self, doc: str, before: int, bound: float = PROVIDER_BOUND) -> None:
+        poll(bound, f"the release of {doc}", lambda: self.releases(doc) > before)
 
     def ui_dump(self, bound: float = UI_BOUND) -> ET.Element:
         """The current screen's view tree. uiautomator refuses a screen that is still moving."""
@@ -687,6 +738,13 @@ class PcHost:
         """`tkfs --state STATE ARGS`: its raw output."""
         return self._tkfs("--state", state, *args, bound=bound).require_success().stdout
 
+    def pc_has(self, state: str, path: str) -> bool:
+        """Whether the file or directory is there on the PC."""
+        done = self._tkfs("--state", state, "rpc", "lookup", json.dumps({"path": path}))
+        if done.code != 0 and "NOT_FOUND" not in done.err + done.out:
+            done.require_success()
+        return done.code == 0
+
     def pc_cat(self, state: str, path: str) -> bytes:
         """The file's bytes on the PC. `cat` takes files up to 3 MiB (CAT_MAX_BYTES)."""
         return self.folder(state, "cat", path)
@@ -906,6 +964,17 @@ class Session:
         result = reply["folders"][0]
         self.check("sync-now finishes with no error", result["error"] is None and result["exchanged"] >= 1, result)
         return result
+
+    def sync_with_the_pc_back(self, folder: Folder) -> dict:
+        """A burst, once a PC that was just started or an app that was just killed can take one."""
+
+        def exchanged():
+            reply = self.device.shell_manage("sync-now", {"state": folder.id}, bound=SYNC_BOUND)["folders"][0]
+            if reply["error"] is not None or reply["exchanged"] < 1:
+                raise HarnessError(f"sync-now: {reply}")
+            return reply
+
+        return poll(SYNC_BOUND, "a burst that reaches the PC", exchanged, interval=2)
 
     def tree(self, folder: Folder) -> dict[str, dict[str, str]]:
         """Every document of the folder by path, by listing every directory."""

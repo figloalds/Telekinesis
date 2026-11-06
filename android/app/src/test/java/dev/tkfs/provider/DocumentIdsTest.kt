@@ -50,6 +50,30 @@ class DocumentIdsTest {
         assertFalse(DocumentIds.isChild("F:/", "G:/x"))
     }
 
+    @Test fun aDocumentsParentIsTheDirectoryAboveIt() {
+        assertEquals("F:/", DocumentIds.parent("F:/x"))
+        assertEquals("F:/a", DocumentIds.parent("F:/a/b:c d"))
+        assertEquals("F:/a/b", DocumentIds.parent("F:/a/b/c"))
+    }
+
+    @Test fun aRootIsItsOwnParent() {
+        assertEquals("F:/", DocumentIds.parent("F:/"))
+    }
+
+    @Test fun aHardNameIsAName() {
+        for (name in listOf("a b%#:é.txt", "...", "..a", "a..", ".profile", " ")) {
+            assertEquals(name, DocumentIds.requireName(name))
+        }
+    }
+
+    /** A separator would put the file somewhere else, and the core treats a backslash as one. */
+    @Test fun whatIsNotANameIsRefusedWithItsCode() {
+        for (name in listOf("", ".", "..", "a/b", "/", "a\\b", "\\", "a\u0000b")) {
+            val thrown = assertThrows(name, FileNotFoundException::class.java) { DocumentIds.requireName(name) }
+            assertEquals(name, "INVALID_NAME", thrown.message?.substringBefore(':'))
+        }
+    }
+
     /** A tree grant on /a must not reach /b through a dot-dot. */
     @Test fun aPathThatClimbsOutIsNotAChild() {
         assertFalse(DocumentIds.isChild("F:/a", "F:/a/../b"))

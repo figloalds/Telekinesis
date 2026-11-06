@@ -2135,3 +2135,254 @@ fn failed_shutdown_retries_preserve_scratch_for_startup_recovery() -> Result<()>
     recovered.shutdown()?;
     Ok(())
 }
+
+/// A file this store knows by name, with its bytes on a peer: only the first `held` of its
+/// `chunks` chunks are here, and its manifest only if `manifest` says so. A file of one chunk
+/// has no manifest. Returns the entity and the bytes of each chunk.
+fn seed_file_on_a_peer(
+    store: &mut Store,
+    name: &str,
+    chunks: u64,
+    held: u64,
+    manifest: bool,
+) -> Result<(String, Vec<Vec<u8>>)> {
+    use crate::content::{Kind, Manifest};
+    use crate::model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef};
+    let mut state = store.create(name, EntryKind::File)?;
+    let entity = state.id.clone();
+    let parent = store.projection().visible[&entity].clone();
+    let mut bytes = Vec::new();
+    let mut digests = Vec::new();
+    for index in 0..chunks {
+        let mut chunk = vec![index as u8 + 1; CHUNK_SIZE as usize];
+        chunk[..name.len()].copy_from_slice(name.as_bytes());
+        digests.push(if index < held {
+            store.content.packs.put(Kind::Chunk, &chunk)?
+        } else {
+            Digest::bytes(&chunk)
+        });
+        bytes.push(chunk);
+    }
+    let len = chunks * CHUNK_SIZE;
+    let reference = if chunks == 1 {
+        FileContentRef::new(ContentKind::Direct, digests[0], len)?
+    } else {
+        let encoded = Manifest {
+            len,
+            chunks: digests,
+        }
+        .encode()?;
+        let digest = if manifest {
+            store.content.packs.put(Kind::Manifest, &encoded)?
+        } else {
+            Digest::bytes(&encoded)
+        };
+        FileContentRef::new(ContentKind::Manifest, digest, len)?
+    };
+    state.content = Some(reference);
+    store.content.packs.flush()?;
+    let event = store.event(
+        &store.active.clone(),
+        state,
+        vec![parent],
+        Operation::Content,
+    );
+    store.apply(&[event])?;
+    store.sync_metadata()?;
+    Ok((entity, bytes))
+}
+
+/// What a real restart does: a new store and working layer, and no fetcher, which a worker
+/// only gets once its engine is open.
+fn recover_after_a_crash(root: &std::path::Path) -> Result<(Mutex<Store>, WorkingLayer, usize)> {
+    let store = Mutex::new(Store::open(root, None)?);
+    let layer = WorkingLayer::new(root, lock(&store).content.clone())?;
+    let recovered = recover(&store, &layer)?;
+    Ok((store, layer, recovered))
+}
+
+fn file_bytes(store: &Store, name: &str) -> Result<Vec<u8>> {
+    let content = store.lookup(name)?.content.unwrap();
+    let mut bytes = vec![0; content.total_len as usize];
+    store.content.read_range(&content, 0, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// A phone edits one spot of a large file and dies before the seal. Sealing must not need the
+/// chunks it never touched: at this point nothing can fetch them, and a failure here would keep
+/// the folder from ever opening again.
+#[test]
+fn a_draft_over_chunks_that_are_not_here_recovers_without_them() -> Result<()> {
+    use crate::model::content::{CHUNK_SIZE, Digest};
+    let root = tempfile::tempdir()?;
+    let (entity, chunks) = {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, chunks) = seed_file_on_a_peer(&mut metadata, "big", 4, 1, true)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open(metadata.basis(&entity)?, true)?;
+        lock(&draft).write(layer.content(), 10, b"edit", false, false)?;
+        (entity, chunks)
+    };
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1);
+    let metadata = lock(&store);
+    let content = metadata.entry(&entity)?.content.unwrap();
+    assert_eq!(content.total_len, 4 * CHUNK_SIZE);
+    let mut first = chunks[0].clone();
+    first[10..14].copy_from_slice(b"edit");
+    let digests = metadata.content.chunks(&content)?;
+    assert_eq!(digests[0], Digest::bytes(&first));
+    for index in 1..4 {
+        assert_eq!(
+            digests[index],
+            Digest::bytes(&chunks[index]),
+            "chunk {index} is not the one the file had"
+        );
+    }
+    Ok(())
+}
+
+/// `wt` with the PC away: nothing of the old file is needed, and nothing can be fetched.
+#[test]
+fn replacing_a_file_never_downloaded_asks_for_nothing() -> Result<()> {
+    use crate::runtime::Engine;
+    for (name, chunks) in [("direct", 1), ("manifest", 4)] {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        seed_file_on_a_peer(&mut lock(&engine.store), name, chunks, 0, false)?;
+        let token = engine.open_to_replace(name)?;
+        engine.truncate(token, 0, false)?;
+        assert_eq!(engine.info(token)?.1, 0);
+        assert_eq!(engine.write(token, 0, b"new", false, false)?, 3);
+        engine.flush(Some(token))?;
+        engine.write(token, 3, b" bytes", false, false)?;
+        engine.flush(Some(token))?;
+        engine.close(token)?;
+        assert_eq!(file_bytes(&lock(&engine.store), name)?, b"new bytes");
+        engine.shutdown()?;
+    }
+    Ok(())
+}
+
+/// The same, dying before the seal, for a new file shorter than, as long as and longer than the
+/// old one, and when the draft's timestamp cannot tell it from a clean one.
+#[test]
+fn a_draft_cut_to_nothing_recovers_without_the_file_it_replaced() -> Result<()> {
+    let old_len = 4 * crate::model::content::CHUNK_SIZE as usize;
+    for len in [5, old_len, old_len + 5] {
+        for coarse_clock in [false, true] {
+            let root = tempfile::tempdir()?;
+            let bytes = vec![7; len];
+            {
+                let mut metadata = Store::open(root.path(), None)?;
+                let (entity, _) = seed_file_on_a_peer(&mut metadata, "big", 4, 0, false)?;
+                let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+                let draft = layer.open_to_replace(metadata.basis(&entity)?)?;
+                let mut draft = lock(&draft);
+                draft.truncate(0)?;
+                draft.write(layer.content(), 0, &bytes, false, false)?;
+                if coarse_clock {
+                    draft.record.modified_ns = modified_ns(draft.file()?)? + 86_400_000_000_000;
+                    draft.persist_record()?;
+                }
+            }
+            let (store, layer, recovered) = recover_after_a_crash(root.path())?;
+            assert_eq!(recovered, 1, "{len} bytes, coarse clock {coarse_clock}");
+            assert_eq!(file_bytes(&lock(&store), "big")?, bytes);
+            drop((store, layer));
+            assert_eq!(recover_after_a_crash(root.path())?.2, 0);
+        }
+    }
+    Ok(())
+}
+
+/// Dying inside the truncate, whichever side of its durable record: the store still opens.
+#[test]
+fn a_kill_during_a_truncating_open_leaves_a_store_that_opens() -> Result<()> {
+    for record_written in [true, false] {
+        let root = tempfile::tempdir()?;
+        {
+            let mut metadata = Store::open(root.path(), None)?;
+            let (entity, _) = seed_file_on_a_peer(&mut metadata, "big", 4, 0, false)?;
+            let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+            let draft = layer.open_to_replace(metadata.basis(&entity)?)?;
+            let mut draft = lock(&draft);
+            draft.truncate(0)?;
+            if !record_written {
+                draft.record.base_visible_len = Some(4 * crate::model::content::CHUNK_SIZE);
+                draft.persist_record()?;
+            }
+        }
+        let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+        assert_eq!(recovered, 1, "record written: {record_written}");
+        assert!(file_bytes(&lock(&store), "big")?.is_empty());
+    }
+    Ok(())
+}
+
+/// `rw` with the PC away: writing part of a chunk that is not here fails, the file stays as it
+/// was, and nothing is left for the sealer or for a restart to turn into a version.
+#[test]
+fn a_partial_write_over_a_chunk_not_here_fails_and_changes_nothing() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    for (name, chunks, manifest) in [("direct", 1, false), ("sparse", 4, true)] {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut lock(&engine.store), name, chunks, 0, manifest)?;
+        let before = lock(&engine.store).basis(&entity)?;
+        let token = engine.open_file(name, false, false, true)?;
+        let error = format!(
+            "{:#}",
+            engine.write(token, 5, b"part", false, false).unwrap_err()
+        );
+        assert!(error.starts_with("OBJECT_MISSING"), "{error}");
+        assert_eq!(engine.info(token)?.1, chunks * CHUNK_SIZE);
+        engine.flush(Some(token))?;
+        engine.close(token)?;
+        let after = lock(&engine.store).basis(&entity)?;
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.content, before.content);
+        engine.shutdown()?;
+        drop(engine);
+
+        // The same failed write, and then no orderly stop.
+        let root = tempfile::tempdir()?;
+        let entity = {
+            let mut metadata = Store::open(root.path(), None)?;
+            let (entity, _) = seed_file_on_a_peer(&mut metadata, name, chunks, 0, manifest)?;
+            let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+            let draft = layer.open(metadata.basis(&entity)?, true)?;
+            assert!(
+                lock(&draft)
+                    .write(layer.content(), 5, b"part", false, false)
+                    .is_err()
+            );
+            entity
+        };
+        let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+        assert_eq!(recovered, 0, "{name}");
+        assert_eq!(
+            lock(&store).entry(&entity)?.content.unwrap().total_len,
+            chunks * CHUNK_SIZE
+        );
+    }
+    Ok(())
+}
+
+/// The file's manifest is not here, so `rw` cannot start: the open fails, and leaves nothing.
+#[test]
+fn opening_for_part_of_a_file_whose_manifest_is_not_here_fails_and_leaves_nothing() -> Result<()> {
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    seed_file_on_a_peer(&mut lock(&engine.store), "big", 4, 0, false)?;
+    let error = format!(
+        "{:#}",
+        engine.open_file("big", false, false, true).unwrap_err()
+    );
+    assert!(error.starts_with("OBJECT_MISSING"), "{error}");
+    assert!(engine.writable_tokens().is_empty());
+    engine.shutdown()?;
+    Ok(())
+}

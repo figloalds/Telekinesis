@@ -12,6 +12,7 @@ class RecoveringReaderTest {
         val readFailures = failures.toMutableList()
         val openFailures = mutableListOf<String>()
         val closeFailures = mutableListOf<String>()
+        val lengthFailures = mutableListOf<String>()
         private var next = 100L
 
         override fun open(): Long {
@@ -29,6 +30,12 @@ class RecoveringReaderTest {
             return size
         }
 
+        override fun length(token: Long): Long {
+            calls += "length $token"
+            lengthFailures.removeFirstOrNull()?.let { throw IOException(it) }
+            return 1234
+        }
+
         override fun close(token: Long) {
             calls += "close $token"
             closeFailures.removeFirstOrNull()?.let { throw IOException(it) }
@@ -36,6 +43,27 @@ class RecoveringReaderTest {
     }
 
     private val buffer = ByteArray(8)
+
+    @Test fun theLengthIsAskedOfTheCurrentToken() {
+        val document = FakeDocument()
+        assertEquals(1234, RecoveringReader(document).length())
+        assertEquals(listOf("open", "length 100"), document.calls)
+    }
+
+    @Test fun aStaleTokenIsReplacedForTheLengthToo() {
+        val document = FakeDocument()
+        document.lengthFailures += "INVALID_HANDLE"
+        assertEquals(1234, RecoveringReader(document).length())
+        assertEquals(listOf("open", "length 100", "close 100", "open", "length 101"), document.calls)
+    }
+
+    @Test fun anyOtherFailureFailsTheLengthAndKeepsTheHandle() {
+        val document = FakeDocument()
+        document.lengthFailures += "NATIVE_PANIC: boom"
+        val reader = RecoveringReader(document)
+        assertThrows(IOException::class.java) { reader.length() }
+        assertEquals(listOf("open", "length 100"), document.calls)
+    }
 
     @Test fun aReadUsesTheTokenItOpened() {
         val document = FakeDocument()

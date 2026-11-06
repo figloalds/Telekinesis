@@ -1054,6 +1054,15 @@ impl LocalContent {
         drop(root_pin);
         Ok(pin)
     }
+    /// [`Self::pin`] for a draft that shows `visible` bytes of `reference`. One that shows
+    /// none needs nothing of it, so this asks for nothing: its manifest may never have been
+    /// here.
+    pub fn pin_visible(&self, reference: &FileContentRef, visible: u64) -> Result<Pin> {
+        if visible == 0 {
+            return Ok(self.packs.pin([reference.digest]));
+        }
+        self.pin(reference)
+    }
     pub fn import(&self, bytes: &[u8]) -> Result<FileContentRef> {
         let chunks = if bytes.is_empty() {
             vec![self.packs.put(Kind::Chunk, &[])?]

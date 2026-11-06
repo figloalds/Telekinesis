@@ -30,8 +30,43 @@ object Native {
     @JvmStatic @Throws(IOException::class)
     external fun read(folder: String, token: Long, offset: Long, out: ByteArray, size: Int): Int
 
+    /**
+     * A handle for writing, whose next call is `truncate(folder, token, 0)`. With the old contents
+     * going, none of them is asked for, so this works on a file the phone never downloaded and
+     * with no PC to ask.
+     */
+    @JvmStatic @Throws(IOException::class)
+    external fun openToReplace(folder: String, path: String): Long
+
+    /** Writes `size` bytes of `data` at `offset`, or at the end if `append`; how many it wrote. */
+    @JvmStatic @Throws(IOException::class)
+    external fun write(folder: String, token: Long, offset: Long, data: ByteArray, size: Int, append: Boolean): Int
+
+    /** What the handle sees as the file's length now. */
+    @JvmStatic @Throws(IOException::class)
+    external fun length(folder: String, token: Long): Long
+
+    @JvmStatic @Throws(IOException::class)
+    external fun truncate(folder: String, token: Long, size: Long)
+
+    /** Makes everything written through the handle durable: `Engine::flush(Some(token))`. */
+    @JvmStatic @Throws(IOException::class)
+    external fun sync(folder: String, token: Long)
+
     @JvmStatic @Throws(IOException::class)
     external fun close(folder: String, token: Long)
+
+    /** Each of these is durable when it returns: the app may be frozen or killed right after. */
+    @JvmStatic @Throws(IOException::class)
+    external fun create(folder: String, path: String, directory: Boolean)
+
+    /** Renames or moves within the folder. Downloads nothing, and fails if `to` exists. */
+    @JvmStatic @Throws(IOException::class)
+    external fun rename(folder: String, from: String, to: String)
+
+    /** Deletes a file or a directory with all it holds. Downloads nothing. */
+    @JvmStatic @Throws(IOException::class)
+    external fun delete(folder: String, path: String)
 
     /** Always throws: a panic with a Java exception pending. See `ShellControl`. */
     @JvmStatic @Throws(IOException::class)

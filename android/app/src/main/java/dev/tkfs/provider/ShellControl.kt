@@ -1,12 +1,20 @@
 package dev.tkfs.provider
 
 import android.content.Context
+import android.database.ContentObserver
+import android.os.Binder
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import dev.tkfs.Native
 import dev.tkfs.Settings
 import org.json.JSONArray
+import org.json.JSONObject
+import java.io.FileOutputStream
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.util.Base64
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * How the end-to-end harness drives the app from outside:
@@ -22,8 +30,15 @@ internal object ShellControl {
     private const val MANAGE = "tkfs.manage"
     private const val FAULT = "tkfs.fault"
     private const val SET_LAST_SYNC = "tkfs.set_last_sync"
+    private const val DOCUMENT = "tkfs.document"
     private const val ROOT_UID = 0
     private const val SHELL_UID = 2000
+
+    /** Descriptors a `write` was told to leave open, by document, for a kill to find or the next `write` to use. */
+    private val leftOpen = HashMap<String, ParcelFileDescriptor>()
+
+    /** How many changes Android told of in each directory's listing, since `changes` first asked. */
+    private val heard = HashMap<String, AtomicInteger>()
 
     fun admits(debugBuild: Boolean, callingUid: Int): Boolean =
         debugBuild && (callingUid == SHELL_UID || callingUid == ROOT_UID)
@@ -47,7 +62,75 @@ internal object ShellControl {
             for (index in 0 until folders.length()) settings.setLastSyncMs(folders.getJSONObject(index).getString("id"), ms)
             "{}"
         }
+        // What `content` cannot do, the way another app would: `--arg OPERATION`, and a payload.
+        DOCUMENT -> reply {
+            val operation = arg ?: throw IOException("MISSING_ARGUMENT: operation")
+            val request = JSONObject(payload(extras?.getString("payload")))
+            // Android checks the caller of each of these, and it should see the app, not the shell.
+            val shell = Binder.clearCallingIdentity()
+            try {
+                document(context, operation, request).toString()
+            } finally {
+                Binder.restoreCallingIdentity(shell)
+            }
+        }
         else -> null
+    }
+
+    private fun document(context: Context, operation: String, request: JSONObject): JSONObject {
+        val resolver = context.contentResolver
+        fun uri(key: String) = DocumentsContract.buildDocumentUri(TkfsProvider.AUTHORITY, request.getString(key))
+        fun made(uri: android.net.Uri?) = JSONObject().put("id", uri?.let(DocumentsContract::getDocumentId))
+        return when (operation) {
+            "create" -> made(
+                DocumentsContract.createDocument(resolver, uri("parent"), request.getString("mime"), request.getString("name")),
+            )
+            "rename" -> made(DocumentsContract.renameDocument(resolver, uri("id"), request.getString("name")))
+            "move" -> made(DocumentsContract.moveDocument(resolver, uri("id"), uri("from"), uri("to")))
+            "delete" -> {
+                DocumentsContract.deleteDocument(resolver, uri("id"))
+                JSONObject()
+            }
+            "write" -> write(context, request)
+            "changes" -> JSONObject().put("count", heardIn(context, request.getString("id")).get())
+            else -> throw IOException("UNSUPPORTED_OPERATION: $operation")
+        }
+    }
+
+    private fun heardIn(context: Context, directory: String): AtomicInteger = synchronized(heard) {
+        heard.getOrPut(directory) {
+            val count = AtomicInteger()
+            val listing = DocumentsContract.buildChildDocumentsUri(TkfsProvider.AUTHORITY, directory)
+            context.contentResolver.registerContentObserver(listing, false, object : ContentObserver(null) {
+                override fun onChange(selfChange: Boolean) {
+                    count.incrementAndGet()
+                }
+            })
+            count
+        }
+    }
+
+    /**
+     * Writes once at `offset` through a real descriptor, fsyncs if asked, and closes unless told
+     * not to. The descriptor is the one left open for this document, or a new one in `mode`.
+     */
+    private fun write(context: Context, request: JSONObject): JSONObject {
+        val id = request.getString("id")
+        val uri = DocumentsContract.buildDocumentUri(TkfsProvider.AUTHORITY, id)
+        val data = Base64.getDecoder().decode(request.getString("data"))
+        val descriptor = synchronized(leftOpen) { leftOpen.remove(id) }
+            ?: context.contentResolver.openFileDescriptor(uri, request.getString("mode"))
+            ?: throw IOException("UNKNOWN_ERROR: no descriptor for $uri")
+        var close = true
+        try {
+            val written = FileOutputStream(descriptor.fileDescriptor).channel
+                .write(ByteBuffer.wrap(data), request.getLong("offset"))
+            if (request.getBoolean("fsync")) descriptor.fileDescriptor.sync()
+            close = request.getBoolean("close")
+            return JSONObject().put("written", written)
+        } finally {
+            if (close) descriptor.close() else synchronized(leftOpen) { leftOpen[id] = descriptor }
+        }
     }
 
     /** `content call` refuses an extra with a colon in its value, so JSON comes as base64. */

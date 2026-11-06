@@ -33,7 +33,13 @@ fn prepare(
 ) -> Result<FileContentRef> {
     scratch.materialize()?;
     let content = layer.content();
-    let old = content.chunks(&scratch.record.basis.content)?;
+    // A draft that shows nothing of its base keeps none of its chunks, and the base's
+    // manifest may never have been here.
+    let old = if scratch.base_visible_len == 0 {
+        Vec::new()
+    } else {
+        content.chunks(&scratch.record.basis.content)?
+    };
     let len = scratch.len()?;
     let mut chunks = Vec::new();
     for index in 0..len.div_ceil(CHUNK_SIZE) {
@@ -298,15 +304,18 @@ pub fn recover(store: &Mutex<Store>, layer: &WorkingLayer) -> Result<usize> {
             .write(true)
             .open(&path)?;
         let stamp = modified_ns(&file)?;
+        let file_len = file.metadata()?.len();
         // Capture the original overlay before rebasing to a committed receipt.
         // Bytes appended beyond that old base are materialized host bytes, not
-        // missing ranges to refill from the receipt's older content.
+        // missing ranges to refill from the receipt's older content. A file shorter
+        // than its boundary was cut before the record could say so.
         let mut base_visible_len = record
             .base_visible_len
-            .unwrap_or(record.basis.content.total_len);
+            .unwrap_or(record.basis.content.total_len)
+            .min(file_len);
         record.base_visible_len = Some(base_visible_len);
-        for index in record.basis.content.total_len.div_ceil(CHUNK_SIZE)
-            ..file.metadata()?.len().div_ceil(CHUNK_SIZE)
+        for index in
+            record.basis.content.total_len.div_ceil(CHUNK_SIZE)..file_len.div_ceil(CHUNK_SIZE)
         {
             record.hydrated.insert(index);
         }
@@ -339,15 +348,23 @@ pub fn recover(store: &Mutex<Store>, layer: &WorkingLayer) -> Result<usize> {
             std::fs::remove_file(path.with_extension("json"))?;
             continue;
         }
+        // Only what the draft holds overrides its base. The rest keeps the chunks it had,
+        // which need not be here: no fetcher exists yet, and a seal that needed one would
+        // keep this store from ever opening.
         let mut dirty = crate::content::working::DirtyBitmap::default();
-        dirty.mark(0, file.metadata()?.len());
-        let pin = layer.content().pin(&record.basis.content)?;
+        for index in &record.hydrated {
+            dirty.mark(index * CHUNK_SIZE, CHUNK_SIZE);
+        }
+        dirty.mark(base_visible_len, file_len.saturating_sub(base_visible_len));
+        let pin = layer
+            .content()
+            .pin_visible(&record.basis.content, base_visible_len)?;
         let hydrated = record.hydrated.clone();
         let scratch = Arc::new(Mutex::new(Scratch {
             modified_time: Some(file_write_time(&file)?),
             explicit_modified_time: false,
             automatic_time_current: false,
-            length: file.metadata()?.len(),
+            length: file_len,
             base_visible_len,
             hydrated,
             hydration_pending: false,
@@ -380,7 +397,10 @@ fn scratch_matches(
     if file.metadata()?.len() != reference.total_len {
         return Ok(false);
     }
-    let chunks = layer.content().chunks(reference)?;
+    // Bytes that cannot be compared are not discarded.
+    let Ok(chunks) = layer.content().chunks(reference) else {
+        return Ok(false);
+    };
     for (index, digest) in chunks.iter().enumerate() {
         let offset = index as u64 * CHUNK_SIZE;
         if !record.hydrated.contains(&(index as u64))

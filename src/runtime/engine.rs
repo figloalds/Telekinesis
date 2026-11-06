@@ -413,6 +413,21 @@ impl Engine {
         open_timing(1, started);
         self.insert_handle(entry, basis, writable, false, metadata_only)
     }
+    /// Opens a file for writing, to cut it to nothing: the caller's next call is
+    /// `truncate(token, 0, false)`, and if that fails it closes the handle. With the old
+    /// contents going none of them is asked for, so this works with no peer to ask on a
+    /// file whose manifest has never been here.
+    pub fn open_to_replace(&self, path: &str) -> Result<u64> {
+        ensure!(!self.stopping.load(Ordering::Acquire), "STOPPING");
+        let (entry, basis) = {
+            let store = lock(&self.store);
+            let entry = store.lookup(path)?;
+            let basis = store.basis(&entry.id)?;
+            (entry, basis)
+        };
+        let scratch = self.working.open_to_replace(basis)?;
+        Ok(self.add_handle(entry, Some(scratch), true))
+    }
     pub fn open_bound(&self, entry: Entry, basis: Basis, writable: bool) -> Result<u64> {
         ensure!(!self.stopping.load(Ordering::Acquire), "STOPPING");
         ensure!(
@@ -446,6 +461,16 @@ impl Engine {
             .flatten();
         open_timing(2, started);
         let started = std::time::Instant::now();
+        let token = self.add_handle(entry, scratch, writable);
+        open_timing(3, started);
+        Ok(token)
+    }
+    fn add_handle(
+        &self,
+        entry: Entry,
+        scratch: Option<Arc<Mutex<Scratch>>>,
+        writable: bool,
+    ) -> u64 {
         let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.handles.write().unwrap().insert(
             token,
@@ -459,8 +484,7 @@ impl Engine {
                 read_ahead: Mutex::new(ReadAhead::default()),
             }),
         );
-        open_timing(3, started);
-        Ok(token)
+        token
     }
     pub fn handle(&self, token: u64) -> Result<Arc<Handle>> {
         self.handles

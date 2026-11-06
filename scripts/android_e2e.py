@@ -28,7 +28,7 @@ import time
 import traceback
 from typing import Callable
 
-from android_e2e_lib import (BUILD_BOUND, CONTROL_URI, DEFAULT_AVD, DIRECTORY_MIME, PACKAGE, ROOT, ROOTS_URI,
+from android_e2e_lib import (BUILD_BOUND, CONTROL_URI, DEFAULT_AVD, DIRECTORY_MIME, FOLDER_READY_BOUND, PACKAGE, ROOT, ROOTS_URI,
                              ContentError, Device, Emulator, Folder, HarnessError, ManageError, PcHost, Report,
                              Session, SYNC_BOUND, UI_BOUND, children_uri, document_uri, poll, run_bounded, sha256, with_parents)
 from build_android import APK, find_sdk
@@ -88,7 +88,6 @@ def scenario_read(s: Session) -> None:
             f"{before} -> {downloaded} pack bytes")
     check_listing_downloads_nothing(s, folder, "after the reads")
 
-    check_writes_refused(s, folder)
     check_cold_start(s, folder, "photo.png")
 
 
@@ -103,20 +102,6 @@ def check_listing_downloads_nothing(s: Session, folder: Folder, when: str) -> di
     s.check(f"listing every directory {when} downloads nothing", after == before,
             f"{before} -> {after} pack bytes")
     return tree
-
-
-def check_writes_refused(s: Session, folder: Folder) -> None:
-    """Until the provider takes writes."""
-    source = s.pc.home / "refused-write"
-    source.write_bytes(b"not for the provider")
-    try:
-        s.device.content_write(folder.doc("notes.txt"), source)
-        refused = ""
-    except ContentError as error:
-        refused = str(error)
-    s.check("a write is refused while the provider is read-only", "READ_ONLY" in refused, refused[:300])
-    s.check("the refused write changed nothing", s.device.content_read(folder.doc("notes.txt"))
-            == folder.files["notes.txt"])
 
 
 def check_cold_start(s: Session, folder: Folder, path: str) -> None:
@@ -384,9 +369,322 @@ def scenario_speed(s: Session) -> None:
             f"{rate:.1f} MiB/s ({took:.2f} s) over the emulator's network, not Wi-Fi; {cached:.1f} MiB/s read again")
 
 
+# The flags Android gives these in DocumentsContract.
+FLAG_WRITE, FLAG_DELETE, FLAG_DIR_CREATE, FLAG_RENAME, FLAG_MOVE = 2, 4, 8, 64, 256
+FILE_FLAGS = FLAG_WRITE | FLAG_DELETE | FLAG_RENAME | FLAG_MOVE
+DIRECTORY_FLAGS = FLAG_DIR_CREATE | FLAG_DELETE | FLAG_RENAME | FLAG_MOVE
+ROOT_SUPPORTS_CREATE, ROOT_SUPPORTS_IS_CHILD = 1, 16
+
+RENAMED_HARD_NAME = "é r%#:enomeado.txt"
+# Larger than a chunk, so it has a manifest and the phone has to fetch that too.
+LARGE_FILE_BYTES = 300 * 1024
+
+
+def refusal(call: Callable[[], object]) -> str:
+    """What the provider refused `call` with; empty if it did not."""
+    try:
+        call()
+    except (ManageError, ContentError) as error:
+        return str(error)
+    return ""
+
+
+def names_in(s: Session, doc: str) -> dict[str, dict[str, str]]:
+    return {row["_display_name"]: row for row in s.device.content_query(children_uri(doc))}
+
+
+def check_on_pc(s: Session, folder: Folder, path: str, content: bytes, what: str) -> None:
+    s.sync_now(folder)
+    on_pc = s.pc.pc_cat(folder.pc_state, path)
+    s.check(f"{what}: the PC has it after a burst", on_pc == content,
+            f"{len(on_pc)} of {len(content)} bytes, {sha256(on_pc)}")
+
+
+def scenario_write(s: Session) -> None:
+    """Acceptance 11 and Review Focus 1 and 2: what apps do to files through the provider, each
+    checked on the PC. It never mounts anything; a real write goes through a descriptor."""
+    large = random.Random(13)
+    files = {
+        "from-pc.txt": b"Written on the PC.\n",
+        "sub/below.txt": b"Below a directory.\n",
+        "kill-after-release.txt": b"Before the kill.\n",
+        "kill-while-open.txt": b"Before the kill, while open.\n",
+        "kill-while-open.bin": large.randbytes(LARGE_FILE_BYTES),
+        "restart-while-open.txt": b"0123456789 before the restart.\n",
+        "replaced-away.bin": large.randbytes(LARGE_FILE_BYTES),
+        "replaced-away.txt": b"A small file nobody read.\n",
+        "edited-away.bin": large.randbytes(LARGE_FILE_BYTES),
+        "edited-away.txt": b"A small file nobody read, either.\n",
+    }
+    folder = s.folder_with(files)
+    check_write_flags(s, folder)
+    # First, while what the others write does not count as files on the phone.
+    check_the_pc_away(s, folder)
+    check_names_and_the_namespace(s, folder)
+    check_the_open_modes(s, folder)
+    check_open_listings_hear_of_changes(s, folder)
+    check_a_kill_after_a_release(s, folder)
+    check_a_kill_while_open(s, folder)
+    check_a_worker_restart_while_open(s, folder)
+
+
+def check_write_flags(s: Session, folder: Folder) -> None:
+    device = s.device
+    root = device.content_query(ROOTS_URI)[0]
+    s.check("the root says it can create", int(root["flags"]) == ROOT_SUPPORTS_CREATE | ROOT_SUPPORTS_IS_CHILD, root)
+    own = device.content_query(document_uri(folder.doc()))[0]
+    s.check("a folder's root can only be created in", int(own["flags"]) == FLAG_DIR_CREATE, own)
+    names = names_in(s, folder.doc())
+    s.check("a file can be written, deleted, renamed and moved", int(names["from-pc.txt"]["flags"]) == FILE_FLAGS,
+            names["from-pc.txt"])
+    s.check("a directory can be created in, deleted, renamed and moved", int(names["sub"]["flags"]) == DIRECTORY_FLAGS,
+            names["sub"])
+
+
+def check_names_and_the_namespace(s: Session, folder: Folder) -> None:
+    """Create through `content write`, edit, rename, move and delete, all with hard names."""
+    device, pc = s.device, s.pc
+    first, second = "Primeira versão.\n".encode() * 200, "Segunda.\n".encode()
+
+    doc = device.create_document(folder.doc(), HARD_NAME, "text/plain")
+    s.check("a hard name is created with the id the provider promised", doc == folder.doc(HARD_NAME), doc)
+    device.content_write(doc, first)
+    opened = [line for line in device.provider_log() if line.startswith(f"open {doc} ")]
+    s.check("`content write` opens the document in mode w", opened == [f"open {doc} w"], opened)
+    s.check("what it wrote reads back", device.content_read(doc) == first)
+    s.check("and lists with its name and size", names_in(s, folder.doc())[HARD_NAME]["_size"] == str(len(first)))
+    check_on_pc(s, folder, HARD_NAME, first, "a created file")
+
+    device.content_write(doc, second)
+    s.check("a shorter `content write` leaves no tail of the longer one", device.content_read(doc) == second)
+    check_on_pc(s, folder, HARD_NAME, second, "an edit")
+
+    clash = device.create_document(folder.doc(), HARD_NAME, "text/plain")
+    s.check("a name that is taken gets the first free number before its extension",
+            clash == folder.doc("a b%#:é (1).txt"), clash)
+    s.check("and the file that had it is untouched", device.content_read(doc) == second)
+    device.delete_document(clash)
+
+    for name in ("a/b", "", ".", ".."):
+        s.check(f"creating {name!r} is refused with its code",
+                refusal(lambda: device.create_document(folder.doc(), name)).startswith("INVALID_NAME"))
+        s.check(f"renaming to {name!r} is refused with its code",
+                refusal(lambda: device.rename_document(doc, name)).startswith("INVALID_NAME"))
+
+    directory = device.create_document(folder.doc(), HARD_DIRECTORY, DIRECTORY_MIME)
+    s.check("a directory with a hard name is created", directory == folder.doc(HARD_DIRECTORY), directory)
+    s.check("and lists as a directory", names_in(s, folder.doc())[HARD_DIRECTORY]["mime_type"] == DIRECTORY_MIME)
+
+    renamed = device.rename_document(doc, RENAMED_HARD_NAME)
+    s.check("a rename says the new id", renamed == folder.doc(RENAMED_HARD_NAME), renamed)
+    s.check("the old name is gone from the listing", HARD_NAME not in names_in(s, folder.doc()))
+    s.check("and the file reads under the new one", device.content_read(renamed) == second)
+    check_on_pc(s, folder, RENAMED_HARD_NAME, second, "a rename")
+    s.check("the old name is gone on the PC", not pc.pc_has(folder.pc_state, HARD_NAME))
+
+    taken = refusal(lambda: device.rename_document(renamed, "from-pc.txt"))
+    s.check("a rename onto a name that is taken is refused", taken.startswith("ALREADY_EXISTS"), taken)
+    s.check("and overwrites nothing", device.content_read(folder.doc("from-pc.txt")) == folder.files["from-pc.txt"])
+
+    across = refusal(lambda: device.move_document(renamed, folder.doc(), "another-folder:/"))
+    s.check("a move across folders is refused, so Android copies and deletes",
+            across.startswith("UNSUPPORTED_OPERATION"), across)
+    s.check("and moves nothing", device.content_read(renamed) == second)
+
+    inside = f"{HARD_DIRECTORY}/{RENAMED_HARD_NAME}"
+    moved = device.move_document(renamed, folder.doc(), directory)
+    s.check("a move says the new id", moved == folder.doc(inside), moved)
+    s.check("the file reads where it went", device.content_read(moved) == second)
+    s.check("and is gone from where it was", RENAMED_HARD_NAME not in names_in(s, folder.doc()))
+    check_on_pc(s, folder, inside, second, "a move into a subfolder")
+    s.check("the old place is empty on the PC", not pc.pc_has(folder.pc_state, RENAMED_HARD_NAME))
+
+    gone = refusal(lambda: device.content_write(folder.doc("no-such-file.txt"), b"lost"))
+    s.check("a write to a document that does not exist fails", "NOT_FOUND" in gone, gone[:300])
+    s.check("and creates nothing", "no-such-file.txt" not in names_in(s, folder.doc()))
+
+    device.delete_document(moved)
+    s.check("a delete takes it out of the listing", not names_in(s, directory))
+    s.sync_now(folder)
+    s.check("a deleted file is gone on the PC", not pc.pc_has(folder.pc_state, inside))
+
+    # What Android's Files app sends for a directory: one delete, with everything in it.
+    device.content_write(device.create_document(directory, "inner.txt"), b"Inside.\n")
+    device.delete_document(directory)
+    s.check("deleting a directory takes it from the listing", HARD_DIRECTORY not in names_in(s, folder.doc()))
+    s.sync_now(folder)
+    s.check("and from the PC", not pc.pc_has(folder.pc_state, HARD_DIRECTORY))
+
+    # A change asks for its own burst: nobody calls sync-now here. The freezer would hold that
+    # burst back, as it does for now, until the transfer job; asking the provider anything keeps
+    # the app awake, and an unknown method starts nothing of its own.
+    alone = device.create_document(folder.doc(), "burst-by-itself.txt", "text/plain")
+    device.content_write(alone, b"Nobody asked.\n")
+
+    def arrived() -> bool:
+        device.call_method("tkfs.no-such-method")
+        return (pc.pc_has(folder.pc_state, "burst-by-itself.txt")
+                and pc.pc_cat(folder.pc_state, "burst-by-itself.txt") == b"Nobody asked.\n")
+
+    poll(SYNC_BOUND, "a written file on the PC with no sync-now", arrived, interval=1)
+    s.check("a write asks for a burst by itself", True)
+
+
+def check_the_open_modes(s: Session, folder: Folder) -> None:
+    device = s.device
+    doc = device.create_document(folder.doc(), "modes.txt", "text/plain")
+
+    s.check("wt writes", device.write_document(doc, "wt", b"0123456789") == 10)
+    s.check("and fsync goes through", device.write_document(doc, "rw", b"AB", offset=2, fsync=True) == 2)
+    s.check("rw keeps what it does not write over", device.content_read(doc) == b"01AB456789")
+    device.write_document(doc, "wa", b"tail")
+    s.check("wa appends, whatever the offset", device.content_read(doc) == b"01AB456789tail")
+    device.write_document(doc, "rwt", b"cut")
+    s.check("rwt truncates", device.content_read(doc) == b"cut")
+    device.write_document(doc, "w", b"w")
+    s.check("w truncates", device.content_read(doc) == b"w")
+    check_on_pc(s, folder, "modes.txt", b"w", "what the modes left")
+
+    large = random.Random(14).randbytes(2 * 1024 * 1024)
+    doc = device.create_document(folder.doc(), "large-upload.bin")
+    started = time.monotonic()
+    device.content_write(doc, large)
+    took = time.monotonic() - started
+    s.check("2 MiB goes through `content write`", sha256(device.content_read(doc)) == sha256(large), f"{took:.1f} s")
+    check_on_pc(s, folder, "large-upload.bin", large, "a large file")
+
+
+def check_open_listings_hear_of_changes(s: Session, folder: Folder) -> None:
+    device = s.device
+    root_doc, sub = folder.doc(), folder.doc("sub")
+
+    def heard(what: str, directories: list[str], change: Callable[[], str | None]) -> str | None:
+        before = {directory: device.changes_heard(directory) for directory in directories}
+        result = change()
+        poll(UI_BOUND, f"{what} heard in {directories}",
+             lambda: all(device.changes_heard(directory) > count for directory, count in before.items()))
+        s.check(f"{what} tells an open listing of {len(directories)} director{'y' if len(directories) == 1 else 'ies'}", True)
+        return result
+
+    doc = heard("a create", [root_doc], lambda: device.create_document(root_doc, "heard.txt"))
+    heard("a closed write", [root_doc], lambda: device.content_write(doc, b"Heard.\n"))
+    doc = heard("a rename", [root_doc], lambda: device.rename_document(doc, "heard again.txt"))
+    doc = heard("a move", [root_doc, sub], lambda: device.move_document(doc, root_doc, sub))
+    heard("a closed write in a subfolder", [sub], lambda: device.write_document(doc, "wa", b"More.\n"))
+    heard("a delete", [sub], lambda: device.delete_document(doc))
+
+
+def check_a_kill_after_a_release(s: Session, folder: Folder) -> None:
+    """A release seals before it returns, and a force-stop right after it loses nothing."""
+    device = s.device
+    doc, content = folder.doc("kill-after-release.txt"), b"After the kill.\n"
+    before = device.releases(doc)
+    device.content_write(doc, content)
+    device.wait_release(doc, before)
+    device.force_stop()
+    s.check("force-stop right after a release ended the app", device.app_pid() is None)
+    s.sync_with_the_pc_back(folder)
+    on_pc = s.pc.pc_cat(folder.pc_state, "kill-after-release.txt")
+    s.check("what was written reaches the PC after the restart", on_pc == content, on_pc[:80])
+
+
+def check_a_kill_while_open(s: Session, folder: Folder) -> None:
+    """No release at all: a real restart seals the draft through `seal::recover`. For the large
+    file the phone holds only the chunk it edited, and at that point nothing can fetch the rest."""
+    device, pc = s.device, s.pc
+    small, large = folder.files["kill-while-open.txt"], folder.files["kill-while-open.bin"]
+    held = device.pack_bytes(folder.state)
+    device.write_document(folder.doc("kill-while-open.txt"), "rw", b"AFTER", close=False)
+    device.write_document(folder.doc("kill-while-open.bin"), "rw", b"AFTER", offset=10, close=False)
+    fetched = device.pack_bytes(folder.state) - held
+    s.check("the edit fetched only part of the large file", fetched < LARGE_FILE_BYTES / 2, f"{fetched} pack bytes")
+    device.force_stop()
+    s.check("force-stop with two writers open ended the app", device.app_pid() is None)
+    s.sync_with_the_pc_back(folder)
+    want = b"AFTER" + small[5:]
+    on_pc = pc.pc_cat(folder.pc_state, "kill-while-open.txt")
+    s.check("a draft killed while open reaches the PC", on_pc == want, on_pc[:80])
+    want = large[:10] + b"AFTER" + large[15:]
+    on_pc = pc.pc_cat(folder.pc_state, "kill-while-open.bin")
+    s.check("a large draft killed while open reaches the PC with only that spot changed",
+            sha256(on_pc) == sha256(want), f"{len(on_pc)} bytes, {sha256(on_pc)}")
+    read = device.content_read(folder.doc("kill-while-open.bin"))
+    s.check("and reads the same on the phone, which fetches the rest", sha256(read) == sha256(want), f"{len(read)} bytes")
+
+
+def check_a_worker_restart_while_open(s: Session, folder: Folder) -> None:
+    """A writable handle never reopens: going on from a new token would lose or misplace what it
+    wrote. After a restart its writes fail, and what it wrote before is safe."""
+    device = s.device
+    doc, content = folder.doc("restart-while-open.txt"), folder.files["restart-while-open.txt"]
+    device.write_document(doc, "rw", b"FIRST", close=False)
+    before = device.releases(doc)
+    device.shell_manage("force-stop", {"state": folder.id}, bound=SYNC_BOUND)
+    device.shell_manage("start", {"state": folder.id})
+    poll(FOLDER_READY_BOUND, "the folder running again",
+         lambda: device.shell_manage("inspect", {"state": folder.id})["phase"]["phase"] == "Running")
+    failed = refusal(lambda: device.write_document(doc, "rw", b"SECOND", offset=5))
+    s.check("a write on a handle from before a worker restart fails with an I/O error", "I/O error" in failed, failed[:300])
+    device.wait_release(doc, before)
+    logged = [line for line in device.provider_log() if line.startswith(f"{doc}: sync: ")]
+    s.check("its release logs the code of the failed sync", any("INVALID_HANDLE" in line for line in logged), logged)
+    want = b"FIRST" + content[5:]
+    s.check("and what it wrote before is there, once", device.content_read(doc) == want)
+    s.sync_with_the_pc_back(folder)
+    on_pc = s.pc.pc_cat(folder.pc_state, "restart-while-open.txt")
+    s.check("and reaches the PC", on_pc == want, on_pc[:80])
+
+
+def check_the_pc_away(s: Session, folder: Folder) -> None:
+    """Review Focus 2. `wt` needs nothing of a file the phone never downloaded, and writing part
+    of one cannot work: it fails, and the file stays as it was on both sides."""
+    device, pc = s.device, s.pc
+    files = folder.files
+    held = device.pack_bytes(folder.state)
+    s.check("the files for this are not on the phone", held < 2 * LARGE_FILE_BYTES, f"{held} pack bytes")
+    new_large, new_small = random.Random(15).randbytes(LARGE_FILE_BYTES // 2), b"Replaced with the PC away.\n"
+
+    failures, summary = pc.stop()
+    s.check("the PC stops cleanly", not failures, failures or summary)
+
+    for path, content in (("replaced-away.bin", new_large), ("replaced-away.txt", new_small)):
+        doc = folder.doc(path)
+        started = time.monotonic()
+        device.content_write(doc, content)
+        s.check(f"w on {path}, never downloaded, works with the PC away", device.content_read(doc) == content,
+                f"{time.monotonic() - started:.1f} s")
+        s.check("and lists with its new size", names_in(s, folder.doc())[path]["_size"] == str(len(content)))
+
+    # The small file opens, and its write fails. The large one's manifest is not here, so its open does.
+    for path, wanted in (("edited-away.txt", "I/O error"), ("edited-away.bin", "OBJECT_MISSING")):
+        doc = folder.doc(path)
+        started = time.monotonic()
+        failed = refusal(lambda: device.write_document(doc, "rw", b"part", offset=3))
+        s.check(f"rw writing part of {path}, never downloaded, fails with an I/O error", wanted in failed,
+                f"{time.monotonic() - started:.1f} s: {failed[:300]}")
+        s.check("and its listed size stays", names_in(s, folder.doc())[path]["_size"] == str(len(files[path])))
+
+    # What was done with the PC away survives a restart too.
+    device.force_stop()
+    s.check("force-stop with the PC away ended the app", device.app_pid() is None)
+    s.check("a replaced file still reads after it", device.content_read(folder.doc("replaced-away.txt")) == new_small)
+
+    pc.start()
+    pc.wait_phase(folder.label, "Running")
+    s.sync_with_the_pc_back(folder)
+    for path, content in (("replaced-away.bin", new_large), ("replaced-away.txt", new_small)):
+        on_pc = pc.pc_cat(folder.pc_state, path)
+        s.check(f"{path} reaches the PC later", on_pc == content, f"{len(on_pc)} of {len(content)} bytes")
+    for path in ("edited-away.txt", "edited-away.bin"):
+        on_pc = pc.pc_cat(folder.pc_state, path)
+        s.check(f"{path} stays as it was on the PC", on_pc == files[path], f"{len(on_pc)} bytes")
+        s.check(f"and reads as it was on the phone", device.content_read(folder.doc(path)) == files[path])
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
     "ui_folders": scenario_ui_folders,
     "read": scenario_read,
+    "write": scenario_write,
     "cold_start": scenario_cold_start,
     "harness": scenario_harness,
     "sync": scenario_sync,
