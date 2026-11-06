@@ -532,6 +532,44 @@ class Device:
         poll(bound, f"{package} frozen", frozen, interval=1)
         return time.monotonic() - started
 
+    def push_download(self, name: str, data: bytes | Path, bound: float = 900) -> str:
+        """Puts a file in /sdcard/Download, has Android scan it and returns its media URI, which
+        another app could share. `data` is bytes, or a file to push as it is."""
+        remote = f"/sdcard/Download/{name}"
+        with tempfile.TemporaryDirectory(prefix="tkfs-e2e-") as local:
+            source = data if isinstance(data, Path) else Path(local) / name
+            if not isinstance(data, Path):
+                source.write_bytes(data)
+            self.adb("push", source, remote, bound=bound).require_success()
+        self.shell("am", "broadcast", "-a", "android.intent.action.MEDIA_SCANNER_SCAN_FILE", "-d", f"file://{remote}")
+
+        def scanned() -> str:
+            rows = self.shell("content", "query", "--uri", "content://media/external/file", "--projection", "_id",
+                              "--where", f"_display_name='{name}'").out
+            found = re.search(r"_id=(\d+)", rows)
+            if not found:
+                raise HarnessError(f"{name} is not scanned yet")
+            return f"content://media/external/file/{found.group(1)}"
+
+        return poll(ADB_BOUND, f"{name} scanned", scanned, interval=1)
+
+    def start_share(self, uri: str, mime: str = "application/octet-stream") -> None:
+        """Another app sharing one stream: ACTION_SEND to ShareActivity, with the read grant."""
+        self.shell("am", "start", "-W", "-a", "android.intent.action.SEND", "-t", mime, "-n",
+                   f"{PACKAGE}/.share.ShareActivity", "--eu", "android.intent.extra.STREAM", uri,
+                   "--grant-read-uri-permission").require_success()
+
+    def battery_exempt(self, exempt: bool) -> None:
+        """The battery-optimization exemption the owner gives in Settings, set from outside."""
+        self.shell("dumpsys", "deviceidle", "whitelist", ("+" if exempt else "-") + PACKAGE).require_success()
+
+    def home(self) -> None:
+        self.shell("input", "keyevent", "KEYCODE_HOME").require_success()
+
+    def transfer_log(self) -> list[str]:
+        """The transfer job's lines since the last `clear_logcat`."""
+        return [line for line in self.provider_log() if line.startswith(("transfer:", "share:"))]
+
     def pack_bytes(self, state: str) -> int:
         """How many bytes the folder at `state` holds in its packs: file contents on the phone."""
         found = self.shell("run-as", PACKAGE, "find", state, "-type", "f", "-path", "*/packs/*",

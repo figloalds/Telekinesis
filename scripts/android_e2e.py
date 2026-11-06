@@ -24,6 +24,7 @@ import os
 from pathlib import Path
 import random
 import sys
+import threading
 import time
 import traceback
 from typing import Callable
@@ -518,20 +519,19 @@ def check_names_and_the_namespace(s: Session, folder: Folder) -> None:
     s.sync_now(folder)
     s.check("and from the PC", not pc.pc_has(folder.pc_state, HARD_DIRECTORY))
 
-    # A change asks for its own burst: nobody calls sync-now here. Left in the background, for now
-    # that burst gets nowhere: Android freezes a cached app and cuts its network, until the transfer
-    # job. Asking the provider anything keeps the app out of that, and an unknown method starts
-    # nothing of its own.
+    # A change asks for its own burst: nobody calls sync-now here, and nothing touches the app
+    # while this waits, so it is cached and frozen, with its network cut. Only the transfer job's
+    # foreground notification gets the file across.
+    device.clear_logcat()
     alone = device.create_document(folder.doc(), "burst-by-itself.txt", "text/plain")
     device.content_write(alone, b"Nobody asked.\n")
 
     def arrived() -> bool:
-        device.call_method("tkfs.no-such-method")
         return (pc.pc_has(folder.pc_state, "burst-by-itself.txt")
                 and pc.pc_cat(folder.pc_state, "burst-by-itself.txt") == b"Nobody asked.\n")
 
-    poll(SYNC_BOUND, "a written file on the PC with no sync-now", arrived, interval=1)
-    s.check("a write asks for a burst by itself", True)
+    poll(SYNC_BOUND, "a written file on the PC with no sync-now and the app left alone", arrived, interval=1)
+    s.check("a write asks for a burst by itself, with the app in the background", True, device.transfer_log())
 
 
 def check_the_open_modes(s: Session, folder: Folder) -> None:
@@ -718,10 +718,163 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
         s.check(f"and reads as it was on the phone", device.content_read(folder.doc(path)) == files[path])
 
 
+SHARE_BOUND = 900
+SHARE_BYTES = 256 * 1024 * 1024
+MIB = 1024 * 1024
+
+
+def random_bytes(rng: random.Random, size: int) -> bytes:
+    """`size` random bytes: `randbytes` itself cannot make 256 MiB at once."""
+    return b"".join(rng.randbytes(min(16 * MIB, size - done)) for done in range(0, size, 16 * MIB))
+
+
+def pc_pack_bytes(folder: Folder) -> int:
+    """What the PC's copy of the folder holds in its packs, so a transfer can be seen under way."""
+    return sum(path.stat().st_size for path in Path(folder.pc_state).rglob("*")
+               if path.is_file() and "packs" in path.parts)
+
+
+def trigger_foreground(device: Device) -> None:
+    """The foreground trigger of the sync table: the app coming to the front, 30 s after its last sync."""
+    device.set_last_sync(60)
+    device.start_app()
+
+
+def share_one(s: Session, name: str, data: bytes | Path, mime: str = "application/octet-stream") -> None:
+    """Another app shares `data`; the owner taps through Save to Telekinesis with the defaults."""
+    device = s.device
+    device.start_share(device.push_download(name, data), mime)
+    texts = device.wait_screen("the share screen", lambda t: "Save 1 file" in t)
+    for wanted in ("Save to Telekinesis", "Inside this folder", "They go to My PC when it's reachable."):
+        s.check(f"the share screen for {name} says {wanted!r}", wanted in texts, texts)
+    device.tap_text("Save 1 file")
+
+
+def pc_has_whole(s: Session, folder: Folder, path: str, content: bytes) -> bool:
+    return s.pc.pc_has(folder.pc_state, path) and sha256(s.pc.pc_cat(folder.pc_state, path)) == sha256(content)
+
+
+def deliver(s: Session, folder: Folder, path: str, content: bytes, what: str, bound: float = SHARE_BOUND,
+            nudge: Callable[[], None] | None = None) -> None:
+    """Waits for `path` on the PC, asking the phone for nothing but `nudge` (a trigger of the table)."""
+    last = [0.0]
+
+    def arrived() -> bool:
+        if nudge and time.monotonic() - last[0] > 30:
+            last[0] = time.monotonic()
+            nudge()
+        return pc_has_whole(s, folder, path, content)
+
+    poll(bound, f"{what} on the PC", arrived, interval=2)
+    s.check(f"{what} is on the PC with identical bytes", True)
+
+
+def scenario_share(s: Session) -> None:
+    """Acceptance 12 and 13: sharing into a folder, and the transfer job that sends it. The app is
+    left in the background for the delivery, because that is where Android cuts its network."""
+    device, pc = s.device, s.pc
+    rng = random.Random(14)
+    clash_old = rng.randbytes(50 * 1024)
+    big_from_pc = random_bytes(rng, SHARE_BYTES)
+    folder = s.folder_with({"clash.bin": clash_old, "seed.txt": b"Here from the start.\n",
+                            "from-pc-large.bin": big_from_pc})
+    names = lambda: {row["_display_name"]: row for row in device.content_query(children_uri(folder.doc()))}
+
+    # The PC away: the app keeps what is shared, and a clash gets a number.
+    failures, summary = pc.stop()
+    s.check("the PC stops cleanly", not failures, failures or summary)
+    one, clash_new = rng.randbytes(3 * MIB), rng.randbytes(70 * 1024)
+    share_one(s, "share-one.bin", one)
+    poll(SHARE_BOUND, "the shared file in the folder", lambda: "share-one.bin" in names())
+    s.check("a shared file is kept with the PC away", device.content_read(folder.doc("share-one.bin")) == one)
+    share_one(s, "clash.bin", clash_new)
+    poll(SHARE_BOUND, "the numbered name", lambda: "clash (1).bin" in names())
+    s.check("a name that is taken gets a number", device.content_read(folder.doc("clash (1).bin")) == clash_new)
+    listed = names()
+    s.check("and the file that had the name is untouched", listed["clash.bin"]["_size"] == str(len(clash_old)))
+    s.check("no working file is left in the folder", not any(name.startswith(".tkfs-part-") for name in listed),
+            sorted(listed))
+
+    # A stream that cannot be read is reported, and nothing is left under any name.
+    device.clear_logcat()
+    device.start_share("content://media/external/file/987654321")
+    device.wait_screen("the share screen", lambda t: "Save 1 file" in t)
+    device.tap_text("Save 1 file")
+
+    def reported() -> bool:
+        return "could not be saved" in device.shell("dumpsys", "notification", "--noredact").out
+
+    poll(60, "the notification that names the failure", reported, interval=2)
+    s.check("a stream that cannot be copied is named in a notification", True)
+    s.check("and leaves nothing in the folder", set(names()) == set(listed), sorted(names()))
+
+    # The PC back: no action on the phone but a trigger of the table.
+    pc.start()
+    pc.wait_phase(folder.label, "Running")
+    for path, content in (("share-one.bin", one), ("clash (1).bin", clash_new)):
+        deliver(s, folder, path, content, f"{path} shared with the PC away", nudge=lambda: trigger_foreground(device))
+    s.check("the file that had the name is as it was on the PC",
+            sha256(pc.pc_cat(folder.pc_state, "clash.bin")) == sha256(clash_old))
+
+    # Delivery from the background, with the app exempt from battery optimization and not.
+    for exempt in (False, True):
+        device.battery_exempt(exempt)
+        device.clear_logcat()
+        name = f"background-{'exempt' if exempt else 'optimized'}.bin"
+        content = rng.randbytes(2 * MIB)
+        share_one(s, name, content)
+        device.home()
+        # Nothing here asks the phone anything: the job has to get it across by itself.
+        deliver(s, folder, name, content, f"{name} from the background", bound=SYNC_BOUND)
+        s.check(f"a share reaches the PC from the background, exemption {'on' if exempt else 'off'}", True,
+                device.transfer_log())
+    device.battery_exempt(True)
+
+    # A force-stop during the push of a large file.
+    device.clear_logcat()
+    large = random_bytes(rng, SHARE_BYTES)
+    before = pc_pack_bytes(folder)
+    share_one(s, "large-push.bin", large)
+    device.home()
+    poll(SHARE_BOUND, "the push under way", lambda: pc_pack_bytes(folder) - before >= 16 * MIB, interval=1)
+    gained = pc_pack_bytes(folder) - before
+    s.check("the large file is only partly on the PC when the app is killed",
+            not pc.pc_has(folder.pc_state, "large-push.bin"), f"{gained} pack bytes there")
+    device.force_stop()
+    s.check("force-stop mid-push ended the app", device.app_pid() is None)
+    deliver(s, folder, "large-push.bin", large, "the large file after a restart",
+            nudge=lambda: trigger_foreground(device))
+
+    # A force-stop during the receive of a large file.
+    held = device.pack_bytes(folder.state)
+    outcome: list[str] = []
+
+    def read() -> None:
+        try:
+            device.content_read(folder.doc("from-pc-large.bin"), bound=SHARE_BOUND)
+            outcome.append("read")
+        except HarnessError as error:
+            outcome.append(f"stopped: {error}")
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    poll(SHARE_BOUND, "the receive under way", lambda: device.pack_bytes(folder.state) - held >= 16 * MIB, interval=1)
+    s.check("the large file is only partly here when the app is killed",
+            device.pack_bytes(folder.state) - held < SHARE_BYTES)
+    device.force_stop()
+    reader.join(60)
+    s.check("force-stop mid-receive ended the app and the reader",
+            device.app_pid() is None and not reader.is_alive(), outcome)
+    again = device.content_read(folder.doc("from-pc-large.bin"), bound=SHARE_BOUND)
+    s.check("the receive completes after a restart with identical bytes", sha256(again) == sha256(big_from_pc),
+            f"{len(again)} bytes")
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
     "ui_folders": scenario_ui_folders,
     "read": scenario_read,
     "write": scenario_write,
+    "share": scenario_share,
     "cold_start": scenario_cold_start,
     "harness": scenario_harness,
     "sync": scenario_sync,
