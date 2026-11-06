@@ -3,7 +3,7 @@ use crate::util::namespace::NamespaceChanges;
 use crate::{
     content::{Kind, seal, working::*},
     core::*,
-    model::content::Digest,
+    model::content::{ContentKind, Digest},
     util::log::event,
 };
 use anyhow::{Context, Result, ensure};
@@ -1181,6 +1181,97 @@ impl Engine {
     }
 }
 
+/// What the head of a file needs a peer to hold before the peer has all of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeadClosure {
+    /// Some head of the entity is an event of this device. A head only a peer wrote is the peer's
+    /// to hold, whatever this device once wrote under it.
+    pub written_here: bool,
+    /// The entity is deleted: there are no bytes to confirm.
+    pub deleted: bool,
+    /// The manifest and chunks of each head written here, without repeats. When a manifest is not
+    /// in the local packs its chunks are unknown, so only the manifest is listed.
+    pub digests: Vec<Digest>,
+}
+
+impl Engine {
+    /// This device's own events with a sequence after `after`, oldest first, at most `limit`.
+    pub fn own_events_after(&self, after: u64, limit: usize) -> Result<Vec<(u64, Event)>> {
+        const PAGE: usize = 1024;
+        let store = lock(&self.store);
+        let mut own = Vec::new();
+        let mut at = after;
+        while own.len() < limit {
+            let page = store.events_after(at, PAGE)?;
+            let Some((last, _)) = page.last() else {
+                break;
+            };
+            at = *last;
+            let full = page.len() == PAGE;
+            for (seq, event) in page {
+                if event.author == store.device {
+                    own.push((seq, event));
+                    if own.len() == limit {
+                        return Ok(own);
+                    }
+                }
+            }
+            if !full {
+                break;
+            }
+        }
+        Ok(own)
+    }
+
+    /// The bytes a peer must hold for `entity`'s current head. It never fetches: what the local
+    /// packs do not have is not asked for from anyone.
+    pub fn head_closure(&self, entity: &str) -> Result<HeadClosure> {
+        let (device, deleted, heads) = {
+            let store = lock(&self.store);
+            let projection = store.projection();
+            let versions = projection
+                .heads
+                .get(entity)
+                .filter(|versions| !versions.is_empty())
+                .with_context(|| format!("NOT_FOUND: no head for {entity}"))?;
+            let heads = versions
+                .iter()
+                .map(|version| {
+                    store
+                        .version(version)?
+                        .with_context(|| format!("NOT_FOUND: head {version} of {entity}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let deleted = projection.entries.get(entity).is_some_and(|e| e.deleted);
+            (store.device.clone(), deleted, heads)
+        };
+        let content = self.working.content();
+        let mut closure = HeadClosure {
+            deleted,
+            ..HeadClosure::default()
+        };
+        for head in heads.iter().filter(|head| head.author == device) {
+            closure.written_here = true;
+            let Some(reference) = head.state.content.as_ref().filter(|_| !head.state.deleted)
+            else {
+                continue;
+            };
+            reference.validate()?;
+            closure.digests.push(reference.digest);
+            if reference.kind == ContentKind::Manifest && content.packs.contains(reference.digest)?
+            {
+                closure.digests.extend(content.chunks(reference)?);
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        closure.digests.retain(|digest| seen.insert(*digest));
+        if closure.deleted {
+            closure.digests.clear();
+        }
+        Ok(closure)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1194,6 +1285,119 @@ mod tests {
         engine.write(handle, 0, bytes, false, false)?;
         engine.flush(Some(handle))?;
         engine.close(handle)
+    }
+
+    /// An event of another device on top of `entity`'s head, as a feed would bring it.
+    fn peer_edit(engine: &Engine, entity: &str, change: impl FnOnce(&mut Entry)) -> Result<Event> {
+        let mut event = {
+            let mut store = lock(&engine.store);
+            let mut state = store.entry(entity)?;
+            change(&mut state);
+            let heads = store.projection().heads[entity].iter().cloned().collect();
+            store.event(MAIN, state, heads, Operation::Content)
+        };
+        event.author = "a peer".into();
+        engine.apply_remote(std::slice::from_ref(&event))?;
+        Ok(event)
+    }
+
+    #[test]
+    fn own_events_are_this_devices_in_order_and_after_a_sequence() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        seed_cached_file(&engine, "first", b"1")?;
+        let first = engine.lookup("first")?.id;
+        peer_edit(&engine, &first, |state| state.attributes = 0x20)?;
+        seed_cached_file(&engine, "second", b"2")?;
+
+        let own = engine.own_events_after(0, 100)?;
+        assert!(own.len() >= 2);
+        assert!(own.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(own.iter().all(|(_, event)| event.author != "a peer"));
+        let all = lock(&engine.store).events_after(0, 100)?;
+        assert_eq!(all.len(), own.len() + 1, "exactly the peer's event is left out");
+
+        let (cut, _) = own[0];
+        assert_eq!(engine.own_events_after(cut, 100)?, own[1..]);
+        assert_eq!(engine.own_events_after(0, 1)?, own[..1]);
+        assert!(engine.own_events_after(own.last().unwrap().0, 100)?.is_empty());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_head_closure_lists_the_manifest_and_every_chunk_without_repeats() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let bytes: Vec<u8> = (0..2 * CHUNK_SIZE as usize + 10)
+            .map(|index| (index / 7 % 251) as u8)
+            .collect();
+        seed_cached_file(&engine, "big", &bytes)?;
+        seed_cached_file(&engine, "small", b"tiny")?;
+
+        let big = engine.lookup("big")?;
+        let reference = big.content.clone().unwrap();
+        let chunks = engine.working.content().chunks(&reference)?;
+        assert_eq!(chunks.len(), 3);
+        let closure = engine.head_closure(&big.id)?;
+        assert!(closure.written_here && !closure.deleted);
+        let mut expected = vec![reference.digest];
+        expected.extend(chunks);
+        assert_eq!(closure.digests, expected);
+
+        let small = engine.lookup("small")?;
+        let closure = engine.head_closure(&small.id)?;
+        assert_eq!(closure.digests, vec![small.content.unwrap().digest]);
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_head_closure_of_a_deleted_file_or_a_peers_head_needs_no_bytes() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        seed_cached_file(&engine, "gone", b"gone")?;
+        seed_cached_file(&engine, "theirs", b"mine first")?;
+        let gone = engine.lookup("gone")?.id;
+        lock(&engine.store).delete(&gone)?;
+        let closure = engine.head_closure(&gone)?;
+        assert!(closure.deleted && closure.written_here && closure.digests.is_empty());
+
+        let theirs = engine.lookup("theirs")?;
+        let other = engine.working.content().import(b"the peer's bytes")?;
+        peer_edit(&engine, &theirs.id, |state| state.content = Some(other))?;
+        let closure = engine.head_closure(&theirs.id)?;
+        assert_eq!(closure, HeadClosure::default());
+
+        assert!(engine.head_closure("no such entity").is_err());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// A head the phone has only by name: the manifest is not here, so nothing more is known.
+    #[test]
+    fn a_head_closure_of_a_manifest_not_held_lists_only_the_manifest() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        seed_cached_file(&engine, "file", b"x")?;
+        let entity = engine.lookup("file")?.id;
+        let absent = FileContentRef::new(
+            ContentKind::Manifest,
+            Digest::bytes(b"never here"),
+            4 * CHUNK_SIZE,
+        )?;
+        {
+            let mut store = lock(&engine.store);
+            let mut state = store.entry(&entity)?;
+            state.content = Some(absent.clone());
+            let heads = store.projection().heads[&entity].iter().cloned().collect();
+            let event = store.event(MAIN, state, heads, Operation::Content);
+            store.apply(&[event])?;
+        }
+        let closure = engine.head_closure(&entity)?;
+        assert_eq!(closure.digests, vec![absent.digest]);
+        engine.shutdown()?;
+        Ok(())
     }
 
     /// The embedded host resolves a folder's current engine on every call, so a

@@ -55,4 +55,29 @@ class SnapshotTest {
         val lane = """{"state": "Ready", "last_error": null}"""
         assertEquals(mapOf("f1" to 1000L), parseExchanges(status(lane)))
     }
+
+    @Test fun theWaitingAnswersAreRead() {
+        assertEquals(0, parseWaiting("[]"))
+        assertEquals(2, parseWaiting("""[{"entity": "a", "path": "/a"}, {"entity": "b", "path": "/b"}]"""))
+        assertEquals(Confirmed(3, 1), parseConfirmed("""{"waiting": 3, "unsupported": 1}"""))
+    }
+
+    @Test fun waitingFilesAreShownAndAFailedReadIsNeverAClear() {
+        val lane = """{"state": "Ready", "last_error": null}"""
+        val polled = parseSnapshot(status(lane))
+        val first = polled.withWaiting(mapOf("f1" to 2), null, mapOf("f1" to Confirmed(2, 5)))
+        assertEquals(2, first.folders.single().waiting)
+        // Never more files unsupported than there are waiting.
+        assertEquals(2, first.folders.single().unsupported)
+        // The next read failed: the folder keeps what it was said to have, not zero.
+        val failed = polled.withWaiting(emptyMap(), first, emptyMap())
+        assertEquals(2, failed.folders.single().waiting)
+        assertEquals(0, failed.folders.single().unsupported)
+        // A read that worked and found none clears, and the old confirmation says nothing then.
+        val cleared = polled.withWaiting(mapOf("f1" to 0), failed, mapOf("f1" to Confirmed(2, 2)))
+        assertEquals(0, cleared.folders.single().waiting)
+        assertEquals(0, cleared.folders.single().unsupported)
+        // Before anything is known, nothing is claimed either way.
+        assertEquals(0, polled.withWaiting(emptyMap(), null, emptyMap()).folders.single().waiting)
+    }
 }

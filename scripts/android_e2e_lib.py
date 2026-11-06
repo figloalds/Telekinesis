@@ -582,6 +582,37 @@ class Device:
         called = self._provider(line)
         return [entry["name"] for entry in json.loads(parse_call(called.out or called.err))]
 
+    def app_sees_metered(self) -> bool:
+        """What the app's own `ConnectivityManager.isActiveNetworkMetered` says now (a debug build)."""
+        reply = json.loads(parse_call(self.call_method("tkfs.metered")))
+        return bool(reply["metered"])
+
+    def confirm(self, folder: str) -> dict:
+        """What `Native.confirm` answers for the folder now: `{waiting, unsupported}` (a debug build)."""
+        line = shell_line(["content", "call", "--uri", CONTROL_URI, "--method", "tkfs.confirm", "--arg", folder])
+        called = self._provider(line, bound=SYNC_BOUND)
+        return json.loads(parse_call(called.out or called.err))
+
+    def set_metered(self, metered: bool) -> None:
+        """Makes the emulator's Wi-Fi really metered, or puts the system's own judgment back, with the policy
+        the Settings app writes for "metered" (`cmd netpolicy set metered-network`). The app must then see it
+        through its own `isActiveNetworkMetered`, or this fails: nothing is simulated in the app."""
+        listed = self.shell("cmd", "netpolicy", "list", "wifi-networks").require_success().out
+        networks = sorted({line.strip().split(";")[0] for line in listed.splitlines() if line.strip()})
+        if not networks:
+            raise HarnessError("the emulator has no saved Wi-Fi network to mark as metered")
+        for name in networks:
+            # It exits 255 even when it worked: what counts is that the app sees the change, below.
+            self.shell("cmd", "netpolicy", "set", "metered-network", name, "true" if metered else "undefined")
+        poll(30, f"the app to see the network as {'metered' if metered else 'unmetered'}",
+             lambda: self.app_sees_metered() == metered, interval=1)
+
+    def waiting_files(self, folder: str) -> list[dict]:
+        """The files the app lists as waiting to send for the folder, from its table on disk."""
+        line = shell_line(["content", "call", "--uri", CONTROL_URI, "--method", "tkfs.waiting", "--arg", folder])
+        called = self._provider(line)
+        return json.loads(parse_call(called.out or called.err))
+
     def home(self) -> None:
         self.shell("input", "keyevent", "KEYCODE_HOME").require_success()
 
@@ -746,6 +777,8 @@ class PcHost:
         self.port: int | None = None
         self.process: subprocess.Popen | None = None
         self.sources = 0
+        # Added to the environment of the next `start`: a fault point that makes this PC an older one.
+        self.extra_env: dict[str, str] = {}
 
     @property
     def endpoint(self) -> str:
@@ -756,6 +789,7 @@ class PcHost:
         env = dict(os.environ)
         env.pop("TKFS_FAKE_NOW_MS", None)
         env.pop("TKFS_UNSUPERVISED_EXIT_S", None)
+        env.update(self.extra_env)
         return env
 
     def start(self) -> None:

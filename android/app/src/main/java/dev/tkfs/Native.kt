@@ -68,6 +68,22 @@ object Native {
     @JvmStatic @Throws(IOException::class)
     external fun delete(folder: String, path: String)
 
+    /**
+     * The files this phone made in the folder that no PC has confirmed yet: `[{entity, path}]`. It
+     * reads a table kept on disk, so it answers with no PC and after the app was killed. A file
+     * the PC has not held is on it, whatever was sent.
+     */
+    @JvmStatic @Throws(IOException::class)
+    external fun waiting(folder: String): String
+
+    /**
+     * Takes this phone's new changes into that table, asks the PCs what they now hold, bounded, and
+     * answers `{waiting, unsupported}`. Only a PC's own answer clears a file. It does not return
+     * quickly with no network: call it off the main thread, after a burst.
+     */
+    @JvmStatic @Throws(IOException::class)
+    external fun confirm(folder: String): String
+
     /** Always throws: a panic with a Java exception pending. See `ShellControl`. */
     @JvmStatic @Throws(IOException::class)
     external fun faultForTest()

@@ -8,6 +8,7 @@ import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import dev.tkfs.Native
 import dev.tkfs.Settings
+import dev.tkfs.sync.SyncCoordinator
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.FileOutputStream
@@ -32,6 +33,9 @@ internal object ShellControl {
     private const val SET_LAST_SYNC = "tkfs.set_last_sync"
     private const val DOCUMENT = "tkfs.document"
     private const val LIST_ALL = "tkfs.list_all"
+    private const val METERED = "tkfs.metered"
+    private const val WAITING = "tkfs.waiting"
+    private const val CONFIRM = "tkfs.confirm"
     private const val ROOT_UID = 0
     private const val SHELL_UID = 2000
 
@@ -80,6 +84,12 @@ internal object ShellControl {
             val folder = arg ?: throw IOException("MISSING_ARGUMENT: folder")
             Native.list(folder, JSONObject(payload(extras?.getString("payload"))).optString("path", "/"))
         }
+        // Whether the app sees the network as metered, by the call its sync policy uses.
+        METERED -> reply { JSONObject().put("metered", SyncCoordinator.metered(context)).toString() }
+        // The files of a folder the PCs have not confirmed: `--arg FOLDER`.
+        WAITING -> reply { Native.waiting(arg ?: throw IOException("MISSING_ARGUMENT: folder")) }
+        // Asks the PCs now, as after a burst: `--arg FOLDER`, answering `{waiting, unsupported}`.
+        CONFIRM -> reply { Native.confirm(arg ?: throw IOException("MISSING_ARGUMENT: folder")) }
         else -> null
     }
 

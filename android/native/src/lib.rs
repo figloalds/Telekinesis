@@ -1,5 +1,7 @@
 //! The Android build of tkfs: the orchestrator and its workers on threads of the app
 //! process, with a small JNI surface for the app and its DocumentsProvider.
+mod phone;
+
 use anyhow::{Result, anyhow, ensure};
 use jni::{
     JNIEnv,
@@ -13,6 +15,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Once, OnceLock, PoisonError},
 };
+use phone::{DaemonPeers, Phone};
 use tkfs::{
     core::{EntryKind, ROOT},
     model::errors::{ErrorWire, UNKNOWN_CODE},
@@ -32,6 +35,49 @@ fn start(config: PathBuf) {
 
 fn host() -> Result<&'static Arc<Host>> {
     HOST.get().ok_or_else(|| anyhow!("ORCHESTRATOR_NOT_READY"))
+}
+
+static PHONE: OnceLock<Phone> = OnceLock::new();
+
+/// What the phone made and the PC has not confirmed, in `phone.sqlite` beside the catalog.
+fn phone() -> Result<&'static Phone> {
+    if let Some(phone) = PHONE.get() {
+        return Ok(phone);
+    }
+    let opened = Phone::open(&host()?.daemon()?.catalog.data_directory.join("phone.sqlite"))?;
+    Ok(PHONE.get_or_init(|| opened))
+}
+
+/// The files of `folder` waiting to send, as `[{entity, path}]`.
+fn waiting(folder: &str) -> Result<Value> {
+    let record = host()?.daemon()?.catalog.resolve(folder)?;
+    let files = phone()?.waiting(&record.id)?;
+    Ok(Value::Array(
+        files
+            .iter()
+            .map(|file| json!({"entity": file.entity, "path": file.path}))
+            .collect(),
+    ))
+}
+
+/// Asks the PCs what they now hold, and returns `{waiting, unsupported}` for `folder`.
+fn confirm(folder: &str) -> Result<Value> {
+    let daemon = host()?.daemon()?;
+    let record = daemon.catalog.resolve(folder)?;
+    let engine = engine(&record.id)?;
+    let journal = engine
+        .store
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .device
+        .clone();
+    let peers = DaemonPeers {
+        daemon: &daemon,
+        folder: &record.id,
+        journal: &journal,
+    };
+    let confirmed = phone()?.confirm(&record.id, &record.repo, &engine, &peers)?;
+    Ok(json!({"waiting": confirmed.waiting, "unsupported": confirmed.unsupported}))
 }
 
 fn engine(folder: &str) -> Result<Arc<Engine>> {
@@ -456,6 +502,33 @@ pub extern "system" fn Java_dev_tkfs_Native_close(
     })
 }
 
+/// `[{entity, path}]`: what this phone made in the folder that no PC has confirmed yet.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_waiting(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+) -> jstring {
+    guard_string(&mut env, |env| {
+        let folder = text(env, &folder)?;
+        Ok(waiting(&folder)?.to_string())
+    })
+}
+
+/// Asks the PCs, bounded, which of the waiting files they now hold, and answers `{waiting,
+/// unsupported}`. Never says a file was sent on anything but a PC's own answer.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_confirm(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+) -> jstring {
+    guard_string(&mut env, |env| {
+        let folder = text(env, &folder)?;
+        Ok(confirm(&folder)?.to_string())
+    })
+}
+
 /// For the end-to-end harness, through a debug build's shell control: the worst a guard must
 /// survive, a panic with a Java exception pending, under Android's own JNI checks.
 #[unsafe(no_mangle)]
@@ -827,6 +900,19 @@ mod tests {
                 Java_dev_tkfs_Native_manage(unsafe { env.unsafe_clone() }, class, action, payload);
             assert!(value.is_null());
             assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+        });
+    }
+
+    #[test]
+    fn waiting_and_confirm_fail_through_the_guard_with_no_host() {
+        with_env(|env| {
+            for entry in [Java_dev_tkfs_Native_waiting, Java_dev_tkfs_Native_confirm] {
+                let class = env.find_class("java/lang/Object").unwrap();
+                let folder = env.new_string("F").unwrap();
+                let value = entry(unsafe { env.unsafe_clone() }, class, folder);
+                assert!(value.is_null());
+                assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+            }
         });
     }
 

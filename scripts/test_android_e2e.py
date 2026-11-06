@@ -573,5 +573,26 @@ class ReadingTheScreen(unittest.TestCase):
             self.assertEqual(path.read_bytes(), b"\x89PNG\r\n\x1a\nrest")
 
 
+class OlderPc(unittest.TestCase):
+    """A PC that predates `content-have` is made by a fault point in its environment, for one start."""
+
+    def pc(self):
+        return PcHost(Path(sys.executable), Path(tempfile.gettempdir()) / "tkfs-e2e-env-test")
+
+    def test_a_start_gets_the_fault_it_was_given_and_the_next_does_not(self):
+        pc = self.pc()
+        pc.extra_env = {"TKFS_FAULT_POINT": "session.features.none"}
+        self.assertEqual(pc._env()["TKFS_FAULT_POINT"], "session.features.none")
+        pc.extra_env = {}
+        self.assertNotEqual(pc._env().get("TKFS_FAULT_POINT"), "session.features.none")
+
+    def test_the_metered_answer_is_the_apps_own(self):
+        device = Device(Path("adb"), "emulator-5554")
+        with patch.object(Device, "call_method", return_value='Result: Bundle[{result={"metered":true}}]'):
+            self.assertTrue(device.app_sees_metered())
+        with patch.object(Device, "call_method", return_value='Result: Bundle[{result={"metered":false}}]'):
+            self.assertFalse(device.app_sees_metered())
+
+
 if __name__ == "__main__":
     unittest.main()

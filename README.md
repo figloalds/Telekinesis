@@ -310,6 +310,7 @@ The desktop app shows the same codes. The code tells you what to do:
 | `ALREADY_EXISTS` | A rename or move would land on a name that is taken. Names that differ only in case or Unicode form are the same name. | Pick another name. |
 | `ROOT_IMMUTABLE` | Something asked to rename or delete a folder's root. | Rename or delete what is inside it. |
 | `NATIVE_PANIC` | A call into the Android app's native code hit a bug. The call failed and the app kept running. The panic is in logcat under the tag `tkfs`. | Retry; if it repeats, report it with `adb logcat -s tkfs`. |
+| `PHONE_DB_UNAVAILABLE` | The Android app could not open `phone.sqlite`, where it keeps the files not yet confirmed by a PC. | Free space on the phone and retry; the files themselves are safe. |
 | `WORKER_LIMIT` | `maximum_running` folders already have a worker. | Stop one, or raise `maximum_running` and restart. |
 | `FOLDER_REQUIRED` | A folder command has neither `--state` nor `--runtime`. | Give `--state DIR` or `--runtime STATE/runtime.json`. |
 | `FOLDER_NOT_FOUND`, `AMBIGUOUS_FOLDER` | The folder argument matches no folder, or more than one. | Use more of the id, or the exact label (`manage list`). |

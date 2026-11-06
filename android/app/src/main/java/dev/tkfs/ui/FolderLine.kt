@@ -8,7 +8,10 @@ enum class Tone { Ok, Waiting, Bad, Quiet }
 
 data class Line(val text: String, val tone: Tone)
 
-/** What the Folders screen knows of one folder. `waiting` is filled in by a later task. */
+/**
+ * What the Folders screen knows of one folder. `waiting` is the files no PC has confirmed holding,
+ * and `unsupported` those of them that a PC could not be asked about because it is too old.
+ */
 data class FolderStatus(
     val id: String,
     val label: String,
@@ -18,6 +21,7 @@ data class FolderStatus(
     val lastSyncMs: Long? = null,
     val waiting: Int = 0,
     val repo: String = "",
+    val unsupported: Int = 0,
 )
 
 private const val REVOKED = "PEER_REVOKED"
@@ -29,7 +33,10 @@ private const val DAY = 24 * HOUR
 fun folderLine(s: FolderStatus, now: Long, zone: ZoneId = ZoneId.systemDefault()): Line = when {
     s.error != null -> Line(errorInWords(s.error), Tone.Bad)
     s.conflicts > 0 -> Line(plural(s.conflicts, "conflict", "conflicts") + " to settle", Tone.Bad)
-    s.waiting > 0 -> Line(plural(s.waiting, "file", "files") + " waiting to send", Tone.Waiting)
+    s.waiting > 0 -> Line(
+        plural(s.waiting, "file", "files") + " waiting to send" + if (s.unsupported > 0) ". Update the PC." else "",
+        Tone.Waiting,
+    )
     s.lastSyncMs == null -> Line("Not synced yet", Tone.Quiet)
     !s.pcReachable -> Line("Synced at " + clock(s.lastSyncMs, zone), Tone.Quiet)
     else -> Line("Synced " + ago(now - s.lastSyncMs), Tone.Ok)
@@ -51,6 +58,8 @@ fun errorInWords(error: String): String = when (val code = codeOf(error)) {
     "WS_CONNECT_FAILED" -> "Could not reach My PC."
     "SYNC_NOW_TIMEOUT" -> "Syncing took too long. Try again."
     "WORKER_NOT_RUNNING" -> "This folder is not running."
+    // Nothing of this phone's can go to it, and it cannot say what it holds either.
+    "PEER_PUSH_UNAVAILABLE" -> "My PC is too old to take files from this phone. Update the PC."
     else -> if (code == null) error else error.substringAfter(':').trim().ifEmpty { error }
 }
 

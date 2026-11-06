@@ -69,6 +69,26 @@ data class Published(val repo: String, val label: String)
 fun parsePublished(reply: String): List<Published> =
     JSONArray(reply).objects().map { Published(it.getString("repo"), it.getString("label")) }
 
+/**
+ * The snapshot with each folder's waiting files. `counted` has the folders whose list could be read
+ * now; one that could not keeps what the last poll said, so a failed read is never a clear. Of
+ * `confirmations`, only what still waits is shown.
+ */
+fun Snapshot.withWaiting(counted: Map<String, Int>, last: Snapshot?, confirmations: Map<String, Confirmed>): Snapshot =
+    copy(folders = folders.map { folder ->
+        val waiting = counted[folder.id] ?: last?.folders?.firstOrNull { it.id == folder.id }?.waiting ?: 0
+        folder.copy(waiting = waiting, unsupported = minOf(waiting, confirmations[folder.id]?.unsupported ?: 0))
+    })
+
+/** How many files `Native.waiting` lists. */
+fun parseWaiting(reply: String): Int = JSONArray(reply).length()
+
+/** What `Native.confirm` answered: files still waiting, and those a too-old PC could not be asked about. */
+data class Confirmed(val waiting: Int, val unsupported: Int)
+
+fun parseConfirmed(reply: String): Confirmed =
+    JSONObject(reply).let { Confirmed(it.getInt("waiting"), it.getInt("unsupported")) }
+
 /** Each folder's newest `last_exchange_ms` in a `status` reply, by folder id; none for a folder with none. */
 fun parseExchanges(reply: String): Map<String, Long> =
     JSONObject(reply).optJSONArray("folders").objects()

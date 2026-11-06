@@ -21,7 +21,8 @@ class FolderLineTest {
         waiting: Int = 0,
         reachable: Boolean = true,
         lastSync: Long? = synced,
-    ) = FolderStatus("id", "Documents", error, conflicts, reachable, lastSync, waiting)
+        unsupported: Int = 0,
+    ) = FolderStatus("id", "Documents", error, conflicts, reachable, lastSync, waiting, unsupported = unsupported)
 
     @Test fun conflictsOutrankWaitingAndWaitingOutranksSynced() {
         assertEquals(Line("2 conflicts to settle", Tone.Bad), line(folder(conflicts = 2, waiting = 3)))
@@ -35,6 +36,20 @@ class FolderLineTest {
         assertEquals(Line("Not synced yet", Tone.Quiet), line(folder(lastSync = null, reachable = false)))
         assertEquals("Synced just now", line(folder(lastSync = now - 20_000)).text)
         assertEquals("Synced 3 h ago", line(folder(lastSync = now - 3 * 3_600_000L)).text)
+    }
+
+    @Test fun anOldPcLeavesFilesWaitingAndSaysToUpdateIt() {
+        assertEquals(
+            Line("2 files waiting to send. Update the PC.", Tone.Waiting),
+            line(folder(waiting = 2, unsupported = 1)),
+        )
+        // Nothing waiting, nothing to say about the PC's age.
+        assertEquals(Line("Synced 2 min ago", Tone.Ok), line(folder(unsupported = 1)))
+    }
+
+    @Test fun aPcThatTakesNoPushesSaysToUpdateIt() {
+        val shown = line(folder(error = "PEER_PUSH_UNAVAILABLE: this peer does not take pushes (peer ws://10.0.2.2:1)", waiting = 1))
+        assertEquals(Line("My PC is too old to take files from this phone. Update the PC.", Tone.Bad), shown)
     }
 
     @Test fun aFolderErrorIsShownInWords() {

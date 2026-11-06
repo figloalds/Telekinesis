@@ -82,4 +82,13 @@ class BurstsTest {
         assertTrue(error.stillApplies(null))
         assertFalse(error.stillApplies(5))
     }
+
+    @Test fun aBurstTheTransferJobEndedIsNotOneToAskThePcAfter() {
+        val ended = BurstResult(listOf(FolderBurst("f", 0, null, BurstError("SYNC_NOW_ENDED: the job stopped", 1), 0)))
+        val failed = BurstResult(listOf(FolderBurst("f", 0, null, BurstError("WS_CONNECT_FAILED: refused", 1), 0)))
+        assertTrue(ended.ended)
+        // A PC that is away is the case "waiting" exists for: that burst is still confirmed, and finds nothing.
+        assertFalse(failed.ended)
+        assertFalse(BurstResult().ended)
+    }
 }

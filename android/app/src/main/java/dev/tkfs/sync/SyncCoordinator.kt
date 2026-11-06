@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.util.Log
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
@@ -15,6 +16,8 @@ import androidx.work.WorkManager
 import dev.tkfs.Native
 import dev.tkfs.Settings
 import dev.tkfs.provider.TkfsProvider
+import dev.tkfs.ui.Confirmed
+import dev.tkfs.ui.parseConfirmed
 import dev.tkfs.ui.parseExchanges
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -23,7 +26,9 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
@@ -44,8 +49,13 @@ object SyncCoordinator {
     internal val gate = TransferGate()
     @Volatile private var lastListingBurstMs = 0L
 
+    private val confirmed = MutableStateFlow<Map<String, Confirmed>>(emptyMap())
+
     val running: StateFlow<Boolean> get() = bursts.isRunning
     val finished: StateFlow<Finished?> get() = done
+
+    /** What the PCs last said of each folder's waiting files, by folder id. */
+    val confirmations: StateFlow<Map<String, Confirmed>> get() = confirmed
 
     fun onForeground(ctx: Context) = launch(ctx, Trigger.Foreground)
 
@@ -118,7 +128,27 @@ object SyncCoordinator {
         val now = System.currentTimeMillis()
         for (folder in result.folders) if (folder.error == null) settings.setLastSyncMs(folder.id, now)
         if (result.exchanged > 0) notifyChange(app)
+        // After every burst, so a file leaves "waiting" as soon as the PC has it. Not after one a stop
+        // ended: that network may be gone.
+        if (!result.ended) confirm(result.folders.map { it.id })
         return result
+    }
+
+    /**
+     * Asks the PCs which of each folder's waiting files they hold, on this thread. A folder that
+     * fails keeps its files waiting: only a PC's answer clears one.
+     */
+    fun confirm(folders: Collection<String>) {
+        for (id in folders) {
+            try {
+                val answer = parseConfirmed(Native.confirm(id))
+                confirmed.update { it + (id to answer) }
+            } catch (error: IOException) {
+                Log.i(TAG, "confirm $id: ${error.message}")
+            } catch (error: JSONException) {
+                Log.i(TAG, "confirm $id: unreadable answer: ${error.message}")
+            }
+        }
     }
 
     /** The burst `trigger` calls for, on this thread. `decided` is a mode the caller already chose. */
@@ -205,7 +235,8 @@ object SyncCoordinator {
         }
     }
 
-    private fun metered(ctx: Context): Boolean =
+    /** What the policy sees: the same call that holds back files on a metered network. */
+    internal fun metered(ctx: Context): Boolean =
         ctx.getSystemService(ConnectivityManager::class.java)?.isActiveNetworkMetered ?: false
 
     /** The roots and every directory listing are stale once a burst brought anything. */
@@ -216,6 +247,7 @@ object SyncCoordinator {
         resolver.notifyChange(Uri.parse("content://${TkfsProvider.AUTHORITY}"), null)
     }
 
+    private const val TAG = "tkfs"
     private const val PERIODIC = "periodic-burst"
     const val TRANSFER = "transfer"
 }

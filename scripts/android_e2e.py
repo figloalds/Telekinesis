@@ -783,6 +783,24 @@ def deliver(s: Session, folder: Folder, path: str, content: bytes | Folder, what
     s.check(f"{what} is on the PC with identical bytes", True)
 
 
+def check_nothing_waits(s: Session, folder: Folder, what: str) -> None:
+    """The table on disk, then the Folders screen, hold nothing waiting for `what`, asking the phone
+    for nothing but a trigger of the table."""
+    device = s.device
+    last = [0.0]
+
+    def empty() -> bool:
+        if time.monotonic() - last[0] > 30:
+            last[0] = time.monotonic()
+            trigger_foreground(device)
+        return not device.waiting_files(folder.id)
+
+    poll(SYNC_BOUND, f"nothing waiting to send for {what}", empty, interval=2)
+    device.wait_screen("no file waiting to send",
+                       lambda texts: not any("waiting to send" in shown for shown in texts), 120)
+    s.check(f"nothing is waiting to send for {what}", True)
+
+
 def wait_transfer_ends(device: Device) -> None:
     """Until the transfer job has said it is done, so the next step starts a job of its own."""
     poll(120, "the transfer job to end", lambda: any("Stop(" in line for line in device.transfer_log()))
@@ -806,6 +824,20 @@ def scenario_share(s: Session) -> None:
     share_one(s, "share-one.bin", one)
     poll(SHARE_BOUND, "the shared file in the folder", lambda: "share-one.bin" in names())
     s.check("a shared file is kept with the PC away", device.content_read(folder.doc("share-one.bin")) == one)
+
+    # What has not reached the PC is said on the Folders screen, from a table on disk: after a kill too.
+    says = lambda text: lambda texts: any(text in shown for shown in texts)
+    only_share_one = lambda: [file["path"] for file in device.waiting_files(folder.id)] == ["/share-one.bin"]
+    device.start_app()
+    device.wait_screen("one file waiting to send", says("1 file waiting to send"), 120)
+    s.check("the Folders screen says 1 file waiting to send, with the PC away", True)
+    s.check("and the table names that file", only_share_one(), device.waiting_files(folder.id))
+    device.force_stop()
+    device.start_app()
+    device.wait_screen("one file waiting after a kill", says("1 file waiting to send"), 120)
+    s.check("it still says so after the app was force-stopped", True)
+    s.check("and the file is still named in the table", only_share_one(), device.waiting_files(folder.id))
+
     share_one(s, "clash.bin", clash_new)
     poll(SHARE_BOUND, "the numbered name", lambda: "clash (1).bin" in names())
     s.check("a name that is taken gets a number", device.content_read(folder.doc("clash (1).bin")) == clash_new)
@@ -878,6 +910,37 @@ def scenario_share(s: Session) -> None:
         deliver(s, folder, path, content, f"{path} shared with the PC away", nudge=lambda: trigger_foreground(device))
     s.check("the file that had the name is as it was on the PC",
             sha256(pc.pc_cat(folder.pc_state, "clash.bin")) == sha256(clash_old))
+
+    # Once the PC holds the bytes and has the events, they are no longer waiting.
+    check_nothing_waits(s, folder, "the shares the PC took")
+
+    # An older PC cannot say what it holds, so the file stays waiting and the app says to update the PC.
+    failures, summary = pc.stop()
+    s.check("the PC stops cleanly to become an older one", not failures, failures or summary)
+    pc.extra_env = {"TKFS_FAULT_POINT": "session.features.none"}
+    pc.start()
+    pc.wait_phase(folder.label, "Running")
+    old_pc = rng.randbytes(1 * MIB)
+    device.content_write(device.create_document(folder.doc(), "old-pc.bin"), old_pc)
+    nudged = [0.0]
+
+    def says_update() -> bool:
+        if time.monotonic() - nudged[0] > 30:
+            nudged[0] = time.monotonic()
+            trigger_foreground(device)
+        return any("Update the PC" in shown for shown in device.screen_texts())
+
+    poll(SYNC_BOUND, "the Folders screen to say to update the PC", says_update, interval=2)
+    shown = [text for text in device.screen_texts() if "Update the PC" in text]
+    s.check("an unsent file shows 'Update the PC' against a PC without content-have", bool(shown), shown)
+    s.check("and is named in the table", [file["path"] for file in device.waiting_files(folder.id)] == ["/old-pc.bin"])
+    failures, summary = pc.stop()
+    s.check("the older PC stops cleanly", not failures, failures or summary)
+    pc.extra_env = {}
+    pc.start()
+    pc.wait_phase(folder.label, "Running")
+    check_nothing_waits(s, folder, "the file once the PC can say what it holds")
+    s.check("the PC has the bytes of that file", pc_has_whole(s, folder, "old-pc.bin", old_pc))
 
     # Delivery from the background, with the app exempt from battery optimization and not.
     for exempt in (False, True):
@@ -1005,6 +1068,72 @@ def scenario_share(s: Session) -> None:
             f"{len(again)} bytes")
 
 
+def scenario_metered(s: Session) -> None:
+    """Acceptance 17: on a metered network, with "Sync on mobile data" off, opening the app brings the PC's
+    names and nothing else. A file shared in stays waiting and moves no bytes, and opening a file that
+    was never downloaded still downloads it, since the owner asked for that one.
+
+    The network is made metered the way Settings does it for a Wi-Fi network (`cmd netpolicy set
+    metered-network`), and the app is asked, through its own ConnectivityManager call, whether it sees it."""
+    device, pc = s.device, s.pc
+    rng = random.Random(17)
+    from_pc = rng.randbytes(3 * MIB)
+    folder = s.folder_with({"seed.txt": b"Here from the start.\n", "download-me.bin": from_pc})
+    names = lambda: {row["_display_name"]: row for row in device.content_query(children_uri(folder.doc()))}
+    waiting_one = lambda texts: any("1 file waiting to send" in text for text in texts)
+    device.battery_exempt(True)
+    try:
+        s.check("the app does not see a metered network to begin with", not device.app_sees_metered())
+        device.set_metered(True)
+        s.check("the app sees the network as metered, by isActiveNetworkMetered", device.app_sees_metered())
+
+        # Opening the app: the PC's new name comes, and no file does.
+        before = device.pack_bytes(folder.state)
+        pc.write_file(folder.pc_state, "name-from-pc.txt", b"Written on the PC.\n")
+        pc.folder(folder.pc_state, "flush")
+        trigger_foreground(device)
+        poll(SYNC_BOUND, "the PC's new name on the phone", lambda: "name-from-pc.txt" in names(), interval=2)
+        s.check("opening the app on a metered network brings the PC's new name", True)
+        s.check("and the file itself was not downloaded", device.pack_bytes(folder.state) == before,
+                f"{before} -> {device.pack_bytes(folder.state)}")
+
+        # A shared file stays here: nothing is pushed.
+        packs = pc_pack_bytes(folder)
+        shared = rng.randbytes(3 * MIB)
+        share_one(s, "metered-share.bin", shared)
+        poll(SHARE_BOUND, "the shared file in the folder", lambda: "metered-share.bin" in names())
+        device.start_app()
+        device.wait_screen("one file waiting to send", waiting_one, 120)
+        s.check("a file shared in on a metered network is waiting to send", True)
+        # Long enough for the job's 5 s debounce and for three foreground bursts.
+        for _ in range(3):
+            time.sleep(15)
+            trigger_foreground(device)
+        s.check("the shared file moved no bytes: the PC's packs are as they were",
+                pc_pack_bytes(folder) == packs, f"{packs} -> {pc_pack_bytes(folder)}")
+        s.check("and it is still waiting",
+                [file["path"] for file in device.waiting_files(folder.id)] == ["/metered-share.bin"],
+                device.waiting_files(folder.id))
+        device.wait_screen("still one file waiting", waiting_one, 120)
+        s.check("the Folders screen still says so", True)
+
+        # A file the owner opens downloads, whatever the network.
+        held = device.pack_bytes(folder.state)
+        read = device.content_read(folder.doc("download-me.bin"), bound=SYNC_BOUND)
+        s.check("opening an undownloaded file on a metered network downloads it", sha256(read) == sha256(from_pc),
+                f"{len(read)} bytes")
+        s.check("and its bytes are on the phone now", device.pack_bytes(folder.state) - held >= len(from_pc))
+        s.check("while the shared file still moved nothing", pc_pack_bytes(folder) == packs)
+    finally:
+        device.set_metered(False)
+    s.check("the app sees the network as unmetered again", not device.app_sees_metered())
+
+    # Back on an unmetered network the file goes by itself, and only then is it no longer waiting.
+    deliver(s, folder, "metered-share.bin", shared, "the file shared on a metered network",
+            nudge=lambda: trigger_foreground(device))
+    check_nothing_waits(s, folder, "the shared file once the network allows it")
+
+
 def scenario_transfer_timeout(s: Session) -> None:
     """Android 15 limits a `dataSync` service, and calls `Service.onTimeout` when the limit is reached.
     WorkManager maps that to a stop of the job. The limit is set to 20 s, and a job is held in its
@@ -1041,6 +1170,7 @@ SCENARIOS: dict[str, Callable[[Session], None]] = {
     "read": scenario_read,
     "write": scenario_write,
     "share": scenario_share,
+    "metered": scenario_metered,
     "transfer_timeout": scenario_transfer_timeout,
     "cold_start": scenario_cold_start,
     "harness": scenario_harness,

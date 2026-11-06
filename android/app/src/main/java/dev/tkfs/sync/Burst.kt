@@ -31,6 +31,8 @@ data class BurstResult(
     val dropped: Boolean = false,
 ) {
     val exchanged: Long get() = folders.sumOf { it.exchanged }
+    /** A stop of the transfer job ended this burst: the network may be gone, so nothing more is asked of the PC. */
+    val ended: Boolean get() = folders.any { it.error?.message?.startsWith("SYNC_NOW_ENDED") == true }
     /** What went wrong per folder. A burst that the transfer job ended on its stop is not a failure to show. */
     val errors: Map<String, BurstError>
         get() = folders.mapNotNull { f -> f.error?.takeUnless { it.message.startsWith("SYNC_NOW_ENDED") }?.let { f.id to it } }.toMap()

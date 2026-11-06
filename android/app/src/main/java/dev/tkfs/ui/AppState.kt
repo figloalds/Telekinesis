@@ -106,11 +106,24 @@ class AppModel(application: Application) : AndroidViewModel(application) {
     fun startPolling() {
         if (polling?.isActive == true) return
         polling = viewModelScope.launch {
+            var shown = true
             while (isActive) {
                 refresh()
+                // Once each time the app shows: what the PC took since the last burst clears here.
+                if (shown) {
+                    shown = false
+                    launch { confirmWhatIsShown() }
+                }
                 delay(POLL_MS)
             }
         }
+    }
+
+    private suspend fun confirmWhatIsShown() {
+        val folders = mutable.value.snapshot?.folders.orEmpty().map { it.id }
+        if (folders.isEmpty()) return
+        withContext(Dispatchers.IO) { SyncCoordinator.confirm(folders) }
+        refresh()
     }
 
     fun stopPolling() {
@@ -139,10 +152,27 @@ class AppModel(application: Application) : AndroidViewModel(application) {
             mutable.update { it.pollFailed(Failure(null, "The app could not read its own status.")) }
             return
         }
+        val shown = withWaiting(snapshot)
         val allowed = getApplication<Application>().getSystemService(PowerManager::class.java)
             .isIgnoringBatteryOptimizations(getApplication<Application>().packageName)
         val storage = if (polls++ % STORAGE_EVERY == 0) storageLine() else mutable.value.storage
-        mutable.update { it.polled(snapshot, storage, System.currentTimeMillis()).copy(batteryAllowed = allowed, shareFailures = ShareLedger.of(getApplication()).notices()) }
+        mutable.update { it.polled(shown, storage, System.currentTimeMillis()).copy(batteryAllowed = allowed, shareFailures = ShareLedger.of(getApplication()).notices()) }
+    }
+
+    /** The folders' waiting files, read from the table on disk: no PC is asked. */
+    private suspend fun withWaiting(snapshot: Snapshot): Snapshot {
+        val counted = withContext(Dispatchers.IO) {
+            snapshot.folders.mapNotNull { folder ->
+                try {
+                    folder.id to parseWaiting(Native.waiting(folder.id))
+                } catch (error: IOException) {
+                    null
+                } catch (error: JSONException) {
+                    null
+                }
+            }.toMap()
+        }
+        return snapshot.withWaiting(counted, mutable.value.snapshot, SyncCoordinator.confirmations.value)
     }
 
     /** One burst for every folder. Its errors stay on their folders until a newer exchange. */
