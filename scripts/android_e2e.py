@@ -413,6 +413,7 @@ def scenario_write(s: Session) -> None:
         "restart-while-open.txt": b"0123456789 before the restart.\n",
         "replaced-away.bin": large.randbytes(LARGE_FILE_BYTES),
         "replaced-away.txt": b"A small file nobody read.\n",
+        "killed-away.bin": large.randbytes(LARGE_FILE_BYTES),
         "edited-away.bin": large.randbytes(LARGE_FILE_BYTES),
         "edited-away.txt": b"A small file nobody read, either.\n",
     }
@@ -515,9 +516,10 @@ def check_names_and_the_namespace(s: Session, folder: Folder) -> None:
     s.sync_now(folder)
     s.check("and from the PC", not pc.pc_has(folder.pc_state, HARD_DIRECTORY))
 
-    # A change asks for its own burst: nobody calls sync-now here. The freezer would hold that
-    # burst back, as it does for now, until the transfer job; asking the provider anything keeps
-    # the app awake, and an unknown method starts nothing of its own.
+    # A change asks for its own burst: nobody calls sync-now here. Left in the background, for now
+    # that burst gets nowhere: Android freezes a cached app and cuts its network, until the transfer
+    # job. Asking the provider anything keeps the app out of that, and an unknown method starts
+    # nothing of its own.
     alone = device.create_document(folder.doc(), "burst-by-itself.txt", "text/plain")
     device.content_write(alone, b"Nobody asked.\n")
 
@@ -541,6 +543,8 @@ def check_the_open_modes(s: Session, folder: Folder) -> None:
     s.check("wa appends, whatever the offset", device.content_read(doc) == b"01AB456789tail")
     device.write_document(doc, "rwt", b"cut")
     s.check("rwt truncates", device.content_read(doc) == b"cut")
+    device.content_write(doc, b"")
+    s.check("w with nothing to write leaves an empty file", device.content_read(doc) == b"")
     device.write_document(doc, "w", b"w")
     s.check("w truncates", device.content_read(doc) == b"w")
     check_on_pc(s, folder, "modes.txt", b"w", "what the modes left")
@@ -586,6 +590,15 @@ def check_a_kill_after_a_release(s: Session, folder: Folder) -> None:
     s.sync_with_the_pc_back(folder)
     on_pc = s.pc.pc_cat(folder.pc_state, "kill-after-release.txt")
     s.check("what was written reaches the PC after the restart", on_pc == content, on_pc[:80])
+
+    # The writer has its bytes in the draft by now. Its release may have run, or be running.
+    content = b"After the second kill.\n"
+    device.content_write(doc, content)
+    device.force_stop()
+    s.check("force-stop with no wait for the release ended the app", device.app_pid() is None)
+    s.sync_with_the_pc_back(folder)
+    on_pc = s.pc.pc_cat(folder.pc_state, "kill-after-release.txt")
+    s.check("what was written reaches the PC all the same", on_pc == content, on_pc[:80])
 
 
 def check_a_kill_while_open(s: Session, folder: Folder) -> None:
@@ -641,7 +654,7 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
     device, pc = s.device, s.pc
     files = folder.files
     held = device.pack_bytes(folder.state)
-    s.check("the files for this are not on the phone", held < 2 * LARGE_FILE_BYTES, f"{held} pack bytes")
+    s.check("the files for this are not on the phone", held < LARGE_FILE_BYTES, f"{held} pack bytes")
     new_large, new_small = random.Random(15).randbytes(LARGE_FILE_BYTES // 2), b"Replaced with the PC away.\n"
 
     failures, summary = pc.stop()
@@ -664,15 +677,20 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
                 f"{time.monotonic() - started:.1f} s: {failed[:300]}")
         s.check("and its listed size stays", names_in(s, folder.doc())[path]["_size"] == str(len(files[path])))
 
-    # What was done with the PC away survives a restart too.
+    # What was done with the PC away survives a restart too, sealed or not. The second file's
+    # draft has no release and its old manifest was never here, and the folder must still open.
+    new_killed = random.Random(16).randbytes(LARGE_FILE_BYTES // 3)
+    device.write_document(folder.doc("killed-away.bin"), "wt", new_killed, close=False)
     device.force_stop()
-    s.check("force-stop with the PC away ended the app", device.app_pid() is None)
+    s.check("force-stop with the PC away and a writer open ended the app", device.app_pid() is None)
     s.check("a replaced file still reads after it", device.content_read(folder.doc("replaced-away.txt")) == new_small)
+    s.check("and so does the one whose writer was killed", device.content_read(folder.doc("killed-away.bin")) == new_killed)
 
     pc.start()
     pc.wait_phase(folder.label, "Running")
     s.sync_with_the_pc_back(folder)
-    for path, content in (("replaced-away.bin", new_large), ("replaced-away.txt", new_small)):
+    for path, content in (("replaced-away.bin", new_large), ("replaced-away.txt", new_small),
+                          ("killed-away.bin", new_killed)):
         on_pc = pc.pc_cat(folder.pc_state, path)
         s.check(f"{path} reaches the PC later", on_pc == content, f"{len(on_pc)} of {len(content)} bytes")
     for path in ("edited-away.txt", "edited-away.bin"):

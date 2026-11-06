@@ -56,7 +56,7 @@ object Native {
     @JvmStatic @Throws(IOException::class)
     external fun close(folder: String, token: Long)
 
-    /** Each of these is durable when it returns: the app may be frozen or killed right after. */
+    /** This, `rename` and `delete` are durable when they return: the app may be frozen or killed right after. */
     @JvmStatic @Throws(IOException::class)
     external fun create(folder: String, path: String, directory: Boolean)
 

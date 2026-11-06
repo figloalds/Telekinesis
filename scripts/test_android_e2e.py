@@ -449,6 +449,62 @@ class Bounds(unittest.TestCase):
         self.assertEqual((done.code, done.stdout, done.stderr), (0, b"\x00\r\n\xff", b"oops"))
 
 
+class DocumentOperations(unittest.TestCase):
+    def device(self):
+        return Device(Path("adb"), "emulator-5554")
+
+    def test_a_release_counts_for_its_own_document_only(self):
+        log = "open F:/a w\nreleased F:/a\nreleased F:/a b\nF:/a: sync: INVALID_HANDLE\nreleased F:/a\n"
+        device = self.device()
+        with patch.object(Device, "adb", return_value=Completed([], 0, log.encode(), b"")):
+            self.assertEqual(device.releases("F:/a"), 2)
+            self.assertEqual(device.releases("F:/a b"), 1)
+            self.assertEqual(device.releases("F:/"), 0)
+
+    def test_an_operation_sends_its_request_as_base64_json_and_returns_the_reply(self):
+        device = self.device()
+        sent = []
+
+        def provider(line, bound):
+            sent.append(shlex.split(line))
+            return Completed([], 0, b'Result: Bundle[{result={"id":"F:/b"}}]', b"")
+
+        with patch.object(Device, "_provider", side_effect=provider):
+            self.assertEqual(device.rename_document("F:/a", "b:c"), "F:/b")
+        words = sent[0]
+        self.assertEqual(words[words.index("--method") + 1], "tkfs.document")
+        self.assertEqual(words[words.index("--arg") + 1], "rename")
+        encoded = words[words.index("--extra") + 1].removeprefix("payload:s:")
+        self.assertEqual(json.loads(base64.b64decode(encoded)), {"id": "F:/a", "name": "b:c"})
+
+    def test_a_write_says_where_and_how_and_carries_its_bytes_as_base64(self):
+        device = self.device()
+        with patch.object(Device, "document", return_value={"written": 3}) as document:
+            self.assertEqual(device.write_document("F:/a", "rw", b"\x00\xff\n", offset=7, close=False), 3)
+        document.assert_called_once_with("write", id="F:/a", mode="rw", offset=7, fsync=False, close=False, data="AP8K")
+
+    def test_a_refusal_raises_with_its_code(self):
+        reply = Completed([], 0, b"Result: Bundle[{error=INVALID_NAME: \"a/b\"}]", b"")
+        with patch.object(Device, "_provider", return_value=reply):
+            with self.assertRaisesRegex(ManageError, "^INVALID_NAME"):
+                self.device().create_document("F:/", "a/b")
+
+
+class OnThePc(unittest.TestCase):
+    def pc(self, code, err):
+        pc = PcHost(Path("tkfs"), Path("home"))
+        pc._tkfs = MagicMock(return_value=Completed(["tkfs"], code, b"", err))
+        return pc
+
+    def test_a_path_that_is_there_or_not(self):
+        self.assertTrue(self.pc(0, b"").pc_has("state", "a"))
+        self.assertFalse(self.pc(1, b"Error: NOT_FOUND").pc_has("state", "a"))
+
+    def test_any_other_failure_says_nothing_of_the_path(self):
+        with self.assertRaisesRegex(HarnessError, "WORKER_NOT_RUNNING"):
+            self.pc(1, b"Error: WORKER_NOT_RUNNING").pc_has("state", "a")
+
+
 class ReadingTheScreen(unittest.TestCase):
     def device(self):
         return Device(Path("adb"), "emulator-5554")
