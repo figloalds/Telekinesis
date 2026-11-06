@@ -19,7 +19,16 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 unicode-normalization = "0.1"
 toml = "0.9"
 polling = "=3.11.0"
-tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake", "native-tls"] }
+tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
+
+# OpenSSL does not cross-build from Windows, so Android uses
+# rustls with bundled roots. Every other target keeps the platform trust store.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tungstenite = { version = "=0.28.0", default-features = false, features = ["native-tls"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+tungstenite = { version = "=0.28.0", default-features = false, features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [target.'cfg(windows)'.dependencies]
 slint = { version = "=1.17.0", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2"] }

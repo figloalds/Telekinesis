@@ -1095,7 +1095,10 @@ fn check_lane(role: LaneRole, lane: Option<LaneSpec>) -> Result<(), String> {
 fn tcp_of(ws: &RawSocket) -> Option<&TcpStream> {
     match ws.get_ref() {
         MaybeTlsStream::Plain(stream) => Some(stream),
+        #[cfg(not(target_os = "android"))]
         MaybeTlsStream::NativeTls(tls) => Some(tls.get_ref()),
+        #[cfg(target_os = "android")]
+        MaybeTlsStream::Rustls(tls) => Some(tls.get_ref()),
         #[allow(unreachable_patterns)]
         _ => None,
     }

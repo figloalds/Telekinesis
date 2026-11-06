@@ -137,7 +137,10 @@ fn part_cost(frame_len: usize) -> usize {
 fn tcp(ws: &Socket) -> io::Result<&TcpStream> {
     match ws.get_ref() {
         MaybeTlsStream::Plain(stream) => Ok(stream),
+        #[cfg(not(target_os = "android"))]
         MaybeTlsStream::NativeTls(stream) => Ok(stream.get_ref()),
+        #[cfg(target_os = "android")]
+        MaybeTlsStream::Rustls(stream) => Ok(stream.get_ref()),
         _ => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "UNSUPPORTED_OPERATION: unsupported TLS stream",

@@ -2087,6 +2087,7 @@ fn daemon_startup_failure_still_shuts_down_the_engine() -> Result<()> {
         crate::orchestrator::worker::Options {
             supervised: false,
             mount: None,
+            on_ready: None,
         },
     );
     let fatal = result

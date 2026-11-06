@@ -410,12 +410,52 @@ pub fn run(config_path: &Path) -> Result<()> {
             None
         }
     };
-    let daemon = Daemon::new(config, config_path, lock)?;
+    let daemon = Daemon::new(config, config_path, lock, Arc::new(RealLauncher))?;
     // From here a signal is a shutdown, never the default termination.
     signals::install(daemon.stopping.clone())?;
+    serve_until_stopped(daemon, data, |_| {})?;
+    signals::completed();
+    Ok(())
+}
+
+/// [`run`] inside a host process (the Android app): failures come back as errors
+/// instead of exiting, no signal handlers are installed, and `launcher` decides
+/// how workers run. `started` gets the daemon once it can take requests.
+pub fn run_embedded(
+    config_path: &Path,
+    launcher: Arc<dyn Launcher>,
+    started: impl FnOnce(Arc<Daemon>),
+) -> Result<()> {
+    let config_path = std::path::absolute(config_path)?;
+    crate::clock::check()?;
+    let config = Config::load_or_init(&config_path)?;
+    let data = config.data_directory.clone();
+    fs::create_dir_all(&data)
+        .with_context(|| format!("DATA_DIRECTORY_UNAVAILABLE: {}", data.display()))?;
+    let lock_path = data.join(LOCK_FILE);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("LOCK_UNAVAILABLE: {}", lock_path.display()))?;
+    try_lock(&lock).with_context(|| format!("ALREADY_RUNNING: {}", lock_path.display()))?;
+    let _log = log::install_daemon_log(&data).ok();
+    let daemon = Daemon::new(config, config_path, lock, launcher)?;
+    serve_until_stopped(daemon, data, started)
+}
+
+/// Serves `daemon` until it stops, then runs its shutdown sequence.
+fn serve_until_stopped(
+    daemon: Arc<Daemon>,
+    data: PathBuf,
+    started: impl FnOnce(Arc<Daemon>),
+) -> Result<()> {
     daemon.start_network()?;
     let discovery = Discovery(data.clone());
     let control = endpoint::serve(daemon.clone())?;
+    started(daemon.clone());
     event!(info, ORCHESTRATOR_STARTED, {
         "pid": std::process::id(),
         "control": control,
@@ -440,7 +480,6 @@ pub fn run(config_path: &Path) -> Result<()> {
     daemon.drain_requests(left.min(REQUEST_DRAIN));
     drop(discovery);
     event!(info, ORCHESTRATOR_STOPPED, { "folders": reply["folders"].clone() });
-    signals::completed();
     Ok(())
 }
 
@@ -473,7 +512,12 @@ fn try_lock(file: &File) -> std::io::Result<()> {
 impl Daemon {
     /// Opens the catalog, binds the peer listen address and builds a
     /// stopped controller per folder.
-    fn new(config: Config, config_path: PathBuf, lock: File) -> Result<Arc<Self>> {
+    fn new(
+        config: Config,
+        config_path: PathBuf,
+        lock: File,
+        launcher: Arc<dyn Launcher>,
+    ) -> Result<Arc<Self>> {
         let catalog = Catalog::open(&config.data_directory)?;
         let installation = catalog.installation()?;
         let listener = match config.listen() {
@@ -494,7 +538,7 @@ impl Daemon {
             started_ms: crate::util::time::now_ms(),
             folders: Mutex::new(BTreeMap::new()),
             executable: std::env::current_exe().context("EXECUTABLE_UNKNOWN")?,
-            launcher: Arc::new(RealLauncher),
+            launcher,
             clock: Arc::new(SystemClock),
             control: OnceLock::new(),
             listen,
@@ -1802,7 +1846,7 @@ mod tests {
         config.network.listen = String::new();
         fs::create_dir_all(&config.data_directory).unwrap();
         let lock = File::create(config.data_directory.join(LOCK_FILE)).unwrap();
-        Daemon::new(config, path, lock).unwrap()
+        Daemon::new(config, path, lock, Arc::new(RealLauncher)).unwrap()
     }
 
     #[test]

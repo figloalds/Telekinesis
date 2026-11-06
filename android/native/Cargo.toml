@@ -1,0 +1,19 @@
+[package]
+name = "tkfs-android"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+name = "tkfs_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+jni = { version = "0.21", default-features = false }
+serde_json = "1.0"
+tkfs = { path = "../.." }
+
+# Separate from the desktop package, which has no workspace of its own.
+[workspace]

@@ -102,6 +102,17 @@ pub struct WorkerProcess {
     /// Adopted: the observer the watcher waits on (it ends once this is gone).
     /// `None` only for a test stand-in ([`WorkerProcess::detached`]).
     process: Option<Arc<ObservedProcess>>,
+    /// Set instead of `process` for a worker on a thread of this process.
+    embedded: Option<Arc<dyn EmbeddedWorker>>,
+}
+
+/// A worker running inside the orchestrator's process (the Android app), which
+/// has no separate OS process to observe or kill.
+pub trait EmbeddedWorker: Send + Sync {
+    fn exited(&self) -> bool;
+    /// Asks the worker to stop; a thread cannot be killed. `Ok(false)` when
+    /// it has already exited.
+    fn stop(&self) -> Result<bool>;
 }
 
 impl WorkerProcess {
@@ -109,10 +120,25 @@ impl WorkerProcess {
     /// launchers in tests; [`Self::exited`] fails on it.
     #[cfg(test)]
     pub(crate) fn detached(pid: u32) -> Self {
-        Self { pid, process: None }
+        Self {
+            pid,
+            process: None,
+            embedded: None,
+        }
+    }
+
+    pub fn embedded(worker: Arc<dyn EmbeddedWorker>) -> Self {
+        Self {
+            pid: std::process::id(),
+            process: None,
+            embedded: Some(worker),
+        }
     }
 
     pub fn exited(&self) -> Result<bool> {
+        if let Some(worker) = &self.embedded {
+            return Ok(worker.exited());
+        }
         match &self.process {
             Some(process) => process.exited(),
             None => anyhow::bail!("PROCESS_DETACHED: pid {} is not observed", self.pid),
@@ -125,6 +151,9 @@ impl WorkerProcess {
     /// terminate; an adopted one's may not on Windows (an error: use
     /// [`kill_verified`] with its record).
     pub fn kill(&self) -> Result<bool> {
+        if let Some(worker) = &self.embedded {
+            return worker.stop();
+        }
         match &self.process {
             Some(process) => process.terminate(),
             None => anyhow::bail!("PROCESS_DETACHED: pid {} is not observed", self.pid),
@@ -217,6 +246,7 @@ pub fn spawn(spec: &LaunchSpec, sink: mpsc::Sender<ProcessEvent>) -> Result<Work
             Ok(()) => Ok(WorkerProcess {
                 pid,
                 process: Some(process),
+                embedded: None,
             }),
             Err(mpsc::SendError(mut child)) => {
                 let error = anyhow::anyhow!(failed("start exit waiter"));
@@ -283,6 +313,7 @@ pub fn adopt(
         WorkerProcess {
             pid,
             process: Some(process),
+            embedded: None,
         },
     )))
 }

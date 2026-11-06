@@ -84,6 +84,8 @@ pub struct Ready {
 pub struct Options {
     pub supervised: bool,
     pub mount: Option<PathBuf>,
+    /// An embedded worker's Ready goes here instead of to stdout.
+    pub on_ready: Option<mpsc::Sender<Ready>>,
 }
 
 /// A startup failure: printed as one JSON line on stdout, then the process
@@ -472,7 +474,12 @@ fn serve(engine: Arc<Engine>, options: &Options, root: &Path) -> Result<()> {
         mounts,
     };
     service.touch();
-    print_line(&serde_json::to_string(&ready)?);
+    match &options.on_ready {
+        Some(sink) => {
+            let _ = sink.send(ready);
+        }
+        None => print_line(&serde_json::to_string(&ready)?),
+    }
 
     let sessions = accept_loop(&engine, &listener, &token, &service);
     drop(listener);

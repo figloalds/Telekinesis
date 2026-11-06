@@ -171,7 +171,10 @@ fn leading_code(message: &str) -> String {
 fn set_read_timeout(socket: &Socket, timeout: Duration) -> Result<()> {
     match socket.get_ref() {
         MaybeTlsStream::Plain(stream) => stream.set_read_timeout(Some(timeout))?,
+        #[cfg(not(target_os = "android"))]
         MaybeTlsStream::NativeTls(stream) => stream.get_ref().set_read_timeout(Some(timeout))?,
+        #[cfg(target_os = "android")]
+        MaybeTlsStream::Rustls(stream) => stream.get_ref().set_read_timeout(Some(timeout))?,
         _ => bail!("UNSUPPORTED_OPERATION: unsupported stream"),
     }
     Ok(())

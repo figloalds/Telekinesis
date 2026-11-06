@@ -417,7 +417,10 @@ fn connect_any(
 fn clone_connector(connector: &Connector) -> Option<Connector> {
     match connector {
         Connector::Plain => Some(Connector::Plain),
+        #[cfg(not(target_os = "android"))]
         Connector::NativeTls(tls) => Some(Connector::NativeTls(tls.clone())),
+        #[cfg(target_os = "android")]
+        Connector::Rustls(tls) => Some(Connector::Rustls(tls.clone())),
         #[allow(unreachable_patterns)]
         _ => None,
     }

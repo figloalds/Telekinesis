@@ -259,7 +259,12 @@ fn run() -> Result<()> {
                 Ok(engine) => engine,
                 Err(error) => worker::exit_fatal(&Fatal::store_open(&error)),
             };
-            match worker::run(engine, worker::Options { supervised, mount }) {
+            let options = worker::Options {
+                supervised,
+                mount,
+                on_ready: None,
+            };
+            match worker::run(engine, options) {
                 Err(error) => match error.downcast::<Fatal>() {
                     Ok(fatal) => worker::exit_fatal(&fatal),
                     Err(error) => Err(error),

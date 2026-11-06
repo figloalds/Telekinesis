@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 import zipfile
@@ -17,6 +18,8 @@ PROJECT = ROOT / "android"
 LIBRARY = "libtkfs_android.so"
 ABIS = {"arm64-v8a": "aarch64-linux-android", "x86_64": "x86_64-linux-android"}
 NDK_VERSION = "27.0.12077973"
+# Android 15+ devices may use 16 KiB pages; every loadable segment must be aligned to that.
+PAGE_ALIGNMENT = 16384
 # Matches minSdk in android/app/build.gradle.
 API = 26
 
@@ -44,7 +47,7 @@ def find_toolchain(sdk):
 
 def preflight(abis):
     if not (PROJECT / "native/Cargo.toml").is_file() or not (PROJECT / "settings.gradle").is_file():
-        raise RuntimeError(f"No Android project in {PROJECT}. It is on branch spike/android; check that out first")
+        raise RuntimeError(f"No Android project in {PROJECT}. Run this from a full checkout")
     for tool in ("cargo", "rustc", "java"):
         if not shutil.which(tool) and not (tool == "java" and os.environ.get("JAVA_HOME")):
             raise RuntimeError(f"Missing {tool}; install it or add it to PATH")
@@ -64,10 +67,29 @@ def build_native(abi, ndk, bin_dir, target_dir):
            f"CC_{lower}": str(clang),
            f"AR_{lower}": str(bin_dir / f"llvm-ar{suffix[1]}"),
            f"RANLIB_{lower}": str(bin_dir / f"llvm-ranlib{suffix[1]}"),
-           f"CARGO_TARGET_{lower.upper()}_LINKER": str(clang)}
+           f"CARGO_TARGET_{lower.upper()}_LINKER": str(clang),
+           f"CARGO_TARGET_{lower.upper()}_RUSTFLAGS": f"-C link-arg=-Wl,-z,max-page-size={PAGE_ALIGNMENT}"}
     run(["cargo", "build", "--locked", "--release", "--target", triple,
          "--manifest-path", PROJECT / "native/Cargo.toml"], env=env)
-    return target_dir / triple / "release" / LIBRARY
+    library = target_dir / triple / "release" / LIBRARY
+    check_page_alignment(library)
+    return library
+
+
+def check_page_alignment(library):
+    """Fails unless every PT_LOAD segment of an ELF64 library is aligned to PAGE_ALIGNMENT."""
+    PT_LOAD = 1
+    data = library.read_bytes()
+    if data[:4] != b"ELF" or data[4] != 2 or data[5] != 1:
+        raise RuntimeError(f"{library} is not a little-endian ELF64 file")
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    for index in range(phnum):
+        header = phoff + index * phentsize
+        kind, = struct.unpack_from("<I", data, header)
+        align, = struct.unpack_from("<Q", data, header + 0x30)
+        if kind == PT_LOAD and align < PAGE_ALIGNMENT:
+            raise RuntimeError(f"{library} has a PT_LOAD segment aligned to {align}, below {PAGE_ALIGNMENT}")
 
 
 def publish_libraries(built):

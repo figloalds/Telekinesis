@@ -1,0 +1,7 @@
+# Build output and local state; the Gradle modules no longer include testclient.
+build/
+.gradle/
+.idea/
+local.properties
+# Built by scripts/build_android.py.
+app/src/main/jniLibs/
