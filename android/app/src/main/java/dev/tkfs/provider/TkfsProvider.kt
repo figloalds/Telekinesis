@@ -1,7 +1,11 @@
 package dev.tkfs.provider
 
+import android.content.res.AssetFileDescriptor
 import android.database.Cursor
 import android.database.MatrixCursor
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Point
 import android.os.Binder
 import android.os.Bundle
 import android.os.CancellationSignal
@@ -12,17 +16,24 @@ import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
 import android.util.Log
-import android.webkit.MimeTypeMap
 import dev.tkfs.BuildConfig
 import dev.tkfs.Native
+import dev.tkfs.Notifications
 import dev.tkfs.R
 import dev.tkfs.share.PART_PREFIX
 import dev.tkfs.share.ShareImports
 import dev.tkfs.sync.SyncCoordinator
+import dev.tkfs.ui.isOnThisPhone
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
+import java.io.InputStream
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * Every folder as a tree of documents. Android starts this on demand, so a request can be the
@@ -45,6 +56,7 @@ class TkfsProvider : DocumentsProvider() {
         Document.COLUMN_SIZE,
         Document.COLUMN_LAST_MODIFIED,
         Document.COLUMN_FLAGS,
+        Document.COLUMN_SUMMARY,
     )
 
     override fun onCreate(): Boolean {
@@ -112,11 +124,128 @@ class TkfsProvider : DocumentsProvider() {
         Log.i(TAG, "open $documentId $mode")
         val storage = requireNotNull(context).getSystemService(StorageManager::class.java)
         return orNotFound {
+            // Bytes the phone lacks come from a PC, and with none there a read would wait for it.
+            // A truncating open needs nothing of the old bytes, so it never asks.
+            if (open.read && !open.truncate) failFastWithoutAPC(documentId, signal)
             if (open.write) {
                 FileProxy.openForWrite(storage, documentId, open) { changed(DocumentIds.parent(documentId)) }
             } else {
                 FileProxy.openForRead(storage, documentId)
             }
+        }
+    }
+
+    /**
+     * For a file that is not all here: waits, bounded, for a PC to be reachable, and if none is,
+     * fails and tells the owner, since a viewer's own error message will not say why.
+     */
+    private fun failFastWithoutAPC(documentId: String, signal: CancellationSignal?) {
+        val (folder, path) = DocumentIds.split(documentId)
+        val entry = JSONObject(Native.stat(folder, path))
+        if (isOnThisPhone(entry.getLong("size"), entry.getLong("local_bytes"))) return
+        try {
+            awaiting(signal) { Native.reachPeer(folder) }
+        } catch (error: IOException) {
+            if (error.message?.substringBefore(':') == "PC_UNREACHABLE") {
+                val name = path.substringAfterLast('/')
+                OpenNotices.of(requireNotNull(context)).add(name)
+                Notifications.cannotOpen(requireNotNull(context), name)
+            }
+            throw error
+        }
+    }
+
+    /**
+     * Runs `block` on a thread of its own and waits for it, so that a cancelled caller is let go
+     * at once. The native wait it started ends by itself within its own bound.
+     */
+    private fun <T> awaiting(signal: CancellationSignal?, block: () -> T): T {
+        val job = waits.submit<T> { block() }
+        try {
+            while (true) {
+                signal?.throwIfCanceled()
+                try {
+                    return job.get(CANCEL_POLL_MS, TimeUnit.MILLISECONDS)
+                } catch (_: TimeoutException) {
+                    continue
+                } catch (failed: ExecutionException) {
+                    throw failed.cause ?: failed
+                }
+            }
+        } finally {
+            if (!job.isDone) job.cancel(true)
+        }
+    }
+
+    /** Only for an image that is all here: a thumbnail never fetches anything. */
+    override fun openDocumentThumbnail(
+        documentId: String,
+        sizeHint: Point,
+        signal: CancellationSignal?,
+    ): AssetFileDescriptor {
+        val (folder, path) = DocumentIds.split(documentId)
+        val entry = orNotFound { JSONObject(Native.stat(folder, path)) }
+        val mime = mimeOf(path.substringAfterLast('/'), entry.getBoolean("directory"))
+        if (!offersThumbnail(mime, entry.getLong("size"), entry.getLong("local_bytes"))) {
+            throw FileNotFoundException("NOT_FOUND: no thumbnail for $documentId")
+        }
+        signal?.throwIfCanceled()
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        orNotFound { NativeStream(folder, path).use { BitmapFactory.decodeStream(it, null, bounds) } }
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            throw FileNotFoundException("NOT_FOUND: not an image: $documentId")
+        }
+        signal?.throwIfCanceled()
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSize(bounds.outWidth, bounds.outHeight, sizeHint.x, sizeHint.y)
+        }
+        val bitmap = orNotFound { NativeStream(folder, path).use { BitmapFactory.decodeStream(it, null, options) } }
+            ?: throw FileNotFoundException("NOT_FOUND: could not decode $documentId")
+        try {
+            signal?.throwIfCanceled()
+            val cache = File(requireNotNull(context).cacheDir, "thumbnails").apply { mkdirs() }
+            val file = File.createTempFile("thumb", ".img", cache)
+            try {
+                file.outputStream().use {
+                    val format = if (bitmap.hasAlpha()) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+                    bitmap.compress(format, THUMBNAIL_QUALITY, it)
+                }
+                val descriptor = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                return AssetFileDescriptor(descriptor, 0, AssetFileDescriptor.UNKNOWN_LENGTH)
+            } finally {
+                // The descriptor keeps what it opened.
+                file.delete()
+            }
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    /** A file all here, read through the engine, which asks no one for what is. */
+    private class NativeStream(private val folder: String, path: String) : InputStream() {
+        private var token = Native.open(folder, path, false)
+        private var offset = 0L
+
+        override fun read(): Int {
+            val one = ByteArray(1)
+            return if (read(one, 0, 1) < 0) -1 else one[0].toInt() and 0xFF
+        }
+
+        override fun read(buffer: ByteArray, at: Int, length: Int): Int {
+            if (length == 0) return 0
+            val chunk = ByteArray(minOf(length, STREAM_CHUNK))
+            val count = Native.read(folder, token, offset, chunk, chunk.size)
+            if (count <= 0) return -1
+            System.arraycopy(chunk, 0, buffer, at, count)
+            offset += count
+            return count
+        }
+
+        override fun close() {
+            if (token < 0) return
+            val last = token
+            token = -1
+            Native.close(folder, last)
         }
     }
 
@@ -196,13 +325,26 @@ class TkfsProvider : DocumentsProvider() {
 
     private fun addRow(cursor: MatrixCursor, id: String, entry: JSONObject, path: String) {
         val name = entry.getString("name").ifEmpty { path }
+        val directory = entry.getBoolean("directory")
+        val size = entry.getLong("size")
+        val local = entry.getLong("local_bytes")
+        val mime = mimeOf(name, directory)
+        val thumbnail = if (offersThumbnail(mime, size, local)) Document.FLAG_SUPPORTS_THUMBNAIL else 0
         cursor.newRow()
             .add(Document.COLUMN_DOCUMENT_ID, id)
             .add(Document.COLUMN_DISPLAY_NAME, name)
-            .add(Document.COLUMN_MIME_TYPE, mime(name, entry.getBoolean("directory")))
-            .add(Document.COLUMN_SIZE, entry.getLong("size"))
+            .add(Document.COLUMN_MIME_TYPE, mime)
+            .add(Document.COLUMN_SIZE, size)
             .add(Document.COLUMN_LAST_MODIFIED, entry.getLong("modified_ms"))
-            .add(Document.COLUMN_FLAGS, flags(entry.getBoolean("directory"), path == "/"))
+            .add(Document.COLUMN_FLAGS, flags(directory, path == "/") or thumbnail)
+            .add(Document.COLUMN_SUMMARY, summary(directory, size, local))
+    }
+
+    /** "On this phone" or "Not downloaded"; a directory holds nothing of its own. */
+    private fun summary(directory: Boolean, size: Long, local: Long): String? = when {
+        directory -> null
+        isOnThisPhone(size, local) -> "On this phone"
+        else -> "Not downloaded"
     }
 
     /** A folder's root can only hold things: it has no parent to go from or name to change. */
@@ -210,13 +352,6 @@ class TkfsProvider : DocumentsProvider() {
         val holds = if (directory) Document.FLAG_DIR_SUPPORTS_CREATE else Document.FLAG_SUPPORTS_WRITE
         if (folderRoot) return holds
         return holds or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME or Document.FLAG_SUPPORTS_MOVE
-    }
-
-    private fun mime(name: String, directory: Boolean): String {
-        if (directory) return Document.MIME_TYPE_DIR
-        val extension = name.substringAfterLast('.', "").lowercase()
-        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
-            ?: "application/octet-stream"
     }
 
     private fun <T> orNotFound(block: () -> T): T = try {
@@ -232,5 +367,11 @@ class TkfsProvider : DocumentsProvider() {
         const val AUTHORITY = "dev.tkfs.documents"
         private const val TAG = "tkfs"
         private const val CREATE_ATTEMPTS = 3
+        private const val CANCEL_POLL_MS = 50L
+        private const val THUMBNAIL_QUALITY = 85
+        private const val STREAM_CHUNK = 256 * 1024
+
+        /** The waits for a PC, each on a thread that is not the caller's, so a cancel is heard. */
+        private val waits = Executors.newCachedThreadPool()
     }
 }

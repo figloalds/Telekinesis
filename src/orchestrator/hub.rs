@@ -703,6 +703,41 @@ impl Daemon {
         Ok(Held::Known(known))
     }
 
+    /// Waits at most `within` for a Ready control lane to a PC that has `folder`'s repo, first
+    /// ending any lane's wait to redial. With none in time this is `PC_UNREACHABLE`, so a reader
+    /// of a file it does not hold learns that now and not after a fetch times out.
+    ///
+    /// A PC has the repo when this device has exchanged it with it. With no exchange on record,
+    /// as after the cursors were reset, any Ready PC counts.
+    pub fn reach_a_peer(&self, folder: &str, within: Duration) -> Result<()> {
+        const POLL: Duration = Duration::from_millis(25);
+        let repo = self.catalog.resolve(folder)?.repo;
+        let network = self.network()?;
+        let end = Instant::now() + within;
+        network.nudge_lanes();
+        loop {
+            let exchanged: BTreeSet<String> = self
+                .catalog
+                .feed_cursors_of_repo(&repo)?
+                .into_iter()
+                .map(|(installation, _)| installation)
+                .collect();
+            let reachable = network.ready_peers().iter().any(|peer| {
+                exchanged.is_empty() || exchanged.contains(&peer.installation)
+            });
+            if reachable {
+                return Ok(());
+            }
+            ensure!(!self.stopping.is_cancelled(), "ORCHESTRATOR_STOPPING");
+            let left = end.saturating_duration_since(Instant::now());
+            ensure!(
+                !left.is_zero(),
+                "PC_UNREACHABLE: no PC answered within {within:?}"
+            );
+            thread::sleep(left.min(POLL));
+        }
+    }
+
     /// The endpoint's address, once (`endpoint::serve`).
     pub fn set_control(&self, address: String) {
         let _ = self.control.set(address);

@@ -939,6 +939,23 @@ impl LocalContent {
         );
         Ok(manifest.chunks)
     }
+    /// [`Self::chunks`] without asking anyone: `None` when the manifest is not here. It
+    /// goes to no fetcher, so it is safe wherever a wait for the network is not.
+    pub fn chunks_if_local(&self, reference: &FileContentRef) -> Result<Option<Vec<Digest>>> {
+        reference.validate()?;
+        if reference.kind == ContentKind::Direct {
+            return Ok(Some(vec![reference.digest]));
+        }
+        if !self.packs.contains(reference.digest)? {
+            return Ok(None);
+        }
+        let manifest = Manifest::decode(&self.packs.get(reference.digest)?)?;
+        ensure!(
+            manifest.len == reference.total_len,
+            "INVALID_MANIFEST_LENGTH"
+        );
+        Ok(Some(manifest.chunks))
+    }
     fn range_chunks(
         &self,
         reference: &FileContentRef,

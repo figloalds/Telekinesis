@@ -17,12 +17,25 @@ object Native {
     @JvmStatic @Throws(IOException::class)
     external fun manage(action: String, payload: String): String
 
-    /** The directory's entries: `[{name, directory, size, modified_ms}]`. */
+    /**
+     * The directory's entries: `[{id, name, directory, size, local_bytes, modified_ms}]`. `id` is the
+     * entity, which a rename keeps, and `local_bytes` is how much of the file is on this phone. Asks
+     * no PC for anything, so it answers at once with none.
+     */
     @JvmStatic @Throws(IOException::class)
     external fun list(folder: String, path: String): String
 
+    /** One entry, as [list] gives it. */
     @JvmStatic @Throws(IOException::class)
     external fun stat(folder: String, path: String): String
+
+    /**
+     * Waits at most 3 s for a PC that has the folder, first ending any wait to redial. Throws
+     * `PC_UNREACHABLE` if none answers: call it before opening a file that is not all here, off the
+     * main thread.
+     */
+    @JvmStatic @Throws(IOException::class)
+    external fun reachPeer(folder: String)
 
     @JvmStatic @Throws(IOException::class)
     external fun open(folder: String, path: String, writable: Boolean): Long

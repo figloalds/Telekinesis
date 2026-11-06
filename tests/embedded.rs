@@ -70,12 +70,17 @@ struct Phone {
     host: Arc<Host>,
     /// The folder's state directory here.
     state: PathBuf,
+    /// The folder's id here.
+    id: String,
     engine: Arc<Engine>,
 }
 
 impl Phone {
     fn with(files: &[(&str, &str)]) -> Result<Self> {
-        let pc = TestDaemon::start()?;
+        Self::with_pc(TestDaemon::start()?, files)
+    }
+
+    fn with_pc(pc: TestDaemon, files: &[(&str, &str)]) -> Result<Self> {
         let shared = pc.manage(&["create", "Shared", "--headless"])?;
         let repo = shared["repo"].as_str().context("no repo")?.to_owned();
         pc.wait_phase("Shared", "Running", REPLICATED)?;
@@ -117,6 +122,7 @@ impl Phone {
             _home: home,
             host,
             state,
+            id,
             engine,
         })
     }
@@ -426,4 +432,80 @@ fn an_embedded_orchestrator_serves_no_control_endpoint() -> Result<()> {
         ensure!(!data.join(name).exists(), "{name} exists");
     }
     host.stop()
+}
+
+/// How long `reach_a_peer` waits when nothing can be reached.
+const REACH: Duration = Duration::from_millis(600);
+
+/// Waits, bounded, until the phone has noticed that its PC is gone.
+fn until_unreachable(daemon: &tkfs::orchestrator::hub::Daemon, folder: &str) -> Result<()> {
+    let end = Instant::now() + Duration::from_secs(30);
+    while daemon.reach_a_peer(folder, Duration::from_millis(100)).is_ok() {
+        ensure!(Instant::now() < end, "the lane to the stopped PC stayed Ready");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+#[test]
+fn reach_a_peer_succeeds_at_once_while_a_peer_is_up() -> Result<()> {
+    let phone = Phone::with(&[("a.txt", "bytes")])?;
+    let daemon = phone.host.daemon()?;
+    let began = Instant::now();
+    daemon.reach_a_peer(&phone.id, Duration::from_secs(3))?;
+    ensure!(began.elapsed() < Duration::from_secs(2), "{:?}", began.elapsed());
+    phone.stop()
+}
+
+#[test]
+fn reach_a_peer_fails_within_its_bound_with_no_peer_up() -> Result<()> {
+    let phone = Phone::with(&[("a.txt", "bytes")])?;
+    let Phone { pc, host, engine, id, _home, .. } = phone;
+    pc.shutdown()?;
+    let daemon = host.daemon()?;
+    until_unreachable(&daemon, &id)?;
+    let began = Instant::now();
+    let refused = daemon.reach_a_peer(&id, REACH).unwrap_err();
+    let took = began.elapsed();
+    ensure!(code_of(&refused) == "PC_UNREACHABLE", "{refused:#}");
+    ensure!(
+        took >= REACH && took < REACH + Duration::from_secs(1),
+        "waited {took:?} for a bound of {REACH:?}"
+    );
+    drop(engine);
+    host.stop()
+}
+
+#[test]
+fn reach_a_peer_redials_a_lane_in_backoff_at_once() -> Result<()> {
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+        probe.local_addr()?.port()
+    };
+    let pc = TestDaemon::start_listening(&format!("127.0.0.1:{port}"), "")?;
+    let phone = Phone::with_pc(pc, &[("a.txt", "bytes")])?;
+    let Phone { pc, host, engine, id, _home, .. } = phone;
+    let kept = pc.shutdown_keep_home()?;
+    let daemon = host.daemon()?;
+    until_unreachable(&daemon, &id)?;
+    // Failed dials back off 1, 2, 4, 8 s and so on. At the fourth the lane sleeps for at least
+    // 6.4 s, well past what the PC needs to come back and `reach_a_peer` to wait.
+    let end = Instant::now() + Duration::from_secs(40);
+    loop {
+        let peers = daemon.execute("peers", &json!({}))?;
+        let control = &peers[0]["lanes"][0];
+        if control["state"] == "Backoff" && control["attempt"].as_u64() >= Some(4) {
+            break;
+        }
+        ensure!(Instant::now() < end, "the lane never reached its fourth backoff: {peers}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let pc = TestDaemon::start_in(kept)?;
+    let began = Instant::now();
+    daemon.reach_a_peer(&id, Duration::from_secs(3))?;
+    let took = began.elapsed();
+    ensure!(took < Duration::from_secs(3), "{took:?}");
+    drop(engine);
+    host.stop()?;
+    pc.shutdown()
 }

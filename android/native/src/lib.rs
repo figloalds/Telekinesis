@@ -15,6 +15,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Once, OnceLock, PoisonError},
+    time::Duration,
 };
 use tkfs::{
     core::{EntryKind, ROOT},
@@ -94,21 +95,43 @@ fn engine(folder: &str) -> Result<Arc<Engine>> {
     host()?.engine(folder)
 }
 
-fn entry_json(entry: &tkfs::core::Entry) -> Value {
+/// How long opening a file the phone lacks waits for a PC before saying there is none. The
+/// provider's open must fail within 5 s, and the rest is the app's own.
+const REACH_WITHIN: Duration = Duration::from_secs(3);
+
+/// `local_bytes` is what of the file is on this phone. Nothing here asks a PC for anything, so
+/// a listing of a folder the phone never downloaded is as quick as one of its own files.
+fn entry_json(engine: &Engine, entry: &tkfs::core::Entry) -> Value {
     let directory = entry.kind == EntryKind::Directory;
     let size = entry
         .working_len
         .or_else(|| entry.content.as_ref().map(|content| content.total_len))
         .unwrap_or(0);
     let modified = entry.times.modified.saturating_sub(UNIX_EPOCH_FILETIME) / 10_000;
-    json!({"name": entry.name, "directory": directory, "size": size, "modified_ms": modified})
+    // A manifest that cannot be read is no bytes here, and no reason to fail the listing.
+    let local = engine
+        .entry_presence(entry)
+        .map_or(0, |presence| presence.local_bytes);
+    json!({
+        "id": entry.id,
+        "name": entry.name,
+        "directory": directory,
+        "size": size,
+        "local_bytes": local,
+        "modified_ms": modified,
+    })
 }
 
 fn list(engine: &Engine, path: &str) -> Result<Value> {
     let token = engine.open_file(path, false, true, false)?;
     let entries = engine.children(token, true);
     engine.close(token)?;
-    Ok(Value::Array(entries?.iter().map(entry_json).collect()))
+    Ok(Value::Array(
+        entries?
+            .iter()
+            .map(|entry| entry_json(engine, entry))
+            .collect(),
+    ))
 }
 
 /// A handle that attaches to any draft of the file but needs none of its contents, so these work
@@ -316,7 +339,8 @@ pub extern "system" fn Java_dev_tkfs_Native_stat(
     guard_string(&mut env, |env| {
         let folder = text(env, &folder)?;
         let path = text(env, &path)?;
-        Ok(entry_json(&engine(&folder)?.lookup(&path)?).to_string())
+        let engine = engine(&folder)?;
+        Ok(entry_json(&engine, &engine.lookup(&path)?).to_string())
     })
 }
 
@@ -536,6 +560,20 @@ pub extern "system" fn Java_dev_tkfs_Native_confirm(
     guard_string(&mut env, |env| {
         let folder = text(env, &folder)?;
         Ok(confirm(&folder)?.to_string())
+    })
+}
+
+/// Waits at most 3 s for a PC that has the folder, and throws `PC_UNREACHABLE` if none is there.
+/// Opening a file the phone does not hold calls this first, so that it fails fast.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_reachPeer(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        host()?.daemon()?.reach_a_peer(&folder, REACH_WITHIN)
     })
 }
 
@@ -924,6 +962,47 @@ mod tests {
                 assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
             }
         });
+    }
+
+    #[test]
+    fn reaching_a_peer_fails_through_the_guard_with_no_host() {
+        with_env(|env| {
+            let class = env.find_class("java/lang/Object").unwrap();
+            let folder = env.new_string("F").unwrap();
+            Java_dev_tkfs_Native_reachPeer(unsafe { env.unsafe_clone() }, class, folder);
+            assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+        });
+    }
+
+    #[test]
+    fn a_listing_says_what_is_on_the_phone_and_a_stat_agrees() {
+        let (_home, engine) = test_engine();
+        never_downloaded(&engine, "/far.bin");
+        let token = engine.open_file("/near.txt", true, false, true).unwrap();
+        engine.write(token, 0, b"made here", false, false).unwrap();
+        engine.close(token).unwrap();
+        create(&engine, "/dir", true).unwrap();
+
+        let rows = list(&engine, "/").unwrap();
+        let row = |name: &str| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == name)
+                .unwrap_or_else(|| panic!("no {name} in {rows}"))
+                .clone()
+        };
+        assert_eq!(row("far.bin")["size"], 4 * CHUNK_SIZE);
+        assert_eq!(row("far.bin")["local_bytes"], 0);
+        assert_eq!(row("near.txt")["size"], 9);
+        assert_eq!(row("near.txt")["local_bytes"], 9);
+        assert_eq!(row("dir")["local_bytes"], 0);
+        assert!(row("near.txt")["id"].as_str().is_some_and(|id| !id.is_empty()));
+
+        let stat = entry_json(&engine, &engine.lookup("/far.bin").unwrap());
+        assert_eq!(stat["local_bytes"], 0);
+        assert_eq!(stat["size"], 4 * CHUNK_SIZE);
+        engine.shutdown().unwrap();
     }
 
     #[test]

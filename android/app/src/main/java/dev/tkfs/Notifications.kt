@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import androidx.work.ForegroundInfo
 import dev.tkfs.ui.MainActivity
+import dev.tkfs.ui.unreachableOpen
 
 /**
  * The notifications of the transfer job and of sharing in. Without the notification permission
@@ -21,6 +22,7 @@ object Notifications {
     const val TRANSFER_ID = 41
     const val SHARE_ID = 42
     private const val SHARE_RESULT_ID = 43
+    private const val OPEN_FAILED_ID = 44
 
     /** The job's notification: it is what lets Android keep the app's network while it sends. */
     fun transfer(context: Context, text: String): ForegroundInfo {
@@ -50,6 +52,20 @@ object Notifications {
             .setAutoCancel(true)
             .build()
         context.getSystemService(NotificationManager::class.java).notify(SHARE_RESULT_ID, notification)
+    }
+
+    /** A file the owner opened could not be, because no PC answered. Nothing is shown without the permission. */
+    fun cannotOpen(context: Context, name: String) {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return
+        val notification = builder(context, RESULT)
+            .setContentTitle("Couldn't open $name")
+            .setContentText(unreachableOpen(name))
+            .setStyle(Notification.BigTextStyle().bigText(unreachableOpen(name)))
+            .setAutoCancel(true)
+            .build()
+        // One per file, so a second file does not replace the first.
+        manager.notify(name, OPEN_FAILED_ID, notification)
     }
 
     private fun builder(context: Context, channel: String): Notification.Builder {

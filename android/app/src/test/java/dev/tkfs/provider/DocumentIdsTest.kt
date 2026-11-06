@@ -74,6 +74,11 @@ class DocumentIdsTest {
         }
     }
 
+    @Test fun aScreenAsksTheSameQuestionTheProviderDoes() {
+        for (name in listOf("a b%#:é.txt", "...", ".profile", " ")) assertTrue(name, DocumentIds.isValidName(name))
+        for (name in listOf("", ".", "..", "a/b", "a\\b", "a\u0000b")) assertFalse(name, DocumentIds.isValidName(name))
+    }
+
     /** A tree grant on /a must not reach /b through a dot-dot. */
     @Test fun aPathThatClimbsOutIsNotAChild() {
         assertFalse(DocumentIds.isChild("F:/a", "F:/a/../b"))

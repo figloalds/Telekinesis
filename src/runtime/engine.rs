@@ -3,7 +3,7 @@ use crate::util::namespace::NamespaceChanges;
 use crate::{
     content::{Kind, seal, working::*},
     core::*,
-    model::content::{ContentKind, Digest},
+    model::content::{CHUNK_SIZE, ContentKind, Digest},
     util::log::event,
 };
 use anyhow::{Context, Result, ensure};
@@ -141,11 +141,46 @@ pub struct Handle {
     pub directory: Mutex<Option<Arc<Vec<Entry>>>>,
     read_ahead: Mutex<ReadAhead>,
 }
+/// How much of a file's bytes are on this device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Presence {
+    pub local_bytes: u64,
+    pub total_bytes: u64,
+}
+impl Presence {
+    /// Every byte is here: the file opens with no one to ask.
+    pub fn is_whole(&self) -> bool {
+        self.local_bytes == self.total_bytes
+    }
+}
+/// Most files whose being whole is remembered. A listing of one large folder stays within it.
+const PRESENCE_CACHE_LIMIT: usize = 16_384;
+/// The content that was whole when last looked at, by its digest. A digest names its bytes, so
+/// the answer holds for any file that has them. Only whole files are kept, and the oldest go first.
+#[derive(Default)]
+struct PresenceCache {
+    whole: HashMap<Digest, u64>,
+    order: VecDeque<Digest>,
+}
+impl PresenceCache {
+    fn insert(&mut self, digest: Digest, local_bytes: u64) {
+        if self.whole.insert(digest, local_bytes).is_none() {
+            self.order.push_back(digest);
+        }
+        while self.whole.len() > PRESENCE_CACHE_LIMIT {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.whole.remove(&oldest);
+        }
+    }
+}
 pub struct Engine {
     pub store: Mutex<Store>,
     pub working: WorkingLayer,
     namespace_changes: Arc<NamespaceChanges>,
     namespace_cache: Mutex<NamespaceCache>,
+    presence_cache: Mutex<PresenceCache>,
     handles: RwLock<BTreeMap<u64, Arc<Handle>>>,
     invalidate: RwLock<Option<Invalidate>>,
     notifications: Mutex<BTreeMap<String, u32>>,
@@ -190,6 +225,7 @@ impl Engine {
             working,
             namespace_changes,
             namespace_cache: Mutex::new(NamespaceCache::default()),
+            presence_cache: Mutex::new(PresenceCache::default()),
             handles: RwLock::new(BTreeMap::new()),
             invalidate: RwLock::new(None),
             notifications: Mutex::new(BTreeMap::new()),
@@ -374,6 +410,56 @@ impl Engine {
             }
         }
         Ok(entry)
+    }
+    /// How much of the file at `path` is here. It asks no one for anything: a file whose
+    /// manifest was never fetched has no bytes here, however large it is.
+    pub fn presence(&self, path: &str) -> Result<Presence> {
+        self.entry_presence(&self.lookup(path)?)
+    }
+    /// [`Self::presence`] for an entry already in hand, as a listing has them.
+    pub fn entry_presence(&self, entry: &Entry) -> Result<Presence> {
+        let Some(reference) = &entry.content else {
+            return Ok(Presence {
+                local_bytes: 0,
+                total_bytes: 0,
+            });
+        };
+        let content = self.working.content();
+        let cached = lock(&self.presence_cache).whole.get(&reference.digest).copied();
+        let held = match cached {
+            Some(held) => held,
+            None => {
+                let held = match content.chunks_if_local(reference)? {
+                    None => 0,
+                    Some(chunks) => {
+                        let mut held = 0;
+                        for (index, digest) in chunks.iter().enumerate() {
+                            if content.packs.contains(*digest)? {
+                                held += (reference.total_len - index as u64 * CHUNK_SIZE)
+                                    .min(CHUNK_SIZE);
+                            }
+                        }
+                        held
+                    }
+                };
+                if held == reference.total_len {
+                    lock(&self.presence_cache).insert(reference.digest, held);
+                }
+                held
+            }
+        };
+        // A draft shows its own length. What it keeps of the file it was made from is here only
+        // if all of that is.
+        let total_bytes = entry.working_len.unwrap_or(reference.total_len);
+        let local_bytes = if held == reference.total_len {
+            total_bytes
+        } else {
+            held.min(total_bytes)
+        };
+        Ok(Presence {
+            local_bytes,
+            total_bytes,
+        })
     }
     pub fn open_file(
         &self,
@@ -1991,6 +2077,175 @@ mod tests {
         engine.shutdown()?;
         assert!(reached_release, "close did not reach scratch release");
         assert_eq!(accessible.ok(), Some(true));
+        Ok(())
+    }
+
+    /// Counts what a fetcher is asked, and fetches nothing.
+    #[derive(Default)]
+    struct Asked(std::sync::atomic::AtomicUsize);
+    impl ObjectFetcher for Asked {
+        fn fetch(&self, _: &[(Digest, Kind)]) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("OBJECT_MISSING")
+        }
+        fn hint(&self, _: &[(Digest, Kind)]) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A file named `path` that has `reference` as its content, whatever of it is here.
+    fn file_of(engine: &Engine, path: &str, reference: FileContentRef) -> Result<()> {
+        let mut store = lock(&engine.store);
+        let mut state = store.create(path, EntryKind::File)?;
+        let parent = store.projection().visible[&state.id].clone();
+        state.content = Some(reference);
+        let branch = store.active.clone();
+        let event = store.event(&branch, state, vec![parent], Operation::Content);
+        store.apply(&[event])?;
+        Ok(())
+    }
+
+    /// A file of `chunks` chunks, the last of them `tail` bytes short of whole, of which the
+    /// chunks at `held` are here, and its manifest too if `manifest`.
+    fn partly_here(
+        engine: &Engine,
+        path: &str,
+        chunks: u64,
+        tail: u64,
+        held: &[u64],
+        manifest: bool,
+    ) -> Result<u64> {
+        let content = engine.working.content();
+        let total = chunks * CHUNK_SIZE - tail;
+        let mut digests = Vec::new();
+        for index in 0..chunks {
+            let size = (total - index * CHUNK_SIZE).min(CHUNK_SIZE) as usize;
+            let mut bytes = vec![0; size];
+            bytes[..8.min(size)].copy_from_slice(&index.to_le_bytes()[..8.min(size)]);
+            digests.push(if held.contains(&index) {
+                content.packs.put(Kind::Chunk, &bytes)?
+            } else {
+                Digest::bytes(&bytes)
+            });
+        }
+        let encoded = Manifest {
+            len: total,
+            chunks: digests,
+        }
+        .encode()?;
+        let digest = if manifest {
+            content.packs.put(Kind::Manifest, &encoded)?
+        } else {
+            Digest::bytes(&encoded)
+        };
+        file_of(
+            engine,
+            path,
+            FileContentRef::new(ContentKind::Manifest, digest, total)?,
+        )?;
+        Ok(total)
+    }
+
+    #[test]
+    fn presence_counts_local_chunks_and_never_fetches() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let asked = Arc::new(Asked::default());
+        engine.working.content().set_fetcher(asked.clone());
+        // Offline, and not even the manifest is here.
+        let total = partly_here(&engine, "/never", 4, 0, &[], false)?;
+        let began = std::time::Instant::now();
+        let presence = engine.presence("/never")?;
+        assert_eq!(
+            presence,
+            Presence {
+                local_bytes: 0,
+                total_bytes: total
+            }
+        );
+        assert!(!presence.is_whole());
+        assert!(began.elapsed() < Duration::from_secs(1));
+        // Nor does it fetch for a file that is whole, or for the folder.
+        partly_here(&engine, "/whole", 3, 0, &[0, 1, 2], true)?;
+        assert!(engine.presence("/whole")?.is_whole());
+        let small = engine.working.content().import(b"small")?;
+        file_of(&engine, "/small", small)?;
+        assert_eq!(
+            engine.presence("/small")?,
+            Presence {
+                local_bytes: 5,
+                total_bytes: 5
+            }
+        );
+        assert_eq!(
+            engine.presence("/")?,
+            Presence {
+                local_bytes: 0,
+                total_bytes: 0
+            }
+        );
+        assert_eq!(asked.0.load(Ordering::SeqCst), 0, "presence asked a fetcher");
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn presence_of_a_partly_read_file_is_partial() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        // Two of four chunks are here, the last of them short.
+        let total = partly_here(&engine, "/part", 4, 100, &[0, 3], true)?;
+        assert_eq!(
+            engine.presence("/part")?,
+            Presence {
+                local_bytes: CHUNK_SIZE + (CHUNK_SIZE - 100),
+                total_bytes: total
+            }
+        );
+        // Only what is whole is remembered, so a chunk arriving later shows.
+        assert!(lock(&engine.presence_cache).whole.is_empty());
+        let reference = engine.lookup("/part")?.content.unwrap();
+        let content = engine.working.content();
+        let chunks = content.chunks(&reference)?;
+        for (index, digest) in chunks.iter().enumerate().skip(1).take(2) {
+            let size = (total - index as u64 * CHUNK_SIZE).min(CHUNK_SIZE) as usize;
+            let mut bytes = vec![0; size];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            assert_eq!(content.packs.put(Kind::Chunk, &bytes)?, *digest);
+        }
+        assert!(engine.presence("/part")?.is_whole());
+        assert_eq!(lock(&engine.presence_cache).whole.len(), 1);
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_whole_files_remembered_stay_within_their_bound() {
+        let mut cache = PresenceCache::default();
+        for index in 0..PRESENCE_CACHE_LIMIT as u64 + 10 {
+            cache.insert(Digest::bytes(&index.to_le_bytes()), index);
+        }
+        assert_eq!(cache.whole.len(), PRESENCE_CACHE_LIMIT);
+        assert_eq!(cache.order.len(), PRESENCE_CACHE_LIMIT);
+        // The oldest went.
+        assert!(!cache.whole.contains_key(&Digest::bytes(&0u64.to_le_bytes())));
+    }
+
+    #[test]
+    fn a_draft_shows_its_own_length_as_here() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let token = engine.open_file("/made", true, false, true)?;
+        engine.write(token, 0, b"made on this phone", false, false)?;
+        assert_eq!(
+            engine.presence("/made")?,
+            Presence {
+                local_bytes: 18,
+                total_bytes: 18
+            }
+        );
+        engine.close(token)?;
+        engine.shutdown()?;
         Ok(())
     }
 }

@@ -49,10 +49,13 @@ object DocumentIds {
      * else or nowhere, and the core treats a backslash as a separator too.
      */
     fun requireName(name: String): String {
-        val valid = name.isNotEmpty() && name != "." && name != ".." && name.none { it in "/\\\u0000" }
-        if (!valid) throw FileNotFoundException("INVALID_NAME: \"$name\"")
+        if (!isValidName(name)) throw FileNotFoundException("INVALID_NAME: \"$name\"")
         return name
     }
+
+    /** What [requireName] accepts, for a screen that asks the owner for a name. */
+    fun isValidName(name: String): Boolean =
+        name.isNotEmpty() && name != "." && name != ".." && name.none { it in "/\\\u0000" }
 
     /**
      * Whether `id` is below `parent`. This guards tree grants, so a path that climbs out of
