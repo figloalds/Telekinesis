@@ -135,7 +135,7 @@ the ones listed under "Changes to the core".
 | `android/` project layout and Gradle wrapper | `BACKGROUND_PREFETCH`: use `sync_profile = "passive"` |
 | Core: `run_embedded`, `Launcher` injection, `EmbeddedWorker`, `Options::on_ready`, TLS `cfg`s | The name "spike" in code, package and comments |
 | `tkfs-android`'s thread launcher | The form-style `MainActivity` |
-| Provider shape and on-demand start | `testclient`: `adb shell content` reaches the provider from outside the app |
+| Provider shape and on-demand start | `testclient`: `adb shell content` reaches the provider from outside the app, through a debug-only path permission the shell holds |
 | `scripts/build_android.py` (already committed) | `android/build-native.ps1` |
 
 Work happens on a new branch, `android-client`, cut from `two-way-content`. The Android
