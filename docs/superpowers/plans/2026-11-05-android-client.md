@@ -820,3 +820,40 @@ Run: `python scripts/build_android.py`. Expected: both ABIs, page alignment chec
 Run: `python scripts/android_e2e.py --scenario all`. Expected: PASS, with `report.json` listing every scenario, and no process left behind.
 
 - [ ] **Step 6: Commit** as `feat: freeze and reinstall checks, Settings, and Android docs`.
+
+### Task 21: Binary object bodies
+
+Added during execution. Task 11 found that objects travel as JSON number arrays, 3.57 wire bytes per random byte, so read-ahead alone reaches about 8.4 MiB/s on an unlimited link and about 2.7 MiB/s on the emulator's network, against the spec's 10 MiB/s target. It also costs mobile data on every transfer.
+
+**Files:**
+- Modify: `src/orchestrator/sync.rs`, `src/orchestrator/worker_client.rs`, `src/orchestrator/network.rs`, `src/orchestrator/push.rs`, `src/orchestrator/sync_driver.rs`, `src/model/protocol.rs`, `docs/ARCHITECTURE.md`, `scripts/android_e2e.py`
+- Test: `src/orchestrator/sync.rs`, `src/orchestrator/network.rs`, `tests/peer_sync.rs`
+
+**Interfaces:**
+- Produces: `sync::encode_objects(objects: &[Object]) -> Vec<u8>` and `sync::decode_objects(body: &[u8]) -> Result<Vec<Object>>`. Binary layout: magic bytes, then per object digest, kind, u32 length and raw bytes. `decode_objects` also accepts today's JSON, told apart by the first byte.
+- Feature `content-binary` in `model::protocol::features`, advertised by both sides of a peer session.
+
+Rules:
+- A reply is binary only when the request asked with `binary: true` in its header, so an older server still answers JSON and a client decodes either.
+- A request body (`objects.store`, `objects.write`) is binary only toward a peer advertising `content-binary`, or a worker known to take it. An older peer or adopted older worker keeps JSON, and tests cover both.
+- Limits are unchanged in meaning: `MAX_BATCH_BYTES` stays, and `MAX_REPLY_JSON` and `OBJECT_JSON_OVERHEAD` keep applying to JSON replies only. A digest is still verified on receipt.
+
+- [ ] **Step 1: Write the failing tests.**
+```rust
+// sync.rs
+fn objects_round_trip_through_the_binary_body()
+fn decode_objects_still_reads_json()
+fn a_truncated_binary_body_is_an_error_and_never_a_partial_object()
+fn a_binary_reply_is_sent_only_when_asked()
+// tests/peer_sync.rs
+fn binary_objects_move_within_a_small_margin_of_their_size() -> Result<()> // proxy bytes for a random file under 1.1 times its size
+fn an_older_peer_still_syncs_with_json_objects() -> Result<()>             // session.features.none
+```
+
+- [ ] **Step 2: Run them.** Expected: FAIL.
+
+- [ ] **Step 3: Implement** per the rules. Run: `cargo test --lib`, `cargo test --test peer_sync --test embedded`, `cargo test --release --test embedded`. Expected: PASS.
+
+- [ ] **Step 4: Put `speed` back into `--scenario all`.** Run: `python scripts/android_e2e.py --scenario speed`. Expected: at least 10 MiB/s. If not, report the number and the remaining bottleneck, without lowering the bound, and leave `speed` out of `all`.
+
+- [ ] **Step 5: Commit** as `feat: objects travel as binary between peers that can`.
