@@ -183,17 +183,21 @@ Document ids stay `FOLDER_ID:/path`, as in the spike. The provider adds these to
 - **A closed write is durable.** A writable handle's release seals it (`Engine::flush` with
   its token) and fsyncs before release returns, and then asks for a burst. The sealer thread
   may be frozen moments later, so this cannot be left to it. If the process dies first,
-  `seal::recover` picks the draft up at the next start.
+  `seal::recover` picks the draft up at the next start. A draft whose seal needs what is not on the
+  phone never keeps the folder from opening: it stays on disk, the sealer asks for what it needs and
+  tries again, and every other file goes on as usual.
 - **Change notifications.** Cursors set a notification URI, and the provider calls
   `notifyChange` when a burst moves events or local files change, so an open Files window
   updates.
 - **Not downloaded yet.** `COLUMN_SUMMARY` shows "On this phone" or "Not downloaded".
   Thumbnails are offered only for files already on the phone, so browsing downloads nothing.
 - **Writing a file the phone lacks.** `w`, `wt` and `rwt` need nothing of the old file, not even
-  its manifest, so they work with no network, before and after a restart. `rw` and `wa` keep what
-  they do not write: writing part of a chunk that is not here fails with an I/O error and changes
-  nothing, and with the manifest not here either, the open itself fails as a read's does. Rename,
-  move and delete need none of a file's contents.
+  its manifest, so they work with no network, before and after a restart. They change nothing until
+  the first write, fsync or close, so a client killed while it holds its descriptor leaves the file
+  as it was. `rw` and `wa` keep what they do not write: writing part of a chunk that is not here, or
+  past a short last chunk that is not here, fails with an I/O error and changes nothing, and with the
+  manifest not here either, the open itself fails as a read's does. Rename, move and delete need
+  none of a file's contents.
 - **Opening a file the phone lacks.** The open clears lane backoff, so a PC that just came
   back is tried at once. With no reachable peer it fails within 5 s rather than the spike's
   20 s, and the app shows why, since a viewer's own error message will not.

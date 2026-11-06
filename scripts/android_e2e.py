@@ -376,6 +376,7 @@ DIRECTORY_FLAGS = FLAG_DIR_CREATE | FLAG_DELETE | FLAG_RENAME | FLAG_MOVE
 ROOT_SUPPORTS_CREATE, ROOT_SUPPORTS_IS_CHILD = 1, 16
 
 RENAMED_HARD_NAME = "é r%#:enomeado.txt"
+CHUNK_BYTES = 64 * 1024
 # Larger than a chunk, so it has a manifest and the phone has to fetch that too.
 LARGE_FILE_BYTES = 300 * 1024
 
@@ -408,6 +409,7 @@ def scenario_write(s: Session) -> None:
         "from-pc.txt": b"Written on the PC.\n",
         "sub/below.txt": b"Below a directory.\n",
         "kill-after-release.txt": b"Before the kill.\n",
+        "kill-before-a-write.txt": b"Before the kill, with nothing written.\n",
         "kill-while-open.txt": b"Before the kill, while open.\n",
         "kill-while-open.bin": large.randbytes(LARGE_FILE_BYTES),
         "restart-while-open.txt": b"0123456789 before the restart.\n",
@@ -591,6 +593,16 @@ def check_a_kill_after_a_release(s: Session, folder: Folder) -> None:
     on_pc = s.pc.pc_cat(folder.pc_state, "kill-after-release.txt")
     s.check("what was written reaches the PC after the restart", on_pc == content, on_pc[:80])
 
+    # A client that holds `w` and has written nothing has changed nothing yet.
+    held, kept = folder.doc("kill-before-a-write.txt"), folder.files["kill-before-a-write.txt"]
+    device.write_document(held, "w", b"", close=False)
+    device.force_stop()
+    s.check("force-stop with a writer that wrote nothing ended the app", device.app_pid() is None)
+    s.check("and the file reads as it was", device.content_read(held) == kept)
+    s.sync_with_the_pc_back(folder)
+    on_pc = s.pc.pc_cat(folder.pc_state, "kill-before-a-write.txt")
+    s.check("and it is as it was on the PC", on_pc == kept, on_pc[:80])
+
     # The writer has its bytes in the draft by now. Its release may have run, or be running.
     content = b"After the second kill.\n"
     device.content_write(doc, content)
@@ -676,6 +688,13 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
         s.check(f"rw writing part of {path}, never downloaded, fails with an I/O error", wanted in failed,
                 f"{time.monotonic() - started:.1f} s: {failed[:300]}")
         s.check("and its listed size stays", names_in(s, folder.doc())[path]["_size"] == str(len(files[path])))
+
+    # Past the end of a file whose short last chunk is not here: the write fails, not its seal.
+    doc, past = folder.doc("edited-away.txt"), 2 * CHUNK_BYTES
+    failed = refusal(lambda: device.write_document(doc, "rw", b"past", offset=past))
+    s.check("rw past the end of a short file never downloaded fails with an I/O error", "I/O error" in failed, failed[:300])
+    size = names_in(s, folder.doc())["edited-away.txt"]["_size"]
+    s.check("and its listed size stays", size == str(len(files["edited-away.txt"])), size)
 
     # What was done with the PC away survives a restart too, sealed or not. The second file's
     # draft has no release and its old manifest was never here, and the folder must still open.

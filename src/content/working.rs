@@ -157,13 +157,21 @@ impl Scratch {
         Ok(())
     }
     fn write_record(&self, durable: bool) -> Result<()> {
-        let path = self.path.with_extension("json");
-        let temp = self.path.with_extension("json.tmp");
-        let mut file = File::create(&temp)?;
-        file.write_all(&serde_json::to_vec(&self.record)?)?;
+        self.write_record_aside(&self.record, durable)?;
+        self.replace_record(durable)
+    }
+    /// Writes `record` where nothing reads it, until [`Self::replace_record`].
+    fn write_record_aside(&self, record: &ScratchRecord, durable: bool) -> Result<()> {
+        let mut file = File::create(self.path.with_extension("json.tmp"))?;
+        file.write_all(&serde_json::to_vec(record)?)?;
         if durable {
             file.sync_all()?;
         }
+        Ok(())
+    }
+    fn replace_record(&self, durable: bool) -> Result<()> {
+        let path = self.path.with_extension("json");
+        let temp = self.path.with_extension("json.tmp");
         // Replace atomically on both supported platforms.
         #[cfg(windows)]
         {
@@ -189,49 +197,92 @@ impl Scratch {
         }
         Ok(())
     }
-    /// Fetch only chunks touched by this operation. Entire overwritten chunks
-    /// need no base data; partial writes must preserve the rest of their chunk.
-    fn hydrate(
-        &mut self,
-        content: &LocalContent,
-        offset: u64,
-        len: u64,
-        overwrite: bool,
-    ) -> Result<()> {
+    /// Puts this chunk's base bytes in the draft, which then reads it from there.
+    fn hydrate_base(&mut self, content: &LocalContent, index: u64) -> Result<()> {
+        if self.hydrated.contains(&index) {
+            return Ok(());
+        }
+        let start = index * CHUNK_SIZE;
+        let count = self
+            .base_visible_len
+            .saturating_sub(start)
+            .min(CHUNK_SIZE)
+            .min(self.len()?.saturating_sub(start));
+        if count > 0 {
+            let mut bytes = vec![0; count as usize];
+            content.read_range(&self.record.basis.content, start, &mut bytes)?;
+            write_at(self.file()?, &bytes, start)?;
+        }
+        self.hydrated.insert(index);
+        self.hydration_pending |= start < self.base_visible_len;
+        Ok(())
+    }
+    /// Fetch only chunks touched by this operation.
+    fn hydrate(&mut self, content: &LocalContent, offset: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
         let initial = self.materialize()?;
-        let file_len = self.len()?;
         for index in offset / CHUNK_SIZE..=(offset + len - 1) / CHUNK_SIZE {
+            self.hydrate_base(content, index)?;
+        }
+        self.publish_hydration(!initial)
+    }
+    /// Publish every newly materialized base range before accepting edits,
+    /// including ranges left by a previous failed hydration attempt.
+    fn publish_hydration(&mut self, durable: bool) -> Result<()> {
+        if self.hydration_pending {
+            self.persist_hydration(durable)?;
+        }
+        Ok(())
+    }
+    /// What a write at `offset` must do before its bytes go in: partial writes must preserve the
+    /// rest of their chunk, so those chunks are brought in and published. Entire overwritten
+    /// chunks need no base data, and are returned: they read from the draft only once their bytes
+    /// are there, so a write that fails on the way leaves them reading as they did.
+    fn prepare_write(
+        &mut self,
+        content: &LocalContent,
+        offset: u64,
+        len: u64,
+        durable: bool,
+    ) -> Result<Vec<u64>> {
+        let file_len = self.len()?;
+        // Growing past a short last chunk changes that chunk, which a seal can only make from its
+        // bytes. Fail here if they are out of reach, not in a seal that can never finish.
+        let last = file_len / CHUNK_SIZE;
+        if file_len % CHUNK_SIZE != 0 && offset + len > file_len && offset > last * CHUNK_SIZE {
+            self.hydrate_base(content, last)?;
+        }
+        let mut whole = Vec::new();
+        for index in offset / CHUNK_SIZE..=(offset + len - 1) / CHUNK_SIZE {
+            let start = index * CHUNK_SIZE;
             if self.hydrated.contains(&index) {
                 continue;
             }
-            let start = index * CHUNK_SIZE;
-            if overwrite && offset <= start && offset + len >= (start + CHUNK_SIZE).min(file_len) {
-                self.hydrated.insert(index);
-                self.hydration_pending |= start < self.base_visible_len;
-                continue;
+            if offset <= start && offset + len >= (start + CHUNK_SIZE).min(file_len) {
+                whole.push(index);
+            } else {
+                self.hydrate_base(content, index)?;
             }
-            let count = self
-                .base_visible_len
-                .saturating_sub(start)
-                .min(CHUNK_SIZE)
-                .min(file_len.saturating_sub(start));
-            if count > 0 {
-                let mut bytes = vec![0; count as usize];
-                content.read_range(&self.record.basis.content, start, &mut bytes)?;
-                write_at(self.file()?, &bytes, start)?;
+        }
+        self.publish_hydration(durable)?;
+        Ok(whole)
+    }
+    /// The bytes of these overwritten chunks are in the draft now, so it may say so. If it cannot
+    /// put that on record they go back to reading from the base.
+    fn accept_whole_chunks(&mut self, whole: &[u64], durable: bool) -> Result<()> {
+        for index in whole {
+            self.hydrated.insert(*index);
+            self.hydration_pending |= index * CHUNK_SIZE < self.base_visible_len;
+        }
+        let published = self.publish_hydration(durable);
+        if published.is_err() {
+            for index in whole {
+                self.hydrated.remove(index);
             }
-            self.hydrated.insert(index);
-            self.hydration_pending |= start < self.base_visible_len;
         }
-        // Publish every newly materialized base range before accepting edits,
-        // including ranges left by a previous failed hydration attempt.
-        if self.hydration_pending {
-            self.persist_hydration(!initial)?;
-        }
-        Ok(())
+        published
     }
     fn persist_hydration(&mut self, durable: bool) -> Result<()> {
         if durable {
@@ -319,8 +370,10 @@ impl Scratch {
         if end > old_len {
             self.persist_visible_boundary()?;
         }
-        self.hydrate(content, offset, count as u64, true)?;
+        let durable = !self.materialize()?;
+        let whole = self.prepare_write(content, offset, count as u64, durable)?;
         write_at(self.file()?, &bytes[..count], offset)?;
+        self.accept_whole_chunks(&whole, durable)?;
         self.length = self.length.max(end);
         self.dirty.mark(offset, count as u64);
         self.changed = true;
@@ -363,13 +416,34 @@ impl Scratch {
         if size > old {
             self.persist_visible_boundary()?;
         }
+        // A shrink that hides base bytes must be on record before the file can grow again. That
+        // record is made first, because a failure from here until the cut must change nothing.
+        let boundary = self.base_visible_len.min(size);
+        let shrink = self.record.base_visible_len != Some(boundary);
+        let hydrated: BTreeSet<u64> = self
+            .hydrated
+            .iter()
+            .copied()
+            .filter(|index| *index * CHUNK_SIZE < size)
+            .collect();
+        if shrink {
+            let mut record = self.record.clone();
+            record.base_visible_len = Some(boundary);
+            record.hydrated = hydrated.clone();
+            self.write_record_aside(&record, true)?;
+        }
         // Unhydrated retained bytes still come from the immutable prefix.
         // A first shrink must not allocate/copy the old discarded length.
-        self.materialize_len(old.min(size))?;
-        self.file()?.set_len(size)?;
+        let cut = self
+            .materialize_len(old.min(size))
+            .and_then(|_| Ok(self.file()?.set_len(size)?));
+        if let Err(error) = cut {
+            let _ = fs::remove_file(self.path.with_extension("json.tmp"));
+            return Err(error);
+        }
         self.length = size;
-        self.base_visible_len = self.base_visible_len.min(size);
-        self.hydrated.retain(|index| *index * CHUNK_SIZE < size);
+        self.base_visible_len = boundary;
+        self.hydrated = hydrated;
         self.dirty.mark(old.min(size), old.abs_diff(size));
         self.changed = true;
         self.revision = self.revision.wrapping_add(1);
@@ -377,7 +451,21 @@ impl Scratch {
         self.explicit_modified_time = false;
         self.automatic_time_current = true;
         self.closed_at = None;
-        self.persist_visible_boundary()
+        if shrink {
+            // The cut stands whatever happens now: a restart reads a file shorter than its record
+            // as cut, and if this fails the next extending operation has to retry it.
+            let published = self
+                .file()?
+                .sync_all()
+                .map_err(anyhow::Error::from)
+                .and_then(|()| self.replace_record(true));
+            if published.is_ok() {
+                self.record.base_visible_len = Some(boundary);
+                self.record.hydrated = self.hydrated.clone();
+                self.hydration_pending = false;
+            }
+        }
+        Ok(())
     }
     pub fn set_modified_time(&mut self, time: u64) -> Result<()> {
         const UNIX: u64 = 116_444_736_000_000_000;
@@ -407,7 +495,6 @@ impl Scratch {
             self.len()?
                 .saturating_sub(index * CHUNK_SIZE)
                 .min(CHUNK_SIZE),
-            false,
         )
     }
 }
@@ -437,6 +524,9 @@ pub struct WorkingLayer {
     entities: Mutex<EntityFiles>,
     pending: Mutex<BTreeMap<String, Weak<Mutex<Scratch>>>>,
     sealing: Mutex<()>,
+    /// Drafts a start found and could not seal yet. They are on disk and in nothing above, so a
+    /// flush, a stop or another file's seal does not wait for them.
+    waiting: Mutex<Vec<PathBuf>>,
 }
 impl WorkingLayer {
     pub fn new(root: &Path, content: LocalContent) -> Result<Self> {
@@ -452,6 +542,7 @@ impl WorkingLayer {
             entities: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
             sealing: Mutex::new(()),
+            waiting: Mutex::new(Vec::new()),
         })
     }
     pub(crate) fn seal_guard(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -461,8 +552,9 @@ impl WorkingLayer {
         self.open_impl(basis, writable, false, NoDraft::Start)?
             .context("SCRATCH_NOT_CREATED")
     }
-    /// A writer's [`Self::open`] for a caller that truncates the draft to 0 at once. It works
-    /// on a file whose manifest has never been here, with no peer to ask.
+    /// A writer's [`Self::open`] for a caller that truncates the draft to 0 before anything else
+    /// it does with it. It works on a file whose manifest has never been here, with no peer to
+    /// ask, and until the truncate there is nothing on disk.
     pub fn open_to_replace(&self, basis: Basis) -> Result<Arc<Mutex<Scratch>>> {
         self.open_impl(basis, true, false, NoDraft::StartToReplace)?
             .context("SCRATCH_NOT_CREATED")
@@ -691,6 +783,18 @@ impl WorkingLayer {
             }
         }
         Ok(())
+    }
+    pub(crate) fn wait_for_retry(&self, draft: PathBuf) {
+        lock(&self.waiting).push(draft);
+    }
+    pub(crate) fn take_waiting(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *lock(&self.waiting))
+    }
+    /// The record of one draft that nothing else is writing.
+    pub(crate) fn record_of(&self, draft: &Path) -> Result<ScratchRecord> {
+        Ok(serde_json::from_slice(&fs::read(
+            draft.with_extension("json"),
+        )?)?)
     }
     pub fn records(&self) -> Result<Vec<(PathBuf, ScratchRecord)>> {
         let mut records = Vec::new();

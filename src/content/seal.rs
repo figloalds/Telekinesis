@@ -1,18 +1,22 @@
 //! Delayed, batched seals. Pack durability precedes the atomic event/receipt batch.
-use crate::model::content::{CHUNK_SIZE, ContentKind, FileContentRef};
+use crate::model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef};
 use crate::{
     content::{
-        local::{Kind, Manifest},
-        working::{Scratch, WorkingLayer, file_write_time, lock, modified_ns},
+        local::{Kind, LocalContent, Manifest},
+        working::{Scratch, ScratchRecord, WorkingLayer, file_write_time, lock, modified_ns},
     },
     core::{Operation, Store},
+    util::log::event,
 };
 use anyhow::{Context, Result};
-use std::sync::{Arc, Mutex};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 struct Prepared {
     index: usize,
-    record: crate::content::working::ScratchRecord,
+    record: ScratchRecord,
     reference: FileContentRef,
     stamp: u128,
     revision: u64,
@@ -25,6 +29,46 @@ pub struct SealStats {
     pub entities: usize,
     pub hashed_chunks: usize,
     pub new_chunks: usize,
+}
+/// Whether a seal keeps this chunk of the draft's base as it is, which takes none of its bytes.
+fn keeps_base_chunk(scratch: &Scratch, index: u64, len: u64, base_chunks: u64) -> bool {
+    let start = index * CHUNK_SIZE;
+    let count = (len - start).min(CHUNK_SIZE);
+    let old_count = scratch
+        .record
+        .basis
+        .content
+        .total_len
+        .saturating_sub(start)
+        .min(CHUNK_SIZE);
+    !scratch.dirty.intersects(start, count) && old_count == count && index < base_chunks
+}
+/// What a seal of this draft would have to fetch.
+fn objects_a_seal_needs(scratch: &Scratch, content: &LocalContent) -> Result<Vec<(Digest, Kind)>> {
+    if scratch.base_visible_len == 0 {
+        return Ok(Vec::new());
+    }
+    let base = &scratch.record.basis.content;
+    if base.kind == ContentKind::Manifest && !content.packs.contains(base.digest)? {
+        return Ok(vec![(base.digest, Kind::Manifest)]);
+    }
+    let old = content.chunks(base)?;
+    let len = scratch.len()?;
+    let mut missing = Vec::new();
+    for index in 0..len.div_ceil(CHUNK_SIZE) {
+        if keeps_base_chunk(scratch, index, len, old.len() as u64)
+            || scratch.hydrated.contains(&index)
+            || index * CHUNK_SIZE >= scratch.base_visible_len
+        {
+            continue;
+        }
+        if let Some(digest) = old.get(index as usize)
+            && !content.packs.contains(*digest)?
+        {
+            missing.push((*digest, Kind::Chunk));
+        }
+    }
+    Ok(missing)
 }
 fn prepare(
     scratch: &mut Scratch,
@@ -45,15 +89,7 @@ fn prepare(
     for index in 0..len.div_ceil(CHUNK_SIZE) {
         let start = index * CHUNK_SIZE;
         let count = (len - start).min(CHUNK_SIZE);
-        let old_count = scratch
-            .record
-            .basis
-            .content
-            .total_len
-            .saturating_sub(start)
-            .min(CHUNK_SIZE);
-        if !scratch.dirty.intersects(start, count) && old_count == count && index < old.len() as u64
-        {
+        if keeps_base_chunk(scratch, index, len, old.len() as u64) {
             chunks.push(old[index as usize]);
             continue;
         }
@@ -279,118 +315,197 @@ pub fn seal_batch(
     Ok(stats)
 }
 
+/// What became of a draft found at a start.
+enum Recovery {
+    /// It is published, under this entity, and gone.
+    Sealed(String),
+    /// There is nothing to publish: it matched what is published, or went to quarantine.
+    Gone,
+    /// It stays on disk: these objects are not here yet.
+    Missing(Vec<(Digest, Kind)>),
+    /// It stays on disk: its seal failed.
+    SealFailed(anyhow::Error),
+}
+
 /// Recovery uses the last committed receipt, not wall-clock ordering of peers.
-/// Only materialized chunks override the immutable base; sparse remote ranges
-/// are rehydrated when the recovered file is sealed or read.
+/// Only materialized chunks override the immutable base. A draft whose seal needs
+/// what is not here must not keep the store from opening, since nothing can fetch
+/// until it has: it stays on disk for [`retry_waiting`], which the sealer calls.
 pub fn recover(store: &Mutex<Store>, layer: &WorkingLayer) -> Result<usize> {
     let mut recovered = 0;
-    for (path, mut record) in layer.records()? {
-        if !path.exists() {
-            continue;
-        }
-        // Namespace transactions may still be inside the short write-back
-        // window. A missing metadata-only successor can rebase to its content
-        // anchor; an uncommitted new entity is preserved for manual recovery.
-        if lock(store).version(&record.basis.version)?.is_none() {
-            if lock(store).version(&record.basis.anchor)?.is_some() {
-                record.basis.version = record.basis.anchor.clone();
-            } else {
-                layer.quarantine(&path)?;
-                continue;
+    for (path, record) in layer.records()? {
+        match recover_draft(store, layer, &path, record)? {
+            Recovery::Sealed(_) => recovered += 1,
+            Recovery::Gone => {}
+            Recovery::Missing(objects) => {
+                event!(warn, DRAFT_WAITS_FOR_OBJECTS, {"draft": path.display().to_string(), "objects": objects.len()});
+                layer.wait_for_retry(path);
+            }
+            Recovery::SealFailed(error) => {
+                event!(warn, DRAFT_SEAL_FAILED, {"draft": path.display().to_string(), "error": format!("{error:#}")});
+                layer.wait_for_retry(path);
             }
         }
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        let stamp = modified_ns(&file)?;
-        let file_len = file.metadata()?.len();
-        // Capture the original overlay before rebasing to a committed receipt.
-        // Bytes appended beyond that old base are materialized host bytes, not
-        // missing ranges to refill from the receipt's older content. A file shorter
-        // than its boundary was cut before the record could say so.
-        let mut base_visible_len = record
-            .base_visible_len
-            .unwrap_or(record.basis.content.total_len)
-            .min(file_len);
-        record.base_visible_len = Some(base_visible_len);
-        for index in
-            record.basis.content.total_len.div_ceil(CHUNK_SIZE)..file_len.div_ceil(CHUNK_SIZE)
-        {
-            record.hydrated.insert(index);
-        }
-        let receipt = { lock(store).receipt(&record.operation)? };
-        if let Some((event, _committed)) = receipt {
-            let version = lock(store)
-                .version(&event)?
-                .context("SEAL_VERSION_MISSING")?;
-            let reference = version.state.content.context("SEAL_CONTENT_MISSING")?;
-            if scratch_matches(&file, &record, &reference, layer)? {
-                drop(file);
-                std::fs::remove_file(&path)?;
-                std::fs::remove_file(path.with_extension("json"))?;
-                continue;
-            }
-            record.basis.version = event;
-            record.basis.anchor = record.basis.version.clone();
-            base_visible_len = base_visible_len.min(reference.total_len);
-            record.base_visible_len = Some(base_visible_len);
-            record.basis.content = reference;
-            record.operation = crate::core::id();
-        } else if stamp <= record.modified_ns
-            && scratch_matches(&file, &record, &record.basis.content, layer)?
-        {
-            // A coarse filesystem clock (or a backwards wall-clock change)
-            // can give changed bytes the clean marker's timestamp. Only bytes
-            // that still match their immutable base may be discarded.
-            drop(file);
-            std::fs::remove_file(&path)?;
-            std::fs::remove_file(path.with_extension("json"))?;
-            continue;
-        }
-        // Only what the draft holds overrides its base. The rest keeps the chunks it had,
-        // which need not be here: no fetcher exists yet, and a seal that needed one would
-        // keep this store from ever opening.
-        let mut dirty = crate::content::working::DirtyBitmap::default();
-        for index in &record.hydrated {
-            dirty.mark(index * CHUNK_SIZE, CHUNK_SIZE);
-        }
-        dirty.mark(base_visible_len, file_len.saturating_sub(base_visible_len));
-        let pin = layer
-            .content()
-            .pin_visible(&record.basis.content, base_visible_len)?;
-        let hydrated = record.hydrated.clone();
-        let scratch = Arc::new(Mutex::new(Scratch {
-            modified_time: Some(file_write_time(&file)?),
-            explicit_modified_time: false,
-            automatic_time_current: false,
-            length: file_len,
-            base_visible_len,
-            hydrated,
-            hydration_pending: false,
-            record,
-            path: path.clone(),
-            file: Some(file),
-            dirty,
-            changed: true,
-            revision: 0,
-            writers: 0,
-            handles: 0,
-            closed_at: None,
-            idle_at: std::time::Instant::now(),
-            pin,
-        }));
-        seal_batch(store, layer, std::slice::from_ref(&scratch))?;
-        drop(scratch);
-        std::fs::remove_file(&path)?;
-        std::fs::remove_file(path.with_extension("json"))?;
-        recovered += 1;
     }
     Ok(recovered)
 }
+
+/// Tries again what [`recover`] left on disk, asking for what it still needs. Nothing here waits
+/// for a fetch, so it can run on the sealer's thread. Returns the entities it published, and a
+/// failure that is not just a wait, for the caller to show; every draft stays until it seals.
+pub fn retry_waiting(
+    store: &Mutex<Store>,
+    layer: &WorkingLayer,
+) -> (Vec<String>, Option<anyhow::Error>) {
+    let mut sealed = Vec::new();
+    let mut failure = None;
+    for path in layer.take_waiting() {
+        let outcome = layer
+            .record_of(&path)
+            .and_then(|record| recover_draft(store, layer, &path, record));
+        match outcome {
+            Ok(Recovery::Sealed(entity)) => {
+                event!(info, DRAFT_RECOVERED, {"draft": path.display().to_string()});
+                sealed.push(entity);
+            }
+            Ok(Recovery::Gone) => {}
+            Ok(Recovery::Missing(objects)) => {
+                layer.content().hint(&objects);
+                layer.wait_for_retry(path);
+            }
+            Ok(Recovery::SealFailed(error)) | Err(error) => {
+                failure = Some(error);
+                layer.wait_for_retry(path);
+            }
+        }
+    }
+    (sealed, failure)
+}
+
+fn recover_draft(
+    store: &Mutex<Store>,
+    layer: &WorkingLayer,
+    path: &Path,
+    mut record: ScratchRecord,
+) -> Result<Recovery> {
+    if !path.exists() {
+        return Ok(Recovery::Gone);
+    }
+    // Namespace transactions may still be inside the short write-back
+    // window. A missing metadata-only successor can rebase to its content
+    // anchor; an uncommitted new entity is preserved for manual recovery.
+    if lock(store).version(&record.basis.version)?.is_none() {
+        if lock(store).version(&record.basis.anchor)?.is_some() {
+            record.basis.version = record.basis.anchor.clone();
+        } else {
+            layer.quarantine(path)?;
+            return Ok(Recovery::Gone);
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    let stamp = modified_ns(&file)?;
+    let file_len = file.metadata()?.len();
+    // Capture the original overlay before rebasing to a committed receipt.
+    // Bytes appended beyond that old base are materialized host bytes, not
+    // missing ranges to refill from the receipt's older content. A file shorter
+    // than its boundary was cut before the record could say so.
+    let mut base_visible_len = record
+        .base_visible_len
+        .unwrap_or(record.basis.content.total_len)
+        .min(file_len);
+    record.base_visible_len = Some(base_visible_len);
+    for index in record.basis.content.total_len.div_ceil(CHUNK_SIZE)..file_len.div_ceil(CHUNK_SIZE)
+    {
+        record.hydrated.insert(index);
+    }
+    let receipt = { lock(store).receipt(&record.operation)? };
+    if let Some((event, _committed)) = receipt {
+        let version = lock(store)
+            .version(&event)?
+            .context("SEAL_VERSION_MISSING")?;
+        let reference = version.state.content.context("SEAL_CONTENT_MISSING")?;
+        if scratch_matches(&file, &record, &reference, layer)? {
+            drop(file);
+            remove_draft(path)?;
+            return Ok(Recovery::Gone);
+        }
+        record.basis.version = event;
+        record.basis.anchor = record.basis.version.clone();
+        base_visible_len = base_visible_len.min(reference.total_len);
+        record.base_visible_len = Some(base_visible_len);
+        record.basis.content = reference;
+        record.operation = crate::core::id();
+    } else if stamp <= record.modified_ns
+        && scratch_matches(&file, &record, &record.basis.content, layer)?
+    {
+        // A coarse filesystem clock (or a backwards wall-clock change)
+        // can give changed bytes the clean marker's timestamp. Only bytes
+        // that still match their immutable base may be discarded.
+        drop(file);
+        remove_draft(path)?;
+        return Ok(Recovery::Gone);
+    }
+    // Only what the draft holds overrides its base. The rest keeps the chunks it had,
+    // which need not be here.
+    let mut dirty = crate::content::working::DirtyBitmap::default();
+    for index in &record.hydrated {
+        dirty.mark(index * CHUNK_SIZE, CHUNK_SIZE);
+    }
+    dirty.mark(base_visible_len, file_len.saturating_sub(base_visible_len));
+    let entity = record.basis.entity.clone();
+    let content = layer.content();
+    let hydrated = record.hydrated.clone();
+    let reference = record.basis.content.clone();
+    let scratch = Arc::new(Mutex::new(Scratch {
+        modified_time: Some(file_write_time(&file)?),
+        explicit_modified_time: false,
+        automatic_time_current: false,
+        length: file_len,
+        base_visible_len,
+        hydrated,
+        hydration_pending: false,
+        record,
+        path: path.to_owned(),
+        file: Some(file),
+        dirty,
+        changed: true,
+        revision: 0,
+        writers: 0,
+        handles: 0,
+        closed_at: None,
+        idle_at: std::time::Instant::now(),
+        // Nothing to keep yet: this asks for nothing it would have to wait for.
+        pin: content.pin_visible(&reference, 0)?,
+    }));
+    match objects_a_seal_needs(&lock(&scratch), content) {
+        Ok(missing) if missing.is_empty() => {}
+        Ok(missing) => return Ok(Recovery::Missing(missing)),
+        Err(error) => return Ok(Recovery::SealFailed(error)),
+    }
+    let sealed = content
+        .pin_visible(&reference, base_visible_len)
+        .and_then(|pin| {
+            lock(&scratch).pin = pin;
+            seal_batch(store, layer, std::slice::from_ref(&scratch))
+        });
+    if let Err(error) = sealed {
+        return Ok(Recovery::SealFailed(error));
+    }
+    drop(scratch);
+    remove_draft(path)?;
+    Ok(Recovery::Sealed(entity))
+}
+fn remove_draft(path: &Path) -> Result<()> {
+    std::fs::remove_file(path)?;
+    std::fs::remove_file(path.with_extension("json"))?;
+    Ok(())
+}
 fn scratch_matches(
     file: &std::fs::File,
-    record: &crate::content::working::ScratchRecord,
+    record: &ScratchRecord,
     reference: &FileContentRef,
     layer: &WorkingLayer,
 ) -> Result<bool> {

@@ -158,9 +158,22 @@ fn truncate_visibility_marker_failure_blocks_later_extension_until_retry() -> Re
     seed_lazy_truncate(&mut lock(&engine.store), &bytes)?;
     let handle = engine.open_file("lazy-truncate", false, false, true)?;
     let scratch = engine.handle(handle)?.scratch.clone().unwrap();
-    let blocked = lock(&scratch).path.with_extension("json.tmp");
-    std::fs::create_dir(&blocked)?;
+    // The record goes aside first, so a failure there has cut nothing.
+    let aside = lock(&scratch).path.with_extension("json.tmp");
+    std::fs::create_dir(&aside)?;
     assert!(engine.truncate(handle, 17, false).is_err());
+    assert_eq!(lock(&scratch).len()?, bytes.len() as u64);
+    std::fs::remove_dir(&aside)?;
+    // A record that cannot replace the old one comes after the cut, which stands: a restart reads
+    // a file shorter than its record as cut. It has to be on record before the file can grow.
+    let record = {
+        let mut draft = lock(&scratch);
+        draft.materialize()?;
+        draft.path.with_extension("json")
+    };
+    std::fs::remove_file(&record)?;
+    std::fs::create_dir(&record)?;
+    engine.truncate(handle, 17, false)?;
     assert_eq!(
         lock(&scratch).len()?,
         17,
@@ -177,7 +190,7 @@ fn truncate_visibility_marker_failure_blocks_later_extension_until_retry() -> Re
         17,
         "failed visibility publication must prevent re-extension"
     );
-    std::fs::remove_dir(&blocked)?;
+    std::fs::remove_dir(&record)?;
     engine.truncate(handle, 17, false)?;
     assert_eq!(lock(&scratch).record.base_visible_len, Some(17));
     engine.truncate(handle, bytes.len() as u64, false)?;
@@ -2296,9 +2309,10 @@ fn a_draft_cut_to_nothing_recovers_without_the_file_it_replaced() -> Result<()> 
     Ok(())
 }
 
-/// Dying inside the truncate, whichever side of its durable record: the store still opens.
+/// Dying inside the first write of a replacement, on either side of the truncate's durable record:
+/// the store still opens, and what the writer got as far as is what it finds.
 #[test]
-fn a_kill_during_a_truncating_open_leaves_a_store_that_opens() -> Result<()> {
+fn a_kill_inside_the_first_write_of_a_replacement_leaves_a_store_that_opens() -> Result<()> {
     for record_written in [true, false] {
         let root = tempfile::tempdir()?;
         {
@@ -2383,6 +2397,505 @@ fn opening_for_part_of_a_file_whose_manifest_is_not_here_fails_and_leaves_nothin
     );
     assert!(error.starts_with("OBJECT_MISSING"), "{error}");
     assert!(engine.writable_tokens().is_empty());
+    engine.shutdown()?;
+    Ok(())
+}
+
+fn drafts_on_disk(root: &std::path::Path) -> Result<usize> {
+    let mut drafts = 0;
+    for entry in std::fs::read_dir(root.join("scratch"))? {
+        drafts += usize::from(entry?.path().extension().is_some_and(|e| e == "json"));
+    }
+    Ok(drafts)
+}
+
+fn wait_until(what: &str, mut done: impl FnMut() -> Result<bool>) -> Result<()> {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !done()? {
+        anyhow::ensure!(std::time::Instant::now() < end, "not within 30 s: {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// A write that covers one whole chunk and part of the next, which is not here, fails. The whole
+/// chunk's bytes were never written, so it must not read as written.
+#[test]
+fn a_failed_spanning_write_leaves_what_the_file_reads_as() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    let (_, chunks) = seed_file_on_a_peer(&mut lock(&engine.store), "big", 3, 1, true)?;
+    let token = engine.open_file("big", false, false, true)?;
+    let span = vec![9u8; CHUNK_SIZE as usize + 10];
+    assert!(engine.write(token, 0, &span, false, false).is_err());
+    let mut first = vec![0u8; CHUNK_SIZE as usize];
+    engine.read(token, 0, &mut first)?;
+    assert!(first == chunks[0], "chunk 0 reads as {:?}", &first[..8]);
+    engine.close(token)?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// The same failed write, and then a smaller one into the chunk it named, which is not here. That
+/// is a partial write over a chunk not here, so it fails too, and no zeros are published.
+#[test]
+fn a_retry_after_a_failed_spanning_write_publishes_no_zeros() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    let (entity, _) = seed_file_on_a_peer(&mut lock(&engine.store), "big", 3, 0, true)?;
+    let before = lock(&engine.store).basis(&entity)?;
+    let token = engine.open_file("big", false, false, true)?;
+    let span = vec![9u8; CHUNK_SIZE as usize + 10];
+    assert!(engine.write(token, 0, &span, false, false).is_err());
+    assert!(engine.write(token, 100, b"edit", false, false).is_err());
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+    assert_eq!(lock(&engine.store).basis(&entity)?.version, before.version);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// The same failed write, and then no orderly stop.
+#[test]
+fn a_failed_spanning_write_killed_leaves_nothing_to_publish() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    let root = tempfile::tempdir()?;
+    let (entity, version) = {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "big", 3, 0, true)?;
+        let basis = metadata.basis(&entity)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open(basis.clone(), true)?;
+        let span = vec![9u8; CHUNK_SIZE as usize + 10];
+        assert!(
+            lock(&draft)
+                .write(layer.content(), 0, &span, false, false)
+                .is_err()
+        );
+        (entity, basis.version)
+    };
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 0);
+    assert_eq!(lock(&store).basis(&entity)?.version, version);
+    Ok(())
+}
+
+/// A write of whole chunks that cannot put them on record fails, and they read as they were.
+#[test]
+fn a_whole_chunk_write_whose_record_fails_leaves_what_the_file_reads_as() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    let (_, chunks) = seed_file_on_a_peer(&mut lock(&engine.store), "big", 3, 3, true)?;
+    let token = engine.open_file("big", false, false, true)?;
+    let scratch = engine.handle(token)?.scratch.clone().unwrap();
+    let blocked = lock(&scratch).path.with_extension("json.tmp");
+    std::fs::create_dir(&blocked)?;
+    let whole = vec![9u8; CHUNK_SIZE as usize];
+    assert!(engine.write(token, 0, &whole, false, false).is_err());
+    let mut first = vec![0u8; CHUNK_SIZE as usize];
+    engine.read(token, 0, &mut first)?;
+    assert!(first == chunks[0], "chunk 0 reads as {:?}", &first[..8]);
+    std::fs::remove_dir(&blocked)?;
+    engine.write(token, 0, &whole, false, false)?;
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+    assert_eq!(
+        &file_bytes(&lock(&engine.store), "big")?[..whole.len()],
+        whole
+    );
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// A write of whole chunks whose bytes do not reach the draft fails, and they read as they were,
+/// now and after a restart.
+#[test]
+fn a_whole_chunk_write_that_fails_on_disk_leaves_what_the_file_reads_as() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    let root = tempfile::tempdir()?;
+    let (entity, version, chunks) = {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, chunks) = seed_file_on_a_peer(&mut metadata, "big", 3, 3, true)?;
+        let basis = metadata.basis(&entity)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open(basis.clone(), true)?;
+        let mut draft = lock(&draft);
+        draft.materialize()?;
+        let read_only = std::fs::File::open(&draft.path)?;
+        draft.file = Some(read_only);
+        let whole = vec![9u8; CHUNK_SIZE as usize];
+        assert!(
+            draft
+                .write(layer.content(), 0, &whole, false, false)
+                .is_err()
+        );
+        let mut first = vec![0u8; CHUNK_SIZE as usize];
+        draft.read(layer.content(), 0, &mut first)?;
+        assert!(first == chunks[0], "chunk 0 reads as {:?}", &first[..8]);
+        (entity, basis.version, chunks)
+    };
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 0);
+    assert_eq!(lock(&store).basis(&entity)?.version, version);
+    assert_eq!(file_bytes(&lock(&store), "big")?, chunks.concat());
+    Ok(())
+}
+
+/// A file of `bytes.len()` bytes, one short chunk, of which nothing is here unless `here`.
+fn seed_short_file(store: &mut Store, name: &str, bytes: &[u8], here: bool) -> Result<String> {
+    use crate::content::Kind;
+    use crate::model::content::{ContentKind, Digest, FileContentRef};
+    let mut state = store.create(name, EntryKind::File)?;
+    let entity = state.id.clone();
+    let parent = store.projection().visible[&entity].clone();
+    if here {
+        store.content.packs.put(Kind::Chunk, bytes)?;
+        store.content.packs.flush()?;
+    }
+    state.content = Some(FileContentRef::new(
+        ContentKind::Direct,
+        Digest::bytes(bytes),
+        bytes.len() as u64,
+    )?);
+    let event = store.event(
+        &store.active.clone(),
+        state,
+        vec![parent],
+        Operation::Content,
+    );
+    store.apply(&[event])?;
+    store.sync_metadata()?;
+    Ok(entity)
+}
+
+/// `rw` past the end of a file whose last chunk is short and not here. A seal would need that
+/// chunk, as it grows into a longer one, so the write fails now rather than the seal for ever.
+#[test]
+fn a_write_past_a_short_last_chunk_not_here_fails_and_changes_nothing() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    let entity = seed_short_file(&mut lock(&engine.store), "small", &[7; 100], false)?;
+    let before = lock(&engine.store).basis(&entity)?;
+    let token = engine.open_file("small", false, false, true)?;
+    let error = format!(
+        "{:#}",
+        engine
+            .write(token, 2 * CHUNK_SIZE, b"past the end", false, false)
+            .unwrap_err()
+    );
+    assert!(error.starts_with("OBJECT_MISSING"), "{error}");
+    assert_eq!(engine.info(token)?.1, 100);
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+    assert_eq!(lock(&engine.store).basis(&entity)?.version, before.version);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// The same with no orderly stop: the store still opens, and the file is as it was.
+#[test]
+fn a_write_past_a_short_last_chunk_killed_leaves_a_store_that_opens() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let root = tempfile::tempdir()?;
+    let (entity, version) = {
+        let mut metadata = Store::open(root.path(), None)?;
+        let entity = seed_short_file(&mut metadata, "small", &[7; 100], false)?;
+        let basis = metadata.basis(&entity)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open(basis.clone(), true)?;
+        let _ = lock(&draft).write(
+            layer.content(),
+            2 * CHUNK_SIZE,
+            b"past the end",
+            false,
+            false,
+        );
+        (entity, basis.version)
+    };
+    let engine = Engine::open(root.path(), None)?;
+    assert_eq!(lock(&engine.store).basis(&entity)?.version, version);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// With that chunk here the same write works, and keeps it.
+#[test]
+fn a_write_past_a_short_last_chunk_here_keeps_its_bytes() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    seed_short_file(&mut lock(&engine.store), "small", &[7; 100], true)?;
+    let token = engine.open_file("small", false, false, true)?;
+    engine.write(token, 2 * CHUNK_SIZE, b"past", false, false)?;
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+    let mut want = vec![0; 2 * CHUNK_SIZE as usize + 4];
+    want[..100].fill(7);
+    want[2 * CHUNK_SIZE as usize..].copy_from_slice(b"past");
+    assert!(file_bytes(&lock(&engine.store), "small")? == want);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// A write over all of that chunk and past it keeps none of its bytes, so it needs none.
+#[test]
+fn a_write_over_all_of_a_short_last_chunk_needs_none_of_it() -> Result<()> {
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    seed_short_file(&mut lock(&engine.store), "small", &[7; 100], false)?;
+    let token = engine.open_file("small", false, false, true)?;
+    engine.write(token, 0, &[8; 200], false, false)?;
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+    assert_eq!(file_bytes(&lock(&engine.store), "small")?, [8; 200]);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// Two drafts killed before their seals, one of which cannot seal: cut in the middle of a chunk
+/// that is not here. Returns the file it is over, and the bytes of that chunk.
+fn seed_a_draft_that_cannot_seal(root: &std::path::Path) -> Result<(String, Vec<u8>)> {
+    let mut metadata = Store::open(root, None)?;
+    let (entity, chunks) = seed_file_on_a_peer(&mut metadata, "big", 4, 0, true)?;
+    let other = seed_short_file(&mut metadata, "other", b"other", true)?;
+    let layer = WorkingLayer::new(root, metadata.content.clone())?;
+    let cut = layer.open(metadata.basis(&entity)?, true)?;
+    lock(&cut).truncate(17)?;
+    let edited = layer.open(metadata.basis(&other)?, true)?;
+    lock(&edited).write(layer.content(), 0, b"OTHER", false, false)?;
+    Ok((entity, chunks[0].clone()))
+}
+
+/// One draft that cannot seal yet costs that draft a wait, and nothing else: the other seals, the
+/// store opens and stops, and the draft is still there at every start.
+#[test]
+fn a_draft_that_cannot_seal_stays_and_the_store_opens() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let root = tempfile::tempdir()?;
+    let (entity, _) = seed_a_draft_that_cannot_seal(root.path())?;
+    let (store, layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1, "the other draft seals");
+    assert_eq!(file_bytes(&lock(&store), "other")?, b"OTHER");
+    assert_eq!(
+        lock(&store).entry(&entity)?.content.unwrap().total_len,
+        4 * CHUNK_SIZE
+    );
+    assert_eq!(drafts_on_disk(root.path())?, 1);
+    drop((store, layer));
+    for _ in 0..2 {
+        let engine = Engine::open(root.path(), None)?;
+        assert_eq!(
+            engine.lookup("big")?.content.unwrap().total_len,
+            4 * CHUNK_SIZE
+        );
+        engine.shutdown()?;
+        drop(engine);
+        wait_until("the store free again", || {
+            Ok(match Engine::open(root.path(), None) {
+                Ok(engine) => {
+                    engine.shutdown()?;
+                    true
+                }
+                Err(_) => false,
+            })
+        })?;
+        assert_eq!(drafts_on_disk(root.path())?, 1);
+    }
+    Ok(())
+}
+
+/// Hands over what it is told to hint, as a peer would once it is reachable.
+struct Supplying {
+    packs: crate::content::PackStore,
+    bytes: Vec<u8>,
+    hinted: Mutex<Vec<crate::model::content::Digest>>,
+}
+impl crate::content::ObjectFetcher for Supplying {
+    fn fetch(&self, _: &[(crate::model::content::Digest, crate::content::Kind)]) -> Result<()> {
+        anyhow::bail!("OBJECT_MISSING: nothing here waits")
+    }
+    fn hint(&self, objects: &[(crate::model::content::Digest, crate::content::Kind)]) {
+        for (digest, kind) in objects {
+            lock(&self.hinted).push(*digest);
+            self.packs.put(*kind, &self.bytes).unwrap();
+        }
+    }
+}
+
+/// Once the worker has a fetcher, what the draft waits for is asked for and the draft seals, with
+/// nothing else having to happen.
+#[test]
+fn a_draft_kept_for_a_retry_seals_once_its_objects_arrive() -> Result<()> {
+    use crate::model::content::Digest;
+    use crate::runtime::Engine;
+    let root = tempfile::tempdir()?;
+    let (_, chunk) = seed_a_draft_that_cannot_seal(root.path())?;
+    let engine = Engine::open(root.path(), None)?;
+    let supplying = std::sync::Arc::new(Supplying {
+        packs: engine.working.content().packs.clone(),
+        bytes: chunk.clone(),
+        hinted: Mutex::new(Vec::new()),
+    });
+    engine.working.content().set_fetcher(supplying.clone());
+    wait_until("the draft sealed", || {
+        Ok(engine.lookup("big")?.content.unwrap().total_len == 17)
+    })?;
+    assert_eq!(lock(&supplying.hinted)[0], Digest::bytes(&chunk));
+    assert_eq!(file_bytes(&lock(&engine.store), "big")?, chunk[..17]);
+    wait_until("the draft gone", || Ok(drafts_on_disk(root.path())? == 0))?;
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// With no fetcher it seals too, if what it needs arrives some other way, as with a burst.
+#[test]
+fn a_draft_kept_for_a_retry_seals_whichever_way_its_objects_arrive() -> Result<()> {
+    use crate::content::Kind;
+    use crate::runtime::Engine;
+    let root = tempfile::tempdir()?;
+    let (_, chunk) = seed_a_draft_that_cannot_seal(root.path())?;
+    let engine = Engine::open(root.path(), None)?;
+    engine.working.content().packs.put(Kind::Chunk, &chunk)?;
+    wait_until("the draft sealed", || {
+        Ok(engine.lookup("big")?.content.unwrap().total_len == 17)
+    })?;
+    assert_eq!(file_bytes(&lock(&engine.store), "big")?, chunk[..17]);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// A draft that waits does not stand in the way of a flush of everything, of other files' seals
+/// or of a stop, and a stop does not lose it.
+#[test]
+fn a_draft_kept_for_a_retry_blocks_nothing() -> Result<()> {
+    use crate::runtime::Engine;
+    let root = tempfile::tempdir()?;
+    seed_a_draft_that_cannot_seal(root.path())?;
+    let engine = Engine::open(root.path(), None)?;
+    let token = engine.open_file("new", true, false, true)?;
+    engine.write(token, 0, b"new", false, false)?;
+    engine.flush(None)?;
+    engine.close(token)?;
+    assert_eq!(file_bytes(&lock(&engine.store), "new")?, b"new");
+    engine.shutdown()?;
+    drop(engine);
+    let mut reopened = None;
+    wait_until("the store free again", || {
+        reopened = Engine::open(root.path(), None).ok();
+        Ok(reopened.is_some())
+    })?;
+    reopened.unwrap().shutdown()?;
+    assert_eq!(drafts_on_disk(root.path())?, 1);
+    Ok(())
+}
+
+/// A truncate whose record cannot be written fails and changes nothing, in a new draft and in one
+/// that holds an edit, so neither a seal nor a restart can publish a cut nobody got.
+#[test]
+fn a_failed_truncate_leaves_the_file_as_it_was() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    for edited in [false, true] {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut lock(&engine.store), "big", 4, 4, true)?;
+        let token = engine.open_file("big", false, false, true)?;
+        let scratch = engine.handle(token)?.scratch.clone().unwrap();
+        if edited {
+            engine.write(token, 0, b"edit", false, false)?;
+        }
+        let want = {
+            let mut bytes = vec![0; 4 * CHUNK_SIZE as usize];
+            engine.read(token, 0, &mut bytes)?;
+            bytes
+        };
+        let was_changed = lock(&scratch).changed;
+        let blocked = lock(&scratch).path.with_extension("json.tmp");
+        std::fs::create_dir(&blocked)?;
+        assert!(engine.truncate(token, 0, false).is_err());
+        assert_eq!(engine.info(token)?.1, 4 * CHUNK_SIZE, "edited: {edited}");
+        assert_eq!(lock(&scratch).changed, was_changed);
+        let mut bytes = vec![0; 4 * CHUNK_SIZE as usize];
+        engine.read(token, 0, &mut bytes)?;
+        assert!(bytes == want, "edited: {edited}");
+        std::fs::remove_dir(&blocked)?;
+        engine.flush(Some(token))?;
+        engine.close(token)?;
+        assert_eq!(
+            lock(&engine.store)
+                .entry(&entity)?
+                .content
+                .unwrap()
+                .total_len,
+            4 * CHUNK_SIZE
+        );
+        assert!(file_bytes(&lock(&engine.store), "big")? == want);
+        engine.shutdown()?;
+    }
+    Ok(())
+}
+
+/// The same for a handle opened to replace a file never downloaded: what `w` does first.
+#[test]
+fn a_failed_truncate_of_a_replacing_handle_leaves_the_file_as_it_was() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    let (entity, _) = seed_file_on_a_peer(&mut lock(&engine.store), "big", 4, 0, false)?;
+    let before = lock(&engine.store).basis(&entity)?;
+    let token = engine.open_to_replace("big")?;
+    let scratch = engine.handle(token)?.scratch.clone().unwrap();
+    let blocked = lock(&scratch).path.with_extension("json.tmp");
+    std::fs::create_dir(&blocked)?;
+    assert!(engine.truncate(token, 0, false).is_err());
+    std::fs::remove_dir(&blocked)?;
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+    let after = lock(&engine.store).basis(&entity)?;
+    assert_eq!(after.version, before.version);
+    assert_eq!(after.content.total_len, 4 * CHUNK_SIZE);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// A handle opened to replace a file changes nothing until its caller cuts it, whether it is then
+/// closed or killed.
+#[test]
+fn a_replacing_handle_changes_nothing_before_it_is_cut() -> Result<()> {
+    use crate::runtime::Engine;
+    let root = tempfile::tempdir()?;
+    let (entity, version) = {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "killed", 4, 0, false)?;
+        let basis = metadata.basis(&entity)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let _draft = layer.open_to_replace(basis.clone())?;
+        (entity, basis.version)
+    };
+    let (store, layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 0);
+    assert_eq!(lock(&store).basis(&entity)?.version, version);
+    assert_eq!(drafts_on_disk(root.path())?, 0);
+    drop((store, layer));
+
+    let engine = Engine::open(root.path(), None)?;
+    let token = engine.open_to_replace("killed")?;
+    engine.close(token)?;
+    engine.flush(None)?;
+    assert_eq!(lock(&engine.store).basis(&entity)?.version, version);
     engine.shutdown()?;
     Ok(())
 }

@@ -158,6 +158,8 @@ pub struct Engine {
     publication: Mutex<()>,
     faults: Mutex<std::collections::BTreeSet<String>>,
 }
+/// How often a draft that could not seal at the start is tried again.
+const WAITING_DRAFT_RETRY: Duration = Duration::from_secs(5);
 impl Engine {
     pub fn open(root: &Path, repo: Option<&str>) -> Result<Arc<Self>> {
         std::fs::create_dir_all(root)?;
@@ -206,6 +208,7 @@ impl Engine {
             .spawn(move || {
                 let mut next_seal = std::time::Instant::now();
                 let mut next_reap = std::time::Instant::now();
+                let mut next_retry = std::time::Instant::now();
                 loop {
                     std::thread::sleep(Duration::from_millis(5));
                     let Some(engine) = weak.upgrade() else {
@@ -232,6 +235,12 @@ impl Engine {
                     if let Err(error) = result {
                         *lock(&engine.error) = Some(format!("{error:#}"));
                     }
+                    if std::time::Instant::now() >= next_retry {
+                        next_retry = std::time::Instant::now() + WAITING_DRAFT_RETRY;
+                        if let Err(error) = engine.retry_waiting_drafts() {
+                            *lock(&engine.error) = Some(format!("{error:#}"));
+                        }
+                    }
                     if std::time::Instant::now() >= next_reap {
                         next_reap = std::time::Instant::now() + Duration::from_secs(1);
                         if let Err(error) = engine.working.reap_clean() {
@@ -241,6 +250,24 @@ impl Engine {
                 }
             })?;
         Ok(engine)
+    }
+    /// Drafts [`seal::recover`] could not seal at the start. This asks again for what they need,
+    /// and what it does not wait for: a hint lasts longer than [`WAITING_DRAFT_RETRY`].
+    fn retry_waiting_drafts(&self) -> Result<()> {
+        let _publication = lock(&self.publication);
+        let (sealed, failure) = seal::retry_waiting(&self.store, &self.working);
+        drop(_publication);
+        if !sealed.is_empty() {
+            let paths: Vec<_> = {
+                let store = lock(&self.store);
+                sealed
+                    .iter()
+                    .filter_map(|entity| store.projection().path(entity).ok())
+                    .collect()
+            };
+            self.invalidate_paths(paths)?;
+        }
+        failure.map_or(Ok(()), Err)
     }
     pub fn set_invalidator(&self, callback: Invalidate) {
         *self.invalidate.write().unwrap() = Some(callback);
@@ -413,10 +440,10 @@ impl Engine {
         open_timing(1, started);
         self.insert_handle(entry, basis, writable, false, metadata_only)
     }
-    /// Opens a file for writing, to cut it to nothing: the caller's next call is
-    /// `truncate(token, 0, false)`, and if that fails it closes the handle. With the old
-    /// contents going none of them is asked for, so this works with no peer to ask on a
-    /// file whose manifest has never been here.
+    /// Opens a file for writing, to cut it to nothing: the caller calls `truncate(token, 0, false)`
+    /// before anything else it does with the handle but `close`. Until then the file stays as it
+    /// was, whatever becomes of the handle. With the old contents going none of them is asked
+    /// for, so this works with no peer to ask on a file whose manifest has never been here.
     pub fn open_to_replace(&self, path: &str) -> Result<u64> {
         ensure!(!self.stopping.load(Ordering::Acquire), "STOPPING");
         let (entry, basis) = {

@@ -31,9 +31,9 @@ object Native {
     external fun read(folder: String, token: Long, offset: Long, out: ByteArray, size: Int): Int
 
     /**
-     * A handle for writing, whose next call is `truncate(folder, token, 0)`. With the old contents
-     * going, none of them is asked for, so this works on a file the phone never downloaded and
-     * with no PC to ask.
+     * A handle for writing, on which `truncate(folder, token, 0)` comes before anything but `close`.
+     * Until then the file stays as it was. With the old contents going, none of them is asked for,
+     * so this works on a file the phone never downloaded and with no PC to ask.
      */
     @JvmStatic @Throws(IOException::class)
     external fun openToReplace(folder: String, path: String): Long

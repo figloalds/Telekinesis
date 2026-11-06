@@ -122,8 +122,9 @@ internal class RecoveringReader(
  * behind its token, so going on from a new token would lose or misplace it. A stale token fails
  * every call, and the draft is sealed by its old engine's stop or at the next start.
  *
- * A truncating open changes nothing until [start], which comes once a descriptor exists: until
- * then the writer only says it is empty, so a failure to make one leaves the file as it was.
+ * A truncating open changes nothing until the first write, fsync or release, and until then only
+ * says it is empty: a client that holds its descriptor and is killed, or a descriptor that could
+ * not be made, leaves the file as it was.
  */
 internal class DocumentWriter(
     private val document: WritableDocument,
@@ -134,41 +135,60 @@ internal class DocumentWriter(
 ) : ProxiedFile {
     private val token = document.open()
 
-    @Volatile private var truncatePending = truncate
-
-    fun start() {
-        if (truncatePending) document.truncate(token)
-        truncatePending = false
-    }
+    private var truncatePending = truncate
+    private var truncateFailed = false
 
     override fun length(): Long = if (truncatePending) 0 else document.length(token)
 
-    override fun read(offset: Long, out: ByteArray, size: Int): Int = document.read(token, offset, out, size)
+    override fun read(offset: Long, out: ByteArray, size: Int): Int =
+        if (truncatePending) 0 else document.read(token, offset, out, size)
 
-    override fun write(offset: Long, data: ByteArray, size: Int): Int =
-        document.write(token, offset, data, size, append)
+    override fun write(offset: Long, data: ByteArray, size: Int): Int {
+        truncateIfPending()
+        return document.write(token, offset, data, size, append)
+    }
 
-    override fun sync() = document.sync(token)
+    override fun sync() {
+        truncateIfPending()
+        document.sync(token)
+    }
 
     /**
      * Seals what was written before this returns, because the sealer thread may be frozen
      * moments later. No writer is left to tell of a failure: the draft stays on disk for the
-     * sealer or the next start, so a burst and a new listing still follow.
+     * sealer or the next start, so a burst and a new listing still follow. A truncate that
+     * already failed the writer is not tried again here, as it would empty the file of someone
+     * who was told it failed, and then nothing changed for a burst to carry.
      */
     override fun release() {
-        attempt("sync") { document.sync(token) }
+        val changed = !(truncatePending && truncateFailed) && attempt("truncate") { truncateIfPending() }
+        if (changed) attempt("sync") { document.sync(token) }
         attempt("close") { document.close(token) }
-        released()
+        if (changed) released()
     }
 
-    override fun abandon() = attempt("close") { document.close(token) }
+    override fun abandon() {
+        attempt("close") { document.close(token) }
+    }
 
-    private inline fun attempt(what: String, call: () -> Unit) {
+    private fun truncateIfPending() {
+        if (!truncatePending) return
         try {
-            call()
+            document.truncate(token)
         } catch (error: IOException) {
-            log("$what: ${error.message}")
+            truncateFailed = true
+            throw error
         }
+        truncatePending = false
+    }
+
+    /** Whether it went well. */
+    private inline fun attempt(what: String, call: () -> Unit): Boolean = try {
+        call()
+        true
+    } catch (error: IOException) {
+        log("$what: ${error.message}")
+        false
     }
 }
 
@@ -263,14 +283,7 @@ internal class FileProxy private constructor(
                 mode.append -> ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_APPEND
                 else -> ParcelFileDescriptor.MODE_WRITE_ONLY
             }
-            val descriptor = descriptor(storage, documentId, writer, access, "tkfs-write")
-            try {
-                writer.start()
-            } catch (error: IOException) {
-                descriptor.close()
-                throw error
-            }
-            return descriptor
+            return descriptor(storage, documentId, writer, access, "tkfs-write")
         }
 
         private fun descriptor(

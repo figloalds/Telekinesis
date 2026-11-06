@@ -96,26 +96,79 @@ class DocumentWriterTest {
         assertEquals(1, calls.count { it == "open" })
     }
 
-    @Test fun aTruncatingOpenChangesNothingUntilItStartsAndIsEmptyAllAlong() {
+    /** A kill now finds nothing changed, however long the client holds its descriptor. */
+    @Test fun aTruncatingOpenChangesNothingBeforeItsFirstWriteAndIsEmptyAllAlong() {
         val writer = writer(truncate = true)
         assertEquals(0, writer.length())
+        assertEquals(0, writer.read(0, data, 8))
         assertEquals(listOf("open"), calls)
-        writer.start()
-        assertEquals(listOf("open", "truncate"), calls)
+    }
+
+    @Test fun theFirstWriteTruncatesAndNoLaterOneDoes() {
+        val writer = writer(truncate = true)
+        writer.write(0, data, 8)
+        writer.write(8, data, 8)
+        assertEquals(listOf("open", "truncate", "write 100@0 8", "write 100@8 8"), calls)
         assertEquals(42, writer.length())
+        assertEquals(8, writer.read(0, data, 8))
+    }
+
+    /** An fsync says the file is as it looks, and it looks empty. */
+    @Test fun anFsyncBeforeAnyWriteTruncatesFirst() {
+        writer(truncate = true).sync()
+        assertEquals(listOf("open", "truncate", "sync"), calls)
+    }
+
+    /** `w` and a close with nothing written leaves an empty file. */
+    @Test fun aReleaseWithNothingWrittenTruncatesThenSeals() {
+        writer(truncate = true).release()
+        assertEquals(listOf("open", "truncate", "sync", "close", "released"), calls)
     }
 
     @Test fun anOpenThatKeepsTheContentsDoesNotTruncate() {
         val writer = writer()
-        writer.start()
-        assertEquals(42, writer.length())
-        assertEquals(listOf("open", "length"), calls)
+        writer.write(0, data, 8)
+        writer.sync()
+        writer.release()
+        assertEquals(listOf("open", "write 100@0 8", "sync", "sync", "close", "released"), calls)
+        assertEquals(0, calls.count { it == "truncate" })
     }
 
-    @Test fun aFailedTruncateFailsTheStart() {
+    /** The writer gets the failure, and nothing was written over a file that was not cut. */
+    @Test fun aFailedTruncateFailsTheWriteAndWritesNothing() {
         val writer = writer(truncate = true)
         document.failing += "truncate"
-        assertThrows(IOException::class.java) { writer.start() }
+        assertThrows(IOException::class.java) { writer.write(0, data, 8) }
+        assertEquals(listOf("open", "truncate"), calls)
+        assertEquals(0, writer.length())
+    }
+
+    @Test fun aWriteAfterAFailedTruncateTriesItAgain() {
+        val writer = writer(truncate = true)
+        document.failing += "truncate"
+        assertThrows(IOException::class.java) { writer.write(0, data, 8) }
+        document.failing.clear()
+        writer.write(0, data, 8)
+        assertEquals(listOf("open", "truncate", "truncate", "write 100@0 8"), calls)
+    }
+
+    /** It was told the write failed, so its close must not empty the file after all. */
+    @Test fun aReleaseAfterAFailedTruncateOnlyClosesAndIsNotAChange() {
+        val writer = writer(truncate = true)
+        document.failing += "truncate"
+        assertThrows(IOException::class.java) { writer.write(0, data, 8) }
+        document.failing.clear()
+        calls.clear()
+        writer.release()
+        assertEquals(listOf("close"), calls)
+    }
+
+    @Test fun aTruncateThatFailsAtTheReleaseOnlyClosesAndLogsItsCode() {
+        val logged = mutableListOf<String>()
+        document.failing += "truncate"
+        writer(truncate = true, log = { logged += it }).release()
+        assertEquals(listOf("open", "truncate", "close"), calls)
+        assertEquals(listOf("truncate: INVALID_HANDLE: truncate"), logged)
     }
 
     /** No descriptor could be made, so nothing was written and nobody is told of a change. */

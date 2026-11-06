@@ -1037,6 +1037,12 @@ impl LocalContent {
         fetcher.hint(&missing);
         Ok(missing)
     }
+    /// Asks for these objects, as [`Self::hint_range`] does, with nothing waiting for them.
+    pub fn hint(&self, objects: &[(Digest, Kind)]) {
+        if let Some(fetcher) = guard(&self.fetcher).clone() {
+            fetcher.hint(objects);
+        }
+    }
     /// Takes back what [`Self::hint_range`] returned.
     pub fn unhint(&self, objects: &[(Digest, Kind)]) {
         if objects.is_empty() {
