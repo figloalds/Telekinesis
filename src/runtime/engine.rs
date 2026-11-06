@@ -3,12 +3,12 @@ use crate::util::namespace::NamespaceChanges;
 use crate::{
     content::{Kind, seal, working::*},
     core::*,
-    model::content::{CHUNK_SIZE, ContentKind, Digest},
+    model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef},
     util::log::event,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::File,
     path::Path,
     sync::{
@@ -1273,6 +1273,164 @@ impl Engine {
     }
 }
 
+/// What [`Engine::evict`] did with the digests it was asked to remove.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Evicted {
+    /// Were here, and are gone.
+    pub removed: usize,
+    /// Are here, and this store keeps them.
+    pub refused: usize,
+}
+
+/// How many chunks one step of [`Engine::hydrate`] asks for: what one read-ahead window holds.
+const HYDRATE_WINDOW: usize = (READ_AHEAD / CHUNK_SIZE) as usize;
+
+impl Engine {
+    /// Removes `digests` from the packs, except what this store must keep: a manifest or a tree, a
+    /// version of an unresolved conflict, what a draft was made from, and what an open handle pins.
+    /// Deciding that the rest can be got back is the caller's. Whatever else is dead in a segment
+    /// this rewrites goes too, as with [`Self::collect`].
+    pub fn evict(&self, digests: &BTreeSet<Digest>) -> Result<Evicted> {
+        // A seal writes its objects and the event that names them under this lock, so nothing
+        // here is taken for dead on its way to being named.
+        let _publication = lock(&self.publication);
+        self.working.reap_released()?;
+        // Before the store: a draft is locked first, as the sealer does.
+        let mut bases = self.working.draft_bases();
+        let mut store = lock(&self.store);
+        for record in self.working.waiting_records()? {
+            // A draft found with a receipt goes on from that version, not the one on its record.
+            if let Some((event, _)) = store.receipt(&record.operation)?
+                && let Some(version) = store.version(&event)?
+            {
+                bases.extend(version.state.content);
+            }
+            bases.push(record.basis.content);
+        }
+        let mut protected = store.content_closure(&bases)?;
+        protected.extend(store.unresolved_conflict_objects()?);
+
+        let packs = &self.working.content().packs;
+        let mut removable = BTreeSet::new();
+        let mut refused = 0;
+        for digest in digests {
+            match packs.kind(*digest)? {
+                None => {}
+                Some(Kind::Chunk) if !protected.contains(digest) => {
+                    removable.insert(*digest);
+                }
+                Some(_) => refused += 1,
+            }
+        }
+        if removable.is_empty() {
+            return Ok(Evicted {
+                removed: 0,
+                refused,
+            });
+        }
+        // What decides what is dead must not be something a kill can take back, leaving an older
+        // head with its bytes gone. [`Self::collect`] has this from its flush.
+        store.sync_metadata()?;
+        // The pump writes with none of these locks. What it writes from here on is in no `live`,
+        // and this leaves it out of what gets collected.
+        let before = packs.close_segment_holding(&removable)?;
+        let mut live = store.live_objects(32)?;
+        // Not only what `live_objects` names: a draft's basis may be no head any more.
+        live.extend(protected);
+        live.retain(|digest| !removable.contains(digest));
+        packs.collect_before(&live, 1.0, before)?;
+        // What is still here is pinned, or has just arrived again.
+        let mut removed = 0;
+        for digest in &removable {
+            removed += usize::from(!packs.contains(*digest)?);
+        }
+        Ok(Evicted {
+            removed,
+            refused: refused + removable.len() - removed,
+        })
+    }
+    /// Downloads the whole of the file `entity` with no reader, through the demand path a read
+    /// takes, so it works on a passive phone. Its steps are the manifest and then a window of chunks
+    /// at a time, with the window after it hinted. Each waits at most [`Demand::FETCH_WAIT`]. One that
+    /// brings part of what it asks for is progress on a slow link, and one that brings nothing fails
+    /// with its code. What came stays either way. `cancel` is looked at between steps, and being
+    /// cancelled is no failure: this returns how much is here, as it does at the end.
+    ///
+    /// [`Demand::FETCH_WAIT`]: crate::orchestrator::demand::Demand::FETCH_WAIT
+    pub fn hydrate(&self, entity: &str, cancel: &dyn Fn() -> bool) -> Result<Presence> {
+        let (entry, reference) = self.file_head(entity)?;
+        if cancel() {
+            return self.entry_presence(&entry);
+        }
+        let content = self.working.content();
+        // As a handle does, so that no evict undoes this while it runs. The manifest comes here.
+        let _pin = content.pin(&reference)?;
+        let mut hinted = Vec::new();
+        let fetched = self.hydrate_chunks(&reference, cancel, &mut hinted);
+        content.unhint(&hinted);
+        fetched?;
+        self.entry_presence(&entry)
+    }
+    fn hydrate_chunks(
+        &self,
+        reference: &FileContentRef,
+        cancel: &dyn Fn() -> bool,
+        hinted: &mut Vec<(Digest, Kind)>,
+    ) -> Result<()> {
+        let content = self.working.content();
+        let mut seen = BTreeSet::new();
+        let mut left = VecDeque::new();
+        for digest in content.chunks(reference)? {
+            if seen.insert(digest) && !content.packs.contains(digest)? {
+                left.push_back((digest, Kind::Chunk));
+            }
+        }
+        while !left.is_empty() {
+            ensure!(!self.stopping.load(Ordering::Acquire), "STOPPING");
+            if cancel() {
+                return Ok(());
+            }
+            let window: Vec<_> = left.drain(..left.len().min(HYDRATE_WINDOW)).collect();
+            content.unhint(&std::mem::take(hinted));
+            hinted.extend(left.iter().take(HYDRATE_WINDOW));
+            content.hint(hinted);
+            let asked = content.ensure(&window);
+            let mut short = Vec::new();
+            for object in &window {
+                if !content.packs.contains(object.0)? {
+                    short.push(*object);
+                }
+            }
+            if short.len() == window.len() {
+                asked?;
+                anyhow::bail!("OBJECT_MISSING: a step of a hydrate brought nothing");
+            }
+            for object in short.into_iter().rev() {
+                left.push_front(object);
+            }
+        }
+        Ok(())
+    }
+    /// The chunks of the head of the file `entity`, in order and without repeats. It asks no one for
+    /// anything: `None` says its manifest is not here, so they are not known.
+    pub fn head_chunks(&self, entity: &str) -> Result<Option<Vec<Digest>>> {
+        let (_, reference) = self.file_head(entity)?;
+        let Some(mut chunks) = self.working.content().chunks_if_local(&reference)? else {
+            return Ok(None);
+        };
+        let mut seen = BTreeSet::new();
+        chunks.retain(|digest| seen.insert(*digest));
+        Ok(Some(chunks))
+    }
+    /// The file `entity` as it shows now, with what it holds.
+    fn file_head(&self, entity: &str) -> Result<(Entry, FileContentRef)> {
+        let entry = lock(&self.store).entry(entity)?;
+        ensure!(!entry.deleted, "NOT_FOUND: {entity} is deleted");
+        let reference = entry.content.clone().context("IS_A_DIRECTORY")?;
+        Ok((entry, reference))
+    }
+}
+
 /// What the head of a file needs a peer to hold before the peer has all of it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HeadClosure {
@@ -2328,6 +2486,745 @@ mod tests {
             }
         );
         engine.close(token)?;
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// `chunks` whole chunks and a bit, none of them like another's or another `seed`'s.
+    fn distinct_bytes(seed: u8, chunks: usize) -> Vec<u8> {
+        let mut bytes = vec![seed; chunks * CHUNK_SIZE as usize + 10];
+        for (index, chunk) in bytes.chunks_mut(CHUNK_SIZE as usize).enumerate() {
+            chunk[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        }
+        bytes
+    }
+
+    fn read_file(engine: &Engine, path: &str) -> Result<Vec<u8>> {
+        let token = engine.open_file(path, false, false, false)?;
+        let read = (|| {
+            let (_, len) = engine.info(token)?;
+            let mut bytes = vec![0; len as usize];
+            ensure!(engine.read(token, 0, &mut bytes)? == bytes.len(), "short");
+            Ok(bytes)
+        })();
+        engine.close(token)?;
+        read
+    }
+
+    fn chunks_of(engine: &Engine, reference: &FileContentRef) -> Result<BTreeSet<Digest>> {
+        Ok(engine
+            .working
+            .content()
+            .chunks(reference)?
+            .into_iter()
+            .collect())
+    }
+
+    fn head_of(engine: &Engine, path: &str) -> Result<FileContentRef> {
+        engine.lookup(path)?.content.context("no content")
+    }
+
+    /// A file written here, with its bytes and its chunks.
+    fn written(
+        engine: &Engine,
+        path: &str,
+        seed: u8,
+        chunks: usize,
+    ) -> Result<(Vec<u8>, BTreeSet<Digest>)> {
+        let bytes = distinct_bytes(seed, chunks);
+        seed_cached_file(engine, path, &bytes)?;
+        let digests = chunks_of(engine, &head_of(engine, path)?)?;
+        assert_eq!(digests.len(), chunks + 1);
+        Ok((bytes, digests))
+    }
+
+    fn held(engine: &Engine, digests: &BTreeSet<Digest>) -> Result<usize> {
+        let packs = &engine.working.content().packs;
+        let mut held = 0;
+        for digest in digests {
+            held += usize::from(packs.contains(*digest)?);
+        }
+        Ok(held)
+    }
+
+    #[test]
+    fn evict_removes_a_file_chunks_and_keeps_its_manifest() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (bytes, chunks) = written(&engine, "file", 1, 3)?;
+        let manifest = head_of(&engine, "file")?.digest;
+        // The file is still in the open segment, and what is in it goes too.
+        let evicted = engine.evict(&chunks)?;
+        assert_eq!(
+            evicted,
+            Evicted {
+                removed: 4,
+                refused: 0
+            }
+        );
+        let content = engine.working.content();
+        assert_eq!(held(&engine, &chunks)?, 0);
+        assert!(content.packs.contains(manifest)?);
+        let presence = engine.presence("file")?;
+        assert_eq!(presence.local_bytes, 0, "{presence:?}");
+        assert_eq!(presence.total_bytes, bytes.len() as u64);
+        // Asked of no one, it does not read as anything else.
+        let missing = read_file(&engine, "file").unwrap_err();
+        assert_eq!(crate::model::errors::code_of(&missing), "OBJECT_MISSING");
+        for chunk in bytes.chunks(CHUNK_SIZE as usize) {
+            content.packs.put(Kind::Chunk, chunk)?;
+        }
+        assert!(read_file(&engine, "file")? == bytes);
+        assert!(engine.presence("file")?.is_whole());
+        // Asked again for what is not here, it has nothing to do.
+        let absent = BTreeSet::from([Digest::bytes(b"not here")]);
+        assert_eq!(engine.evict(&absent)?, Evicted::default());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn evict_keeps_the_chunks_of_an_unresolved_conflict_version() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        written(&engine, "file", 1, 2)?;
+        let id = engine.lookup("file")?.id;
+        // An edit here, and a peer's edit of the version it was made from.
+        let writer = engine.open_file("file", false, false, true)?;
+        engine.truncate(writer, 0, false)?;
+        engine.write(writer, 0, &distinct_bytes(2, 2), false, false)?;
+        let theirs = distinct_bytes(3, 2);
+        let reference = engine.working.content().import(&theirs)?;
+        let peer = peer_edit(&engine, &id, |state| {
+            state.content = Some(reference.clone())
+        })?;
+        engine.flush(Some(writer))?;
+        engine.close(writer)?;
+        let heads = lock(&engine.store).projection().heads[&id].clone();
+        assert_eq!(heads.len(), 2);
+        let mine = heads.iter().find(|head| **head != peer.id).unwrap().clone();
+        let edit = lock(&engine.store).version(&mine)?.unwrap();
+        let edit = chunks_of(&engine, &edit.state.content.unwrap())?;
+        let both: BTreeSet<Digest> = edit
+            .union(&chunks_of(&engine, &reference)?)
+            .copied()
+            .collect();
+        // Whichever one shows, and whoever wrote it.
+        assert_eq!(
+            engine.evict(&both)?,
+            Evicted {
+                removed: 0,
+                refused: both.len()
+            }
+        );
+        assert_eq!(held(&engine, &both)?, both.len());
+        // Once it is settled, what was not chosen can go, and what was chosen still reads.
+        engine.resolve(&id, &peer.id)?;
+        let evicted = engine.evict(&edit)?;
+        assert_eq!(evicted.removed, edit.len(), "{evicted:?}");
+        assert!(read_file(&engine, "file")? == theirs);
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn evict_keeps_the_basis_of_a_draft() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (_, chunks) = written(&engine, "file", 1, 3)?;
+        // A draft started afresh for this pins none of what it was made from, and is based on it.
+        engine.working.reap_released()?;
+        let writer = engine.open_to_replace("file")?;
+        engine.truncate(writer, 0, false)?;
+        engine.write(writer, 0, b"replaced", false, false)?;
+        assert_eq!(
+            engine.evict(&chunks)?,
+            Evicted {
+                removed: 0,
+                refused: chunks.len()
+            }
+        );
+        assert_eq!(held(&engine, &chunks)?, chunks.len());
+        // Once the draft is a version of its own, they are the old file's.
+        engine.flush(Some(writer))?;
+        engine.close(writer)?;
+        assert_eq!(engine.evict(&chunks)?.removed, chunks.len());
+        assert_eq!(read_file(&engine, "file")?, b"replaced");
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn evict_keeps_what_an_open_handle_pins() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (bytes, chunks) = written(&engine, "file", 1, 3)?;
+        // Opened and not read yet, as a viewer may hold a file, with nothing left of the writer.
+        engine.working.reap_released()?;
+        let reader = engine.open_file("file", false, false, false)?;
+        assert_eq!(
+            engine.evict(&chunks)?,
+            Evicted {
+                removed: 0,
+                refused: chunks.len()
+            }
+        );
+        let mut read = vec![0; bytes.len()];
+        engine.read(reader, 0, &mut read)?;
+        assert!(read == bytes);
+        // A closed handle holds nothing, however recently it closed.
+        engine.close(reader)?;
+        assert_eq!(engine.evict(&chunks)?.removed, chunks.len());
+
+        // And chunks that arrive after the open are as much its own as those here before.
+        let reader = engine.open_file("file", false, false, false)?;
+        let content = engine.working.content();
+        for chunk in bytes.chunks(CHUNK_SIZE as usize) {
+            content.packs.put(Kind::Chunk, chunk)?;
+        }
+        assert_eq!(
+            engine.evict(&chunks)?,
+            Evicted {
+                removed: 0,
+                refused: chunks.len()
+            }
+        );
+        engine.close(reader)?;
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn evict_refuses_manifests_and_trees() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (_, chunks) = written(&engine, "file", 1, 2)?;
+        let manifest = head_of(&engine, "file")?.digest;
+        let tree = lock(&engine.store).checkpoint()?.root;
+        let content = engine.working.content();
+        assert_eq!(content.packs.kind(manifest)?, Some(Kind::Manifest));
+        assert_eq!(content.packs.kind(tree)?, Some(Kind::Tree));
+        // Nothing to remove, so nothing is rewritten and no answer about presence goes stale.
+        let generation = content.packs.generation();
+        assert_eq!(
+            engine.evict(&BTreeSet::from([manifest, tree]))?,
+            Evicted {
+                removed: 0,
+                refused: 2
+            }
+        );
+        assert_eq!(content.packs.generation(), generation);
+        // Named with a chunk, they still stay and it goes.
+        let chunk = *chunks.first().unwrap();
+        assert_eq!(
+            engine.evict(&BTreeSet::from([manifest, tree, chunk]))?,
+            Evicted {
+                removed: 1,
+                refused: 2
+            }
+        );
+        assert!(content.packs.contains(manifest)? && content.packs.contains(tree)?);
+        assert!(!content.packs.contains(chunk)?);
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn evict_does_not_touch_other_files_sharing_a_segment() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (_, chunks) = written(&engine, "freed", 1, 3)?;
+        let (bytes, others) = written(&engine, "kept", 2, 3)?;
+        let small = b"a small file";
+        seed_cached_file(&engine, "small", small)?;
+        let evicted = engine.evict(&chunks)?;
+        assert_eq!(evicted.removed, chunks.len());
+        assert_eq!(held(&engine, &chunks)?, 0);
+        assert_eq!(held(&engine, &others)?, others.len());
+        // With no one to ask, so these bytes can only be the ones moved.
+        assert!(read_file(&engine, "kept")? == bytes);
+        assert_eq!(read_file(&engine, "small")?, small);
+        assert!(engine.presence("kept")?.is_whole());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// A kill can take back events not yet durable. If one of those is what made the version before
+    /// it dead, that version would be back as the head, with its bytes gone.
+    #[test]
+    fn evict_goes_by_versions_a_kill_cannot_take_back() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (_, chunks) = written(&engine, "file", 1, 2)?;
+        let id = engine.lookup("file")?.id;
+        let later = engine.working.content().import(b"a later version")?;
+        peer_edit(&engine, &id, |state| state.content = Some(later))?;
+        assert!(!lock(&engine.store).metadata_is_durable());
+        assert_eq!(engine.evict(&chunks)?.removed, chunks.len());
+        assert!(lock(&engine.store).metadata_is_durable());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// Holds a peer's copy of files, and stores what it is asked for at once, as the pump does.
+    struct Peer {
+        packs: crate::content::PackStore,
+        objects: Mutex<HashMap<Digest, Vec<u8>>>,
+        /// How many objects each fetch asked for.
+        fetches: Mutex<Vec<(usize, Kind)>>,
+        /// The most it stores per fetch: a slow link gets a reader's wait only part of the way.
+        per_fetch: AtomicU64,
+        /// What is hinted and not yet taken back, and how many were ever hinted.
+        hints: Mutex<(BTreeMap<Digest, usize>, usize)>,
+        /// Called with the number of the fetch that came in.
+        during: Mutex<Option<DuringFetch>>,
+    }
+    type DuringFetch = Box<dyn FnMut(usize) + Send>;
+    /// A file a [`Peer`] holds.
+    struct OnAPeer {
+        entity: String,
+        bytes: Vec<u8>,
+        reference: FileContentRef,
+        chunks: Vec<Digest>,
+    }
+    impl Peer {
+        fn attached(engine: &Engine) -> Arc<Self> {
+            let content = engine.working.content();
+            let peer = Arc::new(Self {
+                packs: content.packs.clone(),
+                objects: Mutex::new(HashMap::new()),
+                fetches: Mutex::new(Vec::new()),
+                per_fetch: AtomicU64::new(u64::MAX),
+                hints: Mutex::new((BTreeMap::new(), 0)),
+                during: Mutex::new(None),
+            });
+            content.set_fetcher(peer.clone());
+            peer
+        }
+        /// A file named `path` of `chunks` chunks and a bit, of which the first `here` are here,
+        /// and its manifest too if `manifest`.
+        fn file(
+            &self,
+            engine: &Engine,
+            path: &str,
+            seed: u8,
+            chunks: usize,
+            here: usize,
+            manifest: bool,
+        ) -> Result<OnAPeer> {
+            let bytes = distinct_bytes(seed, chunks);
+            let mut digests = Vec::new();
+            for (index, chunk) in bytes.chunks(CHUNK_SIZE as usize).enumerate() {
+                let digest = Digest::bytes(chunk);
+                lock(&self.objects).insert(digest, chunk.to_vec());
+                if index < here {
+                    self.packs.put(Kind::Chunk, chunk)?;
+                }
+                digests.push(digest);
+            }
+            let encoded = Manifest {
+                len: bytes.len() as u64,
+                chunks: digests.clone(),
+            }
+            .encode()?;
+            let digest = Digest::bytes(&encoded);
+            if manifest {
+                self.packs.put(Kind::Manifest, &encoded)?;
+            }
+            lock(&self.objects).insert(digest, encoded);
+            let reference = FileContentRef::new(ContentKind::Manifest, digest, bytes.len() as u64)?;
+            file_of(engine, path, reference.clone())?;
+            Ok(OnAPeer {
+                entity: engine.lookup(path)?.id,
+                bytes,
+                reference,
+                chunks: digests,
+            })
+        }
+        fn store(&self, digest: Digest, kind: Kind) -> Result<()> {
+            let bytes = lock(&self.objects).get(&digest).cloned();
+            self.packs.put(kind, &bytes.context("not on this peer")?)?;
+            Ok(())
+        }
+        fn fetched(&self) -> Vec<usize> {
+            lock(&self.fetches)
+                .iter()
+                .map(|(count, _)| *count)
+                .collect()
+        }
+        fn hints_left(&self) -> usize {
+            lock(&self.hints).0.values().sum()
+        }
+    }
+    impl ObjectFetcher for Peer {
+        fn fetch(&self, objects: &[(Digest, Kind)]) -> Result<()> {
+            let call = {
+                let mut fetches = lock(&self.fetches);
+                fetches.push((objects.len(), objects[0].1));
+                fetches.len()
+            };
+            if let Some(during) = lock(&self.during).as_mut() {
+                during(call);
+            }
+            let most = self.per_fetch.load(Ordering::SeqCst);
+            let most = usize::try_from(most).unwrap_or(usize::MAX);
+            for (digest, kind) in objects.iter().take(most) {
+                self.store(*digest, *kind)?;
+            }
+            self.packs.flush()?;
+            ensure!(most >= objects.len(), "OBJECT_MISSING: not all of it came");
+            Ok(())
+        }
+        fn hint(&self, objects: &[(Digest, Kind)]) {
+            let mut hints = lock(&self.hints);
+            hints.1 += objects.len();
+            for (digest, _) in objects {
+                *hints.0.entry(*digest).or_default() += 1;
+            }
+        }
+        fn unhint(&self, objects: &[(Digest, Kind)]) {
+            let mut hints = lock(&self.hints);
+            for (digest, _) in objects {
+                let count = hints.0.get_mut(digest).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    hints.0.remove(digest);
+                }
+            }
+        }
+    }
+
+    /// A seal and the pump go on as evict runs, and what they add is kept: every evict here rolls
+    /// the segment they write to and rewrites it.
+    #[test]
+    fn evict_leaves_what_seals_and_pump_writes_add_meanwhile() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (victim, chunks) = written(&engine, "victim", 1, 3)?;
+        let peer = Peer::attached(&engine);
+        let incoming = peer.file(&engine, "incoming", 2, 64, 0, true)?;
+        let sealed = std::thread::scope(|scope| -> Result<Vec<(String, Vec<u8>)>> {
+            let sealing = scope.spawn(|| -> Result<Vec<(String, Vec<u8>)>> {
+                let mut files = Vec::new();
+                for index in 0..12u8 {
+                    let path = format!("sealed-{index}");
+                    let bytes = distinct_bytes(10 + index, 2);
+                    seed_cached_file(&engine, &path, &bytes)?;
+                    files.push((path, bytes));
+                }
+                Ok(files)
+            });
+            let pump = scope.spawn(|| -> Result<()> {
+                for digest in &incoming.chunks {
+                    peer.store(*digest, Kind::Chunk)?;
+                    peer.packs.flush()?;
+                }
+                Ok(())
+            });
+            let packs = &engine.working.content().packs;
+            let mut rounds = 0;
+            while !(sealing.is_finished() && pump.is_finished()) {
+                let evicted = engine.evict(&chunks)?;
+                assert_eq!(evicted.refused, 0, "{evicted:?}");
+                for chunk in victim.chunks(CHUNK_SIZE as usize) {
+                    packs.put(Kind::Chunk, chunk)?;
+                }
+                rounds += 1;
+            }
+            assert!(rounds > 1, "evict never ran beside them");
+            pump.join().unwrap()?;
+            sealing.join().unwrap()
+        })?;
+        // No read below needs a peer.
+        for digest in &incoming.chunks {
+            assert!(engine.working.content().packs.contains(*digest)?);
+        }
+        assert_eq!(peer.fetched(), Vec::<usize>::new());
+        for (path, bytes) in sealed {
+            assert!(read_file(&engine, &path)? == bytes, "{path}");
+        }
+        assert!(read_file(&engine, "incoming")? == incoming.bytes);
+        assert_eq!(peer.fetched(), Vec::<usize>::new());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// A read through a handle goes on as if nothing happened. One with no handle, that holds no
+    /// pin, may have to fetch again, or be told to try again, and never reads anything else.
+    #[test]
+    fn reads_during_an_evict_are_right_or_ask_again() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let peer = Peer::attached(&engine);
+        let open = peer.file(&engine, "open", 1, 32, 33, true)?;
+        let free = peer.file(&engine, "free", 2, 32, 33, true)?;
+        let token = engine.open_file("open", false, false, false)?;
+        let names: BTreeSet<Digest> = open.chunks.iter().chain(&free.chunks).copied().collect();
+        let done = AtomicBool::new(false);
+        let evictions = std::thread::scope(|scope| -> Result<Vec<Evicted>> {
+            let through_a_handle = scope.spawn(|| -> Result<u64> {
+                let mut reads = 0;
+                let mut out = vec![0; open.bytes.len()];
+                while !done.load(Ordering::SeqCst) {
+                    engine.read(token, 0, &mut out)?;
+                    assert!(out == open.bytes, "a read through a handle read wrong");
+                    reads += 1;
+                }
+                Ok(reads)
+            });
+            let with_no_handle = scope.spawn(|| -> Result<u64> {
+                let content = engine.working.content();
+                let mut reads = 0;
+                let mut out = vec![0; free.bytes.len()];
+                // Evicts may come between all its reads, and none comes after the last.
+                let end = std::time::Instant::now() + Duration::from_secs(60);
+                while !done.load(Ordering::SeqCst) || reads == 0 {
+                    ensure!(std::time::Instant::now() < end, "no read got through");
+                    match content.read_range(&free.reference, 0, &mut out) {
+                        Ok(()) => {
+                            assert!(out == free.bytes, "a read with no handle read wrong");
+                            reads += 1;
+                        }
+                        Err(error) => {
+                            assert_eq!(
+                                crate::model::errors::code_of(&error),
+                                "OBJECT_MISSING",
+                                "{error:#}"
+                            )
+                        }
+                    }
+                }
+                Ok(reads)
+            });
+            let evictions = (0..24)
+                .map(|_| {
+                    std::thread::sleep(Duration::from_millis(5));
+                    engine.evict(&names)
+                })
+                .collect::<Result<Vec<_>>>();
+            // Whatever came of them: the readers go on until this says so.
+            done.store(true, Ordering::SeqCst);
+            assert!(through_a_handle.join().unwrap()? > 0);
+            assert!(with_no_handle.join().unwrap()? > 0);
+            evictions
+        })?;
+        for evicted in &evictions {
+            assert!(evicted.refused >= open.chunks.len(), "{evicted:?}");
+        }
+        assert!(
+            evictions.iter().any(|evicted| evicted.removed > 0),
+            "nothing was ever removed under the readers"
+        );
+        let pinned: BTreeSet<Digest> = open.chunks.iter().copied().collect();
+        assert_eq!(held(&engine, &pinned)?, pinned.len());
+        engine.close(token)?;
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// How many chunks one step of a hydrate asks for.
+    const WINDOW: usize = (READ_AHEAD / CHUNK_SIZE) as usize;
+
+    #[test]
+    fn hydrate_brings_a_whole_file_a_window_at_a_time() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let peer = Peer::attached(&engine);
+        // The last chunk is the short one, one chunk past the two windows and what is here.
+        let file = peer.file(&engine, "big", 1, 2 * WINDOW + 5, 5, true)?;
+        let presence = engine.hydrate(&file.entity, &|| false)?;
+        assert!(presence.is_whole(), "{presence:?}");
+        assert_eq!(presence.total_bytes, file.bytes.len() as u64);
+        assert_eq!(peer.fetched(), vec![WINDOW, WINDOW, 1]);
+        // What it hinted on the way, it took back.
+        assert!(lock(&peer.hints).1 > 0);
+        assert_eq!(peer.hints_left(), 0);
+        assert!(read_file(&engine, "big")? == file.bytes);
+        // With all of it here, it asks no one for anything.
+        lock(&peer.fetches).clear();
+        assert!(engine.hydrate(&file.entity, &|| false)?.is_whole());
+        assert!(peer.fetched().is_empty());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn hydrate_asks_for_the_manifest_first_and_for_a_repeated_chunk_once() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let peer = Peer::attached(&engine);
+        let chunk = vec![7; CHUNK_SIZE as usize];
+        let digest = Digest::bytes(&chunk);
+        lock(&peer.objects).insert(digest, chunk);
+        let len = 3 * CHUNK_SIZE;
+        let encoded = Manifest {
+            len,
+            chunks: vec![digest; 3],
+        }
+        .encode()?;
+        let manifest = Digest::bytes(&encoded);
+        lock(&peer.objects).insert(manifest, encoded);
+        let reference = FileContentRef::new(ContentKind::Manifest, manifest, len)?;
+        file_of(&engine, "repeats", reference)?;
+        let entity = engine.lookup("repeats")?.id;
+        assert!(engine.hydrate(&entity, &|| false)?.is_whole());
+        assert_eq!(
+            *lock(&peer.fetches),
+            vec![(1, Kind::Manifest), (1, Kind::Chunk)]
+        );
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn hydrate_goes_on_while_a_step_brings_something_and_fails_with_a_code_when_none_does()
+    -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let peer = Peer::attached(&engine);
+        // A slow link: a reader's wait brings a part of what it asks for, and that is progress.
+        peer.per_fetch.store(100, Ordering::SeqCst);
+        let slow = peer.file(&engine, "slow", 1, 300, 0, true)?;
+        assert!(engine.hydrate(&slow.entity, &|| false)?.is_whole());
+        assert!(peer.fetched().len() > 3, "{:?}", peer.fetched());
+        assert!(read_file(&engine, "slow")? == slow.bytes);
+
+        // A link that dies: what came stays, and the failure says what is wrong.
+        lock(&peer.fetches).clear();
+        let dying = peer.file(&engine, "dying", 2, 300, 0, true)?;
+        let per_fetch = peer.clone();
+        *lock(&peer.during) = Some(Box::new(move |call| {
+            if call > 1 {
+                per_fetch.per_fetch.store(0, Ordering::SeqCst);
+            }
+        }));
+        let failed = engine.hydrate(&dying.entity, &|| false).unwrap_err();
+        assert_eq!(crate::model::errors::code_of(&failed), "OBJECT_MISSING");
+        assert_eq!(peer.fetched().len(), 2);
+        assert_eq!(peer.hints_left(), 0);
+        let presence = engine.presence("dying")?;
+        assert_eq!(presence.local_bytes, 100 * CHUNK_SIZE, "{presence:?}");
+        *lock(&peer.during) = None;
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn hydrate_stops_between_steps_when_cancelled() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let peer = Peer::attached(&engine);
+        let file = peer.file(&engine, "big", 1, 2 * WINDOW, 0, false)?;
+        // Before it starts, it asks for nothing, not even the manifest.
+        let presence = engine.hydrate(&file.entity, &|| true)?;
+        assert_eq!(presence.local_bytes, 0, "{presence:?}");
+        assert!(peer.fetched().is_empty());
+        // After the manifest and one window, it says how far it got.
+        let presence = engine.hydrate(&file.entity, &|| peer.fetched().len() == 2)?;
+        assert_eq!(peer.fetched(), vec![1, WINDOW]);
+        assert_eq!(presence.local_bytes, WINDOW as u64 * CHUNK_SIZE);
+        assert!(!presence.is_whole());
+        assert_eq!(peer.hints_left(), 0);
+        // And goes on from there.
+        assert!(engine.hydrate(&file.entity, &|| false)?.is_whole());
+        assert_eq!(peer.fetched(), vec![1, WINDOW, WINDOW, 1]);
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// Evict never takes what a hydrate just brought, so that a hydrate ends with the whole file.
+    #[test]
+    fn hydrate_keeps_what_it_brought_from_an_evict_meanwhile() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let peer = Peer::attached(&engine);
+        let file = peer.file(&engine, "big", 1, WINDOW + 10, 0, true)?;
+        let names: BTreeSet<Digest> = file.chunks.iter().copied().collect();
+        let evicted = Arc::new(Mutex::new(None));
+        let (weak, seen) = (Arc::downgrade(&engine), evicted.clone());
+        *lock(&peer.during) = Some(Box::new(move |call| {
+            if call == 2 {
+                *lock(&seen) = Some(weak.upgrade().unwrap().evict(&names));
+            }
+        }));
+        assert!(engine.hydrate(&file.entity, &|| false)?.is_whole());
+        let evicted = lock(&evicted).take().unwrap()?;
+        assert_eq!(evicted.removed, 0, "{evicted:?}");
+        assert_eq!(evicted.refused, WINDOW);
+        *lock(&peer.during) = None;
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn hydrate_and_head_chunks_of_what_is_no_file_say_so() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let code = crate::model::errors::code_of;
+        let directory = lock(&engine.store)
+            .create("directory", EntryKind::Directory)?
+            .id;
+        seed_cached_file(&engine, "gone", b"gone")?;
+        let gone = engine.lookup("gone")?.id;
+        lock(&engine.store).delete(&gone)?;
+        for (entity, expected) in [
+            (directory.as_str(), "IS_A_DIRECTORY"),
+            (gone.as_str(), "NOT_FOUND"),
+            ("no such entity", "NOT_FOUND"),
+        ] {
+            let failed = engine.hydrate(entity, &|| false).unwrap_err();
+            assert_eq!(code(&failed), expected, "{failed:#}");
+            let failed = engine.head_chunks(entity).unwrap_err();
+            assert_eq!(code(&failed), expected, "{failed:#}");
+        }
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn head_chunks_never_fetches_and_says_when_the_manifest_is_not_here() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let asked = Arc::new(Asked::default());
+        engine.working.content().set_fetcher(asked.clone());
+        // Not here: nothing is known of its chunks, and that is what it says.
+        partly_here(&engine, "/never", 4, 0, &[], false)?;
+        let entity = engine.lookup("/never")?.id;
+        assert_eq!(engine.head_chunks(&entity)?, None);
+        // Here, and none of the chunks: it knows them all.
+        partly_here(&engine, "/named", 4, 0, &[], true)?;
+        let named = engine.lookup("/named")?;
+        let chunks = engine.head_chunks(&named.id)?.unwrap();
+        assert_eq!(
+            chunks,
+            engine
+                .working
+                .content()
+                .chunks_if_local(named.content.as_ref().unwrap())?
+                .unwrap()
+        );
+        assert_eq!(chunks.len(), 4);
+        // A small file is its one chunk, and a repeated chunk is named once.
+        let small = engine.working.content().import(b"small")?;
+        file_of(&engine, "/small", small.clone())?;
+        let entity = engine.lookup("/small")?.id;
+        assert_eq!(engine.head_chunks(&entity)?, Some(vec![small.digest]));
+        let chunk = Digest::bytes(b"repeated");
+        let manifest = Manifest {
+            len: 3 * CHUNK_SIZE,
+            chunks: vec![chunk; 3],
+        };
+        let content = engine.working.content();
+        let digest = content.packs.put(Kind::Manifest, &manifest.encode()?)?;
+        let reference = FileContentRef::new(ContentKind::Manifest, digest, 3 * CHUNK_SIZE)?;
+        file_of(&engine, "/repeats", reference)?;
+        let entity = engine.lookup("/repeats")?.id;
+        assert_eq!(engine.head_chunks(&entity)?, Some(vec![chunk]));
+        assert_eq!(
+            asked.0.load(Ordering::SeqCst),
+            0,
+            "head_chunks asked a fetcher"
+        );
         engine.shutdown()?;
         Ok(())
     }

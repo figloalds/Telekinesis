@@ -2804,6 +2804,113 @@ fn a_draft_kept_for_a_retry_seals_whichever_way_its_objects_arrive() -> Result<(
     Ok(())
 }
 
+/// A draft a start could not seal is in nothing the working layer holds, and no pin keeps its basis.
+/// What of it is here must stay, or the draft would never have all it needs at once. It stays once
+/// a peer's edit has moved the file on, too, when no head names it any more.
+#[test]
+fn evict_keeps_the_basis_of_a_draft_kept_for_a_retry() -> Result<()> {
+    use crate::model::content::{CHUNK_SIZE, Digest};
+    use crate::runtime::{Engine, Evicted};
+    use std::collections::BTreeSet;
+    let root = tempfile::tempdir()?;
+    let first = {
+        let mut metadata = Store::open(root.path(), None)?;
+        // The cut keeps the first chunk as it is, and needs the bytes of the second, not here.
+        let (entity, chunks) = seed_file_on_a_peer(&mut metadata, "big", 4, 1, true)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let cut = layer.open(metadata.basis(&entity)?, true)?;
+        lock(&cut).truncate(CHUNK_SIZE + 17)?;
+        Digest::bytes(&chunks[0])
+    };
+    let engine = Engine::open(root.path(), None)?;
+    assert_eq!(drafts_on_disk(root.path())?, 1);
+    let named = BTreeSet::from([first]);
+    assert_eq!(
+        engine.evict(&named)?,
+        Evicted {
+            removed: 0,
+            refused: 1
+        }
+    );
+    let content = engine.working.content();
+    assert!(content.packs.contains(first)?);
+    // No head names it now, and this evict is of something else entirely.
+    let entity = engine.lookup("big")?.id;
+    let other = content.import(b"the peer's bytes")?;
+    {
+        let mut store = lock(&engine.store);
+        let mut state = store.entry(&entity)?;
+        state.content = Some(other.clone());
+        let heads = store.projection().heads[&entity].iter().cloned().collect();
+        let branch = store.active.clone();
+        let mut event = store.event(&branch, state, heads, Operation::Content);
+        event.author = "a peer".into();
+        store.apply(&[event])?;
+    }
+    let evicted = engine.evict(&BTreeSet::from([other.digest]))?;
+    assert_eq!(evicted.removed, 1, "{evicted:?}");
+    assert!(content.packs.contains(first)?, "the draft's basis went");
+    assert_eq!(drafts_on_disk(root.path())?, 1);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// A draft whose seal went through just before a crash goes on from that version, which is not the
+/// one on its record. That one's chunks stay too.
+#[test]
+fn evict_keeps_what_a_draft_kept_for_a_retry_goes_on_from() -> Result<()> {
+    use crate::content::{Kind, Manifest};
+    use crate::model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef};
+    use crate::runtime::{Engine, Evicted};
+    use std::collections::BTreeSet;
+    let root = tempfile::tempdir()?;
+    let first = {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "big", 4, 0, true)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let cut = layer.open(metadata.basis(&entity)?, true)?;
+        lock(&cut).truncate(CHUNK_SIZE + 17)?;
+        let operation = lock(&cut).record.operation.clone();
+        // What the seal published: a first chunk that is here and a second that is not.
+        let first = metadata
+            .content
+            .packs
+            .put(Kind::Chunk, &vec![1; CHUNK_SIZE as usize])?;
+        let second = Digest::bytes(&vec![2; CHUNK_SIZE as usize]);
+        let len = 2 * CHUNK_SIZE;
+        let encoded = Manifest {
+            len,
+            chunks: vec![first, second],
+        }
+        .encode()?;
+        let manifest = metadata.content.packs.put(Kind::Manifest, &encoded)?;
+        metadata.content.packs.flush()?;
+        let mut state = metadata.entry(&entity)?;
+        state.content = Some(FileContentRef::new(ContentKind::Manifest, manifest, len)?);
+        let heads = metadata.projection().heads[&entity]
+            .iter()
+            .cloned()
+            .collect();
+        let branch = metadata.active.clone();
+        let event = metadata.event(&branch, state, heads, Operation::Content);
+        let receipt = (operation, event.id.clone(), 0);
+        metadata.apply_batch(&[event], &[receipt])?;
+        metadata.sync_metadata()?;
+        first
+    };
+    let engine = Engine::open(root.path(), None)?;
+    assert_eq!(drafts_on_disk(root.path())?, 1, "it does not wait");
+    assert_eq!(
+        engine.evict(&BTreeSet::from([first]))?,
+        Evicted {
+            removed: 0,
+            refused: 1
+        }
+    );
+    engine.shutdown()?;
+    Ok(())
+}
+
 /// A draft that waits does not stand in the way of a flush of everything, of other files' seals
 /// or of a stop, and a stop does not lose it.
 #[test]

@@ -97,6 +97,9 @@ struct State {
     stamp: u64,
     pins: BTreeMap<Digest, usize>,
     verified_reads: u64,
+    /// How many more appends go through whole. The one after stops halfway, as on a full volume.
+    #[cfg(test)]
+    appends_left: Option<usize>,
 }
 struct Inner {
     root: PathBuf,
@@ -202,6 +205,8 @@ impl PackStore {
                 stamp: 0,
                 pins: BTreeMap::new(),
                 verified_reads: 0,
+                #[cfg(test)]
+                appends_left: None,
             }),
         });
         stores.insert(root, Arc::downgrade(&inner));
@@ -260,20 +265,89 @@ impl PackStore {
         }
         if state.offset > 0 && state.offset + bytes.len() as u64 > self.inner.segment_limit {
             Self::flush_locked(&mut state)?;
-            state.segment += 1;
-            state.writer = append_file(&self.inner.root, state.segment)?;
-            state.offset = 0;
+            self.roll_locked(&mut state)?;
         }
+        let offset = self.append(&mut state, bytes)?;
         let location = Location {
             segment: state.segment,
-            offset: state.offset,
+            offset,
             len: bytes.len(),
             kind,
         };
-        state.writer.write_all(bytes)?;
-        state.offset += bytes.len() as u64;
         state.pending.insert(digest, location);
         Ok((digest, true))
+    }
+    /// Opens the next segment for writing. If that fails the open one stays open.
+    fn roll_locked(&self, state: &mut State) -> Result<()> {
+        state.writer.sync_all()?;
+        let writer = append_file(&self.inner.root, state.segment + 1)?;
+        state.segment += 1;
+        state.writer = writer;
+        state.offset = 0;
+        Ok(())
+    }
+    /// Adds `bytes` to the open segment and says where. The file opens to append, so what follows
+    /// a write that stopped short, as on a full volume, would land past where the index says. That
+    /// write is taken back.
+    fn append(&self, state: &mut State, bytes: &[u8]) -> Result<u64> {
+        let offset = state.offset;
+        if let Err(error) = Self::write_out(state, bytes) {
+            self.cut_open_segment(state, offset);
+            return Err(error.into());
+        }
+        state.offset += bytes.len() as u64;
+        Ok(offset)
+    }
+    /// Cuts the open segment back to `offset`, past which the index names nothing. If it cannot be
+    /// cut, what comes next goes after what is there. An append handle cannot cut on every platform.
+    fn cut_open_segment(&self, state: &mut State, offset: u64) {
+        let cut = OpenOptions::new()
+            .write(true)
+            .open(segment_path(&self.inner.root, state.segment))
+            .and_then(|file| file.set_len(offset));
+        state.offset = match cut {
+            Ok(()) => offset,
+            Err(_) => state
+                .writer
+                .metadata()
+                .map_or(state.offset, |metadata| metadata.len()),
+        };
+    }
+    fn write_out(state: &mut State, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(left) = &mut state.appends_left {
+            if *left == 0 {
+                state.writer.write_all(&bytes[..bytes.len() / 2])?;
+                return Err(std::io::ErrorKind::StorageFull.into());
+            }
+            *left -= 1;
+        }
+        state.writer.write_all(bytes)
+    }
+    /// See [`State::appends_left`].
+    #[cfg(test)]
+    pub(crate) fn fail_appends_after(&self, appends: Option<usize>) {
+        guard(&self.inner.state).appends_left = appends;
+    }
+    /// What the object is, if it is here.
+    pub fn kind(&self, digest: Digest) -> Result<Option<Kind>> {
+        Ok(Self::location(&mut guard(&self.inner.state), digest)?.map(|location| location.kind))
+    }
+    /// Closes the open segment if any of `digests` is in it, since a collect passes over the open
+    /// one. Returns the number for [`Self::collect_before`]: whatever is written from now on is in
+    /// that segment or a later one.
+    pub fn close_segment_holding(&self, digests: &BTreeSet<Digest>) -> Result<u64> {
+        let mut state = guard(&self.inner.state);
+        Self::flush_locked(&mut state)?;
+        for digest in digests {
+            if Self::location(&mut state, *digest)?
+                .is_some_and(|location| location.segment == state.segment)
+            {
+                self.roll_locked(&mut state)?;
+                break;
+            }
+        }
+        Ok(state.segment)
     }
     fn flush_locked(state: &mut State) -> Result<()> {
         if state.pending.is_empty() {
@@ -408,6 +482,17 @@ impl PackStore {
     /// Caller supplies transitive snapshot reachability; open handles pin their
     /// entire content closure. Index commit precedes removal of old segments.
     pub fn collect(&self, live: &BTreeSet<Digest>, threshold: f64) -> Result<usize> {
+        self.collect_before(live, threshold, u64::MAX)
+    }
+    /// [`Self::collect`] of the segments below `before`, from [`Self::close_segment_holding`] before
+    /// `live` was worked out. What was written since stays, whether or not `live` names it. An
+    /// error leaves every object readable, and what it had not reached where it was.
+    pub fn collect_before(
+        &self,
+        live: &BTreeSet<Digest>,
+        threshold: f64,
+        before: u64,
+    ) -> Result<usize> {
         ensure!((0.0..=1.0).contains(&threshold), "INVALID_GC_THRESHOLD");
         let mut state = guard(&self.inner.state);
         Self::flush_locked(&mut state)?;
@@ -420,6 +505,30 @@ impl PackStore {
         state.location_order.clear();
         let mut live = live.clone();
         live.extend(state.pins.keys());
+        let before = before.min(state.segment);
+        let removed = self.rewrite_segments(&mut state, &live, threshold, before);
+        // Cached dead objects must not turn a miss into a successful read, even if the rewrite
+        // stopped partway. One still in the packs is only read from there the next time.
+        let dead: Vec<_> = state
+            .cache
+            .keys()
+            .filter(|d| !live.contains(d))
+            .copied()
+            .collect();
+        for digest in dead {
+            let old = state.cache.remove(&digest).unwrap();
+            state.cache_len -= old.bytes.len();
+            state.order.remove(&(old.stamp, digest));
+        }
+        removed
+    }
+    fn rewrite_segments(
+        &self,
+        state: &mut State,
+        live: &BTreeSet<Digest>,
+        threshold: f64,
+        before: u64,
+    ) -> Result<usize> {
         let rows = {
             let mut stmt = state.db.prepare_cached(
                 "SELECT digest,segment,offset,length,kind FROM objects ORDER BY segment,offset",
@@ -447,9 +556,10 @@ impl PackStore {
                 },
             ));
         }
-        let mut removed = 0;
+        let mut rewrites = Vec::new();
         for (segment, entries) in segments {
-            if segment == state.segment {
+            // Rewriting can open new segments, so this is not the open one by then: `before` is.
+            if segment >= before {
                 continue;
             }
             let total = entries.iter().map(|(_, l)| l.len.max(1)).sum::<usize>();
@@ -461,49 +571,71 @@ impl PackStore {
             if kept as f64 / total as f64 >= threshold {
                 continue;
             }
-            let old = File::open(segment_path(&self.inner.root, segment))?;
-            let mut updates = Vec::new();
-            for (digest, loc) in &entries {
-                if !live.contains(digest) {
-                    continue;
-                }
+            rewrites.push((kept, segment, entries));
+        }
+        // Least to copy first: with little room left, what needs none is freed whatever comes of
+        // the rest, and it makes room for them.
+        rewrites.sort_by_key(|(kept, segment, _)| (*kept, *segment));
+        let mut removed = 0;
+        for (_, segment, entries) in rewrites {
+            removed += self.rewrite_segment(state, segment, &entries, live)?;
+        }
+        Ok(removed)
+    }
+    /// Moves the live objects of one old segment to the open one and removes it. The old segment
+    /// and the index stay as they are until the copies are safe on disk, so a failure on the way
+    /// loses nothing, and what was copied is taken back to leave the room it took.
+    fn rewrite_segment(
+        &self,
+        state: &mut State,
+        segment: u64,
+        entries: &[(Digest, Location)],
+        live: &BTreeSet<Digest>,
+    ) -> Result<usize> {
+        let old = File::open(segment_path(&self.inner.root, segment))?;
+        let keeping: Vec<&(Digest, Location)> = entries
+            .iter()
+            .filter(|(digest, _)| live.contains(digest))
+            .collect();
+        // In one piece: this keeps segments to their size, so freeing later never has to copy
+        // more than one at a time, and leaves one place to take back from.
+        let copying = keeping.iter().map(|(_, l)| l.len as u64).sum::<u64>();
+        if copying > 0 && state.offset > 0 && state.offset + copying > self.inner.segment_limit {
+            self.roll_locked(state)?;
+        }
+        let start = state.offset;
+        let copied = (|| -> Result<Vec<(Digest, u64, Location)>> {
+            let mut updates = Vec::with_capacity(keeping.len());
+            for (digest, loc) in &keeping {
                 let mut bytes = vec![0; loc.len];
                 read_exact_at(&old, &mut bytes, loc.offset)?;
                 ensure!(Digest::bytes(&bytes) == *digest, "OBJECT_CORRUPT_DURING_GC");
-                let offset = state.offset;
-                state.writer.write_all(&bytes)?;
-                state.offset += bytes.len() as u64;
-                updates.push((*digest, offset, *loc));
+                updates.push((*digest, self.append(state, &bytes)?, *loc));
             }
             state.writer.sync_all()?;
-            let new_segment = state.segment;
-            let tx = state.db.transaction()?;
-            tx.execute_cached("DELETE FROM objects WHERE segment=?1", [segment])?;
-            for (digest, offset, loc) in updates {
-                tx.execute_cached(
-                    "INSERT INTO objects VALUES(?1,?2,?3,?4,?5)",
-                    params![&digest.0[..], new_segment, offset, loc.len, loc.kind as u8],
-                )?;
+            Ok(updates)
+        })();
+        let updates = match copied {
+            Ok(updates) => updates,
+            Err(error) => {
+                self.cut_open_segment(state, start);
+                return Err(error);
             }
-            tx.commit()?;
-            removed += entries.iter().filter(|(d, _)| !live.contains(d)).count();
-            state.readers.remove(&segment);
-            drop(old);
-            fs::remove_file(segment_path(&self.inner.root, segment))?;
+        };
+        let new_segment = state.segment;
+        let tx = state.db.transaction()?;
+        tx.execute_cached("DELETE FROM objects WHERE segment=?1", [segment])?;
+        for (digest, offset, loc) in updates {
+            tx.execute_cached(
+                "INSERT INTO objects VALUES(?1,?2,?3,?4,?5)",
+                params![&digest.0[..], new_segment, offset, loc.len, loc.kind as u8],
+            )?;
         }
-        // Cached dead objects must not turn a miss into a successful read.
-        let dead: Vec<_> = state
-            .cache
-            .keys()
-            .filter(|d| !live.contains(d))
-            .copied()
-            .collect();
-        for digest in dead {
-            let old = state.cache.remove(&digest).unwrap();
-            state.cache_len -= old.bytes.len();
-            state.order.remove(&(old.stamp, digest));
-        }
-        Ok(removed)
+        tx.commit()?;
+        state.readers.remove(&segment);
+        drop(old);
+        fs::remove_file(segment_path(&self.inner.root, segment))?;
+        Ok(entries.len() - keeping.len())
     }
 }
 
@@ -770,6 +902,199 @@ mod tests {
         assert_eq!(reopened.get(keep)?.as_slice(), b"keep me!");
         assert_eq!(reopened.get(arriving)?.as_slice(), b"arriving");
         Ok(())
+    }
+    /// What a segment file holds, in bytes.
+    fn segment_len(store: &PackStore, segment: u64) -> Result<u64> {
+        Ok(fs::metadata(segment_path(&store.inner.root, segment))?.len())
+    }
+    fn open_segment(store: &PackStore) -> u64 {
+        guard(&store.inner.state).segment
+    }
+    #[test]
+    fn a_failed_rewrite_leaves_every_object_readable_and_the_store_usable() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 24)?;
+        let one = store.put(Kind::Chunk, b"live one")?;
+        let two = store.put(Kind::Chunk, b"live two")?;
+        let dead = store.put(Kind::Chunk, b"dead one")?;
+        store.put(Kind::Chunk, b"rolls on")?;
+        let live = BTreeSet::from([one, two]);
+        let open = open_segment(&store);
+        let len = segment_len(&store, open)?;
+        // The first copy goes through, and the second stops halfway.
+        store.fail_appends_after(Some(1));
+        assert!(store.collect(&live, 1.0).is_err());
+        store.fail_appends_after(None);
+        assert_eq!(store.get(one)?.as_slice(), b"live one");
+        assert_eq!(store.get(two)?.as_slice(), b"live two");
+        assert_eq!(store.get(dead)?.as_slice(), b"dead one", "half-deleted");
+        assert_eq!(segment_len(&store, open)?, len, "what it copied stayed");
+        // What comes next is where the index says.
+        let after = store.put(Kind::Chunk, b"afterward")?;
+        store.flush()?;
+        assert_eq!(store.get(after)?.as_slice(), b"afterward");
+        // And it can be tried again.
+        assert_eq!(store.collect(&live, 1.0)?, 1);
+        assert!(!store.contains(dead)?);
+        assert_eq!(store.get(one)?.as_slice(), b"live one");
+        assert_eq!(store.get(two)?.as_slice(), b"live two");
+        drop(store);
+        let reopened = PackStore::open(root.path())?;
+        assert_eq!(reopened.get(one)?.as_slice(), b"live one");
+        assert_eq!(reopened.get(two)?.as_slice(), b"live two");
+        assert_eq!(reopened.get(after)?.as_slice(), b"afterward");
+        Ok(())
+    }
+    #[test]
+    fn a_put_that_stops_halfway_shifts_nothing_written_after_it() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 1024)?;
+        let first = store.put(Kind::Chunk, b"first")?;
+        store.fail_appends_after(Some(0));
+        assert!(store.put(Kind::Chunk, b"cut short").is_err());
+        store.fail_appends_after(None);
+        assert!(!store.contains(Digest::bytes(b"cut short"))?);
+        let next = store.put(Kind::Chunk, b"next")?;
+        let again = store.put(Kind::Chunk, b"cut short")?;
+        store.flush()?;
+        assert_eq!(store.get(first)?.as_slice(), b"first");
+        assert_eq!(store.get(next)?.as_slice(), b"next");
+        assert_eq!(store.get(again)?.as_slice(), b"cut short");
+        Ok(())
+    }
+    #[test]
+    fn a_segment_that_will_not_open_leaves_the_last_one_open() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 16)?;
+        let first = store.put(Kind::Chunk, b"twelve bytes")?;
+        let open = open_segment(&store);
+        let next = segment_path(&store.inner.root, open + 1);
+        fs::create_dir(&next)?;
+        assert!(store.put(Kind::Chunk, b"too long").is_err());
+        fs::remove_dir(&next)?;
+        assert_eq!(open_segment(&store), open);
+        // This one still fits where it was going to.
+        let small = store.put(Kind::Chunk, b"tiny")?;
+        store.flush()?;
+        assert_eq!(store.get(first)?.as_slice(), b"twelve bytes");
+        assert_eq!(store.get(small)?.as_slice(), b"tiny");
+        Ok(())
+    }
+    /// With little room, what takes no copying is freed before anything that does can fail.
+    #[test]
+    fn a_failed_rewrite_still_frees_a_segment_with_nothing_to_copy() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 1024, 16)?;
+        let live = store.put(Kind::Chunk, b"live one")?;
+        let dead_with_it = store.put(Kind::Chunk, b"dead one")?;
+        let dead = store.put(Kind::Chunk, b"all dead")?;
+        store.put(Kind::Chunk, b"all gone")?;
+        store.put(Kind::Chunk, b"rolls on")?;
+        store.flush()?;
+        // In the cache, which must not answer for what the packs lost.
+        store.get(dead)?;
+        store.fail_appends_after(Some(0));
+        assert!(store.collect(&BTreeSet::from([live]), 1.0).is_err());
+        store.fail_appends_after(None);
+        assert!(!store.contains(dead)?);
+        assert!(store.get(dead).is_err(), "the cache still answered");
+        assert_eq!(store.get(live)?.as_slice(), b"live one");
+        assert!(store.contains(dead_with_it)?);
+        Ok(())
+    }
+    #[test]
+    fn a_closed_segment_is_collected_and_what_comes_after_it_stays() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 16)?;
+        let named = store.put(Kind::Chunk, b"named!!!")?;
+        let kept = store.put(Kind::Chunk, b"kept!!!!")?;
+        let open = open_segment(&store);
+        let before = store.close_segment_holding(&BTreeSet::from([named]))?;
+        assert!(before > open, "the segment that holds it stayed open");
+        // These come once `live` has been worked out, and it does not name them. One is past a
+        // segment that closed by itself.
+        let arriving = store.put(Kind::Chunk, b"arrives!")?;
+        let also = store.put(Kind::Chunk, b"arrives2")?;
+        let last = store.put(Kind::Chunk, b"arrives3")?;
+        assert!(open_segment(&store) > before);
+        assert_eq!(
+            store.collect_before(&BTreeSet::from([kept]), 1.0, before)?,
+            1
+        );
+        assert!(!store.contains(named)?);
+        assert_eq!(store.get(kept)?.as_slice(), b"kept!!!!");
+        assert_eq!(store.get(arriving)?.as_slice(), b"arrives!");
+        assert_eq!(store.get(also)?.as_slice(), b"arrives2");
+        assert_eq!(store.get(last)?.as_slice(), b"arrives3");
+        Ok(())
+    }
+    #[test]
+    fn a_segment_is_closed_only_for_what_it_holds() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 8)?;
+        let old = store.put(Kind::Chunk, b"in a old")?;
+        let held = store.put(Kind::Chunk, b"in it!!!")?;
+        let open = open_segment(&store);
+        for elsewhere in [BTreeSet::new(), BTreeSet::from([old])] {
+            assert_eq!(store.close_segment_holding(&elsewhere)?, open);
+        }
+        let absent = BTreeSet::from([Digest::bytes(b"not here")]);
+        assert_eq!(store.close_segment_holding(&absent)?, open);
+        assert_eq!(open_segment(&store), open);
+        assert_eq!(
+            store.close_segment_holding(&BTreeSet::from([held]))?,
+            open + 1
+        );
+        // Pending and durable: a restart still has it.
+        drop(store);
+        assert_eq!(
+            PackStore::open(root.path())?.get(held)?.as_slice(),
+            b"in it!!!"
+        );
+        Ok(())
+    }
+    /// What is rewritten stays in segments of the usual size, so that freeing later never has to
+    /// copy more than one at a time. That can open a segment on the way, and what was open before
+    /// it, with copies already in it, must not be taken for one to rewrite.
+    #[test]
+    fn a_rewrite_keeps_to_the_segment_limit_and_loses_nothing() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 32)?;
+        let mut live = BTreeSet::new();
+        let mut dead = Vec::new();
+        let mut kept = Vec::new();
+        for segment in 0..4u8 {
+            for object in 0..3u8 {
+                let bytes = [b'a' + segment, b'0' + object, 1, 2, 3, 4, 5, 6];
+                let digest = store.put(Kind::Chunk, &bytes)?;
+                live.insert(digest);
+                kept.push((digest, bytes));
+            }
+            dead.push(store.put(Kind::Chunk, &[b'a' + segment, b'x', 1, 2, 3, 4, 5, 6])?);
+        }
+        let open_object = store.put(Kind::Chunk, b"in open!")?;
+        let open = open_segment(&store);
+        assert_eq!(store.collect(&live, 1.0)?, dead.len());
+        assert!(open_segment(&store) > open, "nothing rolled");
+        for digest in &dead {
+            assert!(!store.contains(*digest)?);
+        }
+        // Its object was not named live, and the open segment is not collected.
+        assert!(store.contains(open_object)?);
+        let check = |store: &PackStore| -> Result<()> {
+            for (digest, bytes) in &kept {
+                assert_eq!(store.get(*digest)?.as_slice(), bytes);
+            }
+            assert_eq!(store.get(open_object)?.as_slice(), b"in open!");
+            Ok(())
+        };
+        check(&store)?;
+        for segment in open..=open_segment(&store) {
+            assert!(segment_len(&store, segment)? <= 32, "segment {segment}");
+        }
+        store.flush()?;
+        drop(store);
+        check(&PackStore::open(root.path())?)
     }
     #[test]
     fn location_cache_evicts_without_losing_indexed_objects() -> Result<()> {

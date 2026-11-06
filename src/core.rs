@@ -1398,14 +1398,7 @@ impl Store {
                     if let Some(event) = self.version(head)?
                         && let Some(content) = event.state.content
                     {
-                        pending.push((
-                            content.digest,
-                            if content.kind == crate::model::content::ContentKind::Direct {
-                                ObjectKind::Chunk
-                            } else {
-                                ObjectKind::Manifest
-                            },
-                        ));
+                        pending.push(content_root(&content));
                     }
                 }
             }
@@ -1432,16 +1425,35 @@ impl Store {
             if let Some(event) = self.version(&row?)?
                 && let Some(c) = event.state.content
             {
-                pending.push((
-                    c.digest,
-                    if c.kind == crate::model::content::ContentKind::Direct {
-                        ObjectKind::Chunk
-                    } else {
-                        ObjectKind::Manifest
-                    },
-                ));
+                pending.push(content_root(&c));
             }
         }
+        self.closure(pending)
+    }
+    /// The objects of every version of an entity with more than one head, on any branch: what the
+    /// owner has yet to choose between. It asks no one, so what an absent manifest would name is not
+    /// in it.
+    pub fn unresolved_conflict_objects(&self) -> Result<BTreeSet<Digest>> {
+        let mut q = self.db.prepare_cached(
+            "SELECT version FROM heads WHERE (branch,entity) IN \
+             (SELECT branch,entity FROM heads GROUP BY branch,entity HAVING count(*)>1)",
+        )?;
+        let mut pending = Vec::new();
+        for row in q.query_map([], |r| r.get::<_, String>(0))? {
+            if let Some(event) = self.version(&row?)?
+                && let Some(content) = event.state.content
+            {
+                pending.push(content_root(&content));
+            }
+        }
+        self.closure(pending)
+    }
+    /// `references` and what they name, as far as the packs tell: it asks no one either.
+    pub fn content_closure(&self, references: &[FileContentRef]) -> Result<BTreeSet<Digest>> {
+        self.closure(references.iter().map(content_root).collect())
+    }
+    /// These objects and all they name that is here.
+    fn closure(&self, mut pending: Vec<(Digest, ObjectKind)>) -> Result<BTreeSet<Digest>> {
         let mut live = BTreeSet::new();
         while let Some((digest, kind)) = pending.pop() {
             if !live.insert(digest) {
@@ -1464,14 +1476,7 @@ impl Store {
                             pending.push((tree, ObjectKind::Tree));
                         }
                         if let Some(c) = entry.content {
-                            pending.push((
-                                c.digest,
-                                if c.kind == crate::model::content::ContentKind::Direct {
-                                    ObjectKind::Chunk
-                                } else {
-                                    ObjectKind::Manifest
-                                },
-                            ));
+                            pending.push(content_root(&c));
                         }
                     }
                 }
@@ -1479,6 +1484,17 @@ impl Store {
         }
         Ok(live)
     }
+}
+/// The object a file's content starts from.
+fn content_root(content: &FileContentRef) -> (Digest, ObjectKind) {
+    (
+        content.digest,
+        if content.kind == crate::model::content::ContentKind::Direct {
+            ObjectKind::Chunk
+        } else {
+            ObjectKind::Manifest
+        },
+    )
 }
 impl Drop for Store {
     fn drop(&mut self) {

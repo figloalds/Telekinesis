@@ -141,6 +141,36 @@ impl Phone {
         }
     }
 
+    /// The entity of `path`, once its name came across. It opens nothing.
+    fn entity(&self, path: &str) -> Result<String> {
+        let end = Instant::now() + REPLICATED;
+        loop {
+            match self.engine.lookup(path) {
+                Ok(entry) => return Ok(entry.id),
+                Err(error) => {
+                    ensure!(Instant::now() < end, "{path} never appeared: {error:#}");
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    }
+
+    /// Everything `path` reads as, through a handle of its own.
+    fn read_all(&self, path: &str) -> Result<Vec<u8>> {
+        let token = self.open(path)?;
+        let mut bytes = Vec::new();
+        let mut buffer = vec![0u8; READ_BUFFER];
+        let read = loop {
+            match self.engine.read(token, bytes.len() as u64, &mut buffer) {
+                Ok(0) => break Ok(bytes),
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error) => break Err(error),
+            }
+        };
+        self.engine.close(token)?;
+        read
+    }
+
     /// How many of the file's chunks are here.
     fn chunks_here(&self, token: u64) -> Result<usize> {
         let (entry, _) = self.engine.info(token)?;
@@ -294,6 +324,131 @@ fn a_partial_read_does_not_fetch_the_whole_file() -> Result<()> {
     ensure!(here * CHUNK > READ, "only {here} chunks");
     phone.engine.close(token)?;
     phone.stop()
+}
+
+#[test]
+fn a_freed_file_reads_back_identically_from_the_peer() -> Result<()> {
+    let (freed, kept) = (text(3 * 1024 * 1024, 47), text(1024 * 1024, 53));
+    let phone = Phone::with(&[("freed.bin", &freed), ("kept.bin", &kept)])?;
+    ensure!(
+        phone.read_all("/freed.bin")? == freed.as_bytes(),
+        "first read"
+    );
+    ensure!(
+        phone.read_all("/kept.bin")? == kept.as_bytes(),
+        "first read"
+    );
+
+    let engine = &phone.engine;
+    let entity = phone.entity("/freed.bin")?;
+    let chunks = engine.head_chunks(&entity)?.context("no manifest here")?;
+    let evicted = engine.evict(&chunks.iter().copied().collect())?;
+    ensure!(
+        evicted.removed == chunks.len() && evicted.refused == 0,
+        "{evicted:?} of {} chunks",
+        chunks.len()
+    );
+    let presence = engine.presence("/freed.bin")?;
+    ensure!(presence.local_bytes == 0, "{presence:?}");
+    ensure!(
+        engine.presence("/kept.bin")?.is_whole(),
+        "the other one went"
+    );
+
+    // This is a passive phone: what it freed comes back when it is read, and a burst does not bring
+    // it, since the check for space runs at the end of each one.
+    let burst = phone
+        .host
+        .daemon()?
+        .execute("sync-now", &json!({"state": phone.id}))?;
+    ensure!(burst["folders"][0]["error"].is_null(), "{burst}");
+    let presence = engine.presence("/freed.bin")?;
+    ensure!(presence.local_bytes == 0, "{presence:?}");
+    ensure!(
+        phone.read_all("/freed.bin")? == freed.as_bytes(),
+        "read back"
+    );
+    ensure!(engine.presence("/freed.bin")?.is_whole(), "not whole again");
+    phone.stop()
+}
+
+#[test]
+fn hydrate_downloads_a_whole_file_without_a_reader() -> Result<()> {
+    let content = text(READ_AHEAD as usize + 4 * 1024 * 1024, 59);
+    let phone = Phone::with(&[("big.bin", &content)])?;
+    let entity = phone.entity("/big.bin")?;
+    let Phone {
+        pc,
+        host,
+        engine,
+        id,
+        _home,
+        ..
+    } = phone;
+    // Nothing has opened it, so nothing of it is here.
+    ensure!(
+        engine.head_chunks(&entity)?.is_none(),
+        "the manifest is here"
+    );
+
+    let presence = engine.hydrate(&entity, &|| false)?;
+    ensure!(presence.is_whole(), "{presence:?}");
+    ensure!(presence.total_bytes == content.len() as u64, "{presence:?}");
+    let chunks = engine.head_chunks(&entity)?.context("no manifest")?;
+    ensure!(
+        chunks.len() == content.len().div_ceil(64 * 1024),
+        "{}",
+        chunks.len()
+    );
+
+    // All of it is here: it reads with no one to ask.
+    pc.shutdown()?;
+    let daemon = host.daemon()?;
+    until_unreachable(&daemon, &id)?;
+    let token = engine.open_file("/big.bin", false, false, false)?;
+    time_reading(&engine, token, Engine::read, &content)?;
+    engine.close(token)?;
+    drop(engine);
+    host.stop()
+}
+
+/// With no one to ask, a hydrate fails with a code once a step has waited all it may, whether that
+/// step is the manifest or the chunks.
+#[test]
+fn hydrate_with_no_one_to_ask_fails_with_a_code_within_its_bound() -> Result<()> {
+    let phone = Phone::with(&[
+        ("never.bin", &text(200 * 1024, 61)),
+        ("named.bin", &text(200 * 1024, 67)),
+    ])?;
+    let never = phone.entity("/never.bin")?;
+    let named = phone.entity("/named.bin")?;
+    // Its manifest is here now, and of its chunks only what a first read touched.
+    let token = phone.open("/named.bin")?;
+    phone.engine.close(token)?;
+    ensure!(phone.engine.head_chunks(&named)?.is_some(), "no manifest");
+    let Phone {
+        pc,
+        host,
+        engine,
+        id,
+        _home,
+        ..
+    } = phone;
+    pc.shutdown()?;
+    let daemon = host.daemon()?;
+    until_unreachable(&daemon, &id)?;
+    for entity in [&never, &named] {
+        let began = Instant::now();
+        let failed = engine.hydrate(entity, &|| false).unwrap_err();
+        let took = began.elapsed();
+        ensure!(code_of(&failed) == "OBJECT_MISSING", "{failed:#}");
+        ensure!(
+            took < Demand::FETCH_WAIT + Duration::from_secs(5),
+            "waited {took:?}"
+        );
+    }
+    drop(engine);
+    host.stop()
 }
 
 /// A phone with a big file open and nobody left to fetch from: it holds the first

@@ -758,6 +758,14 @@ impl WorkingLayer {
             .collect()
     }
     pub fn reap_clean(&self) -> Result<()> {
+        self.reap(false)
+    }
+    /// [`Self::reap_clean`] without waiting for them to be idle: what no handle has open and holds
+    /// no edit goes now, and what it pins with it. It is only kept in case the file opens again.
+    pub fn reap_released(&self) -> Result<()> {
+        self.reap(true)
+    }
+    fn reap(&self, at_once: bool) -> Result<()> {
         lock(&self.opening).retain(|_, gate| gate.strong_count() != 0);
         lock(&self.bindings).retain(|_, file| file.strong_count() != 0);
         lock(&self.latest).retain(|_, file| file.strong_count() != 0);
@@ -773,10 +781,10 @@ impl WorkingLayer {
                 let s = lock(file);
                 s.handles == 0
                     && !s.changed
-                    && (pressure || s.idle_at.elapsed() >= Duration::from_secs(30))
+                    && (at_once || pressure || s.idle_at.elapsed() >= Duration::from_secs(30))
             })
             .map(|(k, _)| k.clone())
-            .take(256)
+            .take(if at_once { usize::MAX } else { 256 })
             .collect();
         let mut retired = Vec::new();
         for key in keys {
@@ -803,6 +811,26 @@ impl WorkingLayer {
         Ok(serde_json::from_slice(&fs::read(
             draft.with_extension("json"),
         )?)?)
+    }
+    /// The records of the drafts a start could not seal yet. No pin keeps what they were made from.
+    /// The caller keeps their retries out meanwhile.
+    pub(crate) fn waiting_records(&self) -> Result<Vec<ScratchRecord>> {
+        lock(&self.waiting)
+            .iter()
+            .map(|draft| self.record_of(draft))
+            .collect()
+    }
+    /// What every draft in use was made from, whether it has an edit or a handle holds it.
+    pub(crate) fn draft_bases(&self) -> Vec<FileContentRef> {
+        let files: Vec<_> = lock(&self.entities)
+            .values()
+            .flat_map(|files| files.values())
+            .filter_map(Weak::upgrade)
+            .collect();
+        files
+            .iter()
+            .map(|file| lock(file).record.basis.content.clone())
+            .collect()
     }
     pub fn records(&self) -> Result<Vec<(PathBuf, ScratchRecord)>> {
         let mut records = Vec::new();
