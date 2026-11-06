@@ -13,7 +13,14 @@ data class BurstError(val message: String, val since: Long?) {
         lastExchangeMs == null || (since != null && lastExchangeMs <= since)
 }
 
-data class FolderBurst(val id: String, val exchanged: Long, val remaining: Int?, val error: BurstError?)
+data class FolderBurst(
+    val id: String,
+    val exchanged: Long,
+    val remaining: Int?,
+    val error: BurstError?,
+    /** How many local changes this burst sent to its peers. */
+    val pushed: Long = 0,
+)
 
 /** What one burst reported: `sync-now`'s reply, or why the call failed, or that it was dropped. */
 data class BurstResult(
@@ -39,6 +46,7 @@ data class BurstResult(
                 FolderBurst(
                     id = id,
                     exchanged = folder.optLong("exchanged", 0),
+                    pushed = folder.optLong("pushed", 0),
                     remaining = if (folder.isNull("remaining")) null else folder.optInt("remaining"),
                     error = message?.let { BurstError(it, exchangeMs[id]) },
                 )
