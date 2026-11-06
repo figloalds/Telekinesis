@@ -6,7 +6,7 @@
     <application
         android:allowBackup="false"
         android:icon="@drawable/ic_folder"
-        android:label="Telekinesis Spike"
+        android:label="Telekinesis"
         android:theme="@android:style/Theme.Material.Light">
 
         <activity
@@ -19,8 +19,8 @@
         </activity>
 
         <provider
-            android:name=".TkfsProvider"
-            android:authorities="dev.tkfs.spike.documents"
+            android:name=".provider.TkfsProvider"
+            android:authorities="dev.tkfs.documents"
             android:exported="true"
             android:grantUriPermissions="true"
             android:permission="android.permission.MANAGE_DOCUMENTS">

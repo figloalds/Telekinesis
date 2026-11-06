@@ -4,7 +4,7 @@ use anyhow::{Result, anyhow};
 use jni::{
     JNIEnv,
     objects::{JByteArray, JClass, JString},
-    sys::{jint, jlong, jstring},
+    sys::{JNI_FALSE, jboolean, jint, jlong, jstring},
 };
 use serde_json::{Value, json};
 use std::{
@@ -76,7 +76,7 @@ fn string_or_throw(env: &mut JNIEnv, result: Result<String>) -> jstring {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tkfs_spike_Native_start(
+pub extern "system" fn Java_dev_tkfs_Native_start(
     mut env: JNIEnv,
     _: JClass,
     config: JString,
@@ -87,7 +87,7 @@ pub extern "system" fn Java_dev_tkfs_spike_Native_start(
 
 /// One `manage` action, in-process: the same actions the CLI sends.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tkfs_spike_Native_manage(
+pub extern "system" fn Java_dev_tkfs_Native_manage(
     mut env: JNIEnv,
     _: JClass,
     action: JString,
@@ -103,7 +103,7 @@ pub extern "system" fn Java_dev_tkfs_spike_Native_manage(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tkfs_spike_Native_list(
+pub extern "system" fn Java_dev_tkfs_Native_list(
     mut env: JNIEnv,
     _: JClass,
     folder: JString,
@@ -118,7 +118,7 @@ pub extern "system" fn Java_dev_tkfs_spike_Native_list(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tkfs_spike_Native_stat(
+pub extern "system" fn Java_dev_tkfs_Native_stat(
     mut env: JNIEnv,
     _: JClass,
     folder: JString,
@@ -133,23 +133,24 @@ pub extern "system" fn Java_dev_tkfs_spike_Native_stat(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tkfs_spike_Native_open(
+pub extern "system" fn Java_dev_tkfs_Native_open(
     mut env: JNIEnv,
     _: JClass,
     folder: JString,
     path: JString,
+    writable: jboolean,
 ) -> jlong {
     let result = (|| {
         let folder = text(&mut env, &folder)?;
         let path = text(&mut env, &path)?;
-        Ok(engine(&folder)?.open_file(&path, false, false, false)? as jlong)
+        Ok(engine(&folder)?.open_file(&path, false, false, writable != JNI_FALSE)? as jlong)
     })();
     or_throw(&mut env, result, -1)
 }
 
 /// Reads into `out`; hydrates missing chunks and blocks while it does.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tkfs_spike_Native_read(
+pub extern "system" fn Java_dev_tkfs_Native_read(
     mut env: JNIEnv,
     _: JClass,
     folder: JString,
@@ -171,7 +172,7 @@ pub extern "system" fn Java_dev_tkfs_spike_Native_read(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_tkfs_spike_Native_close(
+pub extern "system" fn Java_dev_tkfs_Native_close(
     mut env: JNIEnv,
     _: JClass,
     folder: JString,

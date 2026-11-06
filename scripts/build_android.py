@@ -22,6 +22,9 @@ NDK_VERSION = "27.0.12077973"
 PAGE_ALIGNMENT = 16384
 # Matches minSdk in android/app/build.gradle.
 API = 26
+OUTPUT = ROOT / "target/runnables/android"
+# Where a build with the default --output leaves the installable app.
+APK = OUTPUT / "tkfs-debug.apk"
 
 
 def find_sdk():
@@ -112,7 +115,7 @@ def build_apk(sdk, abis, output, ndk):
     if packaged != set(abis):
         raise RuntimeError(f"APK holds native libraries for {sorted(packaged)}, expected {sorted(abis)}")
     output.mkdir(parents=True, exist_ok=True)
-    destination = output / "tkfs-debug.apk"
+    destination = output / APK.name
     shutil.copy2(apk, destination)
     facts = {"abis": sorted(abis), "native_profile": "release", "apk_signing": "debug", "ndk": ndk.name,
              "rustc": capture(["rustc", "--version"]),
@@ -126,7 +129,7 @@ def main():
     parser.add_argument("--abi", choices=(*ABIS, "all"), default="all",
                         help="arm64-v8a for phones, x86_64 for emulators (default: all)")
     parser.add_argument("--native-only", action="store_true", help="Build the native library and skip the APK")
-    parser.add_argument("--output", type=Path, default=ROOT / "target/runnables/android")
+    parser.add_argument("--output", type=Path, default=OUTPUT)
     args = parser.parse_args()
     abis = list(ABIS) if args.abi == "all" else [args.abi]
     preflight(abis)

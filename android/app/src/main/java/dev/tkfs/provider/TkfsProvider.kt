@@ -1,29 +1,29 @@
-package dev.tkfs.spike
+package dev.tkfs.provider
 
 import android.database.Cursor
 import android.database.MatrixCursor
+import android.os.Binder
+import android.os.Bundle
 import android.os.CancellationSignal
-import android.os.Handler
-import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
-import android.os.ProxyFileDescriptorCallback
 import android.os.storage.StorageManager
 import android.provider.DocumentsContract.Document
 import android.provider.DocumentsContract.Root
 import android.provider.DocumentsProvider
-import android.system.ErrnoException
-import android.system.OsConstants
 import android.util.Log
 import android.webkit.MimeTypeMap
+import dev.tkfs.BuildConfig
+import dev.tkfs.Native
+import dev.tkfs.R
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.FileNotFoundException
 import java.io.IOException
 
 /**
- * Read-only view of every folder. A document id is "FOLDER_ID:/path/in/folder".
- * Android starts this on demand, so a request can be the thing that starts the
- * orchestrator; the native calls wait, bounded, for it and the folder's worker.
+ * Read-only view of every folder. Android starts this on demand, so a request can be the
+ * thing that starts the orchestrator; the native calls wait, bounded, for it and the folder's
+ * worker.
  */
 class TkfsProvider : DocumentsProvider() {
     private val rootColumns = arrayOf(
@@ -49,13 +49,13 @@ class TkfsProvider : DocumentsProvider() {
 
     override fun queryRoots(projection: Array<out String>?): Cursor {
         val cursor = MatrixCursor(projection ?: rootColumns)
-        val folders = JSONArray(call { Native.manage("list", "{}") })
+        val folders = JSONArray(orNotFound { Native.manage("list", "{}") })
         for (index in 0 until folders.length()) {
             val folder = folders.getJSONObject(index)
             val id = folder.getString("id")
             cursor.newRow()
                 .add(Root.COLUMN_ROOT_ID, id)
-                .add(Root.COLUMN_DOCUMENT_ID, "$id:/")
+                .add(Root.COLUMN_DOCUMENT_ID, DocumentIds.make(id, "/"))
                 .add(Root.COLUMN_TITLE, folder.getString("label"))
                 .add(Root.COLUMN_ICON, R.drawable.ic_folder)
                 .add(Root.COLUMN_FLAGS, Root.FLAG_SUPPORTS_IS_CHILD)
@@ -65,8 +65,8 @@ class TkfsProvider : DocumentsProvider() {
 
     override fun queryDocument(documentId: String, projection: Array<out String>?): Cursor {
         val cursor = MatrixCursor(projection ?: documentColumns)
-        val (folder, path) = split(documentId)
-        addRow(cursor, documentId, JSONObject(call { Native.stat(folder, path) }), path)
+        val (folder, path) = DocumentIds.split(documentId)
+        addRow(cursor, documentId, JSONObject(orNotFound { Native.stat(folder, path) }), path)
         return cursor
     }
 
@@ -76,65 +76,39 @@ class TkfsProvider : DocumentsProvider() {
         sortOrder: String?,
     ): Cursor {
         val cursor = MatrixCursor(projection ?: documentColumns)
-        val (folder, path) = split(parentDocumentId)
-        val entries = JSONArray(call { Native.list(folder, path) })
+        val (folder, path) = DocumentIds.split(parentDocumentId)
+        val entries = JSONArray(orNotFound { Native.list(folder, path) })
         for (index in 0 until entries.length()) {
             val entry = entries.getJSONObject(index)
-            val child = path.trimEnd('/') + "/" + entry.getString("name")
-            addRow(cursor, "$folder:$child", entry, child)
+            val child = DocumentIds.childPath(path, entry.getString("name"))
+            addRow(cursor, DocumentIds.make(folder, child), entry, child)
         }
         return cursor
     }
 
-    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
-        val parent = parentDocumentId.trimEnd('/') + "/"
-        return documentId.startsWith(parent) && documentId != parentDocumentId
-    }
+    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean =
+        DocumentIds.isChild(parentDocumentId, documentId)
 
     override fun openDocument(
         documentId: String,
         mode: String,
         signal: CancellationSignal?,
     ): ParcelFileDescriptor {
-        if (mode != "r") throw FileNotFoundException("READ_ONLY: this spike cannot open for $mode")
-        val (folder, path) = split(documentId)
-        val size = JSONObject(call { Native.stat(folder, path) }).getLong("size")
-        var token = call { Native.open(folder, path) }
-        // One thread per open: a read waiting on the network must not stall others.
-        val thread = HandlerThread("tkfs-read").apply { start() }
+        if (mode != "r") throw FileNotFoundException("READ_ONLY: cannot open for $mode")
+        val (folder, path) = DocumentIds.split(documentId)
         val storage = requireNotNull(context).getSystemService(StorageManager::class.java)
-        return storage.openProxyFileDescriptor(
-            ParcelFileDescriptor.MODE_READ_ONLY,
-            object : ProxyFileDescriptorCallback() {
-                override fun onGetSize(): Long = size
+        return orNotFound {
+            val size = JSONObject(Native.stat(folder, path)).getLong("size")
+            FileProxy.openForRead(storage, documentId, size)
+        }
+    }
 
-                override fun onRead(offset: Long, count: Int, data: ByteArray): Int = try {
-                    try {
-                        Native.read(folder, token, offset, data, count)
-                    } catch (error: IOException) {
-                        // Bytes unavailable: retrying would only wait again.
-                        if (error.message?.contains("OBJECT_MISSING") == true) throw error
-                        // The worker restarted (after a freeze) and forgot this handle.
-                        Log.i(TAG, "reopen $documentId: ${error.message}")
-                        token = Native.open(folder, path)
-                        Native.read(folder, token, offset, data, count)
-                    }
-                } catch (error: IOException) {
-                    Log.w(TAG, "read $documentId@$offset: ${error.message}")
-                    throw ErrnoException("read", OsConstants.EIO, error)
-                }
-
-                override fun onRelease() {
-                    try {
-                        Native.close(folder, token)
-                    } catch (error: IOException) {
-                        Log.w(TAG, "close $documentId: ${error.message}")
-                    }
-                    thread.quitSafely()
-                }
-            },
-            Handler(thread.looper),
-        )
+    /** `DocumentsProvider` handles the `android:` methods; `tkfs.` ones are the harness's. */
+    override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
+        if (method.startsWith("tkfs.") && ShellControl.admits(BuildConfig.DEBUG, Binder.getCallingUid())) {
+            ShellControl.answer(method, arg, extras)?.let { return it }
+        }
+        return super.call(method, arg, extras)
     }
 
     private fun addRow(cursor: MatrixCursor, id: String, entry: JSONObject, path: String) {
@@ -155,14 +129,8 @@ class TkfsProvider : DocumentsProvider() {
             ?: "application/octet-stream"
     }
 
-    private fun split(documentId: String): Pair<String, String> {
-        val at = documentId.indexOf(':')
-        if (at < 0) throw FileNotFoundException("INVALID_DOCUMENT_ID: $documentId")
-        return documentId.substring(0, at) to documentId.substring(at + 1)
-    }
-
     /** The provider API only lets these calls throw FileNotFoundException. */
-    private fun <T> call(block: () -> T): T = try {
+    private fun <T> orNotFound(block: () -> T): T = try {
         block()
     } catch (error: IOException) {
         Log.w(TAG, error.message ?: "request failed")

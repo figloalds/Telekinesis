@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Debug builds only: lets `adb shell content` reach the provider, which is how
+    scripts/android_e2e.py drives the app. A DocumentsProvider must keep MANAGE_DOCUMENTS as
+    its permission, and the shell does not hold that, so Android refuses the shell before the
+    provider runs. A path permission admits a caller too. The shell holds this one because
+    `content` needs it, and no ordinary app can.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <provider android:name=".provider.TkfsProvider">
+            <path-permission
+                android:pathPrefix="/"
+                android:permission="android.permission.ACCESS_CONTENT_PROVIDERS_EXTERNALLY" />
+        </provider>
+    </application>
+</manifest>

@@ -1,4 +1,4 @@
-package dev.tkfs.spike
+package dev.tkfs
 
 import android.content.Context
 import java.io.File
@@ -10,11 +10,14 @@ object Native {
         System.loadLibrary("tkfs_android")
     }
 
-    @JvmStatic external fun start(config: String)
+    @JvmStatic @Throws(IOException::class)
+    external fun start(config: String)
 
+    /** One orchestrator action, as `Daemon::execute` takes it. */
     @JvmStatic @Throws(IOException::class)
     external fun manage(action: String, payload: String): String
 
+    /** The directory's entries: `[{name, directory, size, modified_ms}]`. */
     @JvmStatic @Throws(IOException::class)
     external fun list(folder: String, path: String): String
 
@@ -22,7 +25,7 @@ object Native {
     external fun stat(folder: String, path: String): String
 
     @JvmStatic @Throws(IOException::class)
-    external fun open(folder: String, path: String): Long
+    external fun open(folder: String, path: String, writable: Boolean): Long
 
     @JvmStatic @Throws(IOException::class)
     external fun read(folder: String, token: Long, offset: Long, out: ByteArray, size: Int): Int
@@ -30,13 +33,18 @@ object Native {
     @JvmStatic @Throws(IOException::class)
     external fun close(folder: String, token: Long)
 
-    /** Writes the configuration on first run and starts the orchestrator once. */
+    /**
+     * Every way into the process calls this. It writes the configuration on first run,
+     * starts the orchestrator once and returns at once; native calls wait, bounded, for what
+     * they need.
+     */
     fun ensureStarted(context: Context) {
         val files = context.filesDir
         val config = File(files, "orchestrator.toml")
         if (!config.exists()) {
-            // listen = "": the phone only dials its peers.
-            config.writeText(
+            // A kill halfway through writing must not leave a config that cannot start.
+            val draft = File(files, "orchestrator.toml.tmp")
+            draft.writeText(
                 """
                 format_version = 2
                 data_directory = "${File(files, "data").absolutePath}"
@@ -45,16 +53,13 @@ object Native {
 
                 [network]
                 listen = ""
-                sync_profile = "passive"
                 advertise = ""
+                sync_profile = "passive"
                 connections = 4
                 worker_lanes = 2
-                sync_interval_ms = 500
-
-                [freshness]
-                open_wait_ms = 250
                 """.trimIndent() + "\n",
             )
+            if (!draft.renameTo(config)) throw IOException("CONFIG_NOT_WRITTEN: ${config.path}")
         }
         start(config.absolutePath)
     }
