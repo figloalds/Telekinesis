@@ -565,6 +565,15 @@ class Device:
         """The battery-optimization exemption the owner gives in Settings, set from outside."""
         self.shell("dumpsys", "deviceidle", "whitelist", ("+" if exempt else "-") + PACKAGE).require_success()
 
+    def set_data_sync_timeout(self, ms: int | None) -> None:
+        """Android 15's limit on a `dataSync` foreground service, shortened from 6 h so that a test can
+        reach it; None puts the system's own back."""
+        if ms is None:
+            self.shell("device_config", "delete", "activity_manager", "data_sync_fgs_timeout_duration")
+        else:
+            self.shell("device_config", "put", "activity_manager", "data_sync_fgs_timeout_duration",
+                       str(ms)).require_success()
+
     def home(self) -> None:
         self.shell("input", "keyevent", "KEYCODE_HOME").require_success()
 

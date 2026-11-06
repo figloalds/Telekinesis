@@ -19,12 +19,13 @@ class Progress {
 
     fun after(burst: BurstResult): Next {
         if (burst.failure != null) return Next.Stop(Why.Failed)
-        // `null` is an unknown: no peer answered.
-        val open = burst.folders.filter { (it.remaining ?: 0) > 0 }
+        // `null` is an unknown: no peer answered. A folder in error is still waiting, since a
+        // burst that ran out of its time reports an error with `remaining` already at 0.
+        val waiting = burst.folders.filter { (it.remaining ?: 0) > 0 || it.error != null }
         val last = before
         before = burst.folders.mapNotNull { f -> f.remaining?.let { f.id to it } }.toMap()
-        if (open.isEmpty()) return if (burst.errors.isEmpty()) Next.Stop(Why.Done) else Next.Stop(Why.NoProgress)
-        val stuck = open.all { it.pushed == 0L && (it.error != null || last[it.id] == it.remaining) }
+        if (waiting.isEmpty()) return Next.Stop(Why.Done)
+        val stuck = waiting.all { it.pushed == 0L && (it.error != null || last[it.id] == it.remaining) }
         return if (stuck) Next.Stop(Why.NoProgress) else Next.Again
     }
 }

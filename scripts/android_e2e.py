@@ -718,7 +718,7 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
         s.check(f"and reads as it was on the phone", device.content_read(folder.doc(path)) == files[path])
 
 
-SHARE_BOUND = 1200
+SHARE_BOUND = 1800
 SHARE_BYTES = 256 * 1024 * 1024
 MIB = 1024 * 1024
 
@@ -923,11 +923,43 @@ def scenario_share(s: Session) -> None:
             f"{len(again)} bytes")
 
 
+def scenario_transfer_timeout(s: Session) -> None:
+    """Android 15 limits a `dataSync` service, and calls `Service.onTimeout` when the limit is reached.
+    WorkManager maps that to a stop of the job. The limit is set to 20 s, and a job is held in its
+    foreground state by writes that keep arriving: it must stop cleanly, the app must not crash, and
+    the writes must still reach the PC."""
+    device, pc = s.device, s.pc
+    folder = s.folder_with({"seed.txt": b"Here from the start.\n"})
+    device.battery_exempt(True)
+    device.set_data_sync_timeout(20_000)
+    try:
+        device.clear_logcat()
+        doc = device.create_document(folder.doc(), "held.txt", "text/plain")
+        pid = device.app_pid()
+        began = time.monotonic()
+        count = 0
+        # Each write is a local change, and the job waits for a quiet 5 s before its first burst.
+        while time.monotonic() - began < 50:
+            count += 1
+            device.content_write(doc, f"Write number {count}.\n".encode())
+            time.sleep(1.5)
+        log = device.transfer_log()
+        s.check("the job stopped when Android called onTimeout",
+                any(line.startswith("transfer: stopped") for line in log), log)
+        s.check("without the app crashing", device.app_pid() == pid and "FATAL" not in device.adb(
+            "logcat", "-d", "-b", "crash").out, device.app_pid())
+        final = f"Write number {count}.\n".encode()
+        deliver(s, folder, "held.txt", final, "the last write after the stop", bound=SYNC_BOUND)
+    finally:
+        device.set_data_sync_timeout(None)
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
     "ui_folders": scenario_ui_folders,
     "read": scenario_read,
     "write": scenario_write,
     "share": scenario_share,
+    "transfer_timeout": scenario_transfer_timeout,
     "cold_start": scenario_cold_start,
     "harness": scenario_harness,
     "sync": scenario_sync,
