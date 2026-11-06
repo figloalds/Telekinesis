@@ -433,13 +433,16 @@ impl Service {
             digests.len()
         );
         let packs = &self.engine.working.content().packs;
-        packs.flush()?;
+        // `contains` also sees objects still pending. Flush after the loop, so
+        // everything named was seen before the flush and is durable by the
+        // reply, whoever else writes meanwhile.
         let mut held = Vec::new();
         for digest in digests {
             if packs.contains(digest)? {
                 held.push(digest);
             }
         }
+        packs.flush()?;
         Ok(held)
     }
     /// Runs one op; the reply body on success.
