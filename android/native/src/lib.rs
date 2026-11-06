@@ -8,6 +8,7 @@ use jni::{
     objects::{JByteArray, JClass, JString},
     sys::{JNI_FALSE, jboolean, jint, jlong, jstring},
 };
+use phone::{DaemonPeers, Phone};
 use serde_json::{Value, json};
 use std::{
     any::Any,
@@ -15,7 +16,6 @@ use std::{
     path::PathBuf,
     sync::{Arc, Once, OnceLock, PoisonError},
 };
-use phone::{DaemonPeers, Phone};
 use tkfs::{
     core::{EntryKind, ROOT},
     model::errors::{ErrorWire, UNKNOWN_CODE},
@@ -44,7 +44,13 @@ fn phone() -> Result<&'static Phone> {
     if let Some(phone) = PHONE.get() {
         return Ok(phone);
     }
-    let opened = Phone::open(&host()?.daemon()?.catalog.data_directory.join("phone.sqlite"))?;
+    let opened = Phone::open(
+        &host()?
+            .daemon()?
+            .catalog
+            .data_directory
+            .join("phone.sqlite"),
+    )?;
     Ok(PHONE.get_or_init(|| opened))
 }
 

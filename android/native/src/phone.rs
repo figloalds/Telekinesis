@@ -108,7 +108,9 @@ struct Row {
 }
 
 fn hidden(path: &str) -> bool {
-    path.rsplit('/').next().is_some_and(|name| name.starts_with(PART_PREFIX))
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(PART_PREFIX))
 }
 
 enum Blocked {
@@ -226,7 +228,14 @@ impl Phone {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn remember(&self, folder: &str, row: &Row, peer: &str, checked: usize, total: usize) -> Result<()> {
+    fn remember(
+        &self,
+        folder: &str,
+        row: &Row,
+        peer: &str,
+        checked: usize,
+        total: usize,
+    ) -> Result<()> {
         lock(&self.db).execute(
             "UPDATE unconfirmed SET peer=?4, checked=?5, total=?6 \
              WHERE folder=?1 AND entity=?2 AND seq=?3",
@@ -479,7 +488,11 @@ mod tests {
 
     impl Confirmer for FakePeers {
         fn sent(&self, _: &str) -> Vec<(String, u64)> {
-            self.sent.borrow().iter().map(|(p, s)| (p.clone(), *s)).collect()
+            self.sent
+                .borrow()
+                .iter()
+                .map(|(p, s)| (p.clone(), *s))
+                .collect()
         }
         fn held(&self, installation: &str, digests: &[Digest]) -> Held {
             self.asked.borrow_mut().push(digests.len());
@@ -558,7 +571,9 @@ mod tests {
         }
 
         fn confirm(&self) -> Confirmed {
-            self.phone.confirm(FOLDER, REPO, &self.engine, &self.peers).unwrap()
+            self.phone
+                .confirm(FOLDER, REPO, &self.engine, &self.peers)
+                .unwrap()
         }
 
         fn paths(&self) -> Vec<String> {
@@ -591,7 +606,13 @@ mod tests {
     fn a_new_file_waits_until_sent_and_held() {
         let f = fixture();
         f.write("/a.txt", b"hello");
-        assert_eq!(f.confirm(), Confirmed { waiting: 1, unsupported: 0 });
+        assert_eq!(
+            f.confirm(),
+            Confirmed {
+                waiting: 1,
+                unsupported: 0
+            }
+        );
         assert_eq!(f.paths(), ["/a.txt"]);
         f.peers.sent(PC, f.top());
         f.peers.holds(PC, &f.digests("/a.txt"));
@@ -733,7 +754,13 @@ mod tests {
         // Even if it did hold the bytes, nothing can say so.
         f.peers.holds(PC, &f.digests("/a.txt"));
         let confirmed = f.confirm();
-        assert_eq!(confirmed, Confirmed { waiting: 1, unsupported: 1 });
+        assert_eq!(
+            confirmed,
+            Confirmed {
+                waiting: 1,
+                unsupported: 1
+            }
+        );
         assert_eq!(f.paths(), ["/a.txt"]);
         // Another PC that can say so clears it.
         f.peers.sent("new", f.top());
@@ -755,13 +782,21 @@ mod tests {
         let f = fixture();
         f.write("/a.txt", b"hello");
         let confirmed = f.phone.confirm(FOLDER, REPO, &f.engine, &Down).unwrap();
-        assert_eq!(confirmed, Confirmed { waiting: 1, unsupported: 0 });
+        assert_eq!(
+            confirmed,
+            Confirmed {
+                waiting: 1,
+                unsupported: 0
+            }
+        );
     }
 
     #[test]
     fn a_peer_that_lacks_one_digest_does_not_confirm() {
         let f = fixture();
-        let bytes: Vec<u8> = (0..2 * CHUNK_SIZE as usize + 5).map(|i| (i / 3 % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..2 * CHUNK_SIZE as usize + 5)
+            .map(|i| (i / 3 % 251) as u8)
+            .collect();
         f.write("/big", &bytes);
         let digests = f.digests("/big");
         assert_eq!(digests.len(), 4);
@@ -781,7 +816,9 @@ mod tests {
                 digests: 2,
                 time: Duration::from_secs(60),
             });
-        let bytes: Vec<u8> = (0..4 * CHUNK_SIZE as usize).map(|i| (i / 5 % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..4 * CHUNK_SIZE as usize)
+            .map(|i| (i / 5 % 251) as u8)
+            .collect();
         f.write("/big", &bytes);
         f.write("/small", b"s");
         let big = f.digests("/big");
@@ -810,7 +847,9 @@ mod tests {
                 time: Duration::from_secs(60),
             });
         let pattern = |salt: usize| -> Vec<u8> {
-            (0..4 * CHUNK_SIZE as usize).map(|i| ((i / 5 + salt) % 251) as u8).collect()
+            (0..4 * CHUNK_SIZE as usize)
+                .map(|i| ((i / 5 + salt) % 251) as u8)
+                .collect()
         };
         f.write("/big", &pattern(0));
         let old = f.digests("/big");
@@ -838,7 +877,13 @@ mod tests {
     fn a_file_whose_head_cannot_be_read_stays_waiting() {
         let f = fixture();
         let snapshot = f.engine.store.lock().unwrap().checkpoint().unwrap();
-        let other = f.engine.store.lock().unwrap().fork(&snapshot, "other").unwrap();
+        let other = f
+            .engine
+            .store
+            .lock()
+            .unwrap()
+            .fork(&snapshot, "other")
+            .unwrap();
         f.write("/a.txt", b"hello");
         assert_eq!(f.confirm().waiting, 1);
         // On a branch that has never heard of the file there is no head to read.
@@ -857,7 +902,9 @@ mod tests {
                 digests: 1,
                 time: Duration::from_secs(60),
             });
-        let bytes: Vec<u8> = (0..2 * CHUNK_SIZE as usize).map(|i| (i / 5 % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..2 * CHUNK_SIZE as usize)
+            .map(|i| (i / 5 % 251) as u8)
+            .collect();
         f.write("/big", &bytes);
         f.write("/gone.txt", b"gone");
         f.delete("/gone.txt");
@@ -953,7 +1000,13 @@ mod tests {
         f.peers.sent(PC, f.top());
         f.phone.confirm("one", REPO, &f.engine, &f.peers).unwrap();
         f.peers.holds(PC, &f.digests("/a.txt"));
-        assert_eq!(f.phone.confirm("one", REPO, &f.engine, &f.peers).unwrap().waiting, 0);
+        assert_eq!(
+            f.phone
+                .confirm("one", REPO, &f.engine, &f.peers)
+                .unwrap()
+                .waiting,
+            0
+        );
         assert_eq!(f.phone.waiting("two").unwrap(), vec![]);
         f.phone.scan(FOLDER, &f.engine).unwrap();
         assert_eq!(f.paths(), ["/a.txt"]);
@@ -1039,17 +1092,33 @@ mod tests {
     fn a_cursor_of_another_journal_does_not_count() {
         // A removed folder's row, or a start over before its first page saved.
         let (_home, catalog) = catalog_with("device-1");
-        assert!(counted_cursors(&catalog, REPO, "device-2").unwrap().is_empty());
-        assert!(counted_cursors(&catalog, "another repo", "device-1").unwrap().is_empty());
+        assert!(
+            counted_cursors(&catalog, REPO, "device-2")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            counted_cursors(&catalog, "another repo", "device-1")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn a_cursor_of_a_peer_no_longer_paired_does_not_count() {
         let (_home, catalog) = catalog_with("device-1");
         catalog.unpair("pc").unwrap();
-        assert!(counted_cursors(&catalog, REPO, "device-1").unwrap().is_empty());
+        assert!(
+            counted_cursors(&catalog, REPO, "device-1")
+                .unwrap()
+                .is_empty()
+        );
         // The race: a driver saves one more cursor after the unpair.
         save_cursor(&catalog, "pc", "device-1", 9);
-        assert!(counted_cursors(&catalog, REPO, "device-1").unwrap().is_empty());
+        assert!(
+            counted_cursors(&catalog, REPO, "device-1")
+                .unwrap()
+                .is_empty()
+        );
     }
 }

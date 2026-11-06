@@ -1258,7 +1258,8 @@ impl Engine {
             };
             reference.validate()?;
             closure.digests.push(reference.digest);
-            if reference.kind == ContentKind::Manifest && content.packs.contains(reference.digest)?
+            if reference.kind == ContentKind::Manifest
+                && content.packs.contains(reference.digest)?
             {
                 closure.digests.extend(content.chunks(reference)?);
             }
@@ -1315,12 +1316,20 @@ mod tests {
         assert!(own.windows(2).all(|pair| pair[0].0 < pair[1].0));
         assert!(own.iter().all(|(_, event)| event.author != "a peer"));
         let all = lock(&engine.store).events_after(0, 100)?;
-        assert_eq!(all.len(), own.len() + 1, "exactly the peer's event is left out");
+        assert_eq!(
+            all.len(),
+            own.len() + 1,
+            "exactly the peer's event is left out"
+        );
 
         let (cut, _) = own[0];
         assert_eq!(engine.own_events_after(cut, 100)?, own[1..]);
         assert_eq!(engine.own_events_after(0, 1)?, own[..1]);
-        assert!(engine.own_events_after(own.last().unwrap().0, 100)?.is_empty());
+        assert!(
+            engine
+                .own_events_after(own.last().unwrap().0, 100)?
+                .is_empty()
+        );
         engine.shutdown()?;
         Ok(())
     }
