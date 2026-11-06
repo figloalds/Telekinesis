@@ -54,7 +54,7 @@ use super::{
     network::{self, FolderDirectory, Network},
     process::{self, READY_TIMEOUT},
     signals,
-    sync_driver::{self, Driver, SYNC_NOW_BOUND, SyncFolder, SyncFolders, SyncPolicy},
+    sync_driver::{self, BurstMode, Driver, SYNC_NOW_BOUND, SyncFolder, SyncFolders, SyncPolicy},
     worker::{EXIT_CONFIG, RECORD_FILE, WorkerRecord},
     worker_client::{CALL_DEADLINE, WorkerLink},
 };
@@ -859,7 +859,12 @@ impl Daemon {
                     .sync
                     .get()
                     .context("NETWORK_UNAVAILABLE: the peer network is not running")?;
-                Ok(driver.sync_now(&folders, SYNC_NOW_BOUND))
+                let mode = if payload["metadata_only"].as_bool().unwrap_or(false) {
+                    BurstMode::MetadataOnly
+                } else {
+                    BurstMode::Full
+                };
+                Ok(driver.sync_now(&folders, SYNC_NOW_BOUND, mode))
             }
             "reset-cursors" => {
                 self.sync

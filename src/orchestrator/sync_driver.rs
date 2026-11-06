@@ -261,6 +261,17 @@ impl SyncPolicy {
     }
 }
 
+/// What a `sync-now` moves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BurstMode {
+    /// Metadata first, then the objects it names.
+    #[default]
+    Full,
+    /// Metadata alone: no object is asked for or pushed, so a metered link
+    /// carries a file list and no file.
+    MetadataOnly,
+}
+
 /// (endpoint, repo).
 type Pair = (String, String);
 
@@ -284,6 +295,18 @@ impl Due {
         in_burst(&self.bursts, pair)
     }
 
+    /// Whether the push steps of `pair` are held back: bursts want it, and each
+    /// is metadata-only.
+    fn push_held(&self, pair: &Pair) -> bool {
+        let now = Instant::now();
+        let mut wanting = self
+            .bursts
+            .values()
+            .filter(|burst| burst.wants(pair, now))
+            .peekable();
+        wanting.peek().is_some() && wanting.all(|burst| burst.mode == BurstMode::MetadataOnly)
+    }
+
     /// What every open burst counts for `pair`.
     fn burst_pairs<'a>(&'a mut self, pair: &'a Pair) -> impl Iterator<Item = &'a mut BurstPair> {
         self.bursts
@@ -292,36 +315,47 @@ impl Due {
     }
 
     /// `pair` joins `burst`, with everything due.
+    /// A metadata-only burst marks the exchange alone.
     fn join_burst(&mut self, burst: u64, pair: Pair, error: Option<String>) {
         if let Some(burst) = self.bursts.get_mut(&burst) {
+            let metadata_only = burst.mode == BurstMode::MetadataOnly;
             let state = BurstPair {
                 rescan: true,
                 error,
+                metadata_only,
                 ..BurstPair::default()
             };
             burst.pairs.insert(pair.clone(), state);
             self.exchange.insert(pair.clone());
-            self.demand.insert(pair.clone());
-            self.background.insert(pair);
+            if !metadata_only {
+                self.demand.insert(pair.clone());
+                self.background.insert(pair);
+            }
         }
     }
 }
 
 fn in_burst(bursts: &BTreeMap<u64, Burst>, pair: &Pair) -> bool {
     let now = Instant::now();
-    bursts.values().any(|burst| {
-        burst.until > now
-            && burst
-                .pairs
-                .get(pair)
-                .is_some_and(|state| state.error.is_none() && state.not_published.is_none())
-    })
+    bursts.values().any(|burst| burst.wants(pair, now))
 }
 
 /// One open `sync-now`.
 struct Burst {
     until: Instant,
+    mode: BurstMode,
     pairs: BTreeMap<Pair, BurstPair>,
+}
+
+impl Burst {
+    /// Whether this burst is open and still wants `pair` synced.
+    fn wants(&self, pair: &Pair, now: Instant) -> bool {
+        self.until > now
+            && self
+                .pairs
+                .get(pair)
+                .is_some_and(|state| state.error.is_none() && state.not_published.is_none())
+    }
 }
 
 /// What one `sync-now` counted for one pair.
@@ -339,6 +373,9 @@ struct BurstPair {
     swept: bool,
     /// The peer does not take pushes, so no sweep will come.
     no_push: bool,
+    /// The burst moves metadata alone: no push step or sweep is to come, and
+    /// the exchange is all it waits for.
+    metadata_only: bool,
     /// The listener's scan must start over: what the exchange just told it may
     /// lie behind where the scan stood.
     rescan: bool,
@@ -959,7 +996,9 @@ impl Driver {
     /// A peer with no Ready control lane or no Ready bulk lane for [`LANE_WAIT`]
     /// is reported with the control lane's failure, so it costs that wait and not
     /// the budget, and a daemon that is stopping ends this at once.
-    pub fn sync_now(&self, folders: &[String], budget: Duration) -> Value {
+    /// A [`BurstMode::MetadataOnly`] burst takes no push step and counts no
+    /// `pushed`; it is done when its exchange is.
+    pub fn sync_now(&self, folders: &[String], budget: Duration, mode: BurstMode) -> Value {
         let began = Instant::now();
         let end = began + budget;
         self.lanes.nudge_lanes();
@@ -989,7 +1028,14 @@ impl Driver {
             let burst = due.next_burst;
             due.next_burst += 1;
             let pairs = BTreeMap::new();
-            due.bursts.insert(burst, Burst { until: end, pairs });
+            due.bursts.insert(
+                burst,
+                Burst {
+                    until: end,
+                    mode,
+                    pairs,
+                },
+            );
             burst
         };
         let failure = loop {
@@ -1284,7 +1330,11 @@ impl Driver {
         // Events moved: the objects they name may now be wanted, either way.
         let moved = cursor != task.cursor;
         if moved {
-            lock(&self.due).background.insert(task.key.clone());
+            let mut due = lock(&self.due);
+            if !due.push_held(&task.key) {
+                due.background.insert(task.key.clone());
+            }
+            drop(due);
             self.wake.nudge();
         }
         let answered = slot.job.last_exchange_ms > 0;
@@ -1513,7 +1563,9 @@ impl Driver {
             return false;
         }
         let mut due = lock(&self.due);
-        (!self.passive() || due.in_burst(&pair)) && marks(&mut due).remove(&pair)
+        (!self.passive() || due.in_burst(&pair))
+            && !due.push_held(&pair)
+            && marks(&mut due).remove(&pair)
     }
 
     /// [`Self::take_due`] of the background step. For a burst it also says the
@@ -1526,7 +1578,10 @@ impl Driver {
             return false;
         }
         let mut due = lock(&self.due);
-        if (self.passive() && !due.in_burst(&pair)) || !due.background.remove(&pair) {
+        if (self.passive() && !due.in_burst(&pair))
+            || due.push_held(&pair)
+            || !due.background.remove(&pair)
+        {
             return false;
         }
         let mut rescan = false;
@@ -2073,7 +2128,13 @@ fn burst_pair_settled(
 ) -> bool {
     state.error.is_some()
         || state.not_published.is_some()
-        || ((state.swept || state.no_push)
+        || (state.metadata_only
+            && state.exchanged > 0
+            && state.absent.is_none()
+            && !due.exchange.contains(pair)
+            && !jobs.get(pair).is_some_and(|slot| slot.running))
+        || (!state.metadata_only
+            && (state.swept || state.no_push)
             && state.absent.is_none()
             && !due.exchange.contains(pair)
             && !due.demand.contains(pair)
@@ -4385,12 +4446,23 @@ mod tests {
 
     /// Opens a burst of `pairs`, the way `sync_now` does, ending far off.
     fn open_burst(driver: &Driver, pairs: &[Pair]) -> u64 {
+        open_burst_of(driver, pairs, BurstMode::Full)
+    }
+
+    fn open_burst_of(driver: &Driver, pairs: &[Pair], mode: BurstMode) -> u64 {
         let mut due = lock(&driver.due);
         let burst = due.next_burst;
         due.next_burst += 1;
         let until = Instant::now() + HOUR;
         let map = BTreeMap::new();
-        due.bursts.insert(burst, Burst { until, pairs: map });
+        due.bursts.insert(
+            burst,
+            Burst {
+                until,
+                mode,
+                pairs: map,
+            },
+        );
         for pair in pairs {
             due.join_burst(burst, pair.clone(), None);
         }
@@ -4573,7 +4645,11 @@ mod tests {
             bulk: None,
         };
         let (driver, _root) = policy_driver(lanes, &["repo-1"], passive(SHORT));
-        let reply = driver.sync_now(&["repo-1".to_owned()], Duration::from_secs(5));
+        let reply = driver.sync_now(
+            &["repo-1".to_owned()],
+            Duration::from_secs(5),
+            BurstMode::Full,
+        );
         let folder = folder_of(&reply);
         assert_eq!(folder["id"], "repo-1");
         assert_eq!(folder["remaining"], 0, "{reply}");
@@ -4585,7 +4661,11 @@ mod tests {
     fn sync_now_runs_out_its_budget_as_sync_now_timeout() {
         let (driver, _root) = policy_driver(down_lanes(None), &["repo-1"], passive(SHORT));
         let began = Instant::now();
-        let reply = driver.sync_now(&["repo-1".to_owned()], Duration::from_millis(200));
+        let reply = driver.sync_now(
+            &["repo-1".to_owned()],
+            Duration::from_millis(200),
+            BurstMode::Full,
+        );
         assert!(began.elapsed() < Duration::from_secs(5));
         let folder = folder_of(&reply);
         let error = folder["error"].as_str().unwrap();
@@ -4603,7 +4683,7 @@ mod tests {
             passive(SHORT),
         );
         let began = Instant::now();
-        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND);
+        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND, BurstMode::Full);
         let took = began.elapsed();
         assert!(took >= LANE_WAIT, "{took:?}");
         assert!(took < LANE_WAIT + Duration::from_secs(5), "{took:?}");
@@ -4621,7 +4701,7 @@ mod tests {
             cancelling.cancel();
         });
         let began = Instant::now();
-        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND);
+        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND, BurstMode::Full);
         assert!(began.elapsed() < Duration::from_secs(5));
         stopper.join().unwrap();
         let error = folder_of(&reply)["error"].as_str().unwrap();
@@ -4632,7 +4712,7 @@ mod tests {
     fn sync_now_reports_a_folder_that_is_not_syncing() {
         let (driver, _root) = policy_driver(down_lanes(None), &["repo-1"], passive(SHORT));
         let began = Instant::now();
-        let reply = driver.sync_now(&["paused".to_owned()], SYNC_NOW_BOUND);
+        let reply = driver.sync_now(&["paused".to_owned()], SYNC_NOW_BOUND, BurstMode::Full);
         assert!(began.elapsed() < LANE_WAIT);
         let folder = folder_of(&reply);
         assert_eq!(folder["id"], "paused");
@@ -4780,7 +4860,7 @@ mod tests {
         )
         .unwrap();
         let began = Instant::now();
-        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND);
+        let reply = driver.sync_now(&["repo-1".to_owned()], SYNC_NOW_BOUND, BurstMode::Full);
         assert!(began.elapsed() < LANE_WAIT, "{reply}");
         let error = folder_of(&reply)["error"].as_str().unwrap();
         assert!(error.contains("UNSUPPORTED_OPERATION"), "{reply}");
@@ -4860,6 +4940,41 @@ mod tests {
         let error = report["error"].as_str().unwrap_or_default();
         assert!(error.starts_with("PEER_PUSH_UNAVAILABLE"), "{report}");
         assert!(error.contains(ENDPOINT), "{report}");
+    }
+
+    #[test]
+    fn a_metadata_only_burst_takes_no_push_step() {
+        let listener = Arc::new(Listener {
+            missing: wanted_of(&objects("there", 1)),
+            demand: wanted_of(&objects("read", 1)),
+            ..Listener::default()
+        });
+        let bulk = listener.lane_with("session", &[features::CONTENT_PUSH]);
+        let (driver, _root) = burst_driver(ReadyLanes::one(false, bulk), &[]);
+        let key = pair(ENDPOINT, "repo-1");
+        let burst = open_burst_of(&driver, std::slice::from_ref(&key), BurstMode::MetadataOnly);
+        {
+            let due = lock(&driver.due);
+            assert!(due.exchange.contains(&key));
+            assert!(!due.demand.contains(&key) && !due.background.contains(&key));
+            assert!(due.push_held(&key));
+        }
+        // A mark the burst did not make, as a local change or a notify makes it.
+        driver.local_change("repo-1");
+        lock(&driver.due).demand.insert(key.clone());
+        let mut state = PumpState::default();
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        assert!(!settled_now(&driver, burst), "its exchange has not run");
+        driver.burst_exchanged(&key, true, true, &Ok(()));
+        exchange_done(&driver);
+        assert!(settled_now(&driver, burst));
+        assert!(calls_of_round(&driver, &mut state, &listener).is_empty());
+        let report = report_now(&driver, burst);
+        assert!(report["error"].is_null(), "{report}");
+        assert_eq!(report["pushed"], 0, "{report}");
+        // A full burst beside it lifts the hold.
+        open_burst(&driver, std::slice::from_ref(&key));
+        assert!(!lock(&driver.due).push_held(&key));
     }
 
     /// Bulk lanes that look Ready when a round starts and are gone when asked.

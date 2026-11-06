@@ -116,6 +116,10 @@ pub enum ManagementCommand {
     SyncNow {
         #[arg(value_name = "STATE")]
         folder: Option<String>,
+        /// Exchange metadata only: no file bytes move, so file lists refresh
+        /// on a metered link.
+        #[arg(long)]
+        metadata_only: bool,
     },
     /// Forget how far each folder got with each peer, so that the next sync
     /// starts over: for what a passive host cannot detect itself, such as a peer
@@ -235,7 +239,14 @@ fn request(command: ManagementCommand) -> Result<(&'static str, Value, bool)> {
             }),
             false,
         ),
-        C::SyncNow { folder } => ("sync-now", json!({"state": folder}), false),
+        C::SyncNow {
+            folder,
+            metadata_only,
+        } => (
+            "sync-now",
+            json!({"state": folder, "metadata_only": metadata_only}),
+            false,
+        ),
         C::ResetCursors => ("reset-cursors", json!({}), false),
         C::Shutdown => ("shutdown", json!({}), false),
     })

@@ -274,6 +274,7 @@ listener itself is plain WebSocket: see
 ```sh
 tkfs manage sync-now
 tkfs manage sync-now STATE
+tkfs manage sync-now --metadata-only [STATE]
 ```
 
 `sync-now` syncs one folder, or every folder when none is named, with every
@@ -288,6 +289,13 @@ own readers, but exchanges metadata and pushes only when told to. It:
 - pushes what each peer wants, what its readers wait for first, until a whole
   pass over a peer's listing stores nothing. It does not download: a passive host
   fetches a file when something reads it.
+
+With `--metadata-only` it does the first two steps and not the third: no object
+is asked for or pushed, so a file list refreshes on a metered link and no file
+moves. `pushed` is `0`, `remaining` is `null` (no listing is read), and it
+finishes when the metadata exchange does. A plain `sync-now` later moves the
+bytes. While a metadata-only `sync-now` is open for a folder, no push step runs
+for it unless another, full `sync-now` is open as well.
 
 It prints `{"folders": [{"id", "exchanged", "pushed", "remaining", "error"}]}`:
 

@@ -1292,13 +1292,55 @@ fn passive_pair(files: &[(&str, &str)]) -> Result<Shared> {
 /// `manage sync-now`, within its bound: the reply's one folder, and how long
 /// it took.
 fn sync_now(daemon: &TestDaemon) -> Result<(Value, Duration)> {
+    sync_now_with(daemon, &[])
+}
+
+/// [`sync_now`] with more arguments.
+fn sync_now_with(daemon: &TestDaemon, extra: &[&str]) -> Result<(Value, Duration)> {
     let began = Instant::now();
-    let reply = daemon.manage(&["sync-now"])?;
+    let args = [&["sync-now"], extra].concat();
+    let reply = daemon.manage(&args)?;
     let took = began.elapsed();
     ensure!(took < SYNC_NOW_BOUND, "sync-now took {took:?}");
     let folders = reply["folders"].as_array().context("no folders")?;
     ensure!(folders.len() == 1, "{reply}");
     Ok((folders[0].clone(), took))
+}
+
+#[test]
+fn a_metadata_only_burst_moves_events_and_no_objects() -> Result<()> {
+    let Shared {
+        a,
+        b,
+        state_a,
+        state_b,
+        ..
+    } = passive_pair(&[])?;
+    import(&a, &state_a, "from-a.txt", "bytes only A holds")?;
+    import(&b, &state_b, "from-b.txt", "bytes only B holds")?;
+    let before = pack_bytes(&state_b);
+    let (reply, _) = sync_now_with(&a, &["--metadata-only"])?;
+    ensure!(
+        reply["error"].is_null(),
+        "{reply}
+log:
+{}",
+        a.log_text()
+    );
+    ensure!(reply["pushed"] == 0, "{reply}");
+    wait_entry(&state_b, "from-a.txt", 18, REPLICATED)?;
+    wait_entry(&state_a, "from-b.txt", 18, REPLICATED)?;
+    ensure!(
+        pack_bytes(&state_b) == before,
+        "B's packs grew in a metadata-only burst"
+    );
+    let reply = sync_now_clean(&a)?;
+    ensure!(reply["pushed"].as_u64().is_some_and(|n| n > 0), "{reply}");
+    // Stopped, B's store holds the file whole.
+    let _home_b = b.shutdown_keep_home()?;
+    a.shutdown()?;
+    ensure!(stored_file(&state_b, "from-a.txt")? == b"bytes only A holds");
+    Ok(())
 }
 
 /// [`sync_now`] that reports no error.
