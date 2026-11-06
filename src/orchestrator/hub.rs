@@ -413,14 +413,15 @@ pub fn run(config_path: &Path) -> Result<()> {
     let daemon = Daemon::new(config, config_path, lock, Arc::new(RealLauncher))?;
     // From here a signal is a shutdown, never the default termination.
     signals::install(daemon.stopping.clone())?;
-    serve_until_stopped(daemon, data, |_| {})?;
+    serve_until_stopped(daemon, data, true, |_| {})?;
     signals::completed();
     Ok(())
 }
 
 /// [`run`] inside a host process (the Android app): failures come back as errors
 /// instead of exiting, no signal handlers are installed, and `launcher` decides
-/// how workers run. `started` gets the daemon once it can take requests.
+/// how workers run. It serves no control endpoint and writes no discovery
+/// files: the host calls [`Daemon::execute`] itself. `started` gets the daemon once it can take requests.
 pub fn run_embedded(
     config_path: &Path,
     launcher: Arc<dyn Launcher>,
@@ -443,18 +444,25 @@ pub fn run_embedded(
     try_lock(&lock).with_context(|| format!("ALREADY_RUNNING: {}", lock_path.display()))?;
     let _log = log::install_daemon_log(&data).ok();
     let daemon = Daemon::new(config, config_path, lock, launcher)?;
-    serve_until_stopped(daemon, data, started)
+    serve_until_stopped(daemon, data, false, started)
 }
 
-/// Serves `daemon` until it stops, then runs its shutdown sequence.
+/// Serves `daemon` until it stops, then runs its shutdown sequence. With
+/// `serve_control` it listens on the control endpoint and writes the discovery
+/// files; an embedded orchestrator is driven in-process and does neither.
 fn serve_until_stopped(
     daemon: Arc<Daemon>,
     data: PathBuf,
+    serve_control: bool,
     started: impl FnOnce(Arc<Daemon>),
 ) -> Result<()> {
     daemon.start_network()?;
-    let discovery = Discovery(data.clone());
-    let control = endpoint::serve(daemon.clone())?;
+    let (discovery, control) = if serve_control {
+        let discovery = Discovery(data.clone());
+        (Some(discovery), Some(endpoint::serve(daemon.clone())?))
+    } else {
+        (None, None)
+    };
     started(daemon.clone());
     event!(info, ORCHESTRATOR_STARTED, {
         "pid": std::process::id(),

@@ -301,6 +301,9 @@ The desktop app shows the same codes. The code tells you what to do:
 | `ORCHESTRATOR_STOPPING` | The orchestrator is shutting down. | Wait for it to exit and start it again. |
 | `FORCED_STOP` | Logged: a worker did not stop in time at shutdown and was forced or killed. Committed data is durable. | Nothing; look at `worker.log` if it repeats. |
 | `STRANDED_PROCESS` | A worker could not be shown gone or killed within its bound. | Find the process (`worker.json` names its pid) and end it. |
+| `ORCHESTRATOR_FAILED`, `ORCHESTRATOR_NOT_READY` | The Android app's embedded orchestrator ended with an error, or did not take requests within 15 s of starting. | Read the error text; restart the app. |
+| `WORKER_NOT_READY` | The embedded worker of a folder did not come up within 15 s. | Retry; look at the folder's `manage inspect` phase. |
+| `STRANDED_WORKER` | An embedded worker thread (or the embedded orchestrator) did not stop within its bound. | Restart the app process. |
 | `WORKER_LIMIT` | `maximum_running` folders already have a worker. | Stop one, or raise `maximum_running` and restart. |
 | `FOLDER_REQUIRED` | A folder command has neither `--state` nor `--runtime`. | Give `--state DIR` or `--runtime STATE/runtime.json`. |
 | `FOLDER_NOT_FOUND`, `AMBIGUOUS_FOLDER` | The folder argument matches no folder, or more than one. | Use more of the id, or the exact label (`manage list`). |

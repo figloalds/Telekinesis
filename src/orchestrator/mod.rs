@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod config;
 pub mod control;
 pub mod demand;
+pub mod embedded;
 pub mod endpoint;
 pub mod folder;
 pub mod hub;
