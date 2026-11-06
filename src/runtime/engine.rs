@@ -1,8 +1,10 @@
 //! Filesystem operations share metadata only at namespace/save boundaries.
 use crate::util::namespace::NamespaceChanges;
 use crate::{
-    content::{seal, working::*},
+    content::{Kind, seal, working::*},
     core::*,
+    model::content::Digest,
+    util::log::event,
 };
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -17,6 +19,8 @@ use std::{
 };
 
 type Invalidate = Arc<dyn Fn(&str, u32) -> Result<()> + Send + Sync>;
+/// How far ahead of a sequential reader its chunks are asked for.
+pub const READ_AHEAD: u64 = 16 * 1024 * 1024;
 static OPEN_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static OPEN_NANOS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static NAMESPACE_HITS: AtomicU64 = AtomicU64::new(0);
@@ -120,6 +124,14 @@ pub fn open_stats() -> serde_json::Value {
             .collect(),
     )
 }
+/// Where a handle's read-ahead stands: see [`Engine::read_sequential`].
+#[derive(Default)]
+struct ReadAhead {
+    /// Where the last window starts; `None` until the first read.
+    from: Option<u64>,
+    /// What this handle holds hinted.
+    hinted: Vec<(Digest, Kind)>,
+}
 pub struct Handle {
     pub entry: Mutex<Entry>,
     pub scratch: Option<Arc<Mutex<Scratch>>>,
@@ -127,6 +139,7 @@ pub struct Handle {
     closed: AtomicBool,
     pub delete: AtomicBool,
     pub directory: Mutex<Option<Arc<Vec<Entry>>>>,
+    read_ahead: Mutex<ReadAhead>,
 }
 pub struct Engine {
     pub store: Mutex<Store>,
@@ -443,6 +456,7 @@ impl Engine {
                 closed: AtomicBool::new(false),
                 delete: AtomicBool::new(false),
                 directory: Mutex::new(None),
+                read_ahead: Mutex::new(ReadAhead::default()),
             }),
         );
         open_timing(3, started);
@@ -483,6 +497,48 @@ impl Engine {
         let h = self.handle(token)?;
         let s = h.scratch.as_ref().context("IS_A_DIRECTORY")?;
         lock(s).read(self.working.content(), offset, out)
+    }
+    /// [`Self::read`] for a reader going through a file in order, which is how a
+    /// phone reads. It also asks for the [`READ_AHEAD`] bytes after the read, again
+    /// once the reader has passed half of that window, or left it. A read asks only
+    /// for what it touches, and each such ask costs a wake-up of the worker's pump:
+    /// this way one wake-up brings a window. It never fetches a whole large file for
+    /// a reader that stops, and closing the handle takes back what it asked for.
+    pub fn read_sequential(&self, token: u64, offset: u64, out: &mut [u8]) -> Result<usize> {
+        let count = self.read(token, offset, out)?;
+        if count > 0
+            && let Err(error) = self.read_ahead(token, offset + count as u64)
+        {
+            // The read stands. The next one that needs anything says what is wrong.
+            event!(warn, READ_AHEAD_FAILED, {"error": format!("{error:#}")});
+        }
+        Ok(count)
+    }
+    fn read_ahead(&self, token: u64, end: u64) -> Result<()> {
+        let h = self.handle(token)?;
+        let Some(scratch) = &h.scratch else {
+            return Ok(());
+        };
+        let mut ahead = lock(&h.read_ahead);
+        if ahead
+            .from
+            .is_some_and(|from| (from..from + READ_AHEAD / 2).contains(&end))
+        {
+            return Ok(());
+        }
+        let (reference, visible) = {
+            let scratch = lock(scratch);
+            (
+                scratch.record.basis.content.clone(),
+                scratch.base_visible_len,
+            )
+        };
+        let content = self.working.content();
+        content.unhint(&std::mem::take(&mut ahead.hinted));
+        let len = READ_AHEAD.min(visible.saturating_sub(end));
+        ahead.hinted = content.hint_range(&reference, end, len)?;
+        ahead.from = Some(end);
+        Ok(())
     }
     /// Windows shares cached pages across opens of a pathname. After notify
     /// purges those pages, paging reads must populate them from the visible head.
@@ -835,10 +891,13 @@ impl Engine {
         // Scratch release can wait for a batched seal. Do not hold the global
         // handle map across that wait and stall every other file callback.
         let handle = self.handles.write().unwrap().remove(&token);
-        if let Some(handle) = handle
-            && let Some(scratch) = &handle.scratch
-        {
-            self.working.release(scratch);
+        if let Some(handle) = handle {
+            self.working
+                .content()
+                .unhint(&lock(&handle.read_ahead).hinted);
+            if let Some(scratch) = &handle.scratch {
+                self.working.release(scratch);
+            }
         }
         cleanup
     }
@@ -1074,6 +1133,10 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        content::{Kind, Manifest, ObjectFetcher},
+        model::content::{CHUNK_SIZE, ContentKind, Digest, FileContentRef},
+    };
 
     fn seed_cached_file(engine: &Engine, path: &str, bytes: &[u8]) -> Result<()> {
         let handle = engine.open_file(path, true, false, true)?;
@@ -1305,6 +1368,124 @@ mod tests {
         let metadata = engine.open_native_file("file", false, false, false, None, true)?;
         assert_eq!(engine.info(metadata)?.1, 4);
         engine.close(metadata)?;
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// Records what it is told to hint, call by call, and what is taken back.
+    #[derive(Default)]
+    struct HintLog {
+        hinted: Mutex<Vec<Vec<Digest>>>,
+        taken_back: Mutex<Vec<Digest>>,
+    }
+    impl ObjectFetcher for HintLog {
+        fn fetch(&self, _: &[(Digest, Kind)]) -> Result<()> {
+            anyhow::bail!("OBJECT_MISSING")
+        }
+        fn hint(&self, objects: &[(Digest, Kind)]) {
+            lock(&self.hinted).push(objects.iter().map(|(digest, _)| *digest).collect());
+        }
+        fn unhint(&self, objects: &[(Digest, Kind)]) {
+            lock(&self.taken_back).extend(objects.iter().map(|(digest, _)| *digest));
+        }
+    }
+
+    /// A read handle on a file of `chunks` chunks of which the first `held` are
+    /// here, with the digests of them all and a log of what it hints.
+    fn read_ahead_handle(
+        engine: &Engine,
+        chunks: u64,
+        held: u64,
+    ) -> Result<(u64, Vec<Digest>, Arc<HintLog>)> {
+        let content = engine.working.content();
+        let token = engine.open_file("big", true, false, true)?;
+        engine.flush(Some(token))?;
+        engine.close(token)?;
+        let mut digests = Vec::new();
+        for index in 0..chunks {
+            let mut bytes = vec![0; CHUNK_SIZE as usize];
+            bytes[..8].copy_from_slice(&index.to_le_bytes());
+            digests.push(if index < held {
+                content.packs.put(Kind::Chunk, &bytes)?
+            } else {
+                Digest::bytes(&bytes)
+            });
+        }
+        let manifest = Manifest {
+            len: chunks * CHUNK_SIZE,
+            chunks: digests.clone(),
+        };
+        let reference = FileContentRef::new(
+            ContentKind::Manifest,
+            content.packs.put(Kind::Manifest, &manifest.encode()?)?,
+            manifest.len,
+        )?;
+        let log = Arc::new(HintLog::default());
+        content.set_fetcher(log.clone());
+        let mut entry = engine.lookup("big")?;
+        entry.content = Some(reference.clone());
+        let basis = Basis {
+            entity: entry.id.clone(),
+            branch: "read-ahead".into(),
+            version: "v".into(),
+            anchor: "v".into(),
+            content: reference,
+        };
+        Ok((engine.open_bound(entry, basis, false)?, digests, log))
+    }
+
+    #[test]
+    fn a_plain_read_hints_nothing() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (token, _, log) = read_ahead_handle(&engine, 8, 2)?;
+        let mut bytes = vec![0; 1024];
+        assert_eq!(engine.read(token, 0, &mut bytes)?, 1024);
+        engine.close(token)?;
+        assert!(lock(&log.hinted).is_empty());
+        assert!(lock(&log.taken_back).is_empty());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn read_ahead_follows_the_reader_and_ends_with_the_handle() -> Result<()> {
+        let window = (READ_AHEAD / CHUNK_SIZE) as usize;
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        // Held up to 3/4 of a window in: the reader goes that far without a fetch.
+        let held = 3 * window / 4;
+        let (token, digests, log) = read_ahead_handle(&engine, 2 * window as u64, held as u64)?;
+        let hints = || lock(&log.hinted).clone();
+        let mut bytes = vec![0; CHUNK_SIZE as usize];
+
+        // The first read asks for the window after it, without what is here.
+        engine.read_sequential(token, 0, &mut bytes)?;
+        assert_eq!(hints(), vec![digests[held..=window].to_vec()]);
+        assert!(lock(&log.taken_back).is_empty());
+
+        // Short of half that window, nothing more.
+        let half = READ_AHEAD / 2;
+        engine.read_sequential(token, half - CHUNK_SIZE, &mut bytes)?;
+        assert_eq!(hints().len(), 1);
+
+        // Past it, the window moves, and the last one is taken back first.
+        engine.read_sequential(token, half + CHUNK_SIZE, &mut bytes)?;
+        let moved = hints();
+        assert_eq!(moved.len(), 2);
+        let from = window / 2 + 2;
+        assert_eq!(moved[1], digests[held..from + window]);
+        assert_eq!(*lock(&log.taken_back), moved[0]);
+
+        // A jump back is a new place to read from.
+        engine.read_sequential(token, 0, &mut bytes)?;
+        assert_eq!(hints().len(), 3);
+        assert_eq!(hints()[2], digests[held..=window]);
+
+        // The handle's close takes back what it still holds.
+        lock(&log.taken_back).clear();
+        engine.close(token)?;
+        assert_eq!(*lock(&log.taken_back), hints()[2]);
         engine.shutdown()?;
         Ok(())
     }

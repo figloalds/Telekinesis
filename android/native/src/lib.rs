@@ -224,7 +224,8 @@ pub extern "system" fn Java_dev_tkfs_Native_open(
     })
 }
 
-/// Reads into `out`; hydrates missing chunks and blocks while it does.
+/// Reads into `out`; hydrates missing chunks and blocks while it does, and asks for
+/// the chunks after them before the reader gets there.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_tkfs_Native_read(
     mut env: JNIEnv,
@@ -243,7 +244,7 @@ pub extern "system" fn Java_dev_tkfs_Native_read(
         );
         let folder = text(env, &folder)?;
         let mut buffer = vec![0u8; size as usize];
-        let count = engine(&folder)?.read(token as u64, offset as u64, &mut buffer)?;
+        let count = engine(&folder)?.read_sequential(token as u64, offset as u64, &mut buffer)?;
         // SAFETY: i8 and u8 have the same layout; `count` is within `buffer`.
         let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<i8>(), count) };
         env.set_byte_array_region(&out, 0, bytes)?;

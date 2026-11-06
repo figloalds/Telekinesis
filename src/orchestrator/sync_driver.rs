@@ -21,7 +21,10 @@
 //!   go on instead: see below.
 //! * **object pump** — one thread for every Running, unpaused folder. Each
 //!   round has two passes (spec §7.8: demand never waits behind background
-//!   traffic). Pass 1 supplies every folder's pending `watch` demand; pass 2
+//!   traffic). Pass 1 supplies every folder's pending `watch` demand, then at
+//!   most one batch of what its readers hinted, so that a read that begins
+//!   waiting meanwhile, or a handle that closes, counts after one batch and not
+//!   after a whole read-ahead window; pass 2
 //!   prefetches `objects.missing {limit: OBJECT_BATCH, exclude, after}` per
 //!   folder — a resumable scan: a page not wholly stored moves the folder's
 //!   cursor past it, so every missing object is eventually listed — and is
@@ -42,7 +45,9 @@
 //!   `sync_interval_ms` unless woken. A peer whose fetch timed out or lost its
 //!   lane sits out the next round, and a coded failure rests only that (folder,
 //!   peer), as a push failure does. A reader's fetch gives a peer [`DEMAND_TRY`]
-//!   while another could answer, with a peer known not to answer asked last. The
+//!   while another could answer, with a peer known not to answer asked last, and
+//!   the last peer asked gets its whole deadline, even at rest: a phone's one PC
+//!   must not be locked out by its own slow link. The
 //!   pump never blocks the scheduler. After each pass it also
 //!   pushes ([`push`]), so a round runs: this side's demand, the listeners'
 //!   demand, background pull, background push. The background push stops
@@ -156,9 +161,9 @@ pub const UNAVAILABLE_MAX: Duration = Duration::from_secs(300);
 /// pump while a push step stays due: a new control session and a failed step
 /// send no poke.
 const DUE_CHECK: Duration = Duration::from_millis(500);
-/// How long a reader's `objects.fetch` waits for a peer when another could answer
-/// or the peer is known not to, so that one that hangs does not use up the
-/// reader's own wait (`Demand::FETCH_WAIT`).
+/// How long a reader's `objects.fetch` waits for a peer when another could answer,
+/// so that one that hangs does not use up the reader's own wait
+/// (`Demand::FETCH_WAIT`).
 const DEMAND_TRY: Duration = Duration::from_secs(3);
 /// After a sweep that stored nothing, the pair's next poll is at least this many
 /// times as long as the sweep took. A short one changes nothing. A long one is
@@ -500,6 +505,8 @@ pub struct SyncFolder {
     pub link: Arc<WorkerLink>,
     /// The objects the worker's readers wait for (its last `watch`).
     pub demand: Vec<(Digest, Kind)>,
+    /// The objects they are expected to want next, nearest first.
+    pub hints: Vec<(Digest, Kind)>,
 }
 
 /// The folders to sync (implemented over the daemon's folder slots).
@@ -1710,21 +1717,36 @@ impl Driver {
             .supplied
             .retain(|_, at| now.saturating_duration_since(*at) < DEMAND_SUPPLIED);
         let mut stored = 0;
-        // Pass 1: what readers wait for. A digest just written may still be
-        // listed until the worker's next `watch`: it is not fetched again.
+        // Pass 1: what readers wait for, then one batch of what they hinted: the
+        // next round lists afresh. A digest just written may still be listed until
+        // the worker's next `watch`: it is not fetched again.
         for folder in &folders {
-            let demand: Vec<(Digest, Kind)> = folder
-                .demand
-                .iter()
-                .filter(|(digest, _)| !state.supplied.contains_key(&(folder.id.clone(), *digest)))
-                .copied()
-                .collect();
-            if !demand.is_empty() && !endpoints.is_empty() && !self.cancel.is_cancelled() {
-                // A peer known not to answer is asked last: it may be the only
-                // one that holds this, so it is not passed over.
-                let mut asked = state.askable(&endpoints, &folder.id);
-                asked.sort_by_key(|endpoint| state.push.endpoint_rests(endpoint, now));
-                stored += self.supply(state, &asked, folder, demand, None).stored;
+            let unsupplied = |listed: &[(Digest, Kind)]| -> Vec<(Digest, Kind)> {
+                listed
+                    .iter()
+                    .filter(|(digest, _)| {
+                        !state.supplied.contains_key(&(folder.id.clone(), *digest))
+                    })
+                    .copied()
+                    .collect()
+            };
+            let demand = unsupplied(&folder.demand);
+            let mut hints = unsupplied(&folder.hints);
+            hints.truncate(OBJECT_BATCH);
+            if (demand.is_empty() && hints.is_empty())
+                || endpoints.is_empty()
+                || self.cancel.is_cancelled()
+            {
+                continue;
+            }
+            // A peer known not to answer is asked last: it may be the only
+            // one that holds this, so it is not passed over.
+            let mut asked = state.askable(&endpoints, &folder.id);
+            asked.sort_by_key(|endpoint| state.push.endpoint_rests(endpoint, now));
+            for wanted in [demand, hints] {
+                if !wanted.is_empty() {
+                    stored += self.supply(state, &asked, folder, wanted, None).stored;
+                }
             }
         }
         // What the listeners' readers wait for. A failure needs no mark: their
@@ -1900,8 +1922,8 @@ impl Driver {
     /// round, and one that gave a coded failure does so for this folder alone.
     /// With `interrupt`, stops once the wake moved past it, cancelling the call in
     /// flight: no failure, and what it asked stays missing and is listed again.
-    /// Without it a reader is waiting, so a peer gets [`DEMAND_TRY`] while another
-    /// could answer or when it is known not to.
+    /// Without it a reader is waiting or about to, so a peer gets [`DEMAND_TRY`]
+    /// while another could answer, and the last one its whole deadline.
     fn supply(
         &self,
         state: &mut PumpState,
@@ -1925,9 +1947,7 @@ impl Driver {
                 continue;
             }
             let logged = format!("{endpoint} {}", folder.id);
-            let hurried = interrupt.is_none()
-                && (index + 1 < endpoints.len()
-                    || state.push.endpoint_rests(endpoint, Instant::now()));
+            let hurried = interrupt.is_none() && index + 1 < endpoints.len();
             for (conn, batch) in lanes_for(self.lanes.as_ref(), endpoint, &remaining) {
                 // Objects of unknown size (manifests) first, in their own
                 // small batches; then the chunks.
@@ -2889,6 +2909,7 @@ mod tests {
                     repo: "repo-1".into(),
                     link: link.clone(),
                     demand: lock(demand).clone(),
+                    hints: Vec::new(),
                 })
                 .collect()
         }
@@ -3470,6 +3491,7 @@ mod tests {
             repo: repo.into(),
             link: fake_worker(fake),
             demand: Vec::new(),
+            hints: Vec::new(),
         }
     }
 
@@ -3715,6 +3737,7 @@ mod tests {
             repo: "repo-1".into(),
             link: fake_worker(fake),
             demand: Vec::new(),
+            hints: Vec::new(),
         };
         let listener = Arc::new(Listener {
             missing: wanted_of(&all),
@@ -3938,6 +3961,7 @@ mod tests {
             repo: "repo-1".into(),
             link: fake_worker(fake),
             demand: Vec::new(),
+            hints: Vec::new(),
         };
         let listener = Arc::new(Listener {
             missing: wanted_of(&all),
@@ -3981,6 +4005,7 @@ mod tests {
                     repo: repo.clone(),
                     link: link.clone(),
                     demand: demand.clone(),
+                    hints: Vec::new(),
                 })
                 .collect()
         }
@@ -4787,6 +4812,7 @@ mod tests {
             repo: "repo-1".into(),
             link: fake_worker(fake),
             demand: Vec::new(),
+            hints: Vec::new(),
         };
         assert!(driver.take_background(&mut state, &syncing, ENDPOINT));
         assert!(!settled(&driver), "a sweep is under way");
@@ -4817,6 +4843,7 @@ mod tests {
             repo: "repo-1".into(),
             link: fake_worker(Arc::new(FakeFolder::default())),
             demand: Vec::new(),
+            hints: Vec::new(),
         };
         let at = (syncing.id.clone(), ENDPOINT.to_owned());
         state.push.peers.entry(at.clone()).or_default().scan = Some("7".into());
@@ -6659,6 +6686,117 @@ mod tests {
         driver.pump_round(&mut state, driver.wake.current());
         assert_eq!(fake.written(), [wanted[0].digest]);
         assert!(hung.calls().is_empty(), "{:?}", hung.calls());
+    }
+
+    #[test]
+    fn a_single_peer_at_rest_keeps_its_full_deadline_for_a_reader() {
+        // It answers, later than a peer that another could stand in for is given.
+        let wanted = objects("wanted", 1);
+        let listener = Arc::new(Listener {
+            held: wanted.clone(),
+            during_fetch: Some(Box::new(|| {
+                thread::sleep(DEMAND_TRY + Duration::from_millis(300))
+            })),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder::default());
+        let folders = Arc::new(RepoFolders(vec![(
+            "repo-1".into(),
+            fake_worker(fake.clone()),
+            wanted_of(&wanted),
+        )]));
+        let (driver, _root) = driver(listener.lane(), folders, Seq::new());
+        let mut state = PumpState::default();
+        state.push.rest_endpoint(ENDPOINT);
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(fake.written(), [wanted[0].digest]);
+        // So the next read finds it again, and the rest it was at is over.
+        assert!(!state.resting.contains_key(ENDPOINT));
+        assert!(!state.push.endpoint_rests(ENDPOINT, Instant::now()));
+    }
+
+    /// One folder whose readers wait for `reads` and hint `hints`.
+    struct HintingFolder {
+        link: Arc<WorkerLink>,
+        reads: Mutex<Wanted>,
+        hints: Mutex<Wanted>,
+    }
+
+    impl SyncFolders for HintingFolder {
+        fn syncing(&self) -> Vec<SyncFolder> {
+            vec![SyncFolder {
+                id: "f1".into(),
+                repo: "repo-1".into(),
+                link: self.link.clone(),
+                demand: lock(&self.reads).clone(),
+                hints: lock(&self.hints).clone(),
+            }]
+        }
+        fn knows(&self, repo: &str) -> bool {
+            repo == "repo-1"
+        }
+    }
+
+    #[test]
+    fn read_ahead_is_asked_a_batch_a_round_and_a_waiting_read_goes_first() {
+        // More than a batch of hints, and a read that is not among them.
+        let all = objects("hint", OBJECT_BATCH + 8);
+        let read = objects("read", 1);
+        let listener = Arc::new(Listener {
+            held: [all.clone(), read.clone()].concat(),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder::default());
+        let folders = Arc::new(HintingFolder {
+            link: fake_worker(fake.clone()),
+            reads: Mutex::new(Vec::new()),
+            hints: Mutex::new(wanted_of(&all)),
+        });
+        let (driver, _root) = driver(listener.lane(), folders.clone(), Seq::new());
+        let digests = |objects: &[Object]| objects.iter().map(|o| o.digest).collect::<Vec<_>>();
+        let mut state = PumpState::default();
+
+        let stored = driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(stored, OBJECT_BATCH, "a long read-ahead holds nothing up");
+        assert_eq!(
+            fake.written(),
+            digests(&all[..OBJECT_BATCH]),
+            "nearest first"
+        );
+
+        // A reader starts waiting. It is asked for by itself and before the rest,
+        // so whatever is slow about the rest does not count against it.
+        *lock(&folders.reads) = wanted_of(&read);
+        let fetches = calls_named(&listener.calls(), "fetch");
+        assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 9);
+        assert_eq!(calls_named(&listener.calls(), "fetch"), fetches + 2);
+        assert_eq!(fake.written()[OBJECT_BATCH], read[0].digest);
+        assert_eq!(
+            fake.written()[OBJECT_BATCH + 1..],
+            digests(&all[OBJECT_BATCH..])
+        );
+    }
+
+    #[test]
+    fn read_ahead_a_handle_took_back_is_asked_no_further() {
+        let all = objects("hint", 2 * OBJECT_BATCH);
+        let listener = Arc::new(Listener {
+            held: all.clone(),
+            ..Listener::default()
+        });
+        let fake = Arc::new(FakeFolder::default());
+        let folders = Arc::new(HintingFolder {
+            link: fake_worker(fake.clone()),
+            reads: Mutex::new(Vec::new()),
+            hints: Mutex::new(wanted_of(&all)),
+        });
+        let (driver, _root) = driver(listener.lane(), folders.clone(), Seq::new());
+        let mut state = PumpState::default();
+        driver.pump_round(&mut state, driver.wake.current());
+        assert_eq!(fake.written().len(), OBJECT_BATCH);
+        lock(&folders.hints).clear();
+        assert_eq!(driver.pump_round(&mut state, driver.wake.current()), 0);
+        assert_eq!(fake.written().len(), OBJECT_BATCH);
     }
 
     #[test]

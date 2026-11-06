@@ -376,6 +376,40 @@ class CommandLine(unittest.TestCase):
             android_e2e.parse_args(["--scenario", "no-such"])
         self.assertEqual(caught.exception.code, 2)
 
+    def test_release_pc_is_off_until_asked_for(self):
+        self.assertFalse(android_e2e.parse_args([]).release_pc)
+        self.assertTrue(android_e2e.parse_args(["--release-pc"]).release_pc)
+
+
+class WhichTkfs(unittest.TestCase):
+    def test_the_speed_scenario_always_measures_a_release_pc(self):
+        self.assertTrue(android_e2e.uses_release_pc("speed", False))
+        self.assertFalse(android_e2e.uses_release_pc("read", False))
+        self.assertTrue(android_e2e.uses_release_pc("read", True))
+
+    def test_each_profile_has_its_own_binary(self):
+        self.assertEqual(android_e2e.tkfs_binary().parent.name, "debug")
+        self.assertEqual(android_e2e.tkfs_binary(True).parent.name, "release")
+
+    def run_build(self, names, release_pc):
+        ran = []
+
+        def recording(argv, *_, **__):
+            ran.append([str(word) for word in argv])
+            return MagicMock()
+
+        with patch.object(android_e2e, "run_bounded", recording):
+            android_e2e.build(Path("logs"), names, release_pc)
+        return [" ".join(argv) for argv in ran if argv[0] == "cargo"]
+
+    def test_a_build_makes_only_the_tkfs_its_scenarios_use(self):
+        debug = "cargo build --locked --bin tkfs"
+        release = "cargo build --locked --release --bin tkfs"
+        self.assertEqual(self.run_build(["read"], False), [debug])
+        self.assertEqual(self.run_build(["speed"], False), [release])
+        self.assertEqual(self.run_build(["read"], True), [release])
+        self.assertEqual(self.run_build(["read", "speed"], False), [debug, release])
+
 
 class Bounds(unittest.TestCase):
     def test_a_poll_gives_up_at_its_bound_with_the_last_reason(self):

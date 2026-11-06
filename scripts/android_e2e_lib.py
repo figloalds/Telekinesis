@@ -382,18 +382,24 @@ class Device:
         return parse_rows(self._content("query", "--uri", uri).out)
 
     def content_read(self, doc: str, bound: float = PROVIDER_BOUND) -> bytes:
-        """The document's bytes, through the provider. They go through a file on the device:
-        on Windows `adb shell` turns LF into CRLF in its output, and `adb exec-out`, which does
-        not, mixes in any error."""
+        """The document's bytes, through the provider."""
+        return self.content_read_timed(doc, bound)[0]
+
+    def content_read_timed(self, doc: str, bound: float = PROVIDER_BOUND) -> tuple[bytes, float]:
+        """The document's bytes, through the provider, and the seconds that read took on the
+        device. They go through a file there: on Windows `adb shell` turns LF into CRLF in its
+        output, and `adb exec-out`, which does not, mixes in any error."""
         remote = f"{REMOTE_TMP}/tkfs_e2e_read"
+        started = time.monotonic()
         done = self._provider(f"content read --uri {shlex.quote(document_uri(doc))} > {remote}", bound=bound)
+        took = time.monotonic() - started
         try:
             if done.code != 0 or done.err:
                 raise ContentError(f"content read {doc}: {done.err or done.out}")
             with tempfile.TemporaryDirectory(prefix="tkfs-e2e-") as local:
                 target = Path(local) / "read"
                 self.adb("pull", remote, target, bound=bound).require_success()
-                return target.read_bytes()
+                return target.read_bytes(), took
         finally:
             self.shell("rm", "-f", remote)
 

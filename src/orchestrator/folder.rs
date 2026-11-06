@@ -239,10 +239,12 @@ struct WatchThread {
 impl WatchThread {
     /// Loops `link.watch(after)` and sends every result; ends once the stop
     /// flag is set, the link is closed or the receiver is gone. Each result's
-    /// demand replaces `demand`; a change to a non-empty set bumps the wake.
+    /// demand replaces `demand` and its hints `hints`; a change of either to a
+    /// non-empty set bumps the wake.
     fn start(
         link: Arc<WorkerLink>,
         demand: Arc<Mutex<Vec<(Digest, Kind)>>>,
+        hints: Arc<Mutex<Vec<(Digest, Kind)>>>,
         listeners: Listeners,
     ) -> std::io::Result<Self> {
         let (sender, results) = mpsc::channel();
@@ -258,17 +260,13 @@ impl WatchThread {
                     let failed = result.is_err();
                     let mut idle_demand = false;
                     if let Ok(watch) = &result {
-                        let changed = {
-                            let mut current = lock(&demand);
-                            let changed = *current != watch.demand;
-                            if changed {
-                                current.clone_from(&watch.demand);
-                            }
-                            changed
-                        };
-                        idle_demand = !watch.demand.is_empty() && watch.seq == after && !changed;
-                        if let (true, false, Some(wake)) =
-                            (changed, watch.demand.is_empty(), &listeners.wake)
+                        let changed = replaced(&demand, &watch.demand);
+                        let hinted = replaced(&hints, &watch.hints);
+                        let wanted = !watch.demand.is_empty() || !watch.hints.is_empty();
+                        idle_demand = wanted && watch.seq == after && !changed && !hinted;
+                        if ((changed && !watch.demand.is_empty())
+                            || (hinted && !watch.hints.is_empty()))
+                            && let Some(wake) = &listeners.wake
                         {
                             wake.bump();
                         }
@@ -287,6 +285,17 @@ impl WatchThread {
             })?;
         Ok(Self { results, stop })
     }
+}
+
+/// Makes `current` hold `latest`; whether that changed it.
+fn replaced(current: &Mutex<Vec<(Digest, Kind)>>, latest: &[(Digest, Kind)]) -> bool {
+    let mut current = lock(current);
+    let changed = *current != latest;
+    if changed {
+        current.clear();
+        current.extend_from_slice(latest);
+    }
+    changed
 }
 
 impl Drop for WatchThread {
@@ -318,6 +327,8 @@ pub struct Controller {
     heartbeat: Option<Value>,
     /// The running worker's latest object demand (its watch thread's).
     demand: Arc<Mutex<Vec<(Digest, Kind)>>>,
+    /// And the objects its readers are expected to want next.
+    hints: Arc<Mutex<Vec<(Digest, Kind)>>>,
     /// Bumped when that demand changes to a non-empty set.
     wake: Option<Arc<Seq>>,
     /// Told when the worker's feed moves or its readers are blocked.
@@ -359,6 +370,7 @@ impl Controller {
             watch: None,
             heartbeat: None,
             demand: Arc::new(Mutex::new(Vec::new())),
+            hints: Arc::new(Mutex::new(Vec::new())),
             wake: None,
             signals: None,
             last_beat: now,
@@ -395,6 +407,12 @@ impl Controller {
     /// `watch`; empty when it is not running.
     pub fn demand(&self) -> Vec<(Digest, Kind)> {
         lock(&self.demand).clone()
+    }
+
+    /// What the worker's readers are expected to want next, as its last `watch`
+    /// said; empty when it is not running.
+    pub fn hints(&self) -> Vec<(Digest, Kind)> {
+        lock(&self.hints).clone()
     }
 
     pub fn record(&self) -> &FolderRecord {
@@ -737,7 +755,13 @@ impl Controller {
             wake: self.wake.clone(),
             signals: self.signals.clone(),
         };
-        self.watch = match WatchThread::start(link.clone(), self.demand.clone(), listeners) {
+        let watching = WatchThread::start(
+            link.clone(),
+            self.demand.clone(),
+            self.hints.clone(),
+            listeners,
+        );
+        self.watch = match watching {
             Ok(watch) => Some(watch),
             Err(error) => {
                 event!(error, FOLDER_WATCH_START_FAILED, {
@@ -951,6 +975,7 @@ impl Controller {
         self.heartbeat = None;
         // A fresh set: the old watch thread may still write to its own.
         self.demand = Arc::new(Mutex::new(Vec::new()));
+        self.hints = Arc::new(Mutex::new(Vec::new()));
         self.watch_errors = 0;
     }
 }
@@ -1204,7 +1229,8 @@ mod tests {
             wake: Some(wake.clone()),
             signals: None,
         };
-        let watch = WatchThread::start(link.clone(), demand.clone(), listeners).unwrap();
+        let hints = Arc::new(Mutex::new(Vec::new()));
+        let watch = WatchThread::start(link.clone(), demand.clone(), hints, listeners).unwrap();
         assert_eq!(wake.wait_past(0, Duration::from_secs(5)), 1);
         assert_eq!(*lock(&demand), wanted);
         // The same demand again: no further wake, and the thread paces its
@@ -1213,6 +1239,58 @@ mod tests {
         assert_eq!(wake.current(), 1);
         let count = *lock(&watches);
         assert!((2..=12).contains(&count), "{count} watches in 600 ms");
+        drop(watch);
+        link.close();
+    }
+
+    #[test]
+    fn the_watch_thread_keeps_hints_wakes_the_pump_and_tells_no_peer() {
+        let hinted = vec![(Digest::bytes(b"chunk"), Kind::Chunk)];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        let watches = Arc::new(Mutex::new(0));
+        let (counted, body) = (
+            watches.clone(),
+            json!({"seq": 1, "heartbeat": {}, "demand": [], "hints": hinted}),
+        );
+        let handler: Arc<dyn Handler> = Arc::new(FnHandler(move |req: Incoming| {
+            *lock(&counted) += 1;
+            req.responder
+                .reply(json!({}), serde_json::to_vec(&body).unwrap());
+        }));
+        thread::spawn(move || {
+            let mut conns = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let accepted = session::accept_loopback(
+                    stream,
+                    Some(TOKEN),
+                    ConnOptions::for_role(LaneRole::Control),
+                );
+                if let Ok(conn) = accepted {
+                    conn.serve(handler.clone());
+                    conns.push(conn);
+                }
+            }
+        });
+        let link = WorkerLink::connect(&ready(&address, PID), 1).unwrap();
+        let (demand, hints) = (
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let (told, listeners, wake) = told_listeners();
+        let watch = WatchThread::start(link.clone(), demand.clone(), hints.clone(), listeners);
+        let watch = watch.unwrap();
+        assert_eq!(wake.wait_past(0, Duration::from_secs(5)), 1);
+        assert_eq!(*lock(&hints), hinted);
+        assert!(lock(&demand).is_empty());
+        // The same hints again: no further wake, paced watches, and no reader is
+        // waiting, so no peer is told of any.
+        thread::sleep(Duration::from_millis(600));
+        assert_eq!(wake.current(), 1);
+        let count = *lock(&watches);
+        assert!((2..=12).contains(&count), "{count} watches in 600 ms");
+        assert!(lock(&told.demanding).is_empty());
         drop(watch);
         link.close();
     }
@@ -1239,6 +1317,7 @@ mod tests {
             feed,
             heartbeat: Value::Null,
             demand,
+            hints: Vec::new(),
         }
     }
 

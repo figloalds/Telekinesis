@@ -2,6 +2,7 @@
 
     python scripts/android_e2e.py --scenario read
     python scripts/android_e2e.py --scenario all --skip-build --keep-emulator
+    python scripts/android_e2e.py --scenario read --release-pc
 
 It drives the app from outside with adb: `content` reaches the provider, and `content call`
 with method tkfs.manage reaches the orchestrator inside it (debug builds only). It never
@@ -358,34 +359,66 @@ def scenario_sync(s: Session) -> None:
     s.check("and the PC was asked nothing", asked_after == asked_before, f"{asked_before} -> {asked_after}")
 
 
+SPEED_FILE_BYTES = 64 * 1024 * 1024
+SPEED_WANTED_MIB_S = 10
+
+
+def scenario_speed(s: Session) -> None:
+    """A first read of a new 64 MiB random file through the provider, from a release-built PC. It
+    crosses the emulator's own network, so it says nothing of Wi-Fi. The second read comes from
+    the phone, which shows what the rest of the path allows."""
+    content = random.Random(11).randbytes(SPEED_FILE_BYTES)
+    folder = s.folder_with({"big.bin": content})
+    read, took = s.device.content_read_timed(folder.doc("big.bin"))
+    s.check("the file reads the same on the phone", sha256(read) == sha256(content), f"{len(read)} bytes")
+    _, again = s.device.content_read_timed(folder.doc("big.bin"))
+    rate = len(read) / (1024 * 1024) / took
+    cached = len(read) / (1024 * 1024) / again
+    s.check(f"a first read goes at least {SPEED_WANTED_MIB_S} MiB/s", rate >= SPEED_WANTED_MIB_S,
+            f"{rate:.1f} MiB/s ({took:.2f} s) over the emulator's network, not Wi-Fi; {cached:.1f} MiB/s read again")
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
     "ui_folders": scenario_ui_folders,
     "read": scenario_read,
     "cold_start": scenario_cold_start,
     "harness": scenario_harness,
     "sync": scenario_sync,
+    "speed": scenario_speed,
 }
+
+# A debug PC spends its time on its own JSON, so these would measure that.
+RELEASE_PC_SCENARIOS = {"speed"}
 
 
 # ---- running ------------------------------------------------------------------------------
 
 
-def build(run_dir: Path) -> None:
-    """The x86_64 APK for the emulator and the PC's tkfs, each logging to a file."""
+def uses_release_pc(name: str, release_pc: bool) -> bool:
+    return release_pc or name in RELEASE_PC_SCENARIOS
+
+
+def build(run_dir: Path, names: list[str], release_pc: bool) -> None:
+    """The x86_64 APK for the emulator and each tkfs the scenarios use on the PC, each logging
+    to a file."""
     python = sys.executable
     run_bounded([python, ROOT / "scripts/build_android.py", "--abi", "x86_64"], BUILD_BOUND, cwd=ROOT,
                 log=run_dir / "build-android.log").require_success()
-    run_bounded(["cargo", "build", "--locked", "--bin", "tkfs"], BUILD_BOUND, cwd=ROOT,
-                log=run_dir / "build-tkfs.log").require_success()
+    for release in sorted({uses_release_pc(name, release_pc) for name in names}):
+        profile = ["--release"] if release else []
+        log = run_dir / ("build-tkfs-release.log" if release else "build-tkfs.log")
+        run_bounded(["cargo", "build", "--locked", *profile, "--bin", "tkfs"], BUILD_BOUND, cwd=ROOT,
+                    log=log).require_success()
 
 
-def tkfs_binary() -> Path:
-    return ROOT / "target/debug" / ("tkfs.exe" if os.name == "nt" else "tkfs")
+def tkfs_binary(release: bool = False) -> Path:
+    return ROOT / "target" / ("release" if release else "debug") / ("tkfs.exe" if os.name == "nt" else "tkfs")
 
 
-def run_scenario(name: str, device: Device, report: Report, run_dir: Path, reset: bool) -> None:
+def run_scenario(name: str, device: Device, report: Report, run_dir: Path, reset: bool,
+                 release_pc: bool = False) -> None:
     report.begin(name)
-    pc = PcHost(tkfs_binary(), run_dir / name)
+    pc = PcHost(tkfs_binary(uses_release_pc(name, release_pc)), run_dir / name)
     error = None
     try:
         device.clear_logcat()
@@ -420,6 +453,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--keep-emulator", action="store_true", help="Leave an emulator this run booted running")
     parser.add_argument("--skip-build", action="store_true", help="Use the APK and tkfs already built")
     parser.add_argument("--no-reset", action="store_true", help="Keep the app's data: no pm clear")
+    parser.add_argument("--release-pc", action="store_true",
+                        help=f"Build and use target/release/tkfs on the PC, as {', '.join(RELEASE_PC_SCENARIOS)} always do")
     args = parser.parse_args(argv)
     if args.scenario != "all" and args.scenario not in SCENARIOS:
         parser.error(f"unknown scenario {args.scenario!r}; choose from {', '.join(SCENARIOS)}, all")
@@ -438,7 +473,7 @@ def main() -> int:
     emulator = None
     try:
         if not args.skip_build:
-            build(run_dir)
+            build(run_dir, names, args.release_pc)
         sdk = find_sdk()
         adb = sdk / "platform-tools" / ("adb.exe" if os.name == "nt" else "adb")
         tool = sdk / "emulator" / ("emulator.exe" if os.name == "nt" else "emulator")
@@ -447,7 +482,7 @@ def main() -> int:
         report.data["device"] = {"serial": device.serial, "avd": args.avd, "booted_here": emulator.booted_here}
         device.install(APK)
         for name in names:
-            run_scenario(name, device, report, run_dir, reset=not args.no_reset)
+            run_scenario(name, device, report, run_dir, reset=not args.no_reset, release_pc=args.release_pc)
     except (HarnessError, RuntimeError, OSError) as error:
         report.fail(str(error))
     except Exception:  # A bug here must still stop the emulator and finish the report.

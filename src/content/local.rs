@@ -630,6 +630,80 @@ mod tests {
         }
         Ok(())
     }
+    /// Records what it is asked to hint. A hint must wait for nothing, so it
+    /// also counts fetches.
+    #[derive(Default)]
+    struct RecordingFetcher {
+        hinted: Mutex<Vec<(Digest, Kind)>>,
+        fetches: Mutex<usize>,
+    }
+    impl ObjectFetcher for RecordingFetcher {
+        fn fetch(&self, _objects: &[(Digest, Kind)]) -> Result<()> {
+            *guard(&self.fetches) += 1;
+            anyhow::bail!("OBJECT_MISSING")
+        }
+        fn hint(&self, objects: &[(Digest, Kind)]) {
+            guard(&self.hinted).extend_from_slice(objects);
+        }
+    }
+    #[test]
+    fn hint_range_names_the_missing_chunks_of_a_range_in_order() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let content = LocalContent::open(home.path())?;
+        let fetcher = Arc::new(RecordingFetcher::default());
+        content.set_fetcher(fetcher.clone());
+        let chunk = |n: u8| vec![n; CHUNK_SIZE as usize];
+        let held = content.packs.put(Kind::Chunk, &chunk(1))?;
+        // Absent, and one of them twice: a file may repeat a chunk.
+        let absent = [2, 3, 4].map(|n| Digest::bytes(&chunk(n)));
+        let chunks = vec![held, absent[0], absent[1], absent[0], absent[2]];
+        let len = 4 * CHUNK_SIZE + 9;
+        let manifest = Manifest { len, chunks }.encode()?;
+        let reference = FileContentRef::new(
+            ContentKind::Manifest,
+            content.packs.put(Kind::Manifest, &manifest)?,
+            len,
+        )?;
+        let want = |digests: &[Digest]| {
+            digests
+                .iter()
+                .map(|digest| (*digest, Kind::Chunk))
+                .collect::<Vec<_>>()
+        };
+        // From inside the held chunk to the start of the third absent one.
+        assert_eq!(
+            content.hint_range(&reference, 7, 2 * CHUNK_SIZE)?,
+            want(&absent[..2])
+        );
+        assert_eq!(*guard(&fetcher.hinted), want(&absent[..2]));
+        // Past the end is cut to the end, and a repeated chunk is named once.
+        assert_eq!(
+            content.hint_range(&reference, CHUNK_SIZE, 100 * CHUNK_SIZE)?,
+            want(&absent)
+        );
+        guard(&fetcher.hinted).clear();
+        for (offset, count) in [(0, 0), (len, CHUNK_SIZE), (len + 1, 1)] {
+            assert!(content.hint_range(&reference, offset, count)?.is_empty());
+        }
+        assert!(guard(&fetcher.hinted).is_empty());
+        Ok(())
+    }
+    #[test]
+    fn hint_range_of_an_absent_manifest_hints_nothing_and_does_not_wait() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let content = LocalContent::open(home.path())?;
+        let fetcher = Arc::new(RecordingFetcher::default());
+        content.set_fetcher(fetcher.clone());
+        let reference = FileContentRef::new(
+            ContentKind::Manifest,
+            Digest::bytes(b"not here"),
+            2 * CHUNK_SIZE,
+        )?;
+        assert!(content.hint_range(&reference, 0, CHUNK_SIZE)?.is_empty());
+        assert_eq!(*guard(&fetcher.fetches), 0);
+        assert!(guard(&fetcher.hinted).is_empty());
+        Ok(())
+    }
     #[test]
     fn gc_never_removes_a_pinned_object() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -812,6 +886,10 @@ pub(crate) fn read_exact_at(
 /// be fetched independently without downloading the rest of the file.
 pub trait ObjectFetcher: Send + Sync {
     fn fetch(&self, objects: &[(Digest, Kind)]) -> Result<()>;
+    /// Objects a reader is expected to want soon. Nothing waits for them.
+    fn hint(&self, _objects: &[(Digest, Kind)]) {}
+    /// A reader takes back what it hinted.
+    fn unhint(&self, _objects: &[(Digest, Kind)]) {}
 }
 #[derive(Clone)]
 pub struct LocalContent {
@@ -927,6 +1005,46 @@ impl LocalContent {
             done += count;
         }
         Ok(())
+    }
+    /// Hints the chunks of the range, cut to the file, that are not here yet: what
+    /// a reader is expected to want next, nearest first. Returns them, for
+    /// [`Self::unhint`]. Nothing waits for this: with the manifest not here there
+    /// is nothing to name.
+    pub fn hint_range(
+        &self,
+        reference: &FileContentRef,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<(Digest, Kind)>> {
+        let end = offset.saturating_add(len).min(reference.total_len);
+        let Some(fetcher) = guard(&self.fetcher).clone() else {
+            return Ok(Vec::new());
+        };
+        if offset >= end
+            || (reference.kind == ContentKind::Manifest
+                && !self.packs.contains(reference.digest)?)
+        {
+            return Ok(Vec::new());
+        }
+        let range = (offset / CHUNK_SIZE) as usize..end.div_ceil(CHUNK_SIZE) as usize;
+        let mut seen = BTreeSet::new();
+        let mut missing = Vec::new();
+        for digest in self.range_chunks(reference, range)? {
+            if seen.insert(digest) && !self.packs.contains(digest)? {
+                missing.push((digest, Kind::Chunk));
+            }
+        }
+        fetcher.hint(&missing);
+        Ok(missing)
+    }
+    /// Takes back what [`Self::hint_range`] returned.
+    pub fn unhint(&self, objects: &[(Digest, Kind)]) {
+        if objects.is_empty() {
+            return;
+        }
+        if let Some(fetcher) = guard(&self.fetcher).clone() {
+            fetcher.unhint(objects);
+        }
     }
     pub fn pin(&self, reference: &FileContentRef) -> Result<Pin> {
         let root_pin = self.packs.pin([reference.digest]);

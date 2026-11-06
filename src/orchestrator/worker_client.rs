@@ -25,7 +25,8 @@ pub const WATCH_WAIT_MS: u64 = 2000;
 pub const WATCH_DEADLINE: Duration = Duration::from_secs(4);
 
 /// A `watch` reply: the worker's wake-up counter, its latest feed position,
-/// its health summary and the objects its readers are waiting for.
+/// its health summary, the objects its readers are waiting for and those they
+/// are expected to want next.
 #[derive(Debug, Deserialize)]
 pub struct Watch {
     pub seq: u64,
@@ -35,6 +36,9 @@ pub struct Watch {
     pub feed: u64,
     pub heartbeat: Value,
     pub demand: Vec<(Digest, Kind)>,
+    /// Read-ahead, nearest first. An adopted worker from before this field has none.
+    #[serde(default)]
+    pub hints: Vec<(Digest, Kind)>,
 }
 
 pub struct WorkerLink {

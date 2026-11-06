@@ -13,7 +13,11 @@ use std::{
 };
 use support::daemon::{TestDaemon, run_tkfs};
 use tempfile::TempDir;
-use tkfs::{model::errors::code_of, orchestrator::embedded::Host};
+use tkfs::{
+    model::{content::Digest, errors::code_of},
+    orchestrator::{control, demand::Demand, embedded::Host, sync::OBJECT_BATCH},
+    runtime::{Engine, READ_AHEAD},
+};
 
 const FOLDER_COMMAND: Duration = Duration::from_secs(60);
 const REPLICATED: Duration = Duration::from_secs(60);
@@ -58,50 +62,104 @@ fn folder(state: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// A phone that paired with a PC and received its folder of `files`, with nothing
+/// downloaded yet.
+struct Phone {
+    pc: TestDaemon,
+    _home: TempDir,
+    host: Arc<Host>,
+    /// The folder's state directory here.
+    state: PathBuf,
+    engine: Arc<Engine>,
+}
+
+impl Phone {
+    fn with(files: &[(&str, &str)]) -> Result<Self> {
+        let pc = TestDaemon::start()?;
+        let shared = pc.manage(&["create", "Shared", "--headless"])?;
+        let repo = shared["repo"].as_str().context("no repo")?.to_owned();
+        pc.wait_phase("Shared", "Running", REPLICATED)?;
+        for (name, content) in files {
+            let source: PathBuf = pc.home().join(format!("source-{name}"));
+            fs::write(&source, content)?;
+            folder(
+                &pc.state_dir("Shared")?,
+                &["import", name, source.to_str().unwrap()],
+            )?;
+        }
+        let code = pc.manage(&["reset-pairing-code"])?["code"]
+            .as_str()
+            .context("no code")?
+            .to_owned();
+        let endpoint = pc.listen_endpoint()?;
+
+        let (home, host) = host()?;
+        let daemon = host.daemon()?;
+        daemon.execute(
+            "pair",
+            &json!({"endpoint": endpoint, "code": code, "connections": 2}),
+        )?;
+        let received = daemon.execute(
+            "receive",
+            &json!({"endpoint": endpoint, "repo": repo, "label": "Shared", "mount": null}),
+        )?;
+        let id = received["id"].as_str().context("no folder id")?.to_owned();
+        let engine = host.engine(&id)?;
+        let synced = daemon.execute("sync-now", &json!({"state": id}))?;
+        ensure!(synced["folders"][0]["error"].is_null(), "{synced}");
+        let inspected = daemon.execute("inspect", &json!({"state": id}))?;
+        let state = inspected["record"]["state"]
+            .as_str()
+            .with_context(|| format!("no state: {inspected}"))?
+            .into();
+        Ok(Self {
+            pc,
+            _home: home,
+            host,
+            state,
+            engine,
+        })
+    }
+
+    /// A read handle on `path`, once its name came across.
+    fn open(&self, path: &str) -> Result<u64> {
+        let end = Instant::now() + REPLICATED;
+        loop {
+            match self.engine.open_file(path, false, false, false) {
+                Ok(token) => return Ok(token),
+                Err(error) => {
+                    ensure!(Instant::now() < end, "{path} never appeared: {error:#}");
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    }
+
+    /// How many of the file's chunks are here.
+    fn chunks_here(&self, token: u64) -> Result<usize> {
+        let (entry, _) = self.engine.info(token)?;
+        let reference = entry.content.context("no content")?;
+        let content = self.engine.working.content();
+        let chunks: Vec<Digest> = content.chunks(&reference)?;
+        let mut here = 0;
+        for digest in chunks {
+            here += usize::from(content.packs.contains(digest)?);
+        }
+        Ok(here)
+    }
+
+    fn stop(self) -> Result<()> {
+        drop(self.engine);
+        self.host.stop()?;
+        self.pc.shutdown()
+    }
+}
+
 #[test]
 fn embedded_host_pairs_receives_and_reads_through_the_engine() -> Result<()> {
     let content = text(200 * 1024, 11);
-    let pc = TestDaemon::start()?;
-    let shared = pc.manage(&["create", "Shared", "--headless"])?;
-    let repo = shared["repo"].as_str().context("no repo")?.to_owned();
-    pc.wait_phase("Shared", "Running", REPLICATED)?;
-    let source: PathBuf = pc.home().join("source-a.txt");
-    fs::write(&source, &content)?;
-    folder(
-        &pc.state_dir("Shared")?,
-        &["import", "a.txt", source.to_str().unwrap()],
-    )?;
-    let code = pc.manage(&["reset-pairing-code"])?["code"]
-        .as_str()
-        .context("no code")?
-        .to_owned();
-    let endpoint = pc.listen_endpoint()?;
-
-    let (_home, host) = host()?;
-    let daemon = host.daemon()?;
-    daemon.execute(
-        "pair",
-        &json!({"endpoint": endpoint, "code": code, "connections": 2}),
-    )?;
-    let received = daemon.execute(
-        "receive",
-        &json!({"endpoint": endpoint, "repo": repo, "label": "Shared", "mount": null}),
-    )?;
-    let id = received["id"].as_str().context("no folder id")?.to_owned();
-    let engine = host.engine(&id)?;
-    let synced = daemon.execute("sync-now", &json!({"state": id}))?;
-    ensure!(synced["folders"][0]["error"].is_null(), "{synced}");
-
-    let end = Instant::now() + REPLICATED;
-    let token = loop {
-        match engine.open_file("/a.txt", false, false, false) {
-            Ok(token) => break token,
-            Err(error) => {
-                ensure!(Instant::now() < end, "a.txt never appeared: {error:#}");
-                std::thread::sleep(Duration::from_millis(250));
-            }
-        }
-    };
+    let phone = Phone::with(&[("a.txt", &content)])?;
+    let (engine, token) = (phone.engine.clone(), phone.open("/a.txt")?);
     let mut bytes = Vec::new();
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
@@ -113,15 +171,193 @@ fn embedded_host_pairs_receives_and_reads_through_the_engine() -> Result<()> {
     }
     engine.close(token)?;
     ensure!(bytes == content.as_bytes(), "{} bytes read", bytes.len());
+    drop(engine);
 
     let began = Instant::now();
-    host.stop()?;
+    phone.host.stop()?;
     ensure!(
         began.elapsed() < Duration::from_secs(40),
         "stop took {:?}",
         began.elapsed()
     );
-    pc.shutdown()
+    phone.pc.shutdown()
+}
+
+/// What an unoptimized build gets is the number-array JSON of each chunk, about
+/// 57 ms a chunk here: its pump is the limit, not the wake-ups. So only an
+/// optimized build shows the whole gain.
+const FASTER_THAN_PLAIN: f64 = if cfg!(debug_assertions) { 1.3 } else { 5.0 };
+
+const READ_BUFFER: usize = 128 * 1024;
+
+/// How long `read` takes through a file of `content`, checking what it gets.
+fn time_reading(
+    engine: &Engine,
+    token: u64,
+    read: fn(&Engine, u64, u64, &mut [u8]) -> Result<usize>,
+    content: &str,
+) -> Result<Duration> {
+    let mut buffer = vec![0u8; READ_BUFFER];
+    let mut done = 0;
+    let began = Instant::now();
+    while done < content.len() {
+        ensure!(
+            began.elapsed() < Duration::from_secs(240),
+            "only {done} bytes in {:?}",
+            began.elapsed()
+        );
+        let count = read(engine, token, done as u64, &mut buffer)?;
+        ensure!(count > 0, "nothing at {done}");
+        ensure!(
+            buffer[..count] == content.as_bytes()[done..done + count],
+            "wrong bytes at {done}"
+        );
+        done += count;
+    }
+    Ok(began.elapsed())
+}
+
+fn mib_per_second(bytes: usize, took: Duration) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0) / took.as_secs_f64()
+}
+
+#[test]
+fn a_sequential_first_read_is_at_least_five_times_faster_than_plain_reads() -> Result<()> {
+    const LEN: usize = 32 * 1024 * 1024;
+    let (plain, sequential) = (text(LEN, 31), text(LEN, 37));
+    let phone = Phone::with(&[("plain.bin", &plain), ("sequential.bin", &sequential)])?;
+
+    let token = phone.open("/plain.bin")?;
+    let plain_took = time_reading(&phone.engine, token, Engine::read, &plain)?;
+    phone.engine.close(token)?;
+    let token = phone.open("/sequential.bin")?;
+    let took = time_reading(&phone.engine, token, Engine::read_sequential, &sequential)?;
+    phone.engine.close(token)?;
+
+    let (rate, plain_rate) = (mib_per_second(LEN, took), mib_per_second(LEN, plain_took));
+    println!("plain {plain_rate:.2} MiB/s, sequential {rate:.2} MiB/s");
+    ensure!(
+        rate >= plain_rate * FASTER_THAN_PLAIN,
+        "plain {plain_rate:.2} MiB/s, sequential {rate:.2} MiB/s: \
+         wanted {FASTER_THAN_PLAIN} times as fast"
+    );
+    phone.stop()
+}
+
+#[test]
+fn a_partial_read_does_not_fetch_the_whole_file() -> Result<()> {
+    const LEN: usize = 64 * 1024 * 1024;
+    const READ: usize = 1024 * 1024;
+    const CHUNK: usize = 64 * 1024;
+    let content = text(LEN, 41);
+    let phone = Phone::with(&[("big.bin", &content)])?;
+    let token = phone.open("/big.bin")?;
+    let mut buffer = vec![0u8; READ_BUFFER];
+    let mut done = 0;
+    while done < READ {
+        done += phone
+            .engine
+            .read_sequential(token, done as u64, &mut buffer)?;
+    }
+    let most = (READ + READ_AHEAD as usize + OBJECT_BATCH * CHUNK) / CHUNK;
+    // Read-ahead goes on after the read, for as long as it has anything to get.
+    // On a slow build that is more than the 3 s that are enough on a fast one.
+    let settled = Duration::from_secs(3);
+    let end = Instant::now() + REPLICATED;
+    let (mut here, mut grew) = (phone.chunks_here(token)?, Instant::now());
+    while grew.elapsed() < settled {
+        ensure!(Instant::now() < end, "still fetching: {here} chunks");
+        std::thread::sleep(Duration::from_millis(100));
+        let now = phone.chunks_here(token)?;
+        if now != here {
+            (here, grew) = (now, Instant::now());
+        }
+        ensure!(here <= most, "{here} chunks, at most {most} wanted");
+    }
+    // Read-ahead did run: this is more than the read touched.
+    ensure!(here * CHUNK > READ, "only {here} chunks");
+    phone.engine.close(token)?;
+    phone.stop()
+}
+
+/// A phone with a big file open and nobody left to fetch from: it holds the first
+/// chunk, and then a read at the start of the file hints a window no one can supply.
+struct Stranded {
+    _home: TempDir,
+    host: Arc<Host>,
+    engine: Arc<Engine>,
+    token: u64,
+    state: PathBuf,
+}
+
+impl Stranded {
+    fn hinting() -> Result<Self> {
+        let content = text(8 * 1024 * 1024, 43);
+        let phone = Phone::with(&[("big.bin", &content)])?;
+        let token = phone.open("/big.bin")?;
+        let mut buffer = vec![0u8; 1024];
+        phone.engine.read(token, 0, &mut buffer)?;
+        phone.pc.shutdown()?;
+        phone.engine.read_sequential(token, 0, &mut buffer)?;
+        Ok(Self {
+            _home: phone._home,
+            host: phone.host,
+            engine: phone.engine,
+            token,
+            state: phone.state,
+        })
+    }
+
+    /// How many hints the folder's worker has listed for its pump.
+    fn listed_hints(&self) -> Result<usize> {
+        let asked = json!({"after_seq": u64::MAX, "wait_ms": 0});
+        let watch = control::request(&self.state, "watch", asked)?;
+        watch["hints"].as_array().map(Vec::len).context("no hints")
+    }
+
+    fn close_and_stop(self) -> Result<()> {
+        self.engine.close(self.token)?;
+        drop(self.engine);
+        self.host.stop()
+    }
+}
+
+#[test]
+fn an_idle_open_handle_stops_asking_after_the_hint_ttl() -> Result<()> {
+    let phone = Stranded::hinting()?;
+    let began = Instant::now();
+    ensure!(phone.listed_hints()? > 0, "nothing hinted");
+    // Asking still, while the hints last.
+    let end = began + Demand::HINT_TTL - Duration::from_secs(5);
+    while Instant::now() < end {
+        ensure!(
+            phone.listed_hints()? > 0,
+            "hints went after {:?}",
+            began.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // And no longer, with the handle still open.
+    let end = began + Demand::HINT_TTL + Duration::from_secs(5);
+    while phone.listed_hints()? > 0 {
+        ensure!(
+            Instant::now() < end,
+            "still hinted at {:?}",
+            began.elapsed()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    phone.close_and_stop()
+}
+
+#[test]
+fn closing_a_handle_takes_back_its_read_ahead() -> Result<()> {
+    let phone = Stranded::hinting()?;
+    ensure!(phone.listed_hints()? > 0, "nothing hinted");
+    phone.engine.close(phone.token)?;
+    ensure!(phone.listed_hints()? == 0, "hints outlived the handle");
+    drop(phone.engine);
+    phone.host.stop()
 }
 
 /// The provider keeps a token across a worker restart and calls whatever engine

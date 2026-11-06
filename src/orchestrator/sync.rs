@@ -17,9 +17,9 @@
 //!   once the scan reached its end (the next page without `after` starts
 //!   over).
 //! - `objects.wanted {repo, limit, exclude?, after?}` → [`WantedPage`]
-//!   `{demand, missing, cursor}`: what this worker's readers are blocked on
-//!   (at most [`BATCH`], whatever `limit` is) and an `objects.missing` page
-//!   (`limit` 0: none).
+//!   `{demand, missing, cursor}`: what this worker's readers are blocked on,
+//!   then what they hinted (at most [`BATCH`], whatever `limit` is) and an
+//!   `objects.missing` page (`limit` 0: none).
 //! - `objects.fetch {repo}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`,
 //!   at most [`OBJECT_BATCH`] objects, in request order, absent ones left
 //!   out. The reply is cut to fit the byte bounds, never refused for size

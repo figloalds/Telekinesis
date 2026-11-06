@@ -1264,6 +1264,7 @@ impl SyncFolders for Directory {
                     repo: record.repo.clone(),
                     link: controller.link()?,
                     demand: controller.demand(),
+                    hints: controller.hints(),
                 })
             })
             .collect()

@@ -143,7 +143,7 @@ pub fn heartbeat(engine: &Engine) -> Result<Value> {
     }))
 }
 
-/// `watch {after_seq, wait_ms}` → `{seq, feed, heartbeat, demand}`. Returns at
+/// `watch {after_seq, wait_ms}` → `{seq, feed, heartbeat, demand, hints}`. Returns at
 /// once when `seq > after_seq` or objects are wanted; otherwise waits at most
 /// `min(wait_ms, WATCH_MAX_WAIT_MS)` for the next wake-up. `feed` is the journal's
 /// latest position. It moves only when the journal does, unlike `seq`, which the
@@ -158,11 +158,13 @@ pub fn watch(engine: &Engine, seq: &Seq, demand: &Demand, p: &Value) -> Result<V
         seq.wait_past(after, Duration::from_millis(wait))
     };
     let feed = lock(&engine.store).feed_position()?;
+    let (reads, hints) = demand.listed();
     Ok(json!({
         "seq": seq,
         "feed": feed,
         "heartbeat": heartbeat(engine)?,
-        "demand": demand.pending(),
+        "demand": reads,
+        "hints": hints,
     }))
 }
 

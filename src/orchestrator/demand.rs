@@ -4,6 +4,11 @@
 //! every second and [`Demand`] bumps it whenever a read needs objects the
 //! worker does not have. The orchestrator answers demand by writing the
 //! objects into the worker's packs, which calls [`Demand::arrived`].
+//!
+//! A sequential reader also hints what it will want next. A read that finds its
+//! chunk already here costs no wake-up, and one wake-up then brings a window of
+//! chunks and not only what one read touched. No one waits for a hint, and it
+//! lasts [`Demand::HINT_TTL`], so a viewer left open stops asking.
 use crate::{
     content::{Kind, ObjectFetcher, PackStore},
     model::content::Digest,
@@ -96,10 +101,30 @@ impl Seq {
     }
 }
 
-/// Objects some reader is waiting for, keyed by digest; the count is the
-/// number of waiting fetches.
+type Objects = Vec<(Digest, Kind)>;
+
+/// A chunk a reader is expected to want soon.
+struct Hint {
+    kind: Kind,
+    /// How many times it was hinted and not taken back: once per open handle.
+    holders: usize,
+    expires: Instant,
+    /// Its place among the hints: a reader's nearest chunks are hinted first.
+    order: u64,
+}
+
+#[derive(Default)]
+struct Wanted {
+    /// What readers are waiting for, with the number of waiting fetches.
+    reads: BTreeMap<Digest, (Kind, usize)>,
+    hints: BTreeMap<Digest, Hint>,
+    /// How many hints came so far, which gives each its [`Hint::order`].
+    hinted: u64,
+}
+
+/// Objects some reader is waiting for, and those it hinted, keyed by digest.
 pub struct Demand {
-    wanted: Mutex<BTreeMap<Digest, (Kind, usize)>>,
+    wanted: Mutex<Wanted>,
     cv: Condvar,
     seq: Arc<Seq>,
     packs: PackStore,
@@ -108,30 +133,87 @@ pub struct Demand {
 impl Demand {
     /// How long a read waits for the orchestrator to supply its objects.
     pub const FETCH_WAIT: Duration = Duration::from_secs(10);
+    /// How long a hint lasts unless it is hinted again.
+    pub const HINT_TTL: Duration = Duration::from_secs(15);
+    /// The most hints listed at once.
+    pub const HINT_PENDING: usize = 256;
 
     pub fn new(seq: Arc<Seq>, packs: PackStore) -> Arc<Self> {
         Arc::new(Self {
-            wanted: Mutex::new(BTreeMap::new()),
+            wanted: Mutex::new(Wanted::default()),
             cv: Condvar::new(),
             seq,
             packs,
         })
     }
 
-    pub fn pending(&self) -> Vec<(Digest, Kind)> {
-        lock(&self.wanted)
+    /// What readers are waiting for, then what they hinted.
+    pub fn pending(&self) -> Objects {
+        let (mut reads, hints) = self.listed();
+        reads.extend(hints);
+        reads
+    }
+
+    /// What readers are waiting for, and the unexpired hints in the order they
+    /// came, at most [`Self::HINT_PENDING`], without what a reader waits for.
+    pub fn listed(&self) -> (Objects, Objects) {
+        self.listed_at(Instant::now())
+    }
+
+    fn listed_at(&self, now: Instant) -> (Objects, Objects) {
+        let mut wanted = lock(&self.wanted);
+        wanted.hints.retain(|_, hint| hint.expires > now);
+        let reads = wanted
+            .reads
             .iter()
             .map(|(digest, (kind, _))| (*digest, *kind))
-            .collect()
+            .collect();
+        let mut hints: Vec<_> = wanted
+            .hints
+            .iter()
+            .filter(|(digest, _)| !wanted.reads.contains_key(*digest))
+            .collect();
+        hints.sort_by_key(|(_, hint)| hint.order);
+        let hints = hints
+            .into_iter()
+            .take(Self::HINT_PENDING)
+            .map(|(digest, hint)| (*digest, hint.kind))
+            .collect();
+        (reads, hints)
     }
 
     /// Objects were stored: stop advertising them and wake their readers.
     pub fn arrived(&self, digests: &[Digest]) {
         let mut wanted = lock(&self.wanted);
         for digest in digests {
-            wanted.remove(digest);
+            wanted.reads.remove(digest);
+            wanted.hints.remove(digest);
         }
         self.cv.notify_all();
+    }
+
+    fn hint_at(&self, objects: &[(Digest, Kind)], now: Instant) {
+        if objects.is_empty() {
+            return;
+        }
+        let mut guard = lock(&self.wanted);
+        let wanted = &mut *guard;
+        // An expired hint is a new one: its holders are gone.
+        wanted.hints.retain(|_, hint| hint.expires > now);
+        let expires = now + Self::HINT_TTL;
+        for (digest, kind) in objects {
+            wanted.hinted += 1;
+            let hint = wanted.hints.entry(*digest).or_insert(Hint {
+                kind: *kind,
+                holders: 0,
+                expires,
+                order: wanted.hinted,
+            });
+            hint.holders += 1;
+            hint.expires = expires;
+        }
+        drop(guard);
+        self.seq.bump();
     }
 
     fn fetch_within(&self, objects: &[(Digest, Kind)], wait: Duration) -> Result<()> {
@@ -150,7 +232,7 @@ impl Demand {
         }
         let mut wanted = lock(&self.wanted);
         for (digest, kind) in &registered {
-            wanted.entry(*digest).or_insert((*kind, 0)).1 += 1;
+            wanted.reads.entry(*digest).or_insert((*kind, 0)).1 += 1;
         }
         drop(wanted);
         self.seq.bump();
@@ -187,10 +269,10 @@ impl Demand {
                 .0;
         };
         for (digest, _) in &registered {
-            if let Some(entry) = wanted.get_mut(digest) {
+            if let Some(entry) = wanted.reads.get_mut(digest) {
                 entry.1 = entry.1.saturating_sub(1);
                 if entry.1 == 0 {
-                    wanted.remove(digest);
+                    wanted.reads.remove(digest);
                 }
             }
         }
@@ -203,6 +285,27 @@ impl ObjectFetcher for Demand {
     /// is in the packs, or fails `OBJECT_MISSING` after [`Demand::FETCH_WAIT`].
     fn fetch(&self, objects: &[(Digest, Kind)]) -> Result<()> {
         self.fetch_within(objects, Self::FETCH_WAIT)
+    }
+
+    /// Lists the objects after what readers wait for, for [`Demand::HINT_TTL`]
+    /// from now, and wakes `watch`. Hinting one again refreshes it, and a handle
+    /// holds it until [`Self::unhint`], so it says each object once at a time.
+    fn hint(&self, objects: &[(Digest, Kind)]) {
+        self.hint_at(objects, Instant::now());
+    }
+
+    /// Takes back one hint of each object. One nobody holds any more is no
+    /// longer listed; one that expired or arrived is already gone.
+    fn unhint(&self, objects: &[(Digest, Kind)]) {
+        let mut wanted = lock(&self.wanted);
+        for (digest, _) in objects {
+            if let Some(hint) = wanted.hints.get_mut(digest) {
+                hint.holders = hint.holders.saturating_sub(1);
+                if hint.holders == 0 {
+                    wanted.hints.remove(digest);
+                }
+            }
+        }
     }
 }
 
@@ -308,6 +411,104 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().starts_with("OBJECT_MISSING"), "{error}");
         assert!(demand.pending().is_empty());
+        Ok(())
+    }
+
+    fn chunks(name: &str, count: usize) -> Vec<(Digest, Kind)> {
+        (0..count)
+            .map(|index| {
+                (
+                    Digest::bytes(format!("{name}{index}").as_bytes()),
+                    Kind::Chunk,
+                )
+            })
+            .collect()
+    }
+
+    fn hinted_demand() -> Result<(tempfile::TempDir, Arc<Seq>, Arc<Demand>)> {
+        let root = tempfile::tempdir()?;
+        let seq = Seq::new();
+        let demand = Demand::new(seq.clone(), PackStore::open(root.path())?);
+        Ok((root, seq, demand))
+    }
+
+    #[test]
+    fn hints_come_after_waiting_reads_in_pending() -> Result<()> {
+        let (_root, seq, demand) = hinted_demand()?;
+        let hints = chunks("hint", Demand::HINT_PENDING + 8);
+        demand.hint(&hints);
+        assert_eq!(seq.current(), 1, "a hint wakes `watch`");
+        // In the order hinted, which is the reader's and not the digests'.
+        assert_eq!(demand.pending(), hints[..Demand::HINT_PENDING]);
+        // A reader starts waiting for a hint and for something else.
+        let read = chunks("read", 1)[0];
+        let waiting = [read, hints[3]];
+        let waiter = {
+            let demand = demand.clone();
+            std::thread::spawn(move || demand.fetch_within(&waiting, Duration::from_millis(300)))
+        };
+        assert!(seq.wait_past(1, Duration::from_secs(5)) >= 2);
+        let pending = demand.pending();
+        let mut reads = waiting.to_vec();
+        reads.sort_by_key(|(digest, _)| *digest);
+        assert_eq!(pending[..2], reads, "what readers wait for goes first");
+        assert_eq!(pending[2..5], hints[..3]);
+        assert_eq!(pending[5], hints[4], "and is listed once");
+        // The cap is on hints: nothing a reader waits for is left out.
+        assert_eq!(pending.len(), 2 + Demand::HINT_PENDING);
+        assert_eq!(demand.listed(), (reads, pending[2..].to_vec()));
+        assert!(waiter.join().unwrap().is_err());
+        assert_eq!(
+            demand.pending()[..Demand::HINT_PENDING],
+            hints[..Demand::HINT_PENDING]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_hint_expires_unless_refreshed() -> Result<()> {
+        let (_root, _seq, demand) = hinted_demand()?;
+        let hints = chunks("hint", 2);
+        let start = Instant::now();
+        let after = |seconds: u64| start + Duration::from_secs(seconds);
+        demand.hint_at(&hints, start);
+        let ttl = Demand::HINT_TTL.as_secs();
+        assert_eq!(demand.listed_at(after(ttl - 1)).1, hints);
+        demand.hint_at(&hints[..1], after(ttl - 1));
+        assert_eq!(demand.listed_at(after(ttl)).1, hints[..1]);
+        assert_eq!(demand.listed_at(after(2 * ttl - 2)).1, hints[..1]);
+        assert_eq!(demand.listed_at(after(2 * ttl)).1, Vec::new());
+        // What expired has no holders left: one new hint, one unhint.
+        demand.hint_at(&hints[..1], after(2 * ttl));
+        demand.unhint(&hints[..1]);
+        assert_eq!(demand.listed_at(after(2 * ttl)).1, Vec::new());
+        Ok(())
+    }
+
+    #[test]
+    fn unhint_removes_a_hint_only_when_no_handle_holds_it() -> Result<()> {
+        let (_root, _seq, demand) = hinted_demand()?;
+        let hints = chunks("hint", 2);
+        demand.hint(&hints);
+        demand.hint(&hints[..1]);
+        demand.unhint(&hints);
+        assert_eq!(demand.pending(), hints[..1]);
+        demand.unhint(&hints);
+        assert!(demand.pending().is_empty());
+        // One that is gone is nothing to take back.
+        demand.unhint(&hints);
+        assert!(demand.pending().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn arrival_clears_hints() -> Result<()> {
+        let (_root, _seq, demand) = hinted_demand()?;
+        let hints = chunks("hint", 2);
+        demand.hint(&hints);
+        demand.hint(&hints);
+        demand.arrived(&[hints[0].0]);
+        assert_eq!(demand.pending(), hints[1..]);
         Ok(())
     }
 }
