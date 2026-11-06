@@ -490,6 +490,41 @@ class DocumentOperations(unittest.TestCase):
                 self.device().create_document("F:/", "a/b")
 
 
+class SharingIn(unittest.TestCase):
+    def device(self):
+        return Device(Path("adb"), "emulator-1")
+
+    def test_a_share_carries_its_grant_on_the_intents_data(self):
+        device = self.device()
+        with patch.object(Device, "shell", return_value=Completed([], 0, b"", b"")) as shell:
+            device.start_share("content://media/external/file/7")
+        words = shell.call_args.args
+        self.assertEqual(words[words.index("-d") + 1], "content://media/external/file/7")
+        self.assertEqual(words[words.index("--eu") + 2], "content://media/external/file/7")
+        self.assertIn("--grant-read-uri-permission", words)
+
+    def test_the_exemption_goes_both_ways(self):
+        device = self.device()
+        with patch.object(Device, "shell", return_value=Completed([], 0, b"", b"")) as shell:
+            device.battery_exempt(True)
+            device.battery_exempt(False)
+        self.assertEqual([call.args[-1] for call in shell.call_args_list], ["+dev.tkfs", "-dev.tkfs"])
+
+    def test_the_transfer_log_is_the_jobs_and_the_shares_lines_only(self):
+        log = "transfer: foreground\nopen F:/a w\nshare: dataSync timed out\nreleased F:/a\n"
+        with patch.object(Device, "adb", return_value=Completed([], 0, log.encode(), b"")):
+            self.assertEqual(self.device().transfer_log(), ["transfer: foreground", "share: dataSync timed out"])
+
+    def test_a_content_summary_of_a_pc_entry_is_its_content_or_none(self):
+        pc = PcHost(Path("tkfs"), Path("home"))
+        pc._tkfs = MagicMock(return_value=Completed([], 0, b'{"entry":{"content":{"digest":"x","total_len":3}}}', b""))
+        self.assertEqual(pc.pc_content("state", "a"), '{"digest": "x", "total_len": 3}')
+        pc._tkfs = MagicMock(return_value=Completed([], 0, b'{"entry":{"content":null}}', b""))
+        self.assertIsNone(pc.pc_content("state", "a"))
+        pc._tkfs = MagicMock(return_value=Completed([], 1, b"", b"NOT_FOUND"))
+        self.assertIsNone(pc.pc_content("state", "a"))
+
+
 class OnThePc(unittest.TestCase):
     def pc(self, code, err):
         pc = PcHost(Path("tkfs"), Path("home"))
