@@ -7,10 +7,10 @@
         android:allowBackup="false"
         android:icon="@drawable/ic_folder"
         android:label="Telekinesis"
-        android:theme="@android:style/Theme.Material.Light">
+        android:theme="@style/Theme.Tkfs">
 
         <activity
-            android:name=".MainActivity"
+            android:name=".ui.MainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

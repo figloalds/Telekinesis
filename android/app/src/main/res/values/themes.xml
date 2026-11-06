@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose draws everything; this only paints the window before it does. -->
+    <style name="Theme.Tkfs" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F6F8F7</item>
+    </style>
+</resources>

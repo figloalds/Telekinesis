@@ -28,7 +28,7 @@ from typing import Callable
 
 from android_e2e_lib import (BUILD_BOUND, CONTROL_URI, DEFAULT_AVD, DIRECTORY_MIME, PACKAGE, ROOT, ROOTS_URI,
                              ContentError, Device, Emulator, Folder, HarnessError, ManageError, PcHost, Report,
-                             Session, document_uri, run_bounded, sha256, with_parents)
+                             Session, SYNC_BOUND, UI_BOUND, document_uri, poll, run_bounded, sha256, with_parents)
 from build_android import APK, find_sdk
 
 # ---- scenarios ----------------------------------------------------------------------------
@@ -183,7 +183,7 @@ def scenario_harness(s: Session) -> None:
     again = device.shell("run-as", PACKAGE, "stat", "-c", "%Y %s", config).require_success().out
     s.check("the configuration is written only once", again == written, f"{written} -> {again}")
 
-    device.shell("am", "start", "-W", "-n", f"{PACKAGE}/.MainActivity").require_success()
+    device.start_app()
     shown = [node.get("text") for node in device.ui_dump().iter("node") if node.get("package") == PACKAGE]
     s.check("ui_dump sees the app's own screen", "Telekinesis" in shown, shown)
     s.check("tap_text finds a view by its text", bool(device.tap_text("Telekinesis")))
@@ -200,7 +200,108 @@ def scenario_harness(s: Session) -> None:
     s.check("a frozen app still answers a provider request", len(device.content_query(ROOTS_URI)) == 1)
 
 
+def scenario_ui_folders(s: Session) -> None:
+    """The Folders, Add a PC and Settings screens, driven as a person would. A PC that is away,
+    a PC that revoked the phone, and pairing again with the folder's bytes kept. Screenshots of
+    each screen are in this run's `screens` directory."""
+    device, pc = s.device, s.pc
+    shots = s.report.path.parent / "screens"
+    files = {"notes.txt": b"Notes from the PC.\n" * 50, "photo.bin": random.Random(9).randbytes(600 * 1024)}
+    repo, pc_state = pc.create_folder("Documents", files)
+
+    def shown(what: str, wanted: Callable[[list[str]], bool], bound: float = UI_BOUND) -> list[str]:
+        return device.wait_screen(what, wanted, bound)
+
+    def has(*texts: str) -> Callable[[list[str]], bool]:
+        return lambda found: all(text in found for text in texts)
+
+    def has_part(part: str) -> Callable[[list[str]], bool]:
+        return lambda found: any(part in text for text in found)
+
+    def both(*wanted: Callable[[list[str]], bool]) -> Callable[[list[str]], bool]:
+        return lambda found: all(check(found) for check in wanted)
+
+    def pair_with_fields(code: str) -> None:
+        device.type_into("PC address", pc.endpoint)
+        device.type_into("Pairing code", code)
+        device.screenshot(shots / f"add-pc-filled-{code[:4]}.png")
+        device.tap_text("Pair")
+
+    device.start_app()
+    shown("the empty Folders screen", has("No PC is paired yet.", "Add a PC"))
+    device.screenshot(shots / "folders-empty.png")
+    device.tap_text("Add a PC")
+    shown("the Add a PC screen", has("Scan QR code", "PC address", "Pairing code"))
+    device.screenshot(shots / "add-pc.png")
+    pair_with_fields(pc.pairing_code())
+    found = shown("the PC's folders", has("Receive 1 folder"))
+    s.check("pairing lists the PC's folder with a checkbox", "Documents" in found, found)
+    device.screenshot(shots / "add-pc-choose.png")
+    device.tap_text("Receive 1 folder")
+    found = shown("the folder with a Synced line", both(has("Documents"), has_part("Synced")), SYNC_BOUND)
+    s.check("the Folders screen shows the folder and a Synced line",
+            "Documents" in found and any(text.startswith("Synced") for text in found), found)
+    device.screenshot(shots / "folders-synced.png")
+
+    folder_id = device.shell_manage("list")[0]["id"]
+    state = device.shell_manage("inspect", {"state": folder_id})["record"]["state"]
+    folder = Folder(folder_id, "Documents", repo, state, pc_state, files)
+    want = sha256(files["notes.txt"])
+    s.check("the folder reads through the provider", sha256(device.content_read(folder.doc("notes.txt"))) == want)
+    downloaded = device.pack_bytes(state)
+    s.check("and its bytes are on the phone", downloaded >= len(files["notes.txt"]), f"{downloaded} pack bytes")
+
+    device.tap_text("Settings")
+    found = shown("the Settings screen", has("My PC", pc.endpoint, "Change address", "Unpair"))
+    s.check("Settings names the PC with its address and the two actions", True, found)
+    device.screenshot(shots / "settings.png")
+    device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
+    shown("the Folders screen again", has("Telekinesis", "Sync now"))
+
+    # The PC goes away: the strip says so and each folder keeps its last sync time.
+    failures, summary = pc.stop()
+    s.check("the PC stops cleanly", not failures, failures or summary)
+    found = shown("the unreachable strip", has_part("My PC isn't reachable."))
+    s.check("the strip says when it last synced", any("Last synced at" in text for text in found), found)
+    s.check("the folder says when it last synced", any(text.startswith("Synced at ") for text in found), found)
+    device.screenshot(shots / "folders-unreachable.png")
+    pc.start()
+    device.tap_text("Sync now")
+    found = shown("the strip gone and a Synced line back",
+                  lambda texts: not has_part("isn't reachable")(texts) and has_part("Synced")(texts), SYNC_BOUND)
+    s.check("the strip is gone once the PC is back", True, found)
+
+    # The PC makes a new code, which revokes the phone.
+    new_code = pc.pairing_code()
+    device.tap_text("Sync now")
+    found = shown("Pair again", has_part("Pair again"), SYNC_BOUND)
+    s.check("a revoked phone is told to pair again", any("no longer recognizes this phone" in t for t in found), found)
+    status = device.shell_manage("status")
+    seen = [(peer["endpoint"], [(lane["state"], lane.get("last_error")) for lane in peer["lanes"]])
+            for peer in status["peers"]]
+    s.check("the lane error is what the screen reads", any("PEER_REVOKED" in str(error) for _, lanes in seen
+                                                         for _, error in lanes), seen)
+    device.screenshot(shots / "folders-revoked.png")
+
+    # Pair again: the folder and its bytes stay, and sync works.
+    device.tap_text("Pair again")
+    shown("the Add a PC screen", has("Scan QR code"))
+    pair_with_fields(new_code)
+    found = shown("Folders with a Synced line", both(has("Documents"), has_part("Synced")), SYNC_BOUND)
+    s.check("pairing again keeps the folder on screen", not has_part("Pair again")(found), found)
+    s.check("and its bytes", device.pack_bytes(state) >= downloaded, f"{downloaded} -> {device.pack_bytes(state)}")
+    s.check("and its files still read", sha256(device.content_read(folder.doc("notes.txt"))) == want)
+    pc.write_file(pc_state, "later.txt", b"Written after pairing again.\n")
+    pc.folder(pc_state, "flush")
+    device.tap_text("Sync now")
+    poll(SYNC_BOUND, "the new file on the phone",
+         lambda: b"after pairing again" in device.content_read(folder.doc("later.txt")), interval=2)
+    s.check("a file written on the PC after pairing again reaches the phone", True)
+    device.screenshot(shots / "folders-paired-again.png")
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
+    "ui_folders": scenario_ui_folders,
     "read": scenario_read,
     "cold_start": scenario_cold_start,
     "harness": scenario_harness,

@@ -423,6 +423,40 @@ class Device:
         self.shell("input", "tap", x, y).require_success()
         return x, y
 
+    def screen_texts(self) -> list[str]:
+        """Every text and description on the screen, in tree order."""
+        found = []
+        for node in self.ui_dump().iter("node"):
+            found += [value for value in (node.get("text"), node.get("content-desc")) if value]
+        return found
+
+    def wait_screen(self, what: str, wanted: Callable[[list[str]], bool], bound: float = UI_BOUND) -> list[str]:
+        """The screen's texts once `wanted` accepts them. It names what it waited for when it gives up."""
+
+        def look():
+            texts = self.screen_texts()
+            if not wanted(texts):
+                raise HarnessError(f"on screen: {texts}")
+            return texts
+
+        return poll(bound, what, look, interval=1)
+
+    def type_into(self, field: str, text: str) -> None:
+        """Taps the field described by `field` and types `text` (no spaces: `input text` is plain)."""
+        self.tap_text(field)
+        self.shell("input", "text", text).require_success()
+
+    def start_app(self) -> None:
+        self.shell("am", "start", "-W", "-n", f"{PACKAGE}/.ui.MainActivity").require_success()
+
+    def screenshot(self, path: Path) -> None:
+        """The screen as a PNG, by `adb exec-out screencap -p`."""
+        shot = self.adb("exec-out", "screencap", "-p").require_success().stdout
+        if not shot.startswith(b"\x89PNG"):
+            raise HarnessError(f"screencap gave {len(shot)} bytes that are not a PNG")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(shot)
+
     def wait_frozen(self, package: str, bound: float = FROZEN_BOUND) -> float:
         """Waits until Android has frozen `package`; the seconds that took."""
         started = time.monotonic()

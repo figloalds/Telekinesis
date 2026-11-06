@@ -404,5 +404,33 @@ class Bounds(unittest.TestCase):
         self.assertEqual((done.code, done.stdout, done.stderr), (0, b"\x00\r\n\xff", b"oops"))
 
 
+class ReadingTheScreen(unittest.TestCase):
+    def device(self):
+        return Device(Path("adb"), "emulator-5554")
+
+    def test_wait_screen_returns_the_texts_once_wanted_and_names_them_when_not(self):
+        device = self.device()
+        with patch.object(Device, "screen_texts", side_effect=[["Loading"], ["Documents", "Synced"]]):
+            self.assertEqual(device.wait_screen("a folder", lambda texts: "Synced" in texts, bound=5),
+                             ["Documents", "Synced"])
+        with patch.object(Device, "screen_texts", return_value=["Loading"]):
+            with self.assertRaises(HarnessError) as raised:
+                device.wait_screen("a folder", lambda texts: "Synced" in texts, bound=0)
+        self.assertIn("Loading", str(raised.exception))
+
+    def test_a_screenshot_that_is_not_a_png_is_refused_and_a_png_is_saved(self):
+        device = self.device()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shots" / "a.png"
+            done = lambda data: Completed([], 0, data, b"")
+            with patch.object(Device, "adb", return_value=done(b"not a picture")):
+                with self.assertRaises(HarnessError):
+                    device.screenshot(path)
+            self.assertFalse(path.exists())
+            with patch.object(Device, "adb", return_value=done(b"\x89PNG\r\n\x1a\nrest")):
+                device.screenshot(path)
+            self.assertEqual(path.read_bytes(), b"\x89PNG\r\n\x1a\nrest")
+
+
 if __name__ == "__main__":
     unittest.main()
