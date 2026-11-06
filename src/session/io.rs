@@ -11,7 +11,9 @@
 //!    buffer internally; a turn stops early only after a large burst and then
 //!    polls again without sleeping) and dispatches every frame;
 //! 2. retries delivery of streamed request parts its handlers have not taken;
-//! 3. runs the timers: dead after `dead_after` without hearing from the peer,
+//! 3. runs the timers: dead after `dead_after` without hearing from the peer
+//!    (time this thread itself did not run, such as a frozen process, is not
+//!    counted: the liveness clocks move forward by the gap),
 //!    HEARTBEAT after `heartbeat` of send idleness (one queued at a time), the
 //!    250 ms scan of request deadlines, GOAWAY grace;
 //! 4. writes from the priority queues while tungstenite's buffer holds less
@@ -23,6 +25,10 @@
 //!
 //! Liveness evidence is a received message or readable readiness of the
 //! socket (bytes arrived, possibly part of a large message on a slow link).
+//! A turn that comes `dead_after / 2` or more after the previous one means the
+//! thread was stalled (heartbeats wake it far sooner): the liveness, hold and
+//! stream-idle clocks then move forward by that gap, so only running time
+//! counts as silence.
 //!
 //! Reads are held in two cases, and TCP then pushes back on the peer:
 //! * receive-side flow control: more than `data_queue_bytes` of received
@@ -1621,11 +1627,21 @@ impl Io {
         fault::hang("session.io.turn");
         let now = Instant::now();
         let options = self.shared.options;
-        if now.duration_since(self.last_turn) >= options.dead_after / 2 {
+        let gap = now.duration_since(self.last_turn);
+        if gap >= options.dead_after / 2 {
             // Wake-ups come by `heartbeat`, far inside this gap, so this
-            // thread did not run: the silence is ours, not the peer's.
-            self.last_rx = now;
-            self.last_write_progress = now;
+            // thread did not run (a frozen process): that time was not the
+            // peer's silence. Count only the time the thread ran: every clock
+            // that judges the peer or a consumer moves forward by the gap
+            // (never past `now`), it does not restart, so a peer that stays
+            // silent is still found dead across repeated stalls.
+            let skip = |at: Instant| (at + gap).min(now);
+            self.last_rx = skip(self.last_rx);
+            self.last_write_progress = skip(self.last_write_progress);
+            self.hold_progress = skip(self.hold_progress);
+            for upload in self.uploads.values_mut() {
+                upload.active = skip(upload.active);
+            }
         }
         self.last_turn = now;
         if self.tx_held {

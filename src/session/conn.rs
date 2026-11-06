@@ -103,7 +103,8 @@ pub enum Side {
 pub struct ConnOptions {
     /// HEARTBEAT after this much send idleness (5 s).
     pub heartbeat: Duration,
-    /// Dead after this long with no received frame (20 s).
+    /// Dead after this long with no received frame (20 s). Time the I/O
+    /// thread did not run (a frozen process) is not counted.
     pub dead_after: Duration,
     /// Header bound after authentication (64 KiB).
     pub max_header: usize,

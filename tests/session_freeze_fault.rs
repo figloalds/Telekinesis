@@ -14,6 +14,9 @@ use tkfs::{
 };
 use tungstenite::{WebSocket, stream::MaybeTlsStream};
 
+/// The fault state is process-global: the tests of this binary take turns.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 type Ws = WebSocket<MaybeTlsStream<TcpStream>>;
 
 fn peer() -> PeerInfo {
@@ -52,6 +55,7 @@ fn ws_pair() -> (Ws, Ws) {
 
 #[test]
 fn a_stalled_io_thread_does_not_declare_its_peer_dead() -> Result<()> {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let options = ConnOptions {
         heartbeat: Duration::from_millis(100),
         dead_after: Duration::from_millis(600),
@@ -81,4 +85,33 @@ fn a_stalled_io_thread_does_not_declare_its_peer_dead() -> Result<()> {
     client.close();
     server.close();
     Ok(())
+}
+
+/// A peer that stays silent is still found dead across repeated stalls: only
+/// the time the thread ran counts, the stalls are skipped, not forgiven.
+#[test]
+fn a_silent_peer_is_still_dead_across_repeated_stalls() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let options = ConnOptions {
+        heartbeat: Duration::from_millis(100),
+        dead_after: Duration::from_millis(600),
+        ..ConnOptions::default()
+    };
+    // The raw peer never reads or writes after the handshake.
+    let (_silent_peer, server_ws) = ws_pair();
+    let server = Conn::from_established(server_ws, Side::Server, peer(), options).unwrap();
+    let mut config = FaultConfig::new("session.io.turn", FaultAction::Hang);
+    config.ms = Some(1000);
+    config.count = Some(2);
+    fault::configure(Some(config));
+    let start = std::time::Instant::now();
+    while server.closed().is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "a silent peer was never declared dead"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(server.closed().unwrap().code, "TRANSPORT_DEAD");
+    assert_eq!(fault::fired(), 2);
 }
