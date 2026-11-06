@@ -372,8 +372,16 @@ impl Scratch {
         }
         let durable = !self.materialize()?;
         let whole = self.prepare_write(content, offset, count as u64, durable)?;
-        write_at(self.file()?, &bytes[..count], offset)?;
-        self.accept_whole_chunks(&whole, durable)?;
+        let written = write_at(self.file()?, &bytes[..count], offset)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| self.accept_whole_chunks(&whole, durable));
+        if let Err(error) = written {
+            // What reached past the end is no part of the file, here or at a restart.
+            if end > old_len {
+                let _ = self.file()?.set_len(old_len);
+            }
+            return Err(error);
+        }
         self.length = self.length.max(end);
         self.dirty.mark(offset, count as u64);
         self.changed = true;

@@ -2547,6 +2547,34 @@ fn a_whole_chunk_write_that_fails_on_disk_leaves_what_the_file_reads_as() -> Res
     Ok(())
 }
 
+/// A write past the end that fails leaves the file its length: at a restart the difference would
+/// read as written.
+#[test]
+fn a_growing_write_that_fails_leaves_the_file_its_length() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    seed_short_file(&mut lock(&engine.store), "small", &[7; 100], true)?;
+    let token = engine.open_file("small", false, false, true)?;
+    let scratch = engine.handle(token)?.scratch.clone().unwrap();
+    let blocked = lock(&scratch).path.with_extension("json.tmp");
+    std::fs::create_dir(&blocked)?;
+    let long = vec![8; 2 * CHUNK_SIZE as usize];
+    assert!(engine.write(token, 0, &long, false, false).is_err());
+    assert_eq!(engine.info(token)?.1, 100);
+    assert_eq!(lock(&scratch).file()?.metadata()?.len(), 100);
+    let mut bytes = [0; 100];
+    engine.read(token, 0, &mut bytes)?;
+    assert_eq!(bytes, [7; 100]);
+    std::fs::remove_dir(&blocked)?;
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+    assert_eq!(file_bytes(&lock(&engine.store), "small")?, [7; 100]);
+    engine.shutdown()?;
+    Ok(())
+}
+
 /// A file of `bytes.len()` bytes, one short chunk, of which nothing is here unless `here`.
 fn seed_short_file(store: &mut Store, name: &str, bytes: &[u8], here: bool) -> Result<String> {
     use crate::content::Kind;
