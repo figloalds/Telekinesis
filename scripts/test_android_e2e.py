@@ -4,6 +4,7 @@ Run from scripts/: python -m unittest test_android_e2e
 """
 import base64
 import json
+import os
 from pathlib import Path
 import shlex
 import subprocess
@@ -11,11 +12,13 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from android_e2e import (GiveUp, HarnessError, ManageError, PcHost, Proc, bounds_center, children_uri, document_uri,
-                         emulator_processes, encode_payload, is_frozen, parse_call, parse_rows, poll, run_bounded,
-                         shell_line, split_qr, with_parents)
+import android_e2e
+from android_e2e_lib import (Completed, Device, Emulator, GiveUp, HarnessError, ManageError, PcHost, Proc, Report,
+                             Session, bounds_center, children_uri, document_uri, emulator_processes, encode_payload,
+                             is_frozen, parse_call, parse_rows, poll, run_bounded, shell_line, split_qr,
+                             watched_processes, with_parents)
 
 
 class DocumentUris(unittest.TestCase):
@@ -115,7 +118,7 @@ class EmulatorProcesses(unittest.TestCase):
     ]
 
     def found(self, known=frozenset()):
-        with patch("android_e2e.watched_processes", return_value=self.RUNNING):
+        with patch("android_e2e_lib.watched_processes", return_value=self.RUNNING):
             return [proc.pid for proc in emulator_processes("Phone", known)]
 
     def test_only_this_avds(self):
@@ -125,8 +128,46 @@ class EmulatorProcesses(unittest.TestCase):
         self.assertEqual(self.found({1, 2}), [1, 2, 3])
 
 
+def answers(*replies):
+    """A stand-in for a process query: its replies in turn, repeating the last. An exception
+    among them is raised."""
+    replies = list(replies)
+
+    def answer(*_):
+        reply = replies.pop(0) if len(replies) > 1 else replies[0]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    return answer
+
+
+class ProcessQuery(unittest.TestCase):
+    """A query that failed must not read as "no process left"."""
+
+    @unittest.skipUnless(os.name == "nt", "the query is PowerShell's on Windows")
+    def test_a_failed_windows_query_is_an_error_not_an_empty_list(self):
+        with self.assertRaises(HarnessError):
+            watched_processes("Win32_NoSuchClass")
+
+    @unittest.skipUnless(os.name == "nt", "the query is PowerShell's on Windows")
+    def test_a_real_query_gives_a_list(self):
+        self.assertIsInstance(watched_processes(), list)
+
+    def test_an_unreadable_listing_is_an_error(self):
+        with (patch("android_e2e_lib.run_bounded", return_value=Completed([], 0, b"not a listing", b"")),
+              self.assertRaisesRegex(HarnessError, "not a listing")):
+            watched_processes()
+
+    def test_a_failed_command_is_an_error(self):
+        with (patch("android_e2e_lib.run_bounded", return_value=Completed(["query"], 1, b"[]", b"denied")),
+              self.assertRaisesRegex(HarnessError, "denied")):
+            watched_processes()
+
+
 class StoppingThePc(unittest.TestCase):
-    """A PC process that will not stop is a failure, and is not left running."""
+    """A PC process that will not stop is a failure and is not left running, whatever else
+    goes wrong on the way, and "none left" is only said of a query that saw the daemon."""
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="tkfs-e2e-test-")
@@ -140,32 +181,200 @@ class StoppingThePc(unittest.TestCase):
         self.addCleanup(process.kill)
         return process
 
+    def daemon(self, script="import time; time.sleep(60)") -> Proc:
+        self.pc.process = self.sleeper(script)
+        return Proc(self.pc.process.pid, "tkfs.exe", "tkfs start")
+
+    def stop(self, processes, shutdown=None, **bounds):
+        replies = {"return_value": {"stopped": True}} if shutdown is None else {"side_effect": shutdown}
+        constants = {f"android_e2e_lib.{name}": bound for name, bound in bounds.items()}
+        patches = [patch(name, bound) for name, bound in constants.items()]
+        for active in patches:
+            active.start()
+            self.addCleanup(active.stop)
+        with (patch.object(PcHost, "manage", **replies) as self.manage,
+              patch("android_e2e_lib.tkfs_processes", side_effect=processes)):
+            return self.pc.stop()
+
+    def test_a_clean_stop_says_what_ran(self):
+        daemon = self.daemon("pass")
+        self.assertEqual(self.stop(answers([daemon, Proc(2, "tkfs.exe", "")], [])),
+                         ([], "2 process(es) ran, none left"))
+
     def test_a_daemon_that_ignores_shutdown_is_killed_and_reported(self):
-        self.pc.process = stubborn = self.sleeper()
-        with (patch.object(PcHost, "manage", return_value={"stopped": True}),
-              patch("android_e2e.PC_STOP_BOUND", 0.2), patch("android_e2e.tkfs_processes", return_value=[])):
-            failures, _ = self.pc.stop()
-        self.assertEqual(len(failures), 1)
-        self.assertIn(f"STRANDED_PROCESS: daemon pid {stubborn.pid}", failures[0])
-        self.assertIsNotNone(stubborn.poll())
+        daemon = self.daemon()
+        process = self.pc.process
+        failures, summary = self.stop(answers([daemon], []), PC_STOP_BOUND=0.2)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn(f"STRANDED_PROCESS: daemon pid {daemon.pid}", failures[0])
+        self.assertIsNotNone(process.poll())
+        self.assertEqual(summary, "")
 
     def test_a_worker_that_outlives_its_daemon_is_killed_and_reported(self):
-        self.pc.process = self.sleeper("pass")
+        daemon = self.daemon("pass")
         worker = self.sleeper()
-        left = [Proc(worker.pid, "tkfs.exe", f"tkfs --state {self.pc.home}")]
-        with (patch.object(PcHost, "manage", return_value={"stopped": True}),
-              patch("android_e2e.KILL_BOUND", 0.2), patch("android_e2e.tkfs_processes", return_value=left)):
-            failures, _ = self.pc.stop()
-        self.assertEqual(len(failures), 1)
+        left = Proc(worker.pid, "tkfs.exe", "tkfs --state home")
+        failures, _ = self.stop(answers([daemon, left], [left]), KILL_BOUND=0.2)
+        self.assertEqual(len(failures), 1, failures)
         self.assertIn(f"STRANDED_PROCESS: tkfs.exe pid {worker.pid}", failures[0])
         self.assertIsNotNone(worker.wait(10))
 
-    def test_a_clean_stop_says_what_ran(self):
-        self.pc.process = self.sleeper("pass")
-        ran = [[Proc(1, "tkfs.exe", ""), Proc(2, "tkfs.exe", "")], []]
-        with (patch.object(PcHost, "manage", return_value={"stopped": True}),
-              patch("android_e2e.tkfs_processes", side_effect=ran)):
-            self.assertEqual(self.pc.stop(), ([], "2 process(es) ran, none left"))
+    def test_a_failed_first_query_still_shuts_the_daemon_down(self):
+        self.daemon("pass")
+        failures, summary = self.stop(answers(HarnessError("no first query"), []))
+        self.manage.assert_called_once()
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("no first query", failures[0])
+        self.assertEqual(summary, "")
+
+    def test_a_bad_reply_to_shutdown_still_ends_the_daemon_at_once(self):
+        daemon = self.daemon()
+        process = self.pc.process
+        started = time.monotonic()
+        failures, _ = self.stop(answers([daemon], []), shutdown=ValueError("not JSON"))
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("not JSON", failures[0])
+        self.assertIn(f"STRANDED_PROCESS: daemon pid {daemon.pid}", failures[1])
+        self.assertIsNotNone(process.poll())
+
+    def test_a_query_that_cannot_see_the_running_daemon_is_a_failure(self):
+        self.pc.process = process = self.sleeper()
+        failures, summary = self.stop(answers([], []), shutdown=lambda *_, **__: process.kill() or {})
+        self.assertIn(f"did not show daemon pid {process.pid}", failures[0])
+        self.assertEqual(summary, "")
+
+    def test_a_failed_last_query_is_not_none_left(self):
+        daemon = self.daemon("pass")
+        failures, summary = self.stop(answers([daemon], HarnessError("no last query")), KILL_BOUND=0.2)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("no last query", failures[0])
+        self.assertEqual(summary, "")
+
+    def test_any_exception_from_the_last_query_is_a_failure(self):
+        daemon = self.daemon("pass")
+        failures, _ = self.stop(answers([daemon], ValueError("not JSON")), KILL_BOUND=0.2)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("not JSON", failures[0])
+
+
+class ReachingTheProvider(unittest.TestCase):
+    """Android's low-memory killer can take the cached app between two calls, and a call that
+    races with that finds no provider. It reached nothing, so it is safe to repeat."""
+
+    NOT_FOUND = Completed([], 0, b"", b"Error while accessing provider:dev.tkfs.documents\n"
+                                      b"java.lang.IllegalStateException: Could not find provider: dev.tkfs.documents\n")
+    REFUSED = Completed([], 0, b"", b"Error while accessing provider:dev.tkfs.documents\n"
+                                    b"java.lang.SecurityException: Permission Denial\n")
+    ANSWER = Completed([], 0, b'Result: Bundle[{result={"ok":1}}]\n', b"")
+    ROWS = Completed([], 0, b"Row: 0 root_id=F, title=T\n", b"")
+
+    def setUp(self):
+        self.device = Device(Path("adb"), "emulator-5554")
+        for name, value in (("android_e2e_lib.PROVIDER_RETRY", 0.01), ("builtins.print", MagicMock())):
+            active = patch(name, value)
+            active.start()
+            self.addCleanup(active.stop)
+
+    def test_a_manage_call_repeats_until_the_provider_is_back(self):
+        with patch("android_e2e_lib.run_bounded", side_effect=[self.NOT_FOUND, self.NOT_FOUND, self.ANSWER]) as run:
+            self.assertEqual(self.device.shell_manage("status"), {"ok": 1})
+        self.assertEqual(run.call_count, 3)
+
+    def test_a_query_repeats_too(self):
+        with patch("android_e2e_lib.run_bounded", side_effect=[self.NOT_FOUND, self.ROWS]):
+            self.assertEqual(self.device.content_query("content://x"), [{"root_id": "F", "title": "T"}])
+
+    def test_a_provider_that_never_comes_back_fails_within_the_bound(self):
+        with (patch("android_e2e_lib.PROVIDER_START_BOUND", 0.05),
+              patch("android_e2e_lib.run_bounded", return_value=self.NOT_FOUND)):
+            started = time.monotonic()
+            with self.assertRaisesRegex(HarnessError, "Could not find provider"):
+                self.device.shell_manage("status")
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_any_other_failure_is_not_repeated(self):
+        with patch("android_e2e_lib.run_bounded", return_value=self.REFUSED) as run:
+            with self.assertRaisesRegex(HarnessError, "Permission Denial"):
+                self.device.shell_manage("status")
+        self.assertEqual(run.call_count, 1)
+
+    def test_a_process_that_dies_during_a_call_is_not_repeated(self):
+        died = Completed([], 0, b"", b"Error while accessing provider:dev.tkfs.documents\n"
+                                     b"android.os.DeadObjectException\n")
+        with patch("android_e2e_lib.run_bounded", return_value=died) as run:
+            with self.assertRaisesRegex(HarnessError, "DeadObjectException"):
+                self.device.shell_manage("receive", {"label": "x"})
+        self.assertEqual(run.call_count, 1)
+
+
+class StoppingTheEmulator(unittest.TestCase):
+    def setUp(self):
+        self.emulator = Emulator(Path("adb"), Path("emulator"), "Phone", Path("."))
+        self.emulator.device = Device(Path("adb"), "emulator-5554")
+        self.done = Completed([], 0, b"", b"")
+
+    def test_a_failed_first_query_still_asks_it_to_exit(self):
+        with (patch("android_e2e_lib.emulator_processes", side_effect=answers(HarnessError("no query"), [])),
+              patch("android_e2e_lib.run_bounded", return_value=self.done) as run):
+            failures = self.emulator.stop()
+        self.assertIn("emu", run.call_args.args[0])
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("no query", failures[0])
+
+    def test_a_failed_kill_command_still_checks_what_is_left(self):
+        with (patch("android_e2e_lib.emulator_processes", side_effect=answers([Proc(1, "emulator", "")], [])),
+              patch("android_e2e_lib.run_bounded", side_effect=HarnessError("adb hung"))):
+            failures = self.emulator.stop()
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("adb hung", failures[0])
+
+    def test_what_is_left_is_killed_and_reported(self):
+        left = Proc(7, "qemu.exe", "qemu -avd Phone")
+        with (patch("android_e2e_lib.emulator_processes", return_value=[left]),
+              patch("android_e2e_lib.EMULATOR_STOP_BOUND", 0.2),
+              patch("android_e2e_lib.run_bounded", return_value=self.done),
+              patch("android_e2e_lib.kill_pid") as kill):
+            failures = self.emulator.stop()
+        kill.assert_called_once_with(7)
+        self.assertEqual(len(failures), 1, failures)
+        self.assertIn("STRANDED_PROCESS: qemu.exe pid 7", failures[0])
+
+    def test_a_clean_stop_has_no_failures(self):
+        with (patch("android_e2e_lib.emulator_processes", side_effect=answers([Proc(1, "emulator", "")], [])),
+              patch("android_e2e_lib.run_bounded", return_value=self.done)):
+            self.assertEqual(self.emulator.stop(), [])
+
+
+class RunningAScenario(unittest.TestCase):
+    def run_one(self, stop):
+        with tempfile.TemporaryDirectory(prefix="tkfs-e2e-test-") as temp:
+            report = Report(Path(temp), {})
+            with (patch.dict(android_e2e.SCENARIOS, {"x": lambda s: s.check("ran", True)}),
+                  patch.object(PcHost, "start"), patch.object(Session, "check_pairing_qr"),
+                  patch.object(PcHost, "stop", side_effect=stop), patch("builtins.print")):
+                android_e2e.run_scenario("x", MagicMock(), report, Path(temp), reset=True)
+            return report.data["scenarios"][0]
+
+    def test_a_crash_while_stopping_the_pc_still_ends_the_scenario_as_failed(self):
+        scenario = self.run_one(ValueError("not JSON"))
+        self.assertEqual(scenario["status"], "fail")
+        self.assertEqual(scenario["checks"][-1]["status"], "fail")
+        self.assertIn("not JSON", scenario["checks"][-1]["detail"])
+
+    def test_a_clean_run_passes(self):
+        scenario = self.run_one([([], "1 process(es) ran, none left")])
+        self.assertEqual(scenario["status"], "pass")
+
+
+class CommandLine(unittest.TestCase):
+    def test_a_known_scenario_and_all_are_accepted(self):
+        self.assertEqual(android_e2e.parse_args(["--scenario", "read"]).scenario, "read")
+        self.assertEqual(android_e2e.parse_args([]).scenario, "all")
+
+    def test_an_unknown_scenario_is_refused(self):
+        with patch("sys.stderr"), self.assertRaises(SystemExit) as caught:
+            android_e2e.parse_args(["--scenario", "no-such"])
+        self.assertEqual(caught.exception.code, 2)
 
 
 class Bounds(unittest.TestCase):

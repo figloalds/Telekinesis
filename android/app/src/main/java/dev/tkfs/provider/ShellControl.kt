@@ -17,6 +17,7 @@ import java.util.Base64
  */
 internal object ShellControl {
     private const val MANAGE = "tkfs.manage"
+    private const val FAULT = "tkfs.fault"
     private const val ROOT_UID = 0
     private const val SHELL_UID = 2000
 
@@ -26,8 +27,13 @@ internal object ShellControl {
     /** `{"result": json}`, `{"error": message}`, or null for a method that is not ours. */
     fun answer(method: String, arg: String?, extras: Bundle?): Bundle? = when (method) {
         MANAGE -> reply {
-            val action = arg ?: throw IOException("ARGUMENT_REQUIRED: action")
+            val action = arg ?: throw IOException("MISSING_ARGUMENT: action")
             Native.manage(action, payload(extras?.getString("payload")))
+        }
+        // Proves a panic in native code fails the call, not the process, under Android's JNI checks.
+        FAULT -> reply {
+            Native.faultForTest()
+            "{}"
         }
         else -> null
     }

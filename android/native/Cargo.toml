@@ -15,5 +15,9 @@ jni = { version = "0.21", default-features = false }
 serde_json = "1.0"
 tkfs = { path = "../.." }
 
+[dev-dependencies]
+# A real JVM with its JNI checks on, to test how entry points fail.
+jni = { version = "0.21", default-features = false, features = ["invocation"] }
+
 # Separate from the desktop package, which has no workspace of its own.
 [workspace]

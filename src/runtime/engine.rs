@@ -21,6 +21,10 @@ static OPEN_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static OPEN_NANOS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static NAMESPACE_HITS: AtomicU64 = AtomicU64::new(0);
 static NAMESPACE_MISSES: AtomicU64 = AtomicU64::new(0);
+/// Handle tokens, unique across every engine of the process. The embedded host
+/// resolves a folder's current engine on each call, so a token kept across a
+/// worker restart must be `INVALID_HANDLE` there, not another file's handle.
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 const NAMESPACE_CACHE_LIMIT: usize = 65_536;
 const NAMESPACE_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -130,7 +134,6 @@ pub struct Engine {
     namespace_changes: Arc<NamespaceChanges>,
     namespace_cache: Mutex<NamespaceCache>,
     handles: RwLock<BTreeMap<u64, Arc<Handle>>>,
-    next: AtomicU64,
     invalidate: RwLock<Option<Invalidate>>,
     notifications: Mutex<BTreeMap<String, u32>>,
     pub stopping: AtomicBool,
@@ -173,7 +176,6 @@ impl Engine {
             namespace_changes,
             namespace_cache: Mutex::new(NamespaceCache::default()),
             handles: RwLock::new(BTreeMap::new()),
-            next: AtomicU64::new(1),
             invalidate: RwLock::new(None),
             notifications: Mutex::new(BTreeMap::new()),
             stopping: AtomicBool::new(false),
@@ -431,7 +433,7 @@ impl Engine {
             .flatten();
         open_timing(2, started);
         let started = std::time::Instant::now();
-        let token = self.next.fetch_add(1, Ordering::Relaxed);
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.handles.write().unwrap().insert(
             token,
             Arc::new(Handle {
@@ -1078,6 +1080,46 @@ mod tests {
         engine.write(handle, 0, bytes, false, false)?;
         engine.flush(Some(handle))?;
         engine.close(handle)
+    }
+
+    /// The embedded host resolves a folder's current engine on every call, so a
+    /// token kept across a worker restart reaches an engine that never issued it.
+    #[test]
+    fn two_engines_never_share_a_token() -> Result<()> {
+        let (first_home, second_home) = (tempfile::tempdir()?, tempfile::tempdir()?);
+        let first = Engine::open(first_home.path(), None)?;
+        let second = Engine::open(second_home.path(), None)?;
+        seed_cached_file(&first, "file", b"first")?;
+        seed_cached_file(&second, "file", b"second")?;
+        let open = |engine: &Engine| -> Result<Vec<u64>> {
+            (0..8)
+                .map(|_| engine.open_file("file", false, false, false))
+                .collect()
+        };
+        let (from_first, from_second) = (open(&first)?, open(&second)?);
+        assert!(
+            from_first.iter().all(|token| !from_second.contains(token)),
+            "{from_first:?} and {from_second:?} share a token"
+        );
+
+        let stale = from_first[0];
+        let mut bytes = [0u8; 16];
+        let refused = second.read(stale, 0, &mut bytes).unwrap_err();
+        assert_eq!(crate::model::errors::code_of(&refused), "INVALID_HANDLE");
+        let refused = second.close(stale).unwrap_err();
+        assert_eq!(crate::model::errors::code_of(&refused), "INVALID_HANDLE");
+        assert_eq!(second.read(from_second[0], 0, &mut bytes)?, 6);
+        assert_eq!(&bytes[..6], b"second");
+
+        for token in from_first {
+            first.close(token)?;
+        }
+        for token in from_second {
+            second.close(token)?;
+        }
+        first.shutdown()?;
+        second.shutdown()?;
+        Ok(())
     }
 
     #[test]

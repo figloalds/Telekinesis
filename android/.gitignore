@@ -3,5 +3,6 @@ build/
 .gradle/
 .idea/
 local.properties
-# Built by scripts/build_android.py.
+# Built by scripts/build_android.py, and by cargo test in android/native.
+native/target/
 app/src/main/jniLibs/

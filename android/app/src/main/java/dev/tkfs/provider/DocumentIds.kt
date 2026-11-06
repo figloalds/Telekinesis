@@ -3,7 +3,7 @@ package dev.tkfs.provider
 import java.io.FileNotFoundException
 
 /**
- * A document id is "FOLDER_ID:/path/in/folder". A folder id holds no colon and a path may,
+ * A document id is `FOLDER_ID:/path/in/folder`. A folder id holds no colon and a path may,
  * so only the first colon separates them.
  */
 object DocumentIds {

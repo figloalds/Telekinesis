@@ -1102,7 +1102,13 @@ fn write_log(file: &Mutex<RotatingFile>, bytes: &[u8]) -> io::Result<()> {
 /// carry them only if the capture thread ran before the process ended).
 fn install_panic_hook(file: &Arc<Mutex<RotatingFile>>) {
     let file = Arc::downgrade(file);
+    // The Android app's own hook, already in place, puts panics in logcat. Nothing else chains:
+    // on the desktop the default hook would only repeat this on the captured stderr.
+    #[cfg(target_os = "android")]
+    let earlier = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        #[cfg(target_os = "android")]
+        earlier(info);
         let payload = info.payload();
         let message = payload
             .downcast_ref::<&str>()

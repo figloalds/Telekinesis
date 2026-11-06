@@ -13,7 +13,7 @@ use std::{
 };
 use support::daemon::{TestDaemon, run_tkfs};
 use tempfile::TempDir;
-use tkfs::orchestrator::embedded::Host;
+use tkfs::{model::errors::code_of, orchestrator::embedded::Host};
 
 const FOLDER_COMMAND: Duration = Duration::from_secs(60);
 const REPLICATED: Duration = Duration::from_secs(60);
@@ -122,6 +122,51 @@ fn embedded_host_pairs_receives_and_reads_through_the_engine() -> Result<()> {
         began.elapsed()
     );
     pc.shutdown()
+}
+
+/// The provider keeps a token across a worker restart and calls whatever engine
+/// serves the folder by then. That token must fail, so that the provider reopens,
+/// and must not name another open file on the new engine.
+#[test]
+fn a_token_kept_across_a_worker_restart_reaches_no_other_file() -> Result<()> {
+    let (_home, host) = host()?;
+    let daemon = host.daemon()?;
+    let created = daemon.execute("create", &json!({"label": "Local"}))?;
+    let id = created["id"].as_str().context("no folder id")?.to_owned();
+    let engine = host.engine(&id)?;
+    for (path, bytes) in [("/a.txt", b"bytes of a"), ("/b.txt", b"bytes of b")] {
+        let token = engine.open_file(path, true, false, true)?;
+        engine.write(token, 0, bytes, false, false)?;
+        engine.flush(Some(token))?;
+        engine.close(token)?;
+    }
+    let stale = engine.open_file("/a.txt", false, false, false)?;
+    // The worker's store lock goes with the last reference to its engine.
+    drop(engine);
+
+    daemon.execute("force-stop", &json!({"state": id}))?;
+    daemon.execute("start", &json!({"state": id}))?;
+    let engine = host.engine(&id)?;
+    let reopened = (0..8)
+        .map(|_| engine.open_file("/b.txt", false, false, false))
+        .collect::<Result<Vec<u64>>>()?;
+    ensure!(
+        !reopened.contains(&stale),
+        "the new engine issued {stale} again: {reopened:?}"
+    );
+
+    let mut bytes = [0u8; 16];
+    let refused = engine.read(stale, 0, &mut bytes).unwrap_err();
+    ensure!(code_of(&refused) == "INVALID_HANDLE", "{refused:#}");
+    let refused = engine.close(stale).unwrap_err();
+    ensure!(code_of(&refused) == "INVALID_HANDLE", "{refused:#}");
+    for token in reopened {
+        let read = engine.read(token, 0, &mut bytes)?;
+        ensure!(&bytes[..read] == b"bytes of b", "{:?}", &bytes[..read]);
+        engine.close(token)?;
+    }
+    drop(engine);
+    host.stop()
 }
 
 #[test]

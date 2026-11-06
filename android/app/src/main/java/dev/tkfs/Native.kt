@@ -33,6 +33,10 @@ object Native {
     @JvmStatic @Throws(IOException::class)
     external fun close(folder: String, token: Long)
 
+    /** Always throws: a panic with a Java exception pending. See `ShellControl`. */
+    @JvmStatic @Throws(IOException::class)
+    external fun faultForTest()
+
     /**
      * Every way into the process calls this. It writes the configuration on first run,
      * starts the orchestrator once and returns at once; native calls wait, bounded, for what
@@ -59,7 +63,7 @@ object Native {
                 worker_lanes = 2
                 """.trimIndent() + "\n",
             )
-            if (!draft.renameTo(config)) throw IOException("CONFIG_NOT_WRITTEN: ${config.path}")
+            if (!draft.renameTo(config)) throw IOException("CONFIG_WRITE_FAILED: ${config.path}")
         }
         start(config.absolutePath)
     }
