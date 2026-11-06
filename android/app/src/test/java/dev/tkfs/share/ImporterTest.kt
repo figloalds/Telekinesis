@@ -123,6 +123,39 @@ class ImporterTest {
         assertFalse(seen.isEmpty())
     }
 
+    @Test fun aWorkingFileIsWrittenDownBeforeItExistsAndClearedWhenItIsGone() {
+        val folder = FakeFolder()
+        val told = mutableListOf<String>()
+        val importer = Importer(
+            folder,
+            working = { told += "working ${it.substringAfterLast('/').take(11)} exists=${it in folder.files}" },
+            cleared = { told += "cleared ${it.substringAfterLast('/').take(11)}" },
+        )
+        importer.import("/", "a.bin", ByteArrayInputStream(bytes)) {}
+        assertEquals(listOf("working .tkfs-part- exists=false", "cleared .tkfs-part-"), told)
+        told.clear()
+        try {
+            importer.import("/", "b.bin", Breaking(bytes, after = 8)) {}
+            fail("the copy should fail")
+        } catch (error: ImportFailed) {
+            assertEquals(listOf("working .tkfs-part- exists=false", "cleared .tkfs-part-"), told)
+        }
+    }
+
+    @Test fun aWorkingFileThatCannotBeRemovedIsNotClearedSoTheSweepFindsIt() {
+        val folder = object : FolderFiles by FakeFolder() {
+            override fun delete(path: String) = throw IOException("WORKER_NOT_RUNNING: gone")
+        }
+        val told = mutableListOf<String>()
+        try {
+            Importer(folder, working = { told += "working" }, cleared = { told += "cleared" })
+                .import("/", "a.bin", Breaking(bytes, after = 8)) {}
+            fail("the copy should fail")
+        } catch (error: ImportFailed) {
+            assertEquals(listOf("working"), told)
+        }
+    }
+
     @Test fun anEmptyStreamIsAnEmptyFile() {
         val folder = FakeFolder()
         Importer(folder).import("/", "empty.txt", ByteArrayInputStream(ByteArray(0))) {}

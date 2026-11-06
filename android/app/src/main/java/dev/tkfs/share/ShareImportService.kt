@@ -15,6 +15,7 @@ import dev.tkfs.Notifications
 import dev.tkfs.sync.SyncCoordinator
 import dev.tkfs.ui.errorInWords
 import java.io.IOException
+import java.util.UUID
 import java.util.concurrent.Executors
 
 /**
@@ -34,10 +35,18 @@ class ShareImportService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Within seconds of the start, whatever follows.
-        ServiceCompat.startForeground(
-            this, Notifications.SHARE_ID, Notifications.sharing(this, "Starting", 0, 0), ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-        )
+        // Within seconds of the start. A refusal (the `dataSync` budget is spent, or Android will not
+        // have it from here) must not lose the share: the copy goes on without the service.
+        try {
+            ServiceCompat.startForeground(
+                this, Notifications.SHARE_ID, Notifications.sharing(this, "Starting", 0, 0),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } catch (error: IllegalStateException) {
+            Log.w(TAG, "share: no foreground: ${error.javaClass.simpleName}: ${error.message}")
+        } catch (error: SecurityException) {
+            Log.w(TAG, "share: no foreground: ${error.javaClass.simpleName}: ${error.message}")
+        }
         val folder = intent?.getStringExtra(FOLDER)
         val directory = intent?.getStringExtra(DIRECTORY) ?: "/"
         val label = intent?.getStringExtra(LABEL) ?: "Telekinesis"
@@ -46,11 +55,21 @@ class ShareImportService : Service() {
             finishIfIdle(extra = 0)
             return START_NOT_STICKY
         }
+        // Written down before anything else, so that a kill from here on is reported, not silent.
+        val id = UUID.randomUUID().toString()
+        val names = uris.map { displayNameOf(contentResolver, it) }
+        ShareImports.begin(id)
+        ShareLedger.of(this).begin(id, folder, names)
         synchronized(lock) { pending++ }
         worker.execute {
             try {
-                copy(folder, directory, label, uris)
+                copy(id, folder, directory, label, uris, names)
+            } catch (error: Throwable) {
+                // A copy that cannot even run (a dead worker, a bug) still says so.
+                Log.w(TAG, "share: ${error.javaClass.simpleName}: ${error.message}")
+                ShareLedger.of(this).finish(id, failed = names)
             } finally {
+                ShareImports.end(id)
                 finishIfIdle(extra = 1)
             }
         }
@@ -81,17 +100,25 @@ class ShareImportService : Service() {
         }
     }
 
-    private fun copy(folder: String, directory: String, label: String, uris: List<Uri>) {
-        val importer = Importer(EngineFolder(folder))
+    private fun copy(id: String, folder: String, directory: String, label: String, uris: List<Uri>, names: List<String>) {
+        val ledger = ShareLedger.of(this)
+        // What an earlier, killed process left is reported and swept first.
+        ShareImports.recover(this)
+        val importer = Importer(
+            EngineFolder(folder),
+            working = { ledger.working(id, it) },
+            cleared = { ledger.cleared(id, it) },
+        )
         val sizes = uris.map { size(it) }
         val grand = if (sizes.all { it >= 0 }) sizes.sum() else 0L
         var finished = 0L
         var saved = 0
         val failed = mutableListOf<Pair<String, String>>()
         for ((index, uri) in uris.withIndex()) {
-            val name = entryName(displayName(uri))
+            val name = names[index]
             if (stopped) {
                 failed += name to "Android stopped saving."
+                ledger.done(id, name)
                 continue
             }
             var last = 0L
@@ -117,8 +144,11 @@ class ShareImportService : Service() {
                 Log.w(TAG, "share: $name: ${error.message}")
                 failed += name to "the sender no longer allows it."
             }
+            ledger.done(id, name)
             finished += maxOf(0, sizes[index])
         }
+        // The names go to the Folders screen, which does not depend on the notification permission.
+        ledger.finish(id, failed = failed.map { it.first })
         if (saved > 0) SyncCoordinator.onLocalChange(this)
         val (title, text) = resultLines(saved, failed, label)
         Notifications.shared(this, title, text)
@@ -128,9 +158,6 @@ class ShareImportService : Service() {
         getSystemService(android.app.NotificationManager::class.java)
             .notify(Notifications.SHARE_ID, Notifications.sharing(this, text, done, total))
     }
-
-    private fun displayName(uri: Uri): String =
-        query(uri, OpenableColumns.DISPLAY_NAME)?.takeIf { it.isNotEmpty() } ?: uri.lastPathSegment.orEmpty()
 
     private fun size(uri: Uri): Long = query(uri, OpenableColumns.SIZE)?.toLongOrNull() ?: -1
 

@@ -54,6 +54,23 @@ class TransferGate {
         queued = false
     }
 
+    /** A trigger found work left and wants the job: whether the caller must enqueue it. No change is recorded. */
+    @Synchronized fun wanted(): Boolean {
+        if (queued || working) return false
+        queued = true
+        return true
+    }
+
+    /**
+     * The job ended without being stopped: whether it must be enqueued again, because a change
+     * came after `claimed`. A job that ended on no progress with no new change asks for nothing.
+     */
+    @Synchronized fun resume(claimed: Long): Boolean {
+        if (changes == claimed || queued || working) return false
+        queued = true
+        return true
+    }
+
     /** Whether a job is enqueued and has not started. */
     @Synchronized fun waiting(): Boolean = queued && !working
 

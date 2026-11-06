@@ -130,7 +130,47 @@ object SyncCoordinator {
         )
         val result = burst(app, mode)
         if (!result.dropped) done.value = Finished((done.value?.serial ?: 0) + 1, trigger, result)
+        if (mode == Mode.Full && (trigger == Trigger.Foreground || trigger == Trigger.Periodic)) sendWhatIsLeft(app, result)
         return result
+    }
+
+    /**
+     * A burst that left work and moved something goes on as the transfer job, which a burst bounded
+     * to the 185 s of `sync-now` cannot do. One that moved nothing is stuck, and the job would only
+     * find that out again.
+     */
+    private fun sendWhatIsLeft(app: Context, result: BurstResult) {
+        if (result.dropped || Progress().after(result) != Next.Again) return
+        if (!gate.wanted()) return
+        try {
+            enqueueTransfer(app, ExistingWorkPolicy.APPEND_OR_REPLACE)
+        } catch (error: RuntimeException) {
+            gate.notQueued()
+            throw error
+        }
+    }
+
+    /** The transfer job ended with changes it did not cover. */
+    internal fun resumeTransfer(ctx: Context, claimed: Long) {
+        if (!gate.resume(claimed)) return
+        try {
+            enqueueTransfer(ctx.applicationContext, ExistingWorkPolicy.APPEND_OR_REPLACE)
+        } catch (error: RuntimeException) {
+            gate.notQueued()
+            throw error
+        }
+    }
+
+    /**
+     * Ends every open burst now, so a stopped job leaves no bytes moving on a network it may no longer
+     * use. At most the call in flight finishes.
+     */
+    internal fun endBursts() {
+        try {
+            Native.manage("end-bursts", "{}")
+        } catch (error: IOException) {
+            // The orchestrator is not there: no burst is either.
+        }
     }
 
     /** Every 30 min by default and only with a network; `replace` after the interval changes. */

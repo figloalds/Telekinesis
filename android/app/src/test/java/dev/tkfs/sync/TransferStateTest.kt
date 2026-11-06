@@ -94,4 +94,41 @@ class TransferStateTest {
         assertEquals(0, gate.quietFor(17_000))
         assertEquals(0, TransferGate().quietFor(1))
     }
+
+    @Test fun aJobThatEndedWithAChangeItDidNotCoverAsksForAnother() {
+        val gate = TransferGate()
+        gate.changed(0)
+        gate.started()
+        val claimed = gate.claim()
+        gate.changed(1)
+        gate.stopped()
+        assertTrue("a change came after the claim", gate.resume(claimed))
+        assertFalse("and only one job is asked for", gate.resume(claimed))
+    }
+
+    @Test fun aJobThatEndedOnNoProgressAsksForNothingByItself() {
+        val gate = TransferGate()
+        gate.changed(0)
+        gate.started()
+        val claimed = gate.claim()
+        gate.stopped()
+        assertFalse(gate.resume(claimed))
+    }
+
+    @Test fun aTriggerThatFindsWorkLeftAsksForOneJobAndNeverTwo() {
+        val gate = TransferGate()
+        assertTrue(gate.wanted())
+        assertFalse("it is queued", gate.wanted())
+        assertFalse("a change joins it", gate.changed(1))
+        gate.started()
+        assertFalse("it is running", gate.wanted())
+        gate.stopped()
+        assertTrue(gate.wanted())
+    }
+
+    @Test fun aBurstTheJobEndedIsNotAFailureToShow() {
+        val ended = FolderBurst("a", 0, 3, BurstError("SYNC_NOW_ENDED: ended by `end-bursts`", null), pushed = 4)
+        val timeout = FolderBurst("b", 0, 3, BurstError("SYNC_NOW_TIMEOUT: x", null))
+        assertEquals(setOf("b"), BurstResult(listOf(ended, timeout)).errors.keys)
+    }
 }

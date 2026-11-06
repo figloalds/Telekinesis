@@ -31,6 +31,7 @@ internal object ShellControl {
     private const val FAULT = "tkfs.fault"
     private const val SET_LAST_SYNC = "tkfs.set_last_sync"
     private const val DOCUMENT = "tkfs.document"
+    private const val LIST_ALL = "tkfs.list_all"
     private const val ROOT_UID = 0
     private const val SHELL_UID = 2000
 
@@ -73,6 +74,11 @@ internal object ShellControl {
             } finally {
                 Binder.restoreCallingIdentity(shell)
             }
+        }
+        // Every name in a directory, including the working files the provider hides: `--arg FOLDER`, payload {path}.
+        LIST_ALL -> reply {
+            val folder = arg ?: throw IOException("MISSING_ARGUMENT: folder")
+            Native.list(folder, JSONObject(payload(extras?.getString("payload"))).optString("path", "/"))
         }
         else -> null
     }

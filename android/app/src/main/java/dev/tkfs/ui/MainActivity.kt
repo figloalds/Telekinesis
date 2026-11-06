@@ -21,6 +21,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import dev.tkfs.Native
 import dev.tkfs.Settings
+import dev.tkfs.share.ShareImports
 import dev.tkfs.sync.SyncCoordinator
 
 /** The app's one window: the screen is a value in the state, with no navigation library. */
@@ -34,6 +35,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Native.ensureStarted(this)
         SyncCoordinator.schedulePeriodic(this)
+        // A kill mid-copy left a report and working files; the provider does the same when it starts first.
+        ShareImports.recoverInBackground(this)
         setContent {
             TkfsTheme {
                 Surface(Modifier.fillMaxSize()) {
@@ -48,6 +51,7 @@ class MainActivity : ComponentActivity() {
                             onSync = model::syncNow,
                             onAddPc = { model.show(Screen.AddPc) },
                             onSettings = { model.show(Screen.Settings) },
+                            onDismissShareFailures = model::dismissShareFailures,
                         )
                         Screen.AddPc -> AddPcScreen(
                             ui,

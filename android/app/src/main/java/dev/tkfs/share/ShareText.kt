@@ -42,3 +42,11 @@ internal fun resultLines(saved: Int, failed: List<Pair<String, String>>, where: 
     }
     return title to text
 }
+
+/** The strip on the Folders screen for names that were not saved, or null when there are none. */
+internal fun stripText(names: List<String>): String? = when (names.size) {
+    0 -> null
+    1 -> "Couldn't save ${names[0]}. Share it again."
+    2 -> "Couldn't save ${names[0]} and ${names[1]}. Share them again."
+    else -> "Couldn't save ${names[0]}, ${names[1]} and ${names.size - 2} more. Share them again."
+}

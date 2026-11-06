@@ -8,6 +8,7 @@ import androidx.work.WorkerParameters
 import dev.tkfs.Native
 import dev.tkfs.Notifications
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
@@ -26,18 +27,26 @@ import java.io.IOException
 class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun getForegroundInfo(): ForegroundInfo = Notifications.transfer(applicationContext, "Starting")
 
+    /** The changes the last burst began after: what it covers. */
+    @Volatile private var claimed = 0L
+
     override suspend fun doWork(): Result {
         val gate = SyncCoordinator.gate
         gate.started()
+        claimed = gate.claim()
+        var stopped = false
         try {
             becomeForeground("Starting")
             withContext(Dispatchers.IO) { send(gate) }
         } catch (stop: CancellationException) {
             // A stop (constraints, quota, `onTimeout`). The rest is for the next trigger.
+            stopped = true
             Log.i(TAG, "transfer: stopped (${stopReason})")
         } finally {
             gate.stopped()
         }
+        // Ended by itself, with a change that came while it ran: nothing else would send it.
+        if (!stopped) SyncCoordinator.resumeTransfer(applicationContext, claimed)
         return Result.success()
     }
 
@@ -57,8 +66,16 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
         val progress = Progress()
         var dropped = 0
         while (true) {
-            val claimed = gate.claim()
-            val result = SyncCoordinator.transferBurst(applicationContext).await()
+            claimed = gate.claim()
+            val burst = SyncCoordinator.transferBurst(applicationContext)
+            val result = try {
+                burst.await()
+            } catch (stop: CancellationException) {
+                // The burst is not interruptible. Ending it now keeps it from moving bytes, perhaps on
+                // a metered network, until its own bound.
+                withContext(NonCancellable) { SyncCoordinator.endBursts() }
+                throw stop
+            }
             if (result.dropped) {
                 // Another burst is on its way to the PC; ask again once it is done.
                 if (++dropped > MAX_DROPPED) return

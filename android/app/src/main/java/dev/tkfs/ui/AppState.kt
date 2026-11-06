@@ -8,6 +8,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import dev.tkfs.Native
 import dev.tkfs.Settings
+import dev.tkfs.share.ShareLedger
 import dev.tkfs.sync.BurstError
 import dev.tkfs.sync.Finished
 import dev.tkfs.sync.SyncCoordinator
@@ -64,6 +65,8 @@ data class AppUi(
     val periodMinutes: Int = 30,
     /** Whether Android lets the app run while the phone is idle (the battery-optimization exemption). */
     val batteryAllowed: Boolean = true,
+    /** Names of files shared in that were not saved, until the owner dismisses them. */
+    val shareFailures: List<String> = emptyList(),
     val now: Long = System.currentTimeMillis(),
 )
 
@@ -121,6 +124,11 @@ class AppModel(application: Application) : AndroidViewModel(application) {
 
     fun dismissFailure() = mutable.update { it.copy(failure = null) }
 
+    fun dismissShareFailures() {
+        ShareLedger.of(getApplication()).dismiss()
+        mutable.update { it.copy(shareFailures = emptyList()) }
+    }
+
     private suspend fun refresh() {
         val snapshot = try {
             parseSnapshot(call("status"), bursts)
@@ -134,7 +142,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         val allowed = getApplication<Application>().getSystemService(PowerManager::class.java)
             .isIgnoringBatteryOptimizations(getApplication<Application>().packageName)
         val storage = if (polls++ % STORAGE_EVERY == 0) storageLine() else mutable.value.storage
-        mutable.update { it.polled(snapshot, storage, System.currentTimeMillis()).copy(batteryAllowed = allowed) }
+        mutable.update { it.polled(snapshot, storage, System.currentTimeMillis()).copy(batteryAllowed = allowed, shareFailures = ShareLedger.of(getApplication()).notices()) }
     }
 
     /** One burst for every folder. Its errors stay on their folders until a newer exchange. */

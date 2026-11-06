@@ -60,6 +60,8 @@ class ShareActivity : ComponentActivity() {
         val uris = sharedUris(intent)
         val mimeTypes = sharedMimeTypes(intent, uris)
         val source = referrerLabel()
+        // Taken now: a file that goes away before Save still has a name to be told of.
+        val names = uris.map { displayNameOf(contentResolver, it) }
         setContent {
             TkfsTheme {
                 Surface(Modifier.fillMaxSize().safeDrawingPadding()) {
@@ -76,6 +78,7 @@ class ShareActivity : ComponentActivity() {
                                 finish()
                             } catch (error: SecurityException) {
                                 // The sender gave this screen no right to read them, so none can be handed on.
+                                ShareLedger.of(this).addNotices(names)
                                 Toast.makeText(this, "Telekinesis cannot read what was shared.", Toast.LENGTH_LONG).show()
                             }
                         },

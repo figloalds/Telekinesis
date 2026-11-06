@@ -16,6 +16,8 @@ import android.webkit.MimeTypeMap
 import dev.tkfs.BuildConfig
 import dev.tkfs.Native
 import dev.tkfs.R
+import dev.tkfs.share.PART_PREFIX
+import dev.tkfs.share.ShareImports
 import dev.tkfs.sync.SyncCoordinator
 import org.json.JSONArray
 import org.json.JSONObject
@@ -47,6 +49,8 @@ class TkfsProvider : DocumentsProvider() {
 
     override fun onCreate(): Boolean {
         Native.ensureStarted(requireNotNull(context))
+        // A process that was killed mid-copy left a report and working files to remove.
+        ShareImports.recoverInBackground(requireNotNull(context))
         return true
     }
 
@@ -88,6 +92,8 @@ class TkfsProvider : DocumentsProvider() {
         val entries = JSONArray(orNotFound { Native.list(folder, path) })
         for (index in 0 until entries.length()) {
             val entry = entries.getJSONObject(index)
+            // A file being shared in has this name until it is whole.
+            if (entry.getString("name").startsWith(PART_PREFIX)) continue
             val child = DocumentIds.childPath(path, entry.getString("name"))
             addRow(cursor, DocumentIds.make(folder, child), entry, child)
         }

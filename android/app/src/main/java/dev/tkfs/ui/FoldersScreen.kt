@@ -27,16 +27,24 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import dev.tkfs.R
+import dev.tkfs.share.stripText
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FoldersScreen(ui: AppUi, onSync: () -> Unit, onAddPc: () -> Unit, onSettings: () -> Unit) {
+fun FoldersScreen(
+    ui: AppUi,
+    onSync: () -> Unit,
+    onAddPc: () -> Unit,
+    onSettings: () -> Unit,
+    onDismissShareFailures: () -> Unit = {},
+) {
     val snapshot = ui.snapshot
     Column(Modifier.fillMaxSize()) {
         ScreenBar("Telekinesis") { TextButton(onClick = onSettings) { Text("Settings") } }
         // Pulling down is the same as "Sync now".
         PullToRefreshBox(isRefreshing = ui.syncing, onRefresh = onSync, modifier = Modifier.weight(1f)) {
             Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
+                ShareFailureStrip(ui.shareFailures, onDismissShareFailures)
                 when {
                     snapshot == null -> Text("Starting...", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     snapshot.folders.isEmpty() -> Empty(snapshot, onAddPc)
@@ -128,5 +136,20 @@ private fun Strips(snapshot: Snapshot, onAddPc: () -> Unit) {
                 .background(amber().soft, RoundedCornerShape(12.dp))
                 .padding(horizontal = 12.dp, vertical = 10.dp),
         )
+    }
+}
+
+/** Files shared in that were not saved, until dismissed. It does not depend on the notification permission. */
+@Composable
+private fun ShareFailureStrip(names: List<String>, onDismiss: () -> Unit) {
+    val text = stripText(names) ?: return
+    Row(
+        Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp)
+            .background(MaterialTheme.colorScheme.errorContainer, RoundedCornerShape(12.dp))
+            .padding(start = 12.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(text, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+        TextButton(onClick = onDismiss) { Text("Dismiss") }
     }
 }

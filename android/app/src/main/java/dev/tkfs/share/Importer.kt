@@ -46,19 +46,29 @@ class ImportFailed(message: String, cause: Throwable) : IOException(message, cau
  * rename, which is durable. A stream that fails partway, or a process killed partway, leaves a
  * working name and never a half file under the real one; a failure deletes the working file.
  */
-internal class Importer(private val files: FolderFiles, private val bufferSize: Int = 256 * 1024) {
+internal class Importer(
+    private val files: FolderFiles,
+    private val bufferSize: Int = 256 * 1024,
+    /** Told of a working file before it is created, so a kill cannot hide it. */
+    private val working: (String) -> Unit = {},
+    /** Told when a working file is gone or has its real name, and not when its removal failed. */
+    private val cleared: (String) -> Unit = {},
+) {
     /** The path it was saved as. `progress` gets the bytes copied so far. */
     fun import(directory: String, name: String, input: InputStream, progress: (Long) -> Unit): String {
-        val working = DocumentIds.childPath(directory, WORKING + UUID.randomUUID())
-        files.create(working)
+        val part = DocumentIds.childPath(directory, PART_PREFIX + UUID.randomUUID())
+        working(part)
         try {
-            copy(working, input, progress)
-            return rename(working, directory, name)
+            files.create(part)
+            copy(part, input, progress)
+            return rename(part, directory, name).also { cleared(part) }
         } catch (error: Exception) {
             try {
-                files.delete(working)
+                files.delete(part)
+                cleared(part)
             } catch (cleanup: IOException) {
-                error.addSuppressed(cleanup)
+                // Not there is as good as deleted; any other failure leaves it for the sweep.
+                if (cleanup.message?.startsWith("FILE_NOT_FOUND") == true) cleared(part) else error.addSuppressed(cleanup)
             }
             throw error as? ImportFailed ?: ImportFailed(error.message ?: error.javaClass.simpleName, error)
         }
@@ -111,7 +121,9 @@ internal class Importer(private val files: FolderFiles, private val bufferSize: 
     }
 
     private companion object {
-        const val WORKING = ".tkfs-part-"
         const val RENAME_ATTEMPTS = 3
     }
 }
+
+/** The start of a working file's name. The provider does not list these, and a sweep removes what a kill left. */
+internal const val PART_PREFIX = ".tkfs-part-"

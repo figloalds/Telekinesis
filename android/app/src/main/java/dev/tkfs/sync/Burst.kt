@@ -31,7 +31,9 @@ data class BurstResult(
     val dropped: Boolean = false,
 ) {
     val exchanged: Long get() = folders.sumOf { it.exchanged }
-    val errors: Map<String, BurstError> get() = folders.mapNotNull { f -> f.error?.let { f.id to it } }.toMap()
+    /** What went wrong per folder. A burst that the transfer job ended on its stop is not a failure to show. */
+    val errors: Map<String, BurstError>
+        get() = folders.mapNotNull { f -> f.error?.takeUnless { it.message.startsWith("SYNC_NOW_ENDED") }?.let { f.id to it } }.toMap()
 
     companion object {
         val DROPPED = BurstResult(dropped = true)
