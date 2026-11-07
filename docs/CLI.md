@@ -236,8 +236,10 @@ tkfs manage set-endpoint INSTALLATION ws://newhost:43180
 - `pair ENDPOINT` pairs with the orchestrator at ENDPOINT. The other host's
   pairing code is read from the first line of stdin unless `--code` is given
   (stdin keeps it out of the shell history and the process list). The code
-  itself never crosses the network: the hosts authenticate with an HMAC
-  challenge and, once, enroll a per-peer credential that later sessions use.
+  itself never crosses the network, but a key derived from it does, and once
+  authenticated the hosts enroll a per-peer credential that later sessions
+  use. On plain `ws://` these can be read: see
+  [configuration](CONFIGURATION.md#pairing-credentials-and-local-access).
   The orchestrator then keeps a pool of connections to the peer:
   `--connections N` (1-16, default `[network] connections`) sets it, one
   control lane plus at least one bulk lane (`1` is raised to 2). `pair`

@@ -124,6 +124,9 @@ private fun PcRow(
     Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
         Text(name, style = MaterialTheme.typography.bodyLarge)
         Text(peer.endpoint, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        unencryptedNote(peer.endpoint)?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         Row {
             TextButton(onClick = { changing = true }) { Text("Change address") }
             TextButton(onClick = { unpairing = true }) { Text("Unpair") }
@@ -168,6 +171,14 @@ private val PERIODS = listOf(15, 30, 60, 120)
 private fun nextPeriod(current: Int): Int = PERIODS.firstOrNull { it > current } ?: PERIODS.first()
 
 private fun periodWords(minutes: Int): String = if (minutes % 60 == 0 && minutes >= 60) "${minutes / 60} h" else "$minutes min"
+
+/** What a PC's row says of an address that carries the phone's credential in the clear, to whatever answers at it. */
+internal fun unencryptedNote(endpoint: String): String? =
+    if (endpoint.trim().startsWith("ws://", ignoreCase = true)) {
+        "This connection isn't encrypted. Use it only on your own network or a VPN."
+    } else {
+        null
+    }
 
 /** What the Battery row says; when it is not allowed, Android may hold syncing back until the phone is awake. */
 internal fun batteryLine(allowed: Boolean): String =

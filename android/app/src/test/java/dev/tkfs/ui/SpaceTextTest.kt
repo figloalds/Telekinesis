@@ -7,6 +7,14 @@ import org.junit.Assert.assertNull
 import org.junit.Test
 
 class SpaceTextTest {
+    @Test fun onlyAPlainAddressSaysItIsNotEncrypted() {
+        val note = "This connection isn't encrypted. Use it only on your own network or a VPN."
+        assertEquals(note, unencryptedNote("ws://192.168.1.5:43180"))
+        assertEquals(note, unencryptedNote("WS://pc.local:43180"))
+        assertNull(unencryptedNote("wss://pc.example.com"))
+        assertNull(unencryptedNote("WSS://pc.example.com"))
+    }
+
     @Test fun theStripSaysWhatOnlyAPcCanChange() {
         assertEquals("Low on space. Can't free anything until My PC is reachable.", lowSpaceStrip("PC_UNREACHABLE"))
         assertEquals("Low on space. Can't free anything until My PC is updated.", lowSpaceStrip("PC_TOO_OLD"))

@@ -175,12 +175,17 @@ how a peer's times are read. An offset above 5 s is logged as
   over that authenticated session the dialing host then enrolls a fresh
   random 32-byte secret with the accepting host (`peer.enroll`), and both
   keep the key derived from it in `folders.sqlite`. Later sessions
-  authenticate with that key (scheme `peer-hmac-v1`), so each pairing has its
-  own credential that can be revoked alone. A missing or revoked credential
-  is refused with `PEER_REVOKED`.
-- The pairing code never crosses the network: sessions authenticate with an
-  HMAC-SHA256 challenge in both directions, so WS and WSS carry the same
-  proof; WSS adds transport encryption.
+  authenticate with that key, so each pairing has its own credential that can
+  be revoked alone. A missing or revoked credential is refused with
+  `PEER_REVOKED`.
+- **What crosses the network.** There is no challenge: a session's AUTH frame
+  carries the key itself, in hex, which is the per-peer key or, when pairing,
+  the key derived from the code and the listener's salt. The code itself
+  never crosses the network, but that key stands in for it, and `peer.enroll`
+  carries the new secret. Only the listener checks anything: the dialer has
+  nothing but TLS to tell it who answered. So on plain WS anyone who can read
+  the traffic can use these, and a host at the endpoint's address can collect
+  them. Use WSS or a VPN on any network you do not trust.
 - **Revocation.** `manage unpair` first asks the other host to revoke this
   host's credential (best effort: an unreachable host does not block the
   unpair); that host closes this installation's sessions within a second.

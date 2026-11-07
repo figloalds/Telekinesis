@@ -54,6 +54,23 @@ from them, but they are on the phone all the same.
   paste the address and the 64 hex code. If the PC runs `reset-pairing-code` or unpairs the phone,
   the app says to pair again, and pairing again keeps the folder's data.
 
+## Plain `ws://` is for your own network
+
+A `ws://` connection is not encrypted, and it is not checked. Each new session sends this phone's
+credential for that PC across the network as it is, and nothing proves who received it. Pairing sends
+a key made from the pairing code, which stands in for the code, and then the secret the credential
+is made from. Anyone who can read that traffic can use them as this phone.
+
+A phone roams, and that makes this worse than it is on a desktop. The background check runs on
+whatever network the phone is on, so on another network it offers the credential to whatever answers
+at the PC's address, and believes that host: for the events it sends, and for `objects.have`, which
+is what decides that a file can be freed from the phone. Change address has the same limit: over
+`ws://`, a host accepting the credential does not show it is the same PC.
+
+So use `ws://` only on your own network or over a VPN, and use a VPN or a `wss://` proxy for anything
+else (see [configuration](CONFIGURATION.md)). Settings says this on every `ws://` PC. There is no way to
+pin a PC yet: with `wss://` the phone checks the proxy's certificate against the bundled roots.
+
 ## Settings
 
 - Sync on mobile data: off means that on a metered network only file lists update, and files you

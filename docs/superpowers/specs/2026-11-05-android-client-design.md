@@ -396,8 +396,15 @@ however they like.
 **Changing address.** Peers are keyed by endpoint, and pairing at a new address needs a code, which
 revokes everything. So a PC whose address changes would stop the phone syncing and cost a re-pair.
 Settings gets "Change address", backed by a new local action, `manage set-endpoint INSTALLATION
-ENDPOINT`. It replaces that peer's endpoint and reopens its lanes with the existing credential,
-which also proves the PC at the new address is the same one.
+ENDPOINT`. It replaces that peer's endpoint and reopens its lanes with the existing credential. Over
+`wss://` a host that accepts the credential is the same PC. Over `ws://` that shows nothing, since the
+credential goes in the clear and any host can say it accepted it.
+
+**Plain `ws://`.** Nothing authenticates the host at the other end of a `ws://` connection, and a
+phone roams: a background check on another network offers the credential to whatever answers at that
+address, and believes it for events and for `objects.have`. No protocol change is made for this.
+`docs/ANDROID.md` states the risk and recommends a VPN or `wss://` off the home network, and Settings
+says so on every `ws://` PC.
 
 ### Changes to the core
 

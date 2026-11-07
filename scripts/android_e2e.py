@@ -313,6 +313,8 @@ def scenario_ui_folders(s: Session) -> None:
     device.tap_text("Settings")
     found = shown("the Settings screen", has("My PC", pc.endpoint, "Change address", "Unpair"))
     s.check("Settings names the PC with its address and the two actions", True, found)
+    s.check("and says a ws:// connection is not encrypted",
+            "This connection isn't encrypted. Use it only on your own network or a VPN." in found, found)
     device.screenshot(shots / "settings.png")
     check_settings_rows(s, found)
     device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
