@@ -11,7 +11,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use support::daemon::{TestDaemon, run_tkfs};
+use support::{
+    FaultProxy,
+    daemon::{TestDaemon, run_tkfs},
+};
 use tempfile::TempDir;
 use tkfs::{
     model::{content::Digest, errors::code_of},
@@ -81,6 +84,12 @@ impl Phone {
     }
 
     fn with_pc(pc: TestDaemon, files: &[(&str, &str)]) -> Result<Self> {
+        let endpoint = pc.listen_endpoint()?;
+        Self::with_pc_at(pc, endpoint, files)
+    }
+
+    /// The same, dialing the PC at `endpoint`, as through a proxy.
+    fn with_pc_at(pc: TestDaemon, endpoint: String, files: &[(&str, &str)]) -> Result<Self> {
         let shared = pc.manage(&["create", "Shared", "--headless"])?;
         let repo = shared["repo"].as_str().context("no repo")?.to_owned();
         pc.wait_phase("Shared", "Running", REPLICATED)?;
@@ -96,7 +105,6 @@ impl Phone {
             .as_str()
             .context("no code")?
             .to_owned();
-        let endpoint = pc.listen_endpoint()?;
 
         let (home, host) = host()?;
         let daemon = host.daemon()?;
@@ -646,6 +654,42 @@ fn reach_a_peer_fails_within_its_bound_with_no_peer_up() -> Result<()> {
     );
     drop(engine);
     host.stop()
+}
+
+/// A laptop lid closing says nothing to the phone: its lane stays Ready until the session calls it
+/// dead, 20 s of running time on. An open that took Ready for an answer would wait out a fetch and
+/// fail with no reason given.
+#[test]
+fn reach_a_peer_finds_a_pc_that_went_silent_within_its_bound() -> Result<()> {
+    let pc = TestDaemon::start()?;
+    let proxy = FaultProxy::try_start(&pc.listen_endpoint()?)?;
+    let phone = Phone::with_pc_at(pc, proxy.endpoint(), &[("a.txt", "bytes")])?;
+    let daemon = phone.host.daemon()?;
+    let within = Duration::from_secs(3);
+    daemon.reach_a_peer(&phone.id, within)?;
+    let asked = proxy.bytes_up();
+    daemon.reach_a_peer(&phone.id, within)?;
+    ensure!(
+        proxy.bytes_up() > asked,
+        "a PC still there was not asked anything"
+    );
+
+    proxy.blackhole(true);
+    let ready = daemon.execute("peers", &json!({}))?;
+    ensure!(ready[0]["lanes"][0]["state"] == "Ready", "{ready}");
+    let began = Instant::now();
+    let refused = daemon
+        .reach_a_peer(&phone.id, within)
+        .err()
+        .context("a PC that says nothing was taken for reachable")?;
+    let took = began.elapsed();
+    ensure!(code_of(&refused) == "PC_UNREACHABLE", "{refused:#}");
+    ensure!(
+        took >= within - Duration::from_millis(100) && took < within + Duration::from_secs(1),
+        "waited {took:?} for a bound of {within:?}"
+    );
+    proxy.blackhole(false);
+    phone.stop()
 }
 
 #[test]

@@ -208,8 +208,9 @@ Document ids stay `FOLDER_ID:/path`, as in the spike. The provider adds these to
   over it, leaving it for that start. A new or empty file has nothing to lose and recovers under its
   own name, as does anything written by a client that fsynced and closed.
 - **Opening a file the phone lacks.** The open clears lane backoff, so a PC that just came
-  back is tried at once. With no reachable peer it fails within 5 s rather than the spike's
-  20 s, and the app shows why, since a viewer's own error message will not.
+  back is tried at once. It then pings the PC, since a PC that went silent still looks connected. With
+  no peer answering it fails within 5 s rather than the spike's 20 s, and the app shows why, since a
+  viewer's own error message will not.
 
 ### First-read speed
 

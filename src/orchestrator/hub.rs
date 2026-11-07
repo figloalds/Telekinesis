@@ -63,7 +63,7 @@ use super::{
 use crate::{
     model::{
         content::Digest,
-        protocol::{features, frame::NotifyReason},
+        protocol::{features, frame::NotifyReason, ops},
     },
     runtime::Engine,
     session::{CallError, Priority},
@@ -722,12 +722,14 @@ impl Daemon {
         Ok(Held::Known(known))
     }
 
-    /// Waits at most `within` for a Ready control lane to a PC that has `folder`'s repo, first
+    /// Waits at most `within` for a PC that has `folder`'s repo to answer on its control lane, first
     /// ending any lane's wait to redial. With none in time this is `PC_UNREACHABLE`, so a reader
     /// of a file it does not hold learns that now and not after a fetch times out.
     ///
     /// A PC has the repo when this device has exchanged it with it. With no exchange on record,
-    /// as after the cursors were reset, any Ready PC counts.
+    /// as after the cursors were reset, any Ready PC counts. Ready alone says too little: a PC that
+    /// went silent, as with a laptop's lid closing, stays Ready for as long as the session has not
+    /// called it dead, and a freeze moves that further off.
     pub fn reach_a_peer(&self, folder: &str, within: Duration) -> Result<()> {
         const POLL: Duration = Duration::from_millis(25);
         let repo = self.catalog.resolve(folder)?.repo;
@@ -741,12 +743,23 @@ impl Daemon {
                 .into_iter()
                 .map(|(installation, _)| installation)
                 .collect();
-            let reachable = network
+            let candidates: Vec<_> = network
                 .ready_peers()
-                .iter()
-                .any(|peer| exchanged.is_empty() || exchanged.contains(&peer.installation));
-            if reachable {
-                return Ok(());
+                .into_iter()
+                .filter(|peer| exchanged.is_empty() || exchanged.contains(&peer.installation))
+                .collect();
+            for (asked, peer) in candidates.iter().enumerate() {
+                // One that says nothing leaves time for the rest.
+                let share = end.saturating_duration_since(Instant::now())
+                    / (candidates.len() - asked) as u32;
+                if !share.is_zero()
+                    && peer
+                        .control
+                        .call(ops::PING, json!({}), Vec::new(), Priority::Control, share)
+                        .is_ok()
+                {
+                    return Ok(());
+                }
             }
             ensure!(!self.stopping.is_cancelled(), "ORCHESTRATOR_STOPPING");
             let left = end.saturating_duration_since(Instant::now());
