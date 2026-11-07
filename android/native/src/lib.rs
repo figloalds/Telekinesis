@@ -786,8 +786,8 @@ pub extern "system" fn Java_dev_tkfs_Native_freeSpace(
     })
 }
 
-/// Downloads what is kept, and returns how many bytes came. Each step looks at `stop`, an
-/// `AtomicBoolean`, first.
+/// Downloads what is kept, and returns how many bytes came. Each step asks `stop`, a
+/// `BooleanSupplier`, first.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_tkfs_Native_hydrateKept<'local>(
     mut env: JNIEnv<'local>,
@@ -804,7 +804,7 @@ pub extern "system" fn Java_dev_tkfs_Native_hydrateKept<'local>(
             }
             let answer = env
                 .borrow_mut()
-                .call_method(&stop, "get", "()Z", &[])
+                .call_method(&stop, "getAsBoolean", "()Z", &[])
                 .and_then(|value| value.z());
             failed.set(answer.is_err());
             answer.unwrap_or(true)
@@ -1266,15 +1266,12 @@ mod tests {
         });
     }
 
-    /// What it looks at between steps is a real `AtomicBoolean` of the caller's, here with no host
-    /// to get as far as a step. The guard takes it from there.
+    /// With no host it gets as far as no step, so nothing asks what it was given.
     #[test]
     fn hydrating_what_is_kept_fails_through_the_guard_with_no_host() {
         with_env(|env| {
             let class = env.find_class("java/lang/Object").unwrap();
-            let stop = env
-                .new_object("java/util/concurrent/atomic/AtomicBoolean", "()V", &[])
-                .unwrap();
+            let stop = env.new_object("java/lang/Object", "()V", &[]).unwrap();
             let value =
                 Java_dev_tkfs_Native_hydrateKept(unsafe { env.unsafe_clone() }, class, stop);
             assert_eq!(value, -1);

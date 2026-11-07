@@ -15,6 +15,17 @@ class SpaceTextTest {
         assertNull(lowSpaceStrip("NOT_ON_PC"))
     }
 
+    @Test fun theStripSaysWhenWhatIsKeptDoesNotFit() {
+        val short = "Low on space. Not everything you marked to keep fits on this phone."
+        assertEquals(short, lowSpaceStrip(null, keptDoesNotFit = true))
+        assertNull(lowSpaceStrip(null, keptDoesNotFit = false))
+        // What only a PC can change comes first.
+        assertEquals(
+            "Low on space. Can't free anything until My PC is reachable.",
+            lowSpaceStrip("PC_UNREACHABLE", keptDoesNotFit = true),
+        )
+    }
+
     @Test fun removeDownloadHasASentenceForEachWayItCanBeRefused() {
         assertEquals("Not on My PC yet, so it can't be removed.", removeSentence("a.bin", Freed(0, "NOT_ON_PC")))
         val away = removeSentence("a.bin", Freed(0, "PC_UNREACHABLE"))

@@ -1535,6 +1535,7 @@ SPACE_FILE_BYTES = 64 * MIB
 # How far below the floor it is filled: more than two of those files and less than three.
 BELOW_THE_FLOOR = 130 * MIB
 LOW_ON_SPACE = "Low on space. Can't free anything until My PC is reachable."
+KEPT_DOES_NOT_FIT = "Low on space. Not everything you marked to keep fits on this phone."
 BACK_IN_SPACE = 256 * MIB
 
 
@@ -1547,12 +1548,12 @@ def scenario_space(s: Session) -> None:
     on this AVD after this one."""
     device = s.device
     rng = random.Random(19)
-    device.remove_filler()
     files = {name: random_bytes(rng, SPACE_FILE_BYTES) for name in ("kept.bin", "a.bin", "b.bin", "c.bin", "d.bin")}
     files |= {
         "dir/inside.bin": rng.randbytes(3 * MIB),
         "not-here.bin": rng.randbytes(8 * MIB),
         "good.txt": b"The good contents of this file.\n" * 100,
+        "no-room.bin": rng.randbytes(MIB),
     }
     folder = s.folder_with(files, "Space")
     before = device.free_bytes()
@@ -1560,6 +1561,7 @@ def scenario_space(s: Session) -> None:
         check_keeping(s, folder)
         check_freeing(s, folder)
         check_freeing_with_the_pc_away(s, folder)
+        check_what_is_kept_does_not_fit(s, folder)
         check_a_full_disk(s, folder)
     finally:
         # Each on its own: one failing must not leave the other undone, or hide what ended the scenario.
@@ -1762,6 +1764,49 @@ def check_freeing_with_the_pc_away(s: Session, folder: Folder) -> None:
     to_folders(s)
 
 
+def check_what_is_kept_does_not_fit(s: Session, folder: Folder) -> None:
+    """Below the floor with nothing left to free, a marked file does not download towards a full disk,
+    and the Folders screen says so. It comes once there is room."""
+    device = s.device
+    shots = s.report.path.parent / "screens"
+    floor = device.space()["floor"]
+    # Further below the floor than all that could be freed comes to.
+    device.fill_until_free(floor - 768 * MIB)
+    to_folders(s)
+    device.tap_text("Space")
+    device.wait_screen("the files", lambda t: "no-room.bin" in t)
+    press_action(s, "no-room.bin", "Keep on this phone")
+    to_folders(s)
+    device.tap_text("Sync now")
+    found = device.wait_screen("the strip that says so", lambda t: KEPT_DOES_NOT_FIT in t, SYNC_BOUND)
+    s.check("what is kept and does not fit says so on the Folders screen", True, found)
+    device.screenshot(shots / "space-kept-does-not-fit.png")
+    # Long enough for a job to have started, had one been asked for.
+    time.sleep(2 * SYNC_SETTLE)
+    s.check("and does not download below the floor", entry_in(s, folder, "no-room.bin")["local_bytes"] == 0,
+            entry_in(s, folder, "no-room.bin"))
+    s.check("the rest of what is kept stayed", is_here(s, folder, "kept.bin"))
+
+    device.remove_filler()
+    device.tap_text("Sync now")
+    poll(SYNC_BOUND, "the kept file on the phone once there is room", lambda: is_here(s, folder, "no-room.bin"), interval=2)
+    device.wait_screen("the strip gone", lambda t: KEPT_DOES_NOT_FIT not in t and "Sync now" in t, SYNC_BOUND)
+    s.check("once there is room it comes, and the strip goes", True)
+
+
+def freeing_answer(device: Device) -> dict | str:
+    """What "Free up space now" did, or why it could not."""
+    try:
+        return device.free_now()
+    except ManageError as error:
+        return str(error)
+
+
+def read_refused(device: Device, doc: str) -> str:
+    """Why a read of the document failed. A read that gives bytes, the right ones or not, refused nothing."""
+    return refusal(lambda: device.content_digest(doc))
+
+
 def check_a_full_disk(s: Session, folder: Folder) -> None:
     """Review Focus 4. /data is filled until an app has less than 1 MiB of it, with what is reserved
     for the system left to the system, which runs on it. Nothing here may start a burst: at its end
@@ -1787,6 +1832,9 @@ def check_a_full_disk(s: Session, folder: Folder) -> None:
     # it reads whole from its draft, and seals once there is room.
     device.fill_until_free(24 * MIB)
     device.content_write_upload(late, upload)
+    # A second save onto that draft, with no room for this one either: it must not take the first with it.
+    # If the app has found room by now this one works, and the file still ends up with these same bytes.
+    s.report.record("a second save with no room answers", True, refusal(lambda: device.content_write_upload(late, upload))[:200])
     s.check("a write with no room for its seal reads back whole", device.content_digest(late) == sha256(payload))
     device.remove_filler()
     poll(SYNC_BOUND, "that write confirmed by the PC", on_the_pc, interval=2)
@@ -1804,9 +1852,9 @@ def check_a_full_disk(s: Session, folder: Folder) -> None:
     row = device.content_query(document_uri(good))[0]
     s.check("at its old size", row["_size"] == str(len(folder.files["good.txt"])), row)
     s.check("what it wrote does not stay to take up the room", device.free_bytes() >= free - MIB, device.free_bytes())
-    # Freeing has a little room to work in, where the floor would have left it plenty.
-    freed = device.free_now()
-    s.check("with a few MiB free, space can still be freed", freed["bytes"] > 0, freed)
+    # Freeing has a little room to work in, where the floor would have left it plenty. A rewrite needs room
+    # for what else is in a segment, so it may do nothing. It must say so, and break nothing.
+    s.report.record("with a few MiB free, freeing answers", True, freeing_answer(device))
     # It may have taken this file with the rest, and what comes next needs it here.
     s.check("the file reads the same after that", device.content_digest(good) == sha256(folder.files["good.txt"]))
     # Hardly any room at all.
@@ -1822,14 +1870,7 @@ def check_a_full_disk(s: Session, folder: Folder) -> None:
     s.check("no partial file shows", entry_in(s, folder, "fresh.bin")["size"] == 0, entry_in(s, folder, "fresh.bin"))
     s.check("and no other name", set(device.raw_names(folder.id)) == names, device.raw_names(folder.id))
 
-    def refused_receive() -> str:
-        try:
-            digest = device.content_digest(folder.doc("not-here.bin"))
-        except ContentError as error:
-            return str(error)
-        return "" if digest == sha256(folder.files["not-here.bin"]) else f"a read of other bytes: {digest}"
-
-    refused = refused_receive()
+    refused = read_refused(device, folder.doc("not-here.bin"))
     s.check("a receive with a full disk reports an error", bool(refused), refused)
     # A full burst, and freeing, with no room at all: they may do nothing, and must say so.
     pc.write_file(folder.pc_state, "while-full.txt", b"Written while the phone was full.\n")
@@ -1841,12 +1882,8 @@ def check_a_full_disk(s: Session, folder: Folder) -> None:
     s.report.record("a burst with a full disk answers", True, burst)
     # Android clears other apps' caches on its own when it is this full, so this is only what the next step finds.
     s.report.record("what is free for the step after", True, device.free_bytes())
-    # Freeing with next to no room: a rewrite cannot copy, and it may do little. It must say so, and break nothing.
-    try:
-        freed = device.free_now()
-    except ManageError as error:
-        freed = str(error)
-    s.report.record("freeing with a full disk answers", True, freed)
+    # With next to no room, the same.
+    s.report.record("freeing with a full disk answers", True, freeing_answer(device))
 
     device.remove_filler()
     free = device.free_bytes()
@@ -1936,6 +1973,12 @@ def tkfs_binary(release: bool = False) -> Path:
     return ROOT / "target" / ("release" if release else "debug") / ("tkfs.exe" if os.name == "nt" else "tkfs")
 
 
+def prepare_device(device: Device, apk: Path) -> None:
+    """Before anything needs the room: a hard kill of an earlier run can leave the `space` scenario's filler."""
+    device.remove_filler()
+    device.install(apk)
+
+
 def run_scenario(name: str, device: Device, report: Report, run_dir: Path, reset: bool,
                  release_pc: bool = False) -> None:
     report.begin(name)
@@ -2005,7 +2048,7 @@ def main() -> int:
         emulator = Emulator(adb, tool, args.avd, run_dir)
         device = emulator.start()
         report.data["device"] = {"serial": device.serial, "avd": args.avd, "booted_here": emulator.booted_here}
-        device.install(APK)
+        prepare_device(device, APK)
         for name in names:
             run_scenario(name, device, report, run_dir, reset=not args.no_reset, release_pc=args.release_pc)
     except (HarnessError, RuntimeError, OSError) as error:

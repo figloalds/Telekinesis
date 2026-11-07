@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Sends what the owner just made. It repeats full bursts until nothing remains, it is stopped,
  * or a burst makes no progress. What is left waits for the next `onLocalChange`, foreground or
  * periodic trigger, so every end of this job is a success. With nothing left to send, it downloads
- * what the owner marked to keep, under the same network.
+ * what the owner marked to keep, under the same network, and a new change stops that and goes first.
  *
  * The foreground notification is what matters most: a cached app is frozen and its network is
  * cut, and a job without it would not reach the PC. Android may refuse to start the service
@@ -39,7 +39,9 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
         var stopped = false
         try {
             becomeForeground("Starting")
-            withContext(Dispatchers.IO) { if (send(gate)) download() }
+            withContext(Dispatchers.IO) {
+                transferRounds(gate, { claimed }, send = { send(gate) }, download = { changed -> download(changed) })
+            }
         } catch (stop: CancellationException) {
             // A stop (constraints, quota, `onTimeout`). The rest is for the next trigger.
             stopped = true
@@ -52,18 +54,12 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
         return Result.success()
     }
 
-    /** What is kept and not all here. A stop ends it between steps, and what came stays. */
-    private suspend fun download() {
-        val missing = try {
-            Native.keptMissing()
-        } catch (error: IOException) {
-            Log.i(TAG, "transfer: ${error.message}")
-            false
-        }
-        if (!missing) return
+    /** What is kept and not all here. A stop or a change to send ends it between steps, and what came stays. */
+    private suspend fun download(changed: () -> Boolean) {
+        if (!SyncCoordinator.keptMissing()) return
         becomeForeground("Downloading kept files")
         val stop = AtomicBoolean(false)
-        val hydrating = SyncCoordinator.hydrateKept(applicationContext, stop)
+        val hydrating = SyncCoordinator.hydrateKept(applicationContext) { stop.get() || changed() }
         try {
             hydrating.await()
         } catch (cancelled: CancellationException) {
@@ -112,7 +108,7 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
                 next is Next.Stop && next.why != Why.Done -> return false
                 next is Next.Again -> becomeForeground("Still sending")
                 // Nothing remains, but only a burst that began after the last change says so.
-                gate.finish(claimed) -> return true
+                !gate.changedSince(claimed) -> return true
             }
         }
     }

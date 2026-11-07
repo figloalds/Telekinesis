@@ -198,6 +198,30 @@ pub struct Engine {
     pub peer_status: Mutex<BTreeMap<String, serde_json::Value>>,
     publication: Mutex<()>,
     faults: Mutex<std::collections::BTreeSet<String>>,
+    seal_retry: Mutex<SealRetry>,
+}
+/// When the sealer tries a failed batch again. What stops one, like a full disk, does not clear in a
+/// moment, and each try reads and hashes the drafts again with their locks held. A flush is someone
+/// asking and does not wait for this, and any success starts it over.
+#[derive(Default)]
+struct SealRetry {
+    failures: u32,
+    not_before: Option<std::time::Instant>,
+}
+impl SealRetry {
+    /// 1 s, then 2 s, then 4 s, then this.
+    const LONGEST: Duration = Duration::from_secs(5);
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.not_before.is_none_or(|at| now >= at)
+    }
+    fn failed(&mut self, now: std::time::Instant) {
+        self.failures += 1;
+        let wait = Duration::from_secs(1 << (self.failures - 1).min(3));
+        self.not_before = Some(now + wait.min(Self::LONGEST));
+    }
+    fn succeeded(&mut self) {
+        *self = Self::default();
+    }
 }
 /// How often a draft that could not seal at the start is tried again.
 const WAITING_DRAFT_RETRY: Duration = Duration::from_secs(5);
@@ -243,6 +267,7 @@ impl Engine {
             peer_status: Mutex::new(BTreeMap::new()),
             publication: Mutex::new(()),
             faults: Mutex::new(Default::default()),
+            seal_retry: Mutex::new(SealRetry::default()),
         });
         let weak = Arc::downgrade(&engine);
         std::thread::Builder::new()
@@ -269,13 +294,20 @@ impl Engine {
                     if let Err(error) = engine.retry_notifications() {
                         *lock(&engine.error) = Some(format!("{error:#}"));
                     }
-                    let files = engine.working.pending(false);
-                    let _publication = lock(&engine.publication);
-                    let result = seal::seal_batch(&engine.store, &engine.working, &files)
-                        .and_then(|stats| engine.queue_sealed(&files, stats.entities));
-                    drop(_publication);
-                    if let Err(error) = result {
-                        *lock(&engine.error) = Some(format!("{error:#}"));
+                    if lock(&engine.seal_retry).due(std::time::Instant::now()) {
+                        let files = engine.working.pending(false);
+                        let _publication = lock(&engine.publication);
+                        let result = seal::seal_batch(&engine.store, &engine.working, &files)
+                            .and_then(|stats| engine.queue_sealed(&files, stats.entities));
+                        drop(_publication);
+                        match result {
+                            Ok(()) => lock(&engine.seal_retry).succeeded(),
+                            Err(error) => {
+                                *lock(&engine.error) = Some(format!("{error:#}"));
+                                // From now: a large draft takes longer to try than the wait.
+                                lock(&engine.seal_retry).failed(std::time::Instant::now());
+                            }
+                        }
                     }
                     if std::time::Instant::now() >= next_retry {
                         next_retry = std::time::Instant::now() + WAITING_DRAFT_RETRY;
@@ -896,6 +928,7 @@ impl Engine {
         // Also covers namespace-only fsyncs with no dirty content event.
         lock(&self.store).sync_metadata()?;
         *lock(&self.error) = None;
+        lock(&self.seal_retry).succeeded();
         Ok(())
     }
     /// Include pending local saves in the alternatives before choosing a head.
@@ -1326,6 +1359,16 @@ impl Engine {
     /// `digests` are touched. What else is dead in one of those is not copied, and what is dead
     /// anywhere else waits for [`Self::collect`].
     pub fn evict(&self, digests: &BTreeSet<Digest>) -> Result<Evicted> {
+        self.evict_keeping(digests, false)
+    }
+    /// [`Self::evict`] for what no peer was asked about, and a head that shows may be the only copy
+    /// of: a deleted file's chunks. It also keeps what any head that is not a delete names, looked
+    /// at under the locks a seal needs, so a file saved after the caller worked out `digests` counts.
+    /// That file's seal found these chunks here and wrote no copy of its own.
+    pub fn evict_unless_live(&self, digests: &BTreeSet<Digest>) -> Result<Evicted> {
+        self.evict_keeping(digests, true)
+    }
+    fn evict_keeping(&self, digests: &BTreeSet<Digest>, keep_live_heads: bool) -> Result<Evicted> {
         // A seal writes its objects and the event that names them under this lock, so nothing
         // here is taken for dead on its way to being named.
         let _publication = lock(&self.publication);
@@ -1335,6 +1378,9 @@ impl Engine {
         let mut store = lock(&self.store);
         let mut protected = self.draft_objects(bases, &store)?;
         protected.extend(store.unresolved_conflict_objects()?);
+        if keep_live_heads {
+            protected.extend(store.live_head_objects()?);
+        }
 
         let packs = &self.working.content().packs;
         let mut removable = BTreeSet::new();
@@ -3398,6 +3444,92 @@ mod tests {
         assert!(chunks.is_subset(&live), "the original's chunks are named");
         assert!(only_deleted.is_disjoint(&live), "a delete's are not");
         assert!(live.contains(&head_of(&engine, "original")?.digest));
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// The free of a deleted file asks no one, so nothing it names may be all there is of a file
+    /// that shows. A file saved after it worked out what to name has the same chunks, wrote no copy
+    /// of its own and has let go of its draft, and nothing else keeps them.
+    #[test]
+    fn evict_unless_live_keeps_what_a_file_saved_since_names() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (bytes, chunks) = written(&engine, "copy", 1, 2)?;
+        let id = engine.lookup("copy")?.id;
+        lock(&engine.store).delete(&id)?;
+        // What the free worked out, with nothing live naming them.
+        assert!(chunks.is_disjoint(&engine.live_head_objects()?));
+        let named: BTreeSet<Digest> = engine.head_chunks(&id)?.unwrap().into_iter().collect();
+
+        seed_cached_file(&engine, "saved", &bytes)?;
+        assert_eq!(
+            engine.evict_unless_live(&named)?,
+            Evicted {
+                removed: 0,
+                refused: named.len()
+            }
+        );
+        assert_eq!(held(&engine, &chunks)?, chunks.len());
+        assert!(read_file(&engine, "saved")? == bytes);
+
+        // With that file deleted too, they are no one's.
+        let saved = engine.lookup("saved")?.id;
+        lock(&engine.store).delete(&saved)?;
+        assert_eq!(engine.evict_unless_live(&named)?.removed, named.len());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_seal_waits_longer_each_time_up_to_a_limit_and_a_success_starts_over() {
+        let now = std::time::Instant::now();
+        let mut retry = SealRetry::default();
+        assert!(retry.due(now));
+        let waits: Vec<u64> = (0..6)
+            .map(|_| {
+                retry.failed(now);
+                assert!(!retry.due(now));
+                retry.not_before.unwrap().duration_since(now).as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [1, 2, 4, 5, 5, 5]);
+        assert!(retry.due(now + Duration::from_secs(5)));
+        retry.succeeded();
+        assert!(retry.due(now));
+        retry.failed(now);
+        assert_eq!(retry.not_before.unwrap().duration_since(now).as_secs(), 1);
+    }
+
+    /// Each try reads and hashes the draft with its locks held, and a full disk does not clear in a
+    /// moment. A flush is someone asking, and does not wait for the next try.
+    #[test]
+    fn a_seal_that_keeps_failing_is_not_tried_again_at_once_and_a_flush_still_is() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let bytes = distinct_bytes(1, 2);
+        let packs = engine.working.content().packs.clone();
+        packs.fail_appends_after(Some(0));
+        let writer = engine.open_file("file", true, false, true)?;
+        engine.write(writer, 0, &bytes, false, false)?;
+        engine.close(writer)?;
+        // The first try comes after the writeback delay, 1 s. With no wait it would be some 40 tries.
+        std::thread::sleep(Duration::from_millis(3_200));
+        let tries = packs.failed_appends();
+        assert!((1..=3).contains(&tries), "{tries} tries in 3.2 s");
+        assert!(lock(&engine.seal_retry).failures > 0);
+
+        // A flush does not wait, and says how it went.
+        assert!(engine.flush(None).is_err());
+        assert!(packs.failed_appends() > tries);
+        packs.fail_appends_after(None);
+        engine.flush(None)?;
+        assert!(read_file(&engine, "file")? == bytes);
+        assert_eq!(
+            lock(&engine.seal_retry).failures,
+            0,
+            "a success starts over"
+        );
         engine.shutdown()?;
         Ok(())
     }

@@ -3,7 +3,7 @@ package dev.tkfs
 import android.content.Context
 import java.io.File
 import java.io.IOException
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.function.BooleanSupplier
 
 /** The Rust side. Failures arrive as IOException carrying the tkfs error code. */
 object Native {
@@ -130,11 +130,11 @@ object Native {
     external fun freeSpace(needBytes: Long): String
 
     /**
-     * Downloads what is kept and is not all here, and returns how many bytes came. `stop` is looked
-     * at between steps, each of which takes at most some seconds, and what came stays.
+     * Downloads what is kept and is not all here, and returns how many bytes came. `stop` is asked
+     * between steps, each of which takes at most some seconds, and what came stays.
      */
     @JvmStatic @Throws(IOException::class)
-    external fun hydrateKept(stop: AtomicBoolean): Long
+    external fun hydrateKept(stop: BooleanSupplier): Long
 
     /** Whether anything kept is not all here. It asks no PC. */
     @JvmStatic @Throws(IOException::class)

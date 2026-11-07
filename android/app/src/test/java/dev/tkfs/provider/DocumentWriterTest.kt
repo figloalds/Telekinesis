@@ -110,7 +110,7 @@ class DocumentWriterTest {
         val writer = writer(truncate = true)
         writer.write(0, data, 8)
         writer.write(8, data, 8)
-        assertEquals(listOf("open", "truncate", "write 100@0 8", "write 100@8 8"), calls)
+        assertEquals(listOf("open", "sync", "truncate", "write 100@0 8", "write 100@8 8"), calls)
         assertEquals(42, writer.length())
         assertEquals(8, writer.read(0, data, 8))
     }
@@ -118,13 +118,13 @@ class DocumentWriterTest {
     /** An fsync says the file is as it looks, and it looks empty. */
     @Test fun anFsyncBeforeAnyWriteTruncatesFirst() {
         writer(truncate = true).sync()
-        assertEquals(listOf("open", "truncate", "sync"), calls)
+        assertEquals(listOf("open", "sync", "truncate", "sync"), calls)
     }
 
     /** `w` and a close with nothing written leaves an empty file. */
     @Test fun aReleaseWithNothingWrittenTruncatesThenSeals() {
         writer(truncate = true).release()
-        assertEquals(listOf("open", "truncate", "sync", "close", "released"), calls)
+        assertEquals(listOf("open", "sync", "truncate", "sync", "close", "released"), calls)
     }
 
     @Test fun anOpenThatKeepsTheContentsDoesNotTruncate() {
@@ -141,7 +141,7 @@ class DocumentWriterTest {
         val writer = writer(truncate = true)
         document.failing += "truncate"
         assertThrows(IOException::class.java) { writer.write(0, data, 8) }
-        assertEquals(listOf("open", "truncate"), calls)
+        assertEquals(listOf("open", "sync", "truncate"), calls)
         assertEquals(0, writer.length())
     }
 
@@ -151,7 +151,7 @@ class DocumentWriterTest {
         assertThrows(IOException::class.java) { writer.write(0, data, 8) }
         document.failing.clear()
         writer.write(0, data, 8)
-        assertEquals(listOf("open", "truncate", "truncate", "write 100@0 8"), calls)
+        assertEquals(listOf("open", "sync", "truncate", "sync", "truncate", "write 100@0 8"), calls)
     }
 
     /** It was told the write failed, so its close must not empty the file after all. */
@@ -169,7 +169,7 @@ class DocumentWriterTest {
         val logged = mutableListOf<String>()
         document.failing += "truncate"
         writer(truncate = true, log = { logged += it }).release()
-        assertEquals(listOf("open", "truncate", "close"), calls)
+        assertEquals(listOf("open", "sync", "truncate", "close"), calls)
         assertEquals(listOf("truncate: INVALID_HANDLE: truncate"), logged)
     }
 
@@ -178,7 +178,7 @@ class DocumentWriterTest {
         val writer = writer(truncate = true)
         document.failing += "write 100@0 8"
         assertThrows(IOException::class.java) { writer.write(0, data, 8) }
-        assertEquals(listOf("open", "truncate", "write 100@0 8", "abandon"), calls)
+        assertEquals(listOf("open", "sync", "truncate", "write 100@0 8", "abandon"), calls)
     }
 
     @Test fun aReleaseAfterAFailedFirstWriteOnlyClosesAndIsNotAChange() {
@@ -248,6 +248,72 @@ class DocumentWriterTest {
         writer.release()
         assertEquals(0, calls.count { it == "abandon" })
         assertEquals(listOf("sync", "close", "released"), calls.takeLast(3))
+    }
+
+    /** What the draft holds was answered, and a failure of this replacement must have it to go back to. */
+    @Test fun aTruncatingOpenSealsWhatTheDraftHoldsBeforeItCuts() {
+        writer(truncate = true).write(0, data, 8)
+        assertEquals(listOf("sync", "truncate"), calls.subList(1, 3))
+    }
+
+    @Test fun aSealThatFailsBeforeTheCutFailsTheWriteAndCutsNothing() {
+        val writer = writer(truncate = true)
+        document.failing += "sync"
+        assertThrows(IOException::class.java) { writer.write(0, data, 8) }
+        assertEquals(listOf("open", "sync"), calls)
+        calls.clear()
+        writer.release()
+        assertEquals(listOf("close"), calls)
+    }
+
+    /** One draft, as the engine has it: it seals if there is room, and goes back to its last seal. */
+    private class Draft(var room: Boolean) : WritableDocument {
+        var sealed = "the old contents"
+        var holds = sealed
+
+        override fun open(): Long = 1
+        override fun read(token: Long, offset: Long, out: ByteArray, size: Int): Int = 0
+        override fun length(token: Long): Long = holds.length.toLong()
+        override fun close(token: Long) = Unit
+
+        override fun write(token: Long, offset: Long, data: ByteArray, size: Int, append: Boolean): Int {
+            if (!room) throw IOException("No space left on device")
+            holds += String(data, 0, size)
+            return size
+        }
+
+        override fun truncate(token: Long) {
+            holds = ""
+        }
+
+        override fun sync(token: Long) {
+            if (!room) throw IOException("No space left on device")
+            sealed = holds
+        }
+
+        override fun abandon(token: Long) {
+            holds = sealed
+        }
+    }
+
+    /** With room for a draft and not for its seal, a save is answered and stays in that draft. */
+    @Test fun anAnsweredSaveStaysWhenAReplacementOfItFails() {
+        val draft = Draft(room = true)
+        val answered = "answered".toByteArray()
+        val first = DocumentWriter(draft, append = false, truncate = true) {}
+        first.write(0, answered, answered.size)
+        draft.room = false
+        first.release()
+        assertEquals("answered", draft.holds)
+
+        val second = DocumentWriter(draft, append = false, truncate = true) {}
+        assertThrows(IOException::class.java) { second.write(0, data, 8) }
+        second.release()
+        assertEquals("answered", draft.holds)
+        // And it reaches its seal once there is room.
+        draft.room = true
+        draft.sync(1)
+        assertEquals("answered", draft.sealed)
     }
 
     /** No descriptor could be made, so nothing was written and nobody is told of a change. */

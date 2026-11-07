@@ -19,6 +19,105 @@ class SpaceTest {
         assertEquals(0, spaceNeeded(5 * gib, 6 * gib))
     }
 
+    /** A download whose steps are written down, with free space going down as it goes. */
+    private class Download(var free: Int, val canFree: Int = 0) {
+        val steps = mutableListOf<String>()
+        var stopped = false
+        var left = 3
+
+        fun run() = downloadKept(
+            hydrate = { cancel ->
+                steps += "hydrate"
+                var brought = 0L
+                while (left > 0 && !cancel()) {
+                    left--
+                    free--
+                    brought++
+                    steps += "window"
+                }
+                brought
+            },
+            missing = { left > 0 },
+            belowFloor = { free < 0 },
+            freeUp = {
+                steps += "free"
+                free += canFree
+            },
+            stop = { stopped },
+        )
+    }
+
+    /** It looks between windows, and does not go on until the bytes it used are back. */
+    @Test fun aDownloadStopsBelowTheFloorFreesAndGoesOn() {
+        val download = Download(free = 0, canFree = 10)
+        assertEquals(Kept.Done, download.run())
+        assertEquals(listOf("hydrate", "window", "free", "hydrate", "window", "window"), download.steps)
+    }
+
+    /** With nothing to free it ends, and says so. A disk at 0 could not even free. */
+    @Test fun aDownloadThatDoesNotFitEndsThereAndSaysSo() {
+        val download = Download(free = 0, canFree = 0)
+        assertEquals(Kept.DoesNotFit, download.run())
+        assertEquals(listOf("hydrate", "window", "free"), download.steps)
+        assertEquals("one window past the floor and no more", -1, download.free)
+    }
+
+    @Test fun aDownloadDoesNotStartBelowTheFloorIfFreeingDoesNotHelp() {
+        val download = Download(free = -1, canFree = 0)
+        assertEquals(Kept.DoesNotFit, download.run())
+        assertEquals(listOf("free"), download.steps)
+    }
+
+    @Test fun aDownloadStartsBelowTheFloorOnceFreeingHelps() {
+        val download = Download(free = -1, canFree = 10)
+        assertEquals(Kept.Done, download.run())
+        assertEquals(listOf("free", "hydrate", "window", "window", "window"), download.steps)
+    }
+
+    @Test fun aDownloadWithNothingMissingDoesNothing() {
+        val download = Download(free = 5)
+        download.left = 0
+        assertEquals(Kept.Done, download.run())
+        assertEquals(emptyList<String>(), download.steps)
+    }
+
+    /** A stop, or a change to send first: what came stays, and the next round goes on from there. */
+    @Test fun aStopEndsADownloadBetweenWindowsWithNothingFreed() {
+        val download = Download(free = 5)
+        download.stopped = true
+        assertEquals(Kept.Stopped, download.run())
+        assertEquals(emptyList<String>(), download.steps)
+    }
+
+    /** A PC that brings nothing is not asked again until the next job. */
+    @Test fun aDownloadThatBringsNothingEndsThere() {
+        var asked = 0
+        val outcome = downloadKept(
+            hydrate = { asked++; 0L },
+            missing = { true },
+            belowFloor = { false },
+            freeUp = {},
+            stop = { false },
+        )
+        assertEquals(Kept.Done, outcome)
+        assertEquals(1, asked)
+    }
+
+    /** What was marked while it ran is downloaded by this job too. */
+    @Test fun aDownloadGoesRoundForWhatIsStillMissing() {
+        val left = mutableListOf(1L, 1L)
+        var asked = 0
+        val outcome = downloadKept(
+            hydrate = { asked++; left.removeAt(0) },
+            missing = { left.isNotEmpty() },
+            belowFloor = { false },
+            freeUp = {},
+            stop = { false },
+        )
+        assertEquals(Kept.Done, outcome)
+        assertEquals(2, asked)
+    }
+
     @Test fun anAnswerSaysWhatLeftAndWhyNoMoreCould() {
         assertEquals(Freed(7, null), parseFreed("""{"bytes":7,"blocked":null}"""))
         assertEquals(Freed(0, "PC_UNREACHABLE"), parseFreed("""{"bytes":0,"blocked":"PC_UNREACHABLE"}"""))

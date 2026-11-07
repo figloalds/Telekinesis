@@ -82,6 +82,9 @@ class TransferGate {
     /** The changes so far; a burst that begins after this covers them. */
     @Synchronized fun claim(): Long = changes
 
+    /** Whether a change came after `claimed`. It changes nothing: the job goes on either way. */
+    @Synchronized fun changedSince(claimed: Long): Boolean = changes != claimed
+
     /** Whether the job may end: false when a change came after `claimed`. */
     @Synchronized fun finish(claimed: Long): Boolean {
         if (changes != claimed) return false
@@ -97,4 +100,24 @@ class TransferGate {
     /** How long until the last change is `DEBOUNCE` old; 0 if it already is, or there was none. */
     @Synchronized fun quietFor(nowMs: Long): Long =
         if (lastChangeMs == 0L) 0 else maxOf(0, lastChangeMs + SyncPolicy.LOCAL_CHANGE_DEBOUNCE_MS - nowMs)
+}
+
+/**
+ * One transfer job's rounds. What the owner just made goes first, and what is kept downloads with
+ * nothing left to send. The gate stays working all along, so a change needs no job of its own: this
+ * one hears of it through `changed`, stops the download, sends it and goes on with the download.
+ * `send` says whether it ended with nothing left to send, and when it did not, nothing is downloaded:
+ * no PC is taking what it was given. `claimed` is what its last burst covered.
+ */
+internal suspend fun transferRounds(
+    gate: TransferGate,
+    claimed: () -> Long,
+    send: suspend () -> Boolean,
+    download: suspend (changed: () -> Boolean) -> Unit,
+) {
+    while (true) {
+        if (!send()) return
+        download { gate.changedSince(claimed()) }
+        if (gate.finish(claimed())) return
+    }
 }

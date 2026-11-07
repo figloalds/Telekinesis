@@ -2539,6 +2539,54 @@ fn a_replacement_abandoned_leaves_the_file_as_it_was() -> Result<()> {
     Ok(())
 }
 
+/// With room for a draft and not for its seal, a save is answered and stays in its draft. The next
+/// save opens that same draft. It must get that one sealed before it cuts anything: until it has, it
+/// fails and cuts nothing, and once it has, a failure of its own goes back to that save.
+#[test]
+fn a_failed_replacement_keeps_an_earlier_save_that_was_answered() -> Result<()> {
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    let packs = engine.working.content().packs.clone();
+    let token = engine.open_file("file", true, false, true)?;
+    engine.write(token, 0, b"the first version", false, false)?;
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+
+    // Save A: answered, and it cannot seal.
+    packs.fail_appends_after(Some(0));
+    let token = engine.open_file("file", false, false, true)?;
+    engine.write(token, 0, b"THE SECOND VERSION", false, false)?;
+    assert!(engine.flush(Some(token)).is_err());
+    engine.close(token)?;
+
+    // Save B, as a replacing writer goes about it: the seal fails, so there is no cut.
+    let token = engine.open_to_replace("file")?;
+    assert!(engine.flush(Some(token)).is_err());
+    engine.close(token)?;
+    let read = engine.open_file("file", false, false, false)?;
+    let mut bytes = [0; 18];
+    engine.read(read, 0, &mut bytes)?;
+    engine.close(read)?;
+    assert_eq!(&bytes, b"THE SECOND VERSION");
+
+    // With room for that seal, B cuts and fails, and goes back to A.
+    packs.fail_appends_after(None);
+    let token = engine.open_to_replace("file")?;
+    engine.flush(Some(token))?;
+    engine.truncate(token, 0, false)?;
+    engine.write(token, 0, b"half", false, false)?;
+    engine.abandon_draft(token)?;
+    engine.close(token)?;
+    engine.flush(None)?;
+    assert_eq!(
+        file_bytes(&lock(&engine.store), "file")?,
+        b"THE SECOND VERSION"
+    );
+    engine.shutdown()?;
+    Ok(())
+}
+
 /// A write of whole chunks that cannot put them on record fails, and they read as they were.
 #[test]
 fn a_whole_chunk_write_whose_record_fails_leaves_what_the_file_reads_as() -> Result<()> {

@@ -33,7 +33,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.function.BooleanSupplier
 
 /** A burst that ran for `trigger`; `serial` tells two equal results apart. */
 data class Finished(val serial: Long, val trigger: Trigger, val result: BurstResult)
@@ -54,6 +54,7 @@ object SyncCoordinator {
     private val confirmed = MutableStateFlow<Map<String, Confirmed>>(emptyMap())
 
     private val lowSpace = MutableStateFlow<String?>(null)
+    private val keptShort = MutableStateFlow(false)
     private val freeing = Any()
 
     val running: StateFlow<Boolean> get() = bursts.isRunning
@@ -64,6 +65,9 @@ object SyncCoordinator {
 
     /** Why free space stays below the floor, when only a PC could change that: `PC_UNREACHABLE`, `PC_TOO_OLD`, or null. */
     val spaceBlocked: StateFlow<String?> get() = lowSpace
+
+    /** Something marked to keep is not all here, and there is no room for it above the floor. */
+    val keptDoesNotFit: StateFlow<Boolean> get() = keptShort
 
     fun onForeground(ctx: Context) = launch(ctx, Trigger.Foreground)
 
@@ -102,15 +106,29 @@ object SyncCoordinator {
         }
     }
 
-    /** A mark changed, or a burst brought files into a marked folder: the transfer job downloads what is kept. */
+    /**
+     * A mark changed, or a burst brought files into a marked folder: the transfer job downloads what
+     * is kept. Below the floor it would stop as soon as it began, so no job is asked for until a burst
+     * has found room, and the Folders screen says why.
+     */
     fun onKeptChanged(ctx: Context) {
+        val app = ctx.applicationContext
+        if (!keptMissing()) return
+        val short = spaceNeededNow(app) > 0
+        keptShort.value = short
+        if (!short) wantTransfer(app)
+    }
+
+    /** Whether anything kept is not all here. If nothing is, nothing is short of room either. */
+    internal fun keptMissing(): Boolean {
         val missing = try {
             Native.keptMissing()
         } catch (error: IOException) {
             Log.i(TAG, "kept: ${error.message}")
             false
         }
-        if (missing) wantTransfer(ctx.applicationContext)
+        if (!missing) keptShort.value = false
+        return missing
     }
 
     /** Asks for the transfer job with no change to send, unless it is on its way. */
@@ -125,22 +143,30 @@ object SyncCoordinator {
     }
 
     /**
-     * Downloads what is kept for the transfer job, under its network and its stop, which ends the
-     * call between steps. It is not interruptible, so the job can stop waiting for it. Then the floor
-     * is checked again, as what came took room.
+     * Downloads what is kept for the transfer job, under its network, until `stop` says so. It is not
+     * interruptible, so the job can stop waiting for it, and `stop` ends it between steps.
      */
-    internal fun hydrateKept(ctx: Context, stop: AtomicBoolean): Deferred<Unit> {
+    internal fun hydrateKept(ctx: Context, stop: () -> Boolean): Deferred<Unit> {
         val app = ctx.applicationContext
         return scope.async {
-            try {
-                val brought = Native.hydrateKept(stop)
-                Log.i(TAG, "kept: brought $brought bytes")
-            } catch (error: IOException) {
-                // What came stays, and the next job asks again for the rest.
-                Log.i(TAG, "kept: ${error.message}")
-            }
-            if (!stop.get()) checkFloor(app)
+            val ended = downloadKept(
+                hydrate = ::hydrateOnce,
+                missing = ::keptMissing,
+                belowFloor = { spaceNeededNow(app) > 0 },
+                freeUp = { freeUp(app) },
+                stop = stop,
+            )
+            Log.i(TAG, "kept: $ended")
+            if (ended != Kept.Stopped) keptShort.value = ended == Kept.DoesNotFit
         }
+    }
+
+    /** What came stays whatever comes after it, and the next round asks again for the rest. */
+    private fun hydrateOnce(cancel: () -> Boolean): Long = try {
+        Native.hydrateKept(BooleanSupplier { cancel() }).also { Log.i(TAG, "kept: brought $it bytes") }
+    } catch (error: IOException) {
+        Log.i(TAG, "kept: ${error.message}")
+        0
     }
 
     /**

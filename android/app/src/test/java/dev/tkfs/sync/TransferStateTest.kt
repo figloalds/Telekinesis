@@ -1,5 +1,6 @@
 package dev.tkfs.sync
 
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -124,6 +125,67 @@ class TransferStateTest {
         assertFalse("it is running", gate.wanted())
         gate.stopped()
         assertTrue(gate.wanted())
+    }
+
+    /** The job's rounds, with what they would do written down in order. */
+    private class Rounds(val gate: TransferGate = TransferGate()) {
+        val done = mutableListOf<String>()
+        var claimed = 0L
+        var sends = mutableListOf(true, true, true)
+        var downloads = mutableListOf<(() -> Boolean) -> Unit>()
+
+        init {
+            gate.changed(0)
+            gate.started()
+        }
+
+        fun run() = runBlocking {
+            transferRounds(
+                gate,
+                claimed = { claimed },
+                send = {
+                    done += "send"
+                    claimed = gate.claim()
+                    sends.removeAt(0)
+                },
+                download = { changed ->
+                    done += "download"
+                    downloads.removeAt(0)(changed)
+                },
+            )
+        }
+    }
+
+    /** A kept download can last for hours, and what the owner just made goes first. */
+    @Test fun aChangeDuringTheDownloadStopsItGoesFirstAndTheDownloadGoesOn() {
+        val rounds = Rounds()
+        rounds.downloads = mutableListOf(
+            { changed ->
+                assertFalse("nothing has changed yet", changed())
+                assertFalse("the job is still running, so a change needs no other", rounds.gate.changed(1))
+                assertTrue("and this one hears of it", changed())
+            },
+            { changed -> assertFalse("the burst covered it", changed()) },
+        )
+        rounds.run()
+        assertEquals(listOf("send", "download", "send", "download"), rounds.done)
+        assertTrue("it ended, so the next change asks again", rounds.gate.changed(2))
+    }
+
+    @Test fun aJobThatEndsWithNothingKeptToDownloadEndsAsItDid() {
+        val rounds = Rounds()
+        rounds.downloads = mutableListOf({ _ -> })
+        rounds.run()
+        assertEquals(listOf("send", "download"), rounds.done)
+        assertTrue(rounds.gate.changed(1))
+    }
+
+    /** Nothing is downloaded while sending is stuck: the PC is not there to give it. */
+    @Test fun aJobThatCouldNotSendDownloadsNothing() {
+        val rounds = Rounds()
+        rounds.sends = mutableListOf(false)
+        rounds.run()
+        assertEquals(listOf("send"), rounds.done)
     }
 
     @Test fun aBurstTheJobEndedIsNotAFailureToShow() {

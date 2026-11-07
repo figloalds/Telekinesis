@@ -202,9 +202,16 @@ internal class DocumentWriter(
         attempt("close") { document.close(token) }
     }
 
+    /**
+     * This handle may have opened a draft that holds an earlier save, answered and not sealed, as with
+     * room for a draft and not for its seal. That is sealed first: a cut would take it, and a failure of
+     * this replacement would then have only the seal before it to go back to. If it cannot be sealed
+     * nothing is cut, and it stays in the draft for the sealer.
+     */
     private fun truncateIfPending() {
         if (!truncatePending) return
         try {
+            document.sync(token)
             document.truncate(token)
         } catch (error: IOException) {
             truncateFailed = true

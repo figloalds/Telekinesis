@@ -12,10 +12,10 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import android_e2e
-from android_e2e_lib import (Completed, Device, Emulator, GiveUp, HarnessError, ManageError, PcHost, Proc, Report,
+from android_e2e_lib import (Completed, ContentError, Device, Emulator, GiveUp, HarnessError, ManageError, PcHost, Proc, Report,
                              Session, bounds_center, children_uri, document_uri, emulator_processes, encode_payload,
                              is_frozen, parse_call, parse_df_available, parse_rows, png_noise, poll, run_bounded, shell_line, size_text, split_qr,
                              watched_processes, with_parents)
@@ -396,6 +396,28 @@ class RunningAScenario(unittest.TestCase):
     def test_a_clean_run_passes(self):
         scenario = self.run_one([([], "1 process(es) ran, none left")])
         self.assertEqual(scenario["status"], "pass")
+
+
+class ReadingOnAFullDisk(unittest.TestCase):
+    def refused(self, digest=None, error=None):
+        device = MagicMock()
+        device.content_digest.return_value = digest
+        device.content_digest.side_effect = error
+        return android_e2e.read_refused(device, "doc")
+
+    def test_only_a_read_that_fails_is_a_refusal(self):
+        self.assertIn("no room", self.refused(error=ContentError("no room")))
+
+    def test_a_read_that_gives_bytes_is_none_whichever_bytes_they_are(self):
+        self.assertEqual(self.refused(digest="the right ones"), "")
+        self.assertEqual(self.refused(digest="other ones"), "")
+
+
+class StartingASession(unittest.TestCase):
+    def test_a_filler_left_by_a_hard_kill_goes_before_anything_needs_the_room(self):
+        device = MagicMock()
+        android_e2e.prepare_device(device, Path("app.apk"))
+        self.assertEqual(device.method_calls, [call.remove_filler(), call.install(Path("app.apk"))])
 
 
 class CommandLine(unittest.TestCase):

@@ -108,6 +108,9 @@ struct State {
     /// How many more appends go through whole. The one after stops halfway, as on a full volume.
     #[cfg(test)]
     appends_left: Option<usize>,
+    /// How many appends have stopped halfway.
+    #[cfg(test)]
+    failed_appends: usize,
 }
 struct Inner {
     root: PathBuf,
@@ -215,6 +218,8 @@ impl PackStore {
                 verified_reads: 0,
                 #[cfg(test)]
                 appends_left: None,
+                #[cfg(test)]
+                failed_appends: 0,
             }),
         });
         stores.insert(root, Arc::downgrade(&inner));
@@ -325,6 +330,7 @@ impl PackStore {
         #[cfg(test)]
         if let Some(left) = &mut state.appends_left {
             if *left == 0 {
+                state.failed_appends += 1;
                 state.writer.write_all(&bytes[..bytes.len() / 2])?;
                 return Err(std::io::ErrorKind::StorageFull.into());
             }
@@ -336,6 +342,11 @@ impl PackStore {
     #[cfg(test)]
     pub(crate) fn fail_appends_after(&self, appends: Option<usize>) {
         guard(&self.inner.state).appends_left = appends;
+    }
+    /// See [`State::failed_appends`].
+    #[cfg(test)]
+    pub(crate) fn failed_appends(&self) -> usize {
+        guard(&self.inner.state).failed_appends
     }
     /// What the object is, if it is here.
     pub fn kind(&self, digest: Digest) -> Result<Option<Kind>> {

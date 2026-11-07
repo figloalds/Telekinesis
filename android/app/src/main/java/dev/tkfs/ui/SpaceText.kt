@@ -6,10 +6,11 @@ private const val NOT_ON_PC = "NOT_ON_PC"
 private const val PC_UNREACHABLE = "PC_UNREACHABLE"
 private const val PC_TOO_OLD = "PC_TOO_OLD"
 
-/** The strip on the Folders screen when space is low and only a PC could change that; else null. */
-fun lowSpaceStrip(blocked: String?): String? = when (blocked) {
-    PC_UNREACHABLE -> "Low on space. Can't free anything until My PC is reachable."
-    PC_TOO_OLD -> "Low on space. Can't free anything until My PC is updated."
+/** The strip on the Folders screen when space is low and only a PC could change that, or what is marked does not fit; else null. */
+fun lowSpaceStrip(blocked: String?, keptDoesNotFit: Boolean = false): String? = when {
+    blocked == PC_UNREACHABLE -> "Low on space. Can't free anything until My PC is reachable."
+    blocked == PC_TOO_OLD -> "Low on space. Can't free anything until My PC is updated."
+    keptDoesNotFit -> "Low on space. Not everything you marked to keep fits on this phone."
     else -> null
 }
 
