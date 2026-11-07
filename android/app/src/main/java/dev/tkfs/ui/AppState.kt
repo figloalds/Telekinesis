@@ -180,7 +180,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
 
     private suspend fun refresh() {
         val snapshot = try {
-            parseSnapshot(call("status"), bursts)
+            parseSnapshot(call("status"), bursts, settings::lastSyncMs)
         } catch (error: IOException) {
             mutable.update { it.pollFailed(Failure.of(error)) }
             return

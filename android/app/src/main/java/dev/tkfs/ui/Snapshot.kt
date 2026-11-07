@@ -28,9 +28,14 @@ private val DOWN = setOf("Backoff", "Unauthorized", "Incompatible")
 /**
  * The reply of `status`: its `folders` (`folder_entry` in the hub) and its `peers`
  * (`Network::peers`). `bursts` holds the error of each folder's last burst, by folder id; one
- * goes once the folder reports an exchange newer than the burst's.
+ * goes once the folder reports an exchange newer than the burst's. `status` knows of exchanges only
+ * since this process started, so a folder with none there goes by `storedSyncMs`, 0 being none.
  */
-fun parseSnapshot(reply: String, bursts: Map<String, BurstError> = emptyMap()): Snapshot {
+fun parseSnapshot(
+    reply: String,
+    bursts: Map<String, BurstError> = emptyMap(),
+    storedSyncMs: (folder: String) -> Long = { 0 },
+): Snapshot {
     val status = JSONObject(reply)
     val peers = status.optJSONArray("peers").objects().mapNotNull { peer ->
         val endpoint = peer.optStringOrNull("endpoint") ?: return@mapNotNull null
@@ -48,15 +53,15 @@ fun parseSnapshot(reply: String, bursts: Map<String, BurstError> = emptyMap()): 
     val folders = status.optJSONArray("folders").objects().map { entry ->
         val record = entry.getJSONObject("record")
         val id = record.getString("id")
-        val lastSync = lastExchange(entry)
+        val exchanged = lastExchange(entry)
         FolderStatus(
             id = id,
             label = record.getString("label"),
             error = entry.optStringOrNull("error") ?: revoked
-                ?: bursts[id]?.takeIf { it.stillApplies(lastSync) }?.message,
+                ?: bursts[id]?.takeIf { it.stillApplies(exchanged) }?.message,
             conflicts = entry.optInt("conflicts", 0),
             pcReachable = reachable,
-            lastSyncMs = lastSync,
+            lastSyncMs = exchanged ?: storedSyncMs(id).takeIf { it > 0 },
             repo = record.optString("repo"),
         )
     }
@@ -106,9 +111,10 @@ fun parseExchanges(reply: String): Map<String, Long> =
         .mapNotNull { entry -> lastExchange(entry)?.let { entry.getJSONObject("record").getString("id") to it } }
         .toMap()
 
+/** A slot has 0 until its first exchange finishes, which is no time at all. */
 private fun lastExchange(entry: JSONObject): Long? = entry.optJSONObject("sync")?.let { sync ->
     sync.keys().asSequence().mapNotNull { sync.getJSONObject(it).optLongOrNull("last_exchange_ms") }.maxOrNull()
-}
+}?.takeIf { it > 0 }
 
 private fun JSONArray?.objects(): List<JSONObject> =
     if (this == null) emptyList() else (0 until length()).map { getJSONObject(it) }

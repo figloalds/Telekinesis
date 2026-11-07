@@ -8,6 +8,40 @@ import org.junit.Test
 
 /** The shapes `status` really sends: `folder_entry` and `Network::peers`, as seen in ui_folders. */
 class SnapshotTest {
+    private fun synced(sync: String) = """{"folders": [{"record": {"id": "f", "label": "L"}, "sync": $sync}], "peers": []}"""
+
+    /** After a process death nothing in memory has it, and what is stored is still true. */
+    @Test fun aFolderWithNoExchangeInMemoryGoesByTheStoredTime() {
+        val stored = { folder: String -> if (folder == "f") 1_000L else 0L }
+        assertEquals(1_000L, parseSnapshot(synced("{}"), storedSyncMs = stored).folders[0].lastSyncMs)
+        assertEquals(1_000L, parseSnapshot(synced("""{"pc": {}}"""), storedSyncMs = stored).lastSyncMs)
+    }
+
+    /** A slot exists with 0 before its first exchange finishes: that is no time at all, not 1970. */
+    @Test fun anExchangeTimeOfZeroIsNone() {
+        val zero = synced("""{"pc": {"last_exchange_ms": 0}}""")
+        assertEquals(null, parseSnapshot(zero).folders[0].lastSyncMs)
+        assertEquals(1_000L, parseSnapshot(zero, storedSyncMs = { 1_000L }).folders[0].lastSyncMs)
+        assertEquals(emptyMap<String, Long>(), parseExchanges(zero))
+    }
+
+    @Test fun nothingStoredIsNone() {
+        assertEquals(null, parseSnapshot(synced("{}"), storedSyncMs = { 0L }).folders[0].lastSyncMs)
+    }
+
+    @Test fun anExchangeInMemoryGoesBeforeTheStoredTime() {
+        val live = synced("""{"pc": {"last_exchange_ms": 5000}}""")
+        assertEquals(5_000L, parseSnapshot(live, storedSyncMs = { 9_000L }).folders[0].lastSyncMs)
+    }
+
+    /** What clears a burst's error is a newer exchange, and the stored time is not one. */
+    @Test fun theStoredTimeDoesNotClearABurstsError() {
+        val bursts = mapOf("f" to BurstError("SYNC_NOW_TIMEOUT: x", 1_000))
+        val folder = parseSnapshot(synced("{}"), bursts, storedSyncMs = { 9_000L }).folders[0]
+        assertEquals("SYNC_NOW_TIMEOUT: x", folder.error)
+        assertEquals(9_000L, folder.lastSyncMs)
+    }
+
     private fun status(lane: String) = """
         {"daemon": {}, "folders": [{
             "record": {"id": "f1", "repo": "r1", "label": "Documents", "state": "/x"},
