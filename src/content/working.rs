@@ -41,6 +41,11 @@ pub struct ScratchRecord {
     /// Old sidecars use their original basis length.
     #[serde(default)]
     pub base_visible_len: Option<u64>,
+    /// A writer from [`WorkingLayer::open_to_replace`] cut a file that had content and has not
+    /// closed. A draft found with this has no proof its writer finished, so it does not become
+    /// the file: [`crate::content::seal`] recovers it beside the file, under a name of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replacing: bool,
 }
 #[derive(Default)]
 pub struct DirtyBitmap {
@@ -100,6 +105,9 @@ pub struct Scratch {
     /// Chunks a write of the whole of them failed on, which may have left its bytes in the file. They
     /// read as they did for as long as they are not `hydrated`.
     pub(crate) torn: BTreeSet<u64>,
+    /// A writer from [`WorkingLayer::open_to_replace`] holds this, so its cut to nothing goes on
+    /// record as [`ScratchRecord::replacing`].
+    pub(crate) replacement_open: bool,
     pub pin: Pin,
 }
 impl Scratch {
@@ -473,19 +481,32 @@ impl Scratch {
             .copied()
             .filter(|index| *index * CHUNK_SIZE < size)
             .collect();
-        if shrink {
-            let mut record = self.record.clone();
-            record.base_visible_len = Some(boundary);
-            record.hydrated = hydrated.clone();
-            self.write_record_aside(&record, true)?;
-        }
-        // Unhydrated retained bytes still come from the immutable prefix.
-        // A first shrink must not allocate/copy the old discarded length.
-        let cut = self
-            .materialize_len(old.min(size))
-            .and_then(|_| Ok(self.file()?.set_len(size)?));
+        // What a kill right after the cut has to go by: `old` is more than nothing here. On a draft
+        // with no file yet, the record that comes into being with the file says it.
+        let replacing = self.replacement_open && size == 0 && !self.record.replacing;
+        let cut = (|| -> Result<()> {
+            if replacing {
+                self.record.replacing = true;
+                if self.file.is_some() {
+                    self.write_record(true)?;
+                }
+            }
+            if shrink {
+                let mut record = self.record.clone();
+                record.base_visible_len = Some(boundary);
+                record.hydrated = hydrated.clone();
+                self.write_record_aside(&record, true)?;
+            }
+            // Unhydrated retained bytes still come from the immutable prefix.
+            // A first shrink must not allocate/copy the old discarded length.
+            self.materialize_len(old.min(size))?;
+            Ok(self.file()?.set_len(size)?)
+        })();
         if let Err(error) = cut {
             let _ = fs::remove_file(self.path.with_extension("json.tmp"));
+            if replacing {
+                self.record.replacing = false;
+            }
             return Err(error);
         }
         self.length = size;
@@ -514,6 +535,20 @@ impl Scratch {
             }
         }
         Ok(())
+    }
+    /// The last writer closed, so a replacement it was part of is complete. If this cannot reach the
+    /// disk, a start recovers the draft beside the file, which loses nothing.
+    fn replacement_ended(&mut self) {
+        self.replacement_open = false;
+        if !self.record.replacing {
+            return;
+        }
+        self.record.replacing = false;
+        if self.file.is_some()
+            && let Err(error) = self.persist_record()
+        {
+            crate::util::log::event!(warn, DRAFT_RECORD_FAILED, {"draft": self.path.display().to_string(), "error": format!("{error:#}")});
+        }
     }
     pub fn set_modified_time(&mut self, time: u64) -> Result<()> {
         const UNIX: u64 = 116_444_736_000_000_000;
@@ -602,10 +637,14 @@ impl WorkingLayer {
     }
     /// A writer's [`Self::open`] for a caller that truncates the draft to 0 before anything else
     /// it does with it. It works on a file whose manifest has never been here, with no peer to
-    /// ask, and until the truncate there is nothing on disk.
+    /// ask, and until the truncate there is nothing on disk. Its cut of a file that had content
+    /// goes on record, as nothing else says the new contents are complete until its writer closes.
     pub fn open_to_replace(&self, basis: Basis) -> Result<Arc<Mutex<Scratch>>> {
-        self.open_impl(basis, true, false, NoDraft::StartToReplace)?
-            .context("SCRATCH_NOT_CREATED")
+        let file = self
+            .open_impl(basis, true, false, NoDraft::StartToReplace)?
+            .context("SCRATCH_NOT_CREATED")?;
+        lock(&file).replacement_open = true;
+        Ok(file)
     }
     pub fn open_bound(&self, basis: Basis, writable: bool) -> Result<Arc<Mutex<Scratch>>> {
         self.open_impl(basis, writable, true, NoDraft::Start)?
@@ -685,6 +724,7 @@ impl WorkingLayer {
                 modified_ns: 0,
                 hydrated: hydrated.clone(),
                 base_visible_len: Some(basis.content.total_len),
+                replacing: false,
             },
             path,
             file: None,
@@ -703,6 +743,7 @@ impl WorkingLayer {
             hydration_pending: false,
             base_visible_len: basis.content.total_len,
             torn: BTreeSet::new(),
+            replacement_open: false,
             pin,
         };
         let scratch = Arc::new(Mutex::new(scratch));
@@ -725,6 +766,9 @@ impl WorkingLayer {
             if state.writers == 0 && state.changed {
                 state.closed_at = Some(Instant::now());
             }
+            if state.writers == 0 {
+                state.replacement_ended();
+            }
         }
         self.schedule(scratch);
     }
@@ -743,13 +787,12 @@ impl WorkingLayer {
         scratch.handles = scratch.handles.saturating_sub(1);
         scratch.idle_at = Instant::now();
     }
+    /// What is ready to seal. With `force` that is every changed draft, open writers included, but
+    /// not half of a replacement: that writer's own fsync or close makes it a version, or a start
+    /// finds it on disk and recovers it beside the file.
     pub fn pending(&self, force: bool) -> Vec<Arc<Mutex<Scratch>>> {
         if force {
-            return lock(&self.files)
-                .values()
-                .filter(|f| lock(f).changed)
-                .cloned()
-                .collect();
+            return self.materialized_dirty();
         }
         let mut pending = lock(&self.pending);
         pending.retain(|_, weak| {
@@ -769,12 +812,15 @@ impl WorkingLayer {
             })
             .collect()
     }
-    /// Every changed scratch, open writers included. Used after a native
-    /// volume flush issued by another process delivered their cached pages.
+    /// Every changed scratch, open writers included, but for half of a replacement. Used after a
+    /// native volume flush issued by another process delivered their cached pages.
     pub fn materialized_dirty(&self) -> Vec<Arc<Mutex<Scratch>>> {
         lock(&self.files)
             .values()
-            .filter(|f| lock(f).changed)
+            .filter(|f| {
+                let s = lock(f);
+                s.changed && !(s.record.replacing && s.writers != 0)
+            })
             .cloned()
             .collect()
     }
@@ -823,6 +869,7 @@ impl WorkingLayer {
         scratch.length = total;
         scratch.base_visible_len = total;
         scratch.record.base_visible_len = Some(total);
+        scratch.record.replacing = false;
         scratch.hydrated.clear();
         scratch.record.hydrated.clear();
         scratch.torn.clear();

@@ -2277,20 +2277,22 @@ fn replacing_a_file_never_downloaded_asks_for_nothing() -> Result<()> {
     Ok(())
 }
 
-/// The same, dying before the seal, for a new file shorter than, as long as and longer than the
-/// old one, and when the draft's timestamp cannot tell it from a clean one.
+//// The same, dying before the seal, for a new file shorter than, as long as and longer than the
+/// old one, and when the draft's timestamp cannot tell it from a clean one. Nothing says its writer
+/// finished, so what it wrote goes beside the file, which stays as it was.
 #[test]
-fn a_draft_cut_to_nothing_recovers_without_the_file_it_replaced() -> Result<()> {
+fn a_replacement_killed_before_its_seal_recovers_beside_the_file() -> Result<()> {
     let old_len = 4 * crate::model::content::CHUNK_SIZE as usize;
     for len in [5, old_len, old_len + 5] {
         for coarse_clock in [false, true] {
             let root = tempfile::tempdir()?;
             let bytes = vec![7; len];
-            {
+            let before = {
                 let mut metadata = Store::open(root.path(), None)?;
                 let (entity, _) = seed_file_on_a_peer(&mut metadata, "big", 4, 0, false)?;
                 let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
-                let draft = layer.open_to_replace(metadata.basis(&entity)?)?;
+                let basis = metadata.basis(&entity)?;
+                let draft = layer.open_to_replace(basis.clone())?;
                 let mut draft = lock(&draft);
                 draft.truncate(0)?;
                 draft.write(layer.content(), 0, &bytes, false, false)?;
@@ -2298,39 +2300,348 @@ fn a_draft_cut_to_nothing_recovers_without_the_file_it_replaced() -> Result<()> 
                     draft.record.modified_ns = modified_ns(draft.file()?)? + 86_400_000_000_000;
                     draft.persist_record()?;
                 }
-            }
+                basis
+            };
             let (store, layer, recovered) = recover_after_a_crash(root.path())?;
             assert_eq!(recovered, 1, "{len} bytes, coarse clock {coarse_clock}");
-            assert_eq!(file_bytes(&lock(&store), "big")?, bytes);
+            assert_eq!(file_bytes(&lock(&store), "big (recovered)")?, bytes);
+            let after = lock(&store).basis(&before.entity)?;
+            assert_eq!(after.version, before.version, "the file is as it was");
+            assert_eq!(after.content, before.content);
+            assert_eq!(drafts_on_disk(root.path())?, 0);
             drop((store, layer));
-            assert_eq!(recover_after_a_crash(root.path())?.2, 0);
+            let (store, _layer, again) = recover_after_a_crash(root.path())?;
+            assert_eq!(again, 0);
+            assert_eq!(lock(&store).projection().children(ROOT).len(), 2);
         }
     }
     Ok(())
 }
 
 /// Dying inside the first write of a replacement, on either side of the truncate's durable record:
-/// the store still opens, and what the writer got as far as is what it finds.
+/// the store still opens, the file is as it was, and with nothing written there is no new file.
 #[test]
 fn a_kill_inside_the_first_write_of_a_replacement_leaves_a_store_that_opens() -> Result<()> {
     for record_written in [true, false] {
         let root = tempfile::tempdir()?;
-        {
+        let before = {
             let mut metadata = Store::open(root.path(), None)?;
             let (entity, _) = seed_file_on_a_peer(&mut metadata, "big", 4, 0, false)?;
             let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
-            let draft = layer.open_to_replace(metadata.basis(&entity)?)?;
+            let basis = metadata.basis(&entity)?;
+            let draft = layer.open_to_replace(basis.clone())?;
             let mut draft = lock(&draft);
             draft.truncate(0)?;
             if !record_written {
                 draft.record.base_visible_len = Some(4 * crate::model::content::CHUNK_SIZE);
                 draft.persist_record()?;
             }
-        }
+            basis
+        };
         let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
-        assert_eq!(recovered, 1, "record written: {record_written}");
-        assert!(file_bytes(&lock(&store), "big")?.is_empty());
+        assert_eq!(recovered, 0, "record written: {record_written}");
+        assert_eq!(lock(&store).basis(&before.entity)?.version, before.version);
+        assert_eq!(lock(&store).projection().children(ROOT).len(), 1);
+        assert_eq!(drafts_on_disk(root.path())?, 0);
     }
+    Ok(())
+}
+
+/// A name that is taken gets the first free number, and the new file goes where the old one is.
+#[test]
+fn a_killed_replacement_takes_the_first_free_recovered_name() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    {
+        let mut metadata = Store::open(root.path(), None)?;
+        metadata.create("sub", EntryKind::Directory)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "sub/notes.txt", 1, 1, false)?;
+        metadata.create("sub/NOTES (RECOVERED).txt", EntryKind::File)?;
+        metadata.create("sub/notes (recovered) (1).txt", EntryKind::File)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open_to_replace(metadata.basis(&entity)?)?;
+        let mut draft = lock(&draft);
+        draft.truncate(0)?;
+        draft.write(layer.content(), 0, b"half", false, false)?;
+    }
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1);
+    assert_eq!(
+        file_bytes(&lock(&store), "sub/notes (recovered) (2).txt")?,
+        b"half"
+    );
+    assert_eq!(
+        lock(&store)
+            .lookup("sub/notes.txt")?
+            .content
+            .unwrap()
+            .total_len,
+        crate::model::content::CHUNK_SIZE
+    );
+    Ok(())
+}
+
+/// The file and its directory went while the draft waited: what the writer wrote still has a place.
+#[test]
+fn a_killed_replacement_of_a_file_that_went_away_still_recovers() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    {
+        let mut metadata = Store::open(root.path(), None)?;
+        let directory = metadata.create("sub", EntryKind::Directory)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "sub/notes.txt", 1, 1, false)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open_to_replace(metadata.basis(&entity)?)?;
+        {
+            let mut draft = lock(&draft);
+            draft.truncate(0)?;
+            draft.write(layer.content(), 0, b"half", false, false)?;
+        }
+        metadata.delete(&entity)?;
+        metadata.delete(&directory.id)?;
+        metadata.sync_metadata()?;
+    }
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1);
+    assert_eq!(file_bytes(&lock(&store), "notes (recovered).txt")?, b"half");
+    Ok(())
+}
+
+#[test]
+fn a_recovered_name_keeps_the_extension_and_fits() -> Result<()> {
+    let free = std::collections::BTreeSet::new();
+    for (name, want) in [
+        ("notes.txt", "notes (recovered).txt"),
+        ("archive.tar.gz", "archive.tar (recovered).gz"),
+        ("plain", "plain (recovered)"),
+        (".hidden", ".hidden (recovered)"),
+        ("ends.", "ends. (recovered)"),
+    ] {
+        assert_eq!(recovered_name(name, &free)?, want);
+    }
+    let long = format!("{}.txt", "é".repeat(251));
+    let fitted = recovered_name(&long, &free)?;
+    assert!(name_key(&fitted).is_ok(), "{fitted}");
+    assert!(fitted.ends_with(" (recovered).txt"), "{fitted}");
+    let dotted = format!("a.{}", "b".repeat(253));
+    assert!(name_key(&recovered_name(&dotted, &free)?).is_ok());
+    Ok(())
+}
+
+/// A new or empty file has nothing to lose, so its draft recovers under its own name as any other.
+#[test]
+fn a_killed_replacement_of_an_empty_file_recovers_under_its_name() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    {
+        let mut metadata = Store::open(root.path(), None)?;
+        let entry = metadata.create("empty.txt", EntryKind::File)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open_to_replace(metadata.basis(&entry.id)?)?;
+        let mut draft = lock(&draft);
+        draft.truncate(0)?;
+        draft.write(layer.content(), 0, b"first bytes", false, false)?;
+    }
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1);
+    assert_eq!(file_bytes(&lock(&store), "empty.txt")?, b"first bytes");
+    assert_eq!(lock(&store).projection().children(ROOT).len(), 1);
+    Ok(())
+}
+
+/// Only `open_to_replace` says so: the same cut through an ordinary writer is an ordinary edit, and
+/// recovers under its name as it does on a desktop.
+#[test]
+fn a_cut_through_an_ordinary_writer_recovers_under_its_name() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "file", 1, 1, false)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open(metadata.basis(&entity)?, true)?;
+        let mut draft = lock(&draft);
+        draft.truncate(0)?;
+        draft.write(layer.content(), 0, b"cut", false, false)?;
+    }
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1);
+    assert_eq!(file_bytes(&lock(&store), "file")?, b"cut");
+    assert_eq!(lock(&store).projection().children(ROOT).len(), 1);
+    Ok(())
+}
+
+/// A writer that closed has finished: what it wrote is the file, even if nothing has sealed it yet.
+#[test]
+fn a_replacement_whose_writer_closed_recovers_under_its_name() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "file", 1, 1, false)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let draft = layer.open_to_replace(metadata.basis(&entity)?)?;
+        {
+            let mut draft = lock(&draft);
+            draft.truncate(0)?;
+            draft.write(layer.content(), 0, b"all of it", false, false)?;
+        }
+        layer.close(&draft, true);
+    }
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1);
+    assert_eq!(file_bytes(&lock(&store), "file")?, b"all of it");
+    assert_eq!(lock(&store).projection().children(ROOT).len(), 1);
+    Ok(())
+}
+
+/// A replacement that sealed and closed leaves an ordinary draft: an edit made through it later and
+/// killed is an edit of the new version.
+#[test]
+fn a_sealed_replacement_is_unaffected_by_a_later_kill() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "file", 1, 1, false)?;
+        let basis = metadata.basis(&entity)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let store = Mutex::new(metadata);
+        let draft = layer.open_to_replace(basis)?;
+        {
+            let mut draft = lock(&draft);
+            draft.truncate(0)?;
+            draft.write(layer.content(), 0, b"new bytes", false, false)?;
+        }
+        seal_batch(&store, &layer, std::slice::from_ref(&draft))?;
+        layer.close(&draft, true);
+        lock(&draft).write(layer.content(), 0, b"NEW", false, false)?;
+    }
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1);
+    assert_eq!(file_bytes(&lock(&store), "file")?, b"NEW bytes");
+    assert_eq!(lock(&store).projection().children(ROOT).len(), 1);
+
+    // And with nothing after the seal, there is nothing to recover at all.
+    drop((store, _layer));
+    let root = tempfile::tempdir()?;
+    {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "file", 1, 1, false)?;
+        let basis = metadata.basis(&entity)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let store = Mutex::new(metadata);
+        let draft = layer.open_to_replace(basis)?;
+        {
+            let mut draft = lock(&draft);
+            draft.truncate(0)?;
+            draft.write(layer.content(), 0, b"new bytes", false, false)?;
+        }
+        seal_batch(&store, &layer, std::slice::from_ref(&draft))?;
+    }
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(
+        recovered, 0,
+        "its writer never closed, and all it wrote is sealed"
+    );
+    assert_eq!(file_bytes(&lock(&store), "file")?, b"new bytes");
+    assert_eq!(lock(&store).projection().children(ROOT).len(), 1);
+    Ok(())
+}
+
+/// An fsync made a version of what came before it, which stands. What the writer went on to write
+/// still has no proof it finished.
+#[test]
+fn a_replacement_killed_after_an_fsync_recovers_the_rest_beside_that_version() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, _) = seed_file_on_a_peer(&mut metadata, "file.bin", 1, 1, false)?;
+        let basis = metadata.basis(&entity)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let store = Mutex::new(metadata);
+        let draft = layer.open_to_replace(basis)?;
+        {
+            let mut draft = lock(&draft);
+            draft.truncate(0)?;
+            draft.write(layer.content(), 0, b"first half", false, false)?;
+        }
+        seal_batch(&store, &layer, std::slice::from_ref(&draft))?;
+        lock(&draft).write(layer.content(), 10, b" and more", false, false)?;
+    }
+    let (store, _layer, recovered) = recover_after_a_crash(root.path())?;
+    assert_eq!(recovered, 1);
+    assert_eq!(file_bytes(&lock(&store), "file.bin")?, b"first half");
+    assert_eq!(
+        file_bytes(&lock(&store), "file (recovered).bin")?,
+        b"first half and more"
+    );
+    Ok(())
+}
+
+/// Nothing but its own writer may turn half of a replacement into a version: not whatever asks for
+/// everything to be sealed, and not a stop, however orderly. The next start has it, beside the file.
+#[test]
+fn a_flush_or_a_stop_with_a_replacing_writer_open_leaves_the_file_as_it_was() -> Result<()> {
+    use crate::runtime::Engine;
+    let home = tempfile::tempdir()?;
+    let engine = Engine::open(home.path(), None)?;
+    let token = engine.open_file("file.txt", true, false, true)?;
+    engine.write(token, 0, b"the good bytes", false, false)?;
+    engine.flush(Some(token))?;
+    engine.close(token)?;
+    let writer = engine.open_to_replace("file.txt")?;
+    engine.truncate(writer, 0, false)?;
+    engine.write(writer, 0, b"half", false, false)?;
+    engine.flush(None)?;
+    engine.flush_native_volume()?;
+    assert_eq!(
+        file_bytes(&lock(&engine.store), "file.txt")?,
+        b"the good bytes"
+    );
+    engine.shutdown()?;
+    assert_eq!(
+        file_bytes(&lock(&engine.store), "file.txt")?,
+        b"the good bytes"
+    );
+    drop(engine);
+
+    let engine = Engine::open(home.path(), None)?;
+    assert_eq!(
+        file_bytes(&lock(&engine.store), "file.txt")?,
+        b"the good bytes"
+    );
+    assert_eq!(
+        file_bytes(&lock(&engine.store), "file (recovered).txt")?,
+        b"half"
+    );
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// A draft already on disk, so its record exists before the cut: the record must say what is coming
+/// before the file is cut, since a kill right after the cut leaves only that record to go by. The
+/// cut is made to fail here, and the record says so all the same.
+#[test]
+fn a_replacement_is_on_record_before_the_cut() -> Result<()> {
+    use crate::model::content::CHUNK_SIZE;
+    let root = tempfile::tempdir()?;
+    let mut metadata = Store::open(root.path(), None)?;
+    let (entity, _) = seed_file_on_a_peer(&mut metadata, "file", 2, 2, true)?;
+    let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+    let draft = layer.open_to_replace(metadata.basis(&entity)?)?;
+    let mut draft = lock(&draft);
+    draft.write(layer.content(), 0, b"edit", false, false)?;
+    let on_record = |path: &std::path::Path| -> Result<bool> {
+        let record: ScratchRecord =
+            serde_json::from_slice(&std::fs::read(path.with_extension("json"))?)?;
+        Ok(record.replacing)
+    };
+    assert!(!on_record(&draft.path)?, "nothing is cut yet");
+    let writable = draft.file.take().unwrap();
+    draft.file = Some(std::fs::File::open(&draft.path)?);
+    assert!(draft.truncate(0).is_err(), "a read-only handle cannot cut");
+    assert!(on_record(&draft.path)?);
+    assert!(!draft.record.replacing, "and nothing changed here");
+    assert_eq!(draft.len()?, 2 * CHUNK_SIZE);
+    draft.file = Some(writable);
+    draft.truncate(0)?;
+    assert!(on_record(&draft.path)?);
+    assert!(draft.record.replacing);
     Ok(())
 }
 

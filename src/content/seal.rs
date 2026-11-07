@@ -5,11 +5,12 @@ use crate::{
         local::{Kind, LocalContent, Manifest},
         working::{Scratch, ScratchRecord, WorkingLayer, file_write_time, lock, modified_ns},
     },
-    core::{Operation, Store},
+    core::{Entry, Operation, ROOT, Store, Times, name_key},
     util::log::event,
 };
 use anyhow::{Context, Result};
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -315,6 +316,99 @@ pub fn seal_batch(
     Ok(stats)
 }
 
+/// `name (recovered).ext`, or with the first free number if `taken` has that, by [`name_key`]. It
+/// numbers as the app numbers a name that is taken: a dot that starts or ends the name starts no
+/// extension. A long stem gives way, as the new name must fit where the old one did.
+pub(crate) fn recovered_name(name: &str, taken: &BTreeSet<String>) -> Result<String> {
+    const LONGEST: usize = 255;
+    const LONGEST_EXTENSION: usize = 64;
+    let (stem, extension) = match name.rfind('.') {
+        Some(dot) if dot > 0 && dot < name.len() - 1 && name.len() - dot <= LONGEST_EXTENSION => {
+            name.split_at(dot)
+        }
+        _ => (name, ""),
+    };
+    let units = |text: &str| text.encode_utf16().count();
+    for number in 0u64.. {
+        let mark = match number {
+            0 => " (recovered)".to_owned(),
+            number => format!(" (recovered) ({number})"),
+        };
+        let room = LONGEST.saturating_sub(units(&mark) + units(extension));
+        let mut used = 0;
+        let kept: String = stem
+            .chars()
+            .take_while(|c| {
+                used += c.len_utf16();
+                used <= room
+            })
+            .collect();
+        let candidate = format!("{kept}{mark}{extension}");
+        if !taken.contains(&name_key(&candidate)?) {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("a finite directory has a free number")
+}
+
+/// Publishes a draft as a new file beside the one it was to replace, which stays as it was, with
+/// the receipt in the same transaction: a kill after this finds the receipt and nothing to do.
+/// The new file is made as any other is, by a create and a content event, so it syncs like one and
+/// counts as waiting to send. Beside the file as it is now: if its directory has gone since, the new
+/// one goes at the top of the folder, as a folder has no other place to show it.
+fn seal_beside(
+    store: &Mutex<Store>,
+    layer: &WorkingLayer,
+    file: &Arc<Mutex<Scratch>>,
+) -> Result<String> {
+    let _sealing = layer.seal_guard();
+    let mut scratch = lock(file);
+    let mut stats = SealStats::default();
+    let reference = prepare(&mut scratch, layer, &mut stats)?;
+    let _pin = layer.content().pin(&reference)?;
+    layer.content().packs.flush()?;
+    let stamp = modified_ns(scratch.file()?)?;
+    let branch = scratch.record.basis.branch.clone();
+    let mut metadata = lock(store);
+    let original = match metadata.entry(&scratch.record.basis.entity) {
+        Ok(entry) => entry,
+        Err(_) => {
+            metadata
+                .version(&scratch.record.basis.version)?
+                .context("BASE_VERSION_MISSING")?
+                .state
+        }
+    };
+    let parent = metadata
+        .projection()
+        .entries
+        .get(&original.parent)
+        .filter(|entry| !entry.deleted)
+        .map_or_else(|| ROOT.to_owned(), |entry| entry.id.clone());
+    let mut taken = BTreeSet::new();
+    for child in metadata.projection().children(&parent) {
+        taken.insert(name_key(&child.name)?);
+    }
+    let mut state = Entry {
+        id: crate::core::id(),
+        parent,
+        name: recovered_name(&original.name, &taken)?,
+        content: Some(metadata.empty_content()),
+        times: Times::default(),
+        deleted: false,
+        working_len: None,
+        ..original
+    };
+    let entity = state.id.clone();
+    let created = metadata.event(&branch, state.clone(), Vec::new(), Operation::Create);
+    state.content = Some(reference);
+    state.times.modified = scratch.modified_time.unwrap_or(state.times.modified);
+    let content = metadata.event(&branch, state, vec![created.id.clone()], Operation::Content);
+    let receipt = (scratch.record.operation.clone(), content.id.clone(), stamp);
+    metadata.apply_batch(&[created, content], &[receipt])?;
+    Ok(entity)
+}
+
 /// What became of a draft found at a start.
 enum Recovery {
     /// It is published, under this entity, and gone.
@@ -448,6 +542,14 @@ fn recover_draft(
         remove_draft(path)?;
         return Ok(Recovery::Gone);
     }
+    // Half of a replacement that had got no further than its cut: the file stands, and there is
+    // nothing to put beside it.
+    if record.replacing && file_len == 0 {
+        drop(file);
+        remove_draft(path)?;
+        return Ok(Recovery::Gone);
+    }
+    let beside = record.replacing;
     // Only what the draft holds overrides its base. The rest keeps the chunks it had,
     // which need not be here.
     let mut dirty = crate::content::working::DirtyBitmap::default();
@@ -468,6 +570,7 @@ fn recover_draft(
         hydrated,
         hydration_pending: false,
         torn: Default::default(),
+        replacement_open: false,
         record,
         path: path.to_owned(),
         file: Some(file),
@@ -490,11 +593,16 @@ fn recover_draft(
         .pin_visible(&reference, base_visible_len)
         .and_then(|pin| {
             lock(&scratch).pin = pin;
-            seal_batch(store, layer, std::slice::from_ref(&scratch))
+            if beside {
+                seal_beside(store, layer, &scratch)
+            } else {
+                seal_batch(store, layer, std::slice::from_ref(&scratch)).map(|_| entity)
+            }
         });
-    if let Err(error) = sealed {
-        return Ok(Recovery::SealFailed(error));
-    }
+    let entity = match sealed {
+        Ok(entity) => entity,
+        Err(error) => return Ok(Recovery::SealFailed(error)),
+    };
     drop(scratch);
     remove_draft(path)?;
     Ok(Recovery::Sealed(entity))

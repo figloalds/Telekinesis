@@ -1228,6 +1228,64 @@ mod tests {
         }
     }
 
+    /// A replacement cut short is recovered beside its file by the next start, as a new file of this
+    /// device: it waits to send like any other, until a PC holds its bytes.
+    #[test]
+    fn a_recovered_replacement_waits_to_send_like_any_file() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("folder");
+        let phone = Phone::open(&home.path().join("phone.sqlite")).unwrap();
+        {
+            let engine = Engine::open(&folder, None).unwrap();
+            let token = engine.open_file("file.txt", true, false, true).unwrap();
+            engine
+                .write(token, 0, b"the good bytes", false, false)
+                .unwrap();
+            engine.flush(Some(token)).unwrap();
+            engine.close(token).unwrap();
+            let writer = engine.open_to_replace("file.txt").unwrap();
+            engine.truncate(writer, 0, false).unwrap();
+            engine.write(writer, 0, b"half", false, false).unwrap();
+            engine.shutdown().unwrap();
+        }
+        let engine = Engine::open(&folder, None).unwrap();
+        phone.scan(FOLDER, &engine).unwrap();
+        let waiting = phone.waiting(FOLDER).unwrap();
+        let recovered = waiting
+            .iter()
+            .find(|row| row.path == "/file (recovered).txt")
+            .unwrap_or_else(|| panic!("{waiting:?}"));
+        assert!(
+            waiting.iter().any(|row| row.path == "/file.txt"),
+            "{waiting:?}"
+        );
+
+        let peers = FakePeers::default();
+        let top = engine.store.lock().unwrap().feed_position().unwrap();
+        peers.sent(PC, top);
+        let closure = engine.head_closure(&recovered.entity).unwrap();
+        assert!(!closure.digests.is_empty());
+        let still = phone.confirm(FOLDER, REPO, &engine, &peers).unwrap();
+        assert!(
+            phone
+                .waiting(FOLDER)
+                .unwrap()
+                .iter()
+                .any(|row| row.path == "/file (recovered).txt"),
+            "no PC holds its bytes yet: {still:?}"
+        );
+        peers.holds(PC, &closure.digests);
+        phone.confirm(FOLDER, REPO, &engine, &peers).unwrap();
+        assert!(
+            !phone
+                .waiting(FOLDER)
+                .unwrap()
+                .iter()
+                .any(|row| row.path == "/file (recovered).txt")
+        );
+        engine.shutdown().unwrap();
+    }
+
     impl Fixture {
         fn write(&self, path: &str, bytes: &[u8]) {
             let token = self.engine.open_file(path, true, false, true).unwrap();

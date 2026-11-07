@@ -126,8 +126,12 @@ internal class RecoveringReader(
  * every call, and the draft is sealed by its old engine's stop or at the next start.
  *
  * A truncating open changes nothing until the first write, fsync or release, and until then only
- * says it is empty: a client that holds its descriptor and is killed, or a descriptor that could
- * not be made, leaves the file as it was.
+ * says it is empty: a descriptor that could not be made, or this app killed while the client holds
+ * its descriptor, leaves the file as it was. A client that dies is not one of those: Android calls
+ * `onRelease` for it just as for a close, and this cannot tell them apart, so the file is cut and
+ * what it wrote becomes the file. Killed after the cut, this app gets no release at all. Nothing then
+ * says the writer finished, and the next start puts what it wrote beside the file, under a name of
+ * its own, with the file as it was (`seal::recover`).
  *
  * It also replaces the file whole or not at all. A write that fails, as on a full disk, takes back
  * what went before it since the last fsync, at once, so that half a file does not stand in for a good

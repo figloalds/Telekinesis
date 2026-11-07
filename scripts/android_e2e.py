@@ -507,6 +507,7 @@ def scenario_write(s: Session) -> None:
         "kill-before-a-write.txt": b"Before the kill, with nothing written.\n",
         "kill-while-open.txt": b"Before the kill, while open.\n",
         "kill-while-open.bin": large.randbytes(LARGE_FILE_BYTES),
+        "kill-mid-replacement.txt": b"The good bytes, before the kill.\n",
         "restart-while-open.txt": b"0123456789 before the restart.\n",
         "replaced-away.bin": large.randbytes(LARGE_FILE_BYTES),
         "replaced-away.txt": b"A small file nobody read.\n",
@@ -697,14 +698,33 @@ def check_a_kill_after_a_release(s: Session, folder: Folder) -> None:
     on_pc = s.pc.pc_cat(folder.pc_state, "kill-before-a-write.txt")
     s.check("and it is as it was on the PC", on_pc == kept, on_pc[:80])
 
-    # The writer has its bytes in the draft by now. Its release may have run, or be running.
-    content = b"After the second kill.\n"
+    # The writer has its bytes in the draft by now. Its release may have run, or be running. If the
+    # kill came first nothing says the writer finished, so they are beside the file instead.
+    finished, content = content, b"After the second kill.\n"
     device.content_write(doc, content)
     device.force_stop()
     s.check("force-stop with no wait for the release ended the app", device.app_pid() is None)
     s.sync_with_the_pc_back(folder)
     on_pc = s.pc.pc_cat(folder.pc_state, "kill-after-release.txt")
+    if on_pc == finished:
+        on_pc = s.pc.pc_cat(folder.pc_state, "kill-after-release (recovered).txt")
     s.check("what was written reaches the PC all the same", on_pc == content, on_pc[:80])
+
+    # Killed with a replacement under way, there is no release and nothing says the writer finished.
+    # The file stays as it was and what it wrote goes beside it, on both sides. The name is free the
+    # first time and numbered the next.
+    path, kept = "kill-mid-replacement.txt", folder.files["kill-mid-replacement.txt"]
+    for name, half in (("kill-mid-replacement (recovered).txt", b"Half of a repl"),
+                       ("kill-mid-replacement (recovered) (1).txt", b"Half of another")):
+        device.write_document(folder.doc(path), "wt", half, close=False)
+        device.force_stop()
+        s.check(f"force-stop with {name!r} under way ended the app", device.app_pid() is None)
+        s.check("the file reads as it was", device.content_read(folder.doc(path)) == kept)
+        s.check(f"and what the writer wrote reads as {name!r}", device.content_read(folder.doc(name)) == half)
+        s.sync_with_the_pc_back(folder)
+        s.check("the file is as it was on the PC", s.pc.pc_cat(folder.pc_state, path) == kept)
+        on_pc = s.pc.pc_cat(folder.pc_state, name)
+        s.check("and the PC has what the writer wrote beside it", on_pc == half, on_pc[:80])
 
 
 def check_a_kill_while_open(s: Session, folder: Folder) -> None:
@@ -791,19 +811,27 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
     s.check("and its listed size stays", size == str(len(files["edited-away.txt"])), size)
 
     # What was done with the PC away survives a restart too, sealed or not. The second file's
-    # draft has no release and its old manifest was never here, and the folder must still open.
+    # draft has no release and its old manifest was never here, and the folder must still open. Nothing
+    # says that writer finished, so what it wrote is beside the file, which stays as it was.
     new_killed = random.Random(16).randbytes(8 * 1024)
+    recovered = "killed-away (recovered).bin"
     device.write_document(folder.doc("killed-away.bin"), "wt", new_killed, close=False)
     device.force_stop()
     s.check("force-stop with the PC away and a writer open ended the app", device.app_pid() is None)
     s.check("a replaced file still reads after it", device.content_read(folder.doc("replaced-away.txt")) == new_small)
-    s.check("and so does the one whose writer was killed", device.content_read(folder.doc("killed-away.bin")) == new_killed)
+    s.check("and what the killed writer wrote reads beside its file", device.content_read(folder.doc(recovered)) == new_killed)
+    listed = names_in(s, folder.doc())
+    s.check("which lists with its old size", listed["killed-away.bin"]["_size"] == str(len(files["killed-away.bin"])),
+            listed["killed-away.bin"])
+    device.confirm(folder.id)  # What fills the table, after every burst and when the app shows.
+    s.check("and the new file is waiting to send", f"/{recovered}" in [row["path"] for row in device.waiting_files(folder.id)],
+            device.waiting_files(folder.id))
 
     pc.start()
     pc.wait_phase(folder.label, "Running")
     s.sync_with_the_pc_back(folder)
     for path, content in (("replaced-away.bin", new_large), ("replaced-away.txt", new_small),
-                          ("killed-away.bin", new_killed)):
+                          (recovered, new_killed), ("killed-away.bin", files["killed-away.bin"])):
         on_pc = pc.pc_cat(folder.pc_state, path)
         s.check(f"{path} reaches the PC later", on_pc == content, f"{len(on_pc)} of {len(content)} bytes")
     for path in ("edited-away.txt", "edited-away.bin"):

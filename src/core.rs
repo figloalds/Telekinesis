@@ -1014,6 +1014,10 @@ impl Store {
         self.apply(std::slice::from_ref(&event))?;
         Ok(event)
     }
+    /// What a new file holds until its first content event.
+    pub(crate) fn empty_content(&self) -> FileContentRef {
+        self.empty_content.clone()
+    }
     pub fn create(&mut self, path: &str, kind: EntryKind) -> Result<Entry> {
         self.create_with_attributes(path, kind, None)
     }
