@@ -150,7 +150,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
     private suspend fun confirmWhatIsShown() {
         repeat(CONFIRM_ATTEMPTS) {
             val folders = mutable.value.snapshot?.folders.orEmpty().map { it.id }
-            val answered = folders.isNotEmpty() && withContext(Dispatchers.IO) { SyncCoordinator.confirm(folders) }
+            val answered = folders.isNotEmpty() && withContext(Dispatchers.IO) { SyncCoordinator.confirm(getApplication(), folders) }
             refresh()
             if (answered) return
             delay(CONFIRM_RETRY_MS)

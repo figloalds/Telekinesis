@@ -95,7 +95,7 @@ internal object ShellControl {
         // The files of a folder the PCs have not confirmed: `--arg FOLDER`.
         WAITING -> reply { Native.waiting(arg ?: throw IOException("MISSING_ARGUMENT: folder")) }
         // Asks the PCs now, as after a burst: `--arg FOLDER`, answering `{waiting, unsupported}`.
-        CONFIRM -> reply { Native.confirm(arg ?: throw IOException("MISSING_ARGUMENT: folder")) }
+        CONFIRM -> reply { Native.confirm(arg ?: throw IOException("MISSING_ARGUMENT: folder"), SyncCoordinator.metered(context)) }
         // What the app sees of the volume, and what its last check of the floor left: `{free, total, floor, blocked}`.
         SPACE -> reply {
             val volume = StatFs(context.filesDir.path)

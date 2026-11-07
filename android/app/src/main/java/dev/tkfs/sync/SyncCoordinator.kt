@@ -315,9 +315,10 @@ object SyncCoordinator {
         val now = System.currentTimeMillis()
         for (folder in result.folders) if (folder.error == null) settings.setLastSyncMs(folder.id, now)
         if (result.exchanged > 0) notifyChange(app)
+        for (folder in result.folders) if (folder.pushed > 0) notePushed(folder.id)
         // After every burst, so a file leaves "waiting" as soon as the PC has it. Not after one a stop
         // ended: that network may be gone.
-        if (!result.ended) confirm(result.folders.map { it.id })
+        if (!result.ended) confirm(app, result.folders.map { it.id })
         return result
     }
 
@@ -325,11 +326,12 @@ object SyncCoordinator {
      * Asks the PCs which of each folder's waiting files they hold, on this thread. A folder that
      * fails keeps its files waiting: only a PC's answer clears one. True when every folder answered.
      */
-    fun confirm(folders: Collection<String>): Boolean {
+    fun confirm(ctx: Context, folders: Collection<String>): Boolean {
+        val metered = metered(ctx.applicationContext)
         var all = true
         for (id in folders) {
             try {
-                val answer = parseConfirmed(Native.confirm(id))
+                val answer = parseConfirmed(Native.confirm(id, metered))
                 confirmed.update { it + (id to answer) }
                 Log.i(TAG, "confirm $id: $answer")
             } catch (error: IOException) {
@@ -341,6 +343,14 @@ object SyncCoordinator {
             }
         }
         return all
+    }
+
+    private fun notePushed(folder: String) {
+        try {
+            Native.notePushed(folder)
+        } catch (error: IOException) {
+            Log.i(TAG, "pushed $folder: ${error.message}")
+        }
     }
 
     /** The burst `trigger` calls for, on this thread. `decided` is a mode the caller already chose. */

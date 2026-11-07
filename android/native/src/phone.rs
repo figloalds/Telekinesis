@@ -128,6 +128,13 @@ CREATE TABLE IF NOT EXISTS unconfirmed(
     total INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(folder, entity)
 );
+CREATE TABLE IF NOT EXISTS not_held(
+    -- What a PC last said it lacks of this event's file, until something is pushed.
+    folder TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY(folder, entity)
+);
 CREATE TABLE IF NOT EXISTS marks(
     folder TEXT NOT NULL,
     entity TEXT NOT NULL,
@@ -220,6 +227,7 @@ impl Phone {
                 Some((saved, position)) if saved == journal && position <= top => position,
                 Some(_) => {
                     db.execute("DELETE FROM unconfirmed WHERE folder=?1", [folder])?;
+                    db.execute("DELETE FROM not_held WHERE folder=?1", [folder])?;
                     db.execute("DELETE FROM scanned WHERE folder=?1", [folder])?;
                     0
                 }
@@ -329,14 +337,46 @@ impl Phone {
         Ok(())
     }
 
-    /// Scans, asks the peers about what is left, and takes out what they confirmed. The work is
-    /// bounded by the budget: whatever it does not reach stays for the next call.
+    /// Something of this folder reached a PC, so what one lacked it may hold now.
+    pub fn pushed(&self, folder: &str) -> Result<()> {
+        lock(&self.db).execute("DELETE FROM not_held WHERE folder=?1", [folder])?;
+        Ok(())
+    }
+
+    fn lacked(&self, folder: &str) -> Result<HashMap<String, u64>> {
+        let db = lock(&self.db);
+        let mut query = db.prepare_cached("SELECT entity,seq FROM not_held WHERE folder=?1")?;
+        Ok(query
+            .query_map([folder], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// [`Self::confirm_on`] on a network whose cost does not count.
     pub fn confirm(
         &self,
         folder: &str,
         repo: &str,
         engine: &Engine,
         peers: &dyn Confirmer,
+    ) -> Result<Confirmed> {
+        self.confirm_on(folder, repo, engine, peers, false)
+    }
+
+    /// Scans, asks the peers about what is left, and takes out what they confirmed. The work is
+    /// bounded by the budget: whatever it does not reach stays for the next call.
+    ///
+    /// A file a PC lacks is the usual case with a file waiting, and this runs after every burst, so
+    /// a question costs little until it is likely to pay: a sample through the file, and then all of
+    /// it only if every digest asked about is held. On a `metered` network a file the PC last said it
+    /// lacks is not asked about again until something was [`Self::pushed`], as its answer could not
+    /// have changed.
+    pub fn confirm_on(
+        &self,
+        folder: &str,
+        repo: &str,
+        engine: &Engine,
+        peers: &dyn Confirmer,
+        metered: bool,
     ) -> Result<Confirmed> {
         let _one = lock(&self.confirming);
         let deadline = Instant::now() + self.budget.time;
@@ -351,13 +391,22 @@ impl Phone {
         let rows = self.rows(folder)?;
         self.refresh_paths(folder, &rows, engine)?;
         let sent = peers.sent(repo);
+        let lacked = if metered {
+            self.lacked(folder)?
+        } else {
+            HashMap::new()
+        };
         let mut blocked: BTreeMap<String, Blocked> = BTreeMap::new();
         let mut cleared: Vec<(String, u64)> = Vec::new();
         let mut unsupported = BTreeSet::new();
+        let mut not_held: Vec<(String, u64)> = Vec::new();
         'rows: for row in &rows {
             // Out of digests is not out of rows: what needs no bytes still clears.
             if Instant::now() >= deadline {
                 break;
+            }
+            if lacked.get(&row.entity) == Some(&row.seq) {
+                continue;
             }
             let candidates: Vec<&str> = sent
                 .iter()
@@ -389,6 +438,7 @@ impl Phone {
                 continue;
             }
             let total = digests.len();
+            let mut lacks = false;
             for peer in candidates.iter().copied() {
                 if blocked.contains_key(peer) {
                     continue;
@@ -399,6 +449,29 @@ impl Phone {
                     0
                 };
                 let before = at;
+                if total - at > HAVE_SAMPLE {
+                    let sample = sample_of(&digests[at..]);
+                    if left < sample.len() || Instant::now() >= deadline {
+                        continue;
+                    }
+                    match peers.held(peer, &sample) {
+                        Held::Known(known) => {
+                            left -= sample.len();
+                            if !sample.iter().all(|digest| known.contains(digest)) {
+                                lacks = true;
+                                continue;
+                            }
+                        }
+                        Held::NoFeature => {
+                            blocked.insert(peer.to_owned(), Blocked::NoFeature);
+                            continue;
+                        }
+                        Held::Unreachable(_) => {
+                            blocked.insert(peer.to_owned(), Blocked::Unreachable);
+                            continue;
+                        }
+                    }
+                }
                 while at < total {
                     if left == 0 || Instant::now() >= deadline {
                         break;
@@ -409,6 +482,7 @@ impl Phone {
                         Held::Known(known) => {
                             left -= take;
                             if !page.iter().all(|digest| known.contains(digest)) {
+                                lacks = true;
                                 break;
                             }
                             at += take;
@@ -430,6 +504,9 @@ impl Phone {
                     cleared.push((row.entity.clone(), row.seq));
                     continue 'rows;
                 }
+            }
+            if lacks {
+                not_held.push((row.entity.clone(), row.seq));
             }
             if candidates
                 .iter()
@@ -454,6 +531,17 @@ impl Phone {
             for (entity, seq) in &cleared {
                 tx.execute(
                     "DELETE FROM unconfirmed WHERE folder=?1 AND entity=?2 AND seq=?3",
+                    params![folder, entity, seq],
+                )?;
+                tx.execute(
+                    "DELETE FROM not_held WHERE folder=?1 AND entity=?2",
+                    params![folder, entity],
+                )?;
+            }
+            for (entity, seq) in &not_held {
+                tx.execute(
+                    "INSERT INTO not_held(folder,entity,seq) VALUES(?1,?2,?3) \
+                     ON CONFLICT(folder,entity) DO UPDATE SET seq=excluded.seq",
                     params![folder, entity, seq],
                 )?;
             }
@@ -943,6 +1031,19 @@ impl Phone {
     }
 }
 
+/// How many digests are asked about first, of a file with more. 64 KiB of chunks a digest, so this is
+/// a question of about 4 KiB however large the file.
+const HAVE_SAMPLE: usize = 64;
+
+/// [`HAVE_SAMPLE`] digests spread through `digests`, the first and the last among them: what a push
+/// that got partway did not reach, or what is missing here and there.
+fn sample_of(digests: &[Digest]) -> Vec<Digest> {
+    let last = digests.len() - 1;
+    (0..HAVE_SAMPLE)
+        .map(|index| digests[index * last / (HAVE_SAMPLE - 1)])
+        .collect()
+}
+
 /// About how much one evict is asked to free. It holds the store and the packs while it copies what
 /// else is in the segments it touches, and everything that reads waits for that.
 const EVICT_BATCH_BYTES: u64 = 256 * 1024 * 1024;
@@ -1268,6 +1369,153 @@ mod tests {
             phone,
             peers: FakePeers::default(),
         }
+    }
+
+    /// One large file the PC does not hold, as a waiting file usually is: one small question.
+    #[test]
+    fn a_large_file_the_pc_lacks_costs_a_sample_and_no_page() {
+        let f = fixture();
+        f.write("/large", &distinct(1, 300));
+        f.peers.sent(PC, f.top());
+        assert_eq!(f.confirm().waiting, 1);
+        assert_eq!(*f.peers.asked.borrow(), vec![HAVE_SAMPLE]);
+    }
+
+    /// A push that got partway stops at some digest: the sample's last one tells it.
+    #[test]
+    fn a_large_file_with_its_tail_missing_costs_a_sample_and_no_page() {
+        let f = fixture();
+        f.write("/large", &distinct(1, 300));
+        f.peers.sent(PC, f.top());
+        let digests = f.digests("/large");
+        f.peers.holds(PC, &digests[..digests.len() - 1]);
+        assert_eq!(f.confirm().waiting, 1);
+        assert_eq!(*f.peers.asked.borrow(), vec![HAVE_SAMPLE]);
+    }
+
+    /// All of the sample is held: only then the whole of it, and only that clears the file.
+    #[test]
+    fn a_sample_held_goes_on_to_the_whole_file() {
+        let f = fixture();
+        f.write("/large", &distinct(1, 300));
+        f.peers.sent(PC, f.top());
+        let digests = f.digests("/large");
+        f.peers.holds(PC, &digests);
+        let sampled = sample_of(&digests);
+        let hole = digests
+            .iter()
+            .find(|digest| !sampled.contains(digest))
+            .copied()
+            .unwrap();
+        f.peers.held.borrow_mut().get_mut(PC).unwrap().remove(&hole);
+        assert_eq!(f.confirm().waiting, 1, "the sample could not see the hole");
+        assert_eq!(
+            *f.peers.asked.borrow(),
+            vec![HAVE_SAMPLE, digests.len()],
+            "the sample, and then all of it"
+        );
+        f.peers.holds(PC, &digests);
+        assert_eq!(f.confirm().waiting, 0);
+    }
+
+    /// A PC too old to say, or that is away, is told apart on the sample as on a page.
+    #[test]
+    fn a_sample_that_cannot_be_answered_says_why() {
+        let f = fixture();
+        f.write("/large", &distinct(1, 300));
+        f.peers.sent(PC, f.top());
+        f.peers.without_the_feature(PC);
+        let confirmed = f.confirm();
+        assert_eq!((confirmed.waiting, confirmed.unsupported), (1, 1));
+        assert_eq!(f.peers.calls(), 1);
+    }
+
+    /// With few digests the sample would be most of the question, so it is not asked.
+    #[test]
+    fn a_small_file_is_asked_about_as_it_is() {
+        let f = fixture();
+        f.write("/small", &distinct(1, 3));
+        f.peers.sent(PC, f.top());
+        assert_eq!(f.confirm().waiting, 1);
+        assert_eq!(f.peers.asked.borrow().len(), 1);
+    }
+
+    #[test]
+    fn a_sample_is_spread_through_the_file_and_ends_at_its_end() {
+        let digests: Vec<Digest> = (0..1000)
+            .map(|index: u32| Digest::bytes(&index.to_le_bytes()))
+            .collect();
+        let sample = sample_of(&digests);
+        assert_eq!(sample.len(), HAVE_SAMPLE);
+        assert_eq!(sample[0], digests[0]);
+        assert_eq!(sample[HAVE_SAMPLE - 1], digests[999]);
+        let distinct: BTreeSet<_> = sample.iter().collect();
+        assert_eq!(distinct.len(), HAVE_SAMPLE);
+        let short = sample_of(&digests[..HAVE_SAMPLE + 1]);
+        assert_eq!(short.iter().collect::<BTreeSet<_>>().len(), HAVE_SAMPLE);
+    }
+
+    /// On a metered network what the PC lacks is not asked about at every burst, for as long as it
+    /// could not have changed.
+    #[test]
+    fn on_a_metered_network_a_file_the_pc_lacks_waits_for_a_push() {
+        let f = fixture();
+        f.write("/large", &distinct(1, 300));
+        f.write("/also", &distinct(2, 3));
+        f.peers.sent(PC, f.top());
+        let confirm = || {
+            f.phone
+                .confirm_on(FOLDER, REPO, &f.engine, &f.peers, true)
+                .unwrap()
+        };
+
+        assert_eq!(confirm().waiting, 2);
+        let first = f.peers.calls();
+        assert_eq!(first, 2, "it has no answer yet, so it asks");
+        assert_eq!(confirm().waiting, 2);
+        assert_eq!(f.peers.calls(), first, "the same answer, for free");
+
+        // On an unmetered network the cost does not count.
+        f.confirm();
+        let unmetered = f.peers.calls();
+        assert_eq!(unmetered, first + 2);
+
+        // A push: the answer may be another, and this time it is.
+        f.phone.pushed(FOLDER).unwrap();
+        f.peers.holds(PC, &f.digests("/also"));
+        assert_eq!(confirm().waiting, 1);
+        assert_eq!(f.peers.calls(), unmetered + 2);
+        assert_eq!(confirm().waiting, 1);
+        assert_eq!(f.peers.calls(), unmetered + 2);
+
+        // A new version is a new question.
+        f.rewrite("/large", &distinct(3, 300));
+        f.peers.sent(PC, f.top());
+        assert_eq!(confirm().waiting, 1);
+        assert_eq!(f.peers.calls(), unmetered + 3);
+
+        // A PC that was away said nothing, so there is nothing to go by.
+        struct Away;
+        impl Confirmer for Away {
+            fn sent(&self, _: &str) -> Vec<(String, u64)> {
+                vec![(PC.to_owned(), u64::MAX)]
+            }
+            fn held(&self, _: &str, _: &[Digest]) -> Held {
+                Held::Unreachable("away".to_owned())
+            }
+        }
+        f.write("/third", &distinct(4, 3));
+        f.phone
+            .confirm_on(FOLDER, REPO, &f.engine, &Away, true)
+            .unwrap();
+        f.peers.sent(PC, f.top());
+        let asked = f.peers.calls();
+        confirm();
+        assert_eq!(
+            f.peers.calls(),
+            asked + 1,
+            "/third alone: /large has its answer"
+        );
     }
 
     /// A replacement cut short is recovered beside its file by the next start, as a new file of this

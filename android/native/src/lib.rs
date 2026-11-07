@@ -70,7 +70,7 @@ fn waiting(folder: &str) -> Result<Value> {
 }
 
 /// Asks the PCs what they now hold, and returns `{waiting, unsupported}` for `folder`.
-fn confirm(folder: &str) -> Result<Value> {
+fn confirm(folder: &str, metered: bool) -> Result<Value> {
     let daemon = host()?.daemon()?;
     let record = daemon.catalog.resolve(folder)?;
     let engine = engine(&record.id)?;
@@ -85,7 +85,7 @@ fn confirm(folder: &str) -> Result<Value> {
         folder: &record.id,
         journal: &journal,
     };
-    let confirmed = phone()?.confirm(&record.id, &record.repo, &engine, &peers)?;
+    let confirmed = phone()?.confirm_on(&record.id, &record.repo, &engine, &peers, metered)?;
     Ok(json!({
         "waiting": confirmed.waiting,
         "unsupported": confirmed.unsupported,
@@ -699,10 +699,25 @@ pub extern "system" fn Java_dev_tkfs_Native_confirm(
     mut env: JNIEnv,
     _: JClass,
     folder: JString,
+    metered: jboolean,
 ) -> jstring {
     guard_string(&mut env, |env| {
         let folder = text(env, &folder)?;
-        Ok(confirm(&folder)?.to_string())
+        Ok(confirm(&folder, metered != JNI_FALSE)?.to_string())
+    })
+}
+
+/// Something of the folder reached a PC, so what it lacked it may hold now.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_notePushed(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        let record = host()?.daemon()?.catalog.resolve(&folder)?;
+        phone()?.pushed(&record.id)
     })
 }
 
@@ -1218,7 +1233,11 @@ mod tests {
     #[test]
     fn waiting_and_confirm_fail_through_the_guard_with_no_host() {
         with_env(|env| {
-            for entry in [Java_dev_tkfs_Native_waiting, Java_dev_tkfs_Native_confirm] {
+            let entries: [fn(JNIEnv, JClass, JString) -> jstring; 2] = [
+                |env, class, folder| Java_dev_tkfs_Native_waiting(env, class, folder),
+                |env, class, folder| Java_dev_tkfs_Native_confirm(env, class, folder, JNI_TRUE),
+            ];
+            for entry in entries {
                 let class = env.find_class("java/lang/Object").unwrap();
                 let folder = env.new_string("F").unwrap();
                 let value = entry(unsafe { env.unsafe_clone() }, class, folder);

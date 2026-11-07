@@ -304,6 +304,9 @@ The Folders screen must be honest with the PC off, so this is durable and local.
   has passed it) and, for content, `objects.have` confirmed every chunk of its head.
 - One confirming peer is enough. Diagnostics shows the per-peer detail.
 - A file edited again goes back in the table by its new event.
+- Waiting is the usual state of a file, and this is asked after every burst, so the question is kept
+  small: up to 64 digests spread through the file, and full pages only if all of those are held. On a
+  metered network a file the PC last said it lacks is not asked about again until something was pushed.
 
 The burst's `remaining` is not used for this. It counts what the listener lacks from anyone,
 including bytes the phone does not hold either, so it may never reach zero.

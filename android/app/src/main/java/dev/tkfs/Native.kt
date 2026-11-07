@@ -102,10 +102,15 @@ object Native {
     /**
      * Takes this phone's new changes into that table, asks the PCs what they now hold, bounded, and
      * answers `{waiting, unsupported}`. Only a PC's own answer clears a file. It does not return
-     * quickly with no network: call it off the main thread, after a burst.
+     * quickly with no network: call it off the main thread, after a burst. On a `metered` network a
+     * file a PC last said it lacks is not asked about until [notePushed].
      */
     @JvmStatic @Throws(IOException::class)
-    external fun confirm(folder: String): String
+    external fun confirm(folder: String, metered: Boolean): String
+
+    /** Something of the folder reached a PC, so what it lacked it may hold now. */
+    @JvmStatic @Throws(IOException::class)
+    external fun notePushed(folder: String)
 
     /** Keeps a file or directory on this phone, by its entity, or stops. A directory's mark covers what later arrives in it. */
     @JvmStatic @Throws(IOException::class)
