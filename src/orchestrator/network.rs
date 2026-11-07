@@ -2066,6 +2066,89 @@ mod tests {
         listener_of(crate::model::protocol::IPC_VERSION)
     }
 
+    /// A link to `handler` over loopback lanes, as to a worker that says it is of `ipc`.
+    fn link_to(handler: Arc<dyn Handler>, ipc: u32) -> Arc<WorkerLink> {
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", socket.local_addr().unwrap());
+        thread::spawn(move || {
+            let mut conns = Vec::new();
+            for stream in socket.incoming() {
+                let Ok(stream) = stream else { break };
+                if let Ok(conn) = session::accept_loopback(
+                    stream,
+                    Some(TOKEN),
+                    ConnOptions::for_role(LaneRole::Control),
+                ) {
+                    conn.serve(handler.clone());
+                    conns.push(conn);
+                }
+            }
+        });
+        WorkerLink::connect(
+            &crate::orchestrator::worker::Ready {
+                ready: true,
+                repo: "r1".into(),
+                device: "device".into(),
+                instance: "instance".into(),
+                pid: 1,
+                address,
+                token: TOKEN.into(),
+                version: "test".into(),
+                ipc,
+                mounts: Vec::new(),
+            },
+            2,
+        )
+        .unwrap()
+    }
+
+    /// A network that publishes `link` as repo `r1` to a paired `peer-a`.
+    fn publishing(link: &Arc<WorkerLink>, home: &std::path::Path) -> Arc<Network> {
+        let mut config = Config::initialize(&home.join("orchestrator.toml")).unwrap();
+        config.network.listen = String::new();
+        let catalog = Catalog::open(&config.data_directory).unwrap();
+        catalog.save_paired("peer-a", [7; 32]).unwrap();
+        start(
+            &config,
+            catalog,
+            Arc::new(Published(link.clone())),
+            Cancel::new(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A passive dialer counts its events as sent on the strength of `durable`, and nothing about a
+    /// killed listener can show it got lost on the way: its events may have reached the disk anyway.
+    #[test]
+    fn durable_crosses_the_peer_service_to_the_worker() {
+        struct Recording(Mutex<Vec<Value>>);
+        impl Handler for Recording {
+            fn handle(&self, request: Incoming) {
+                if request.op == "meta.exchange" {
+                    lock(&self.0).push(request.header.clone());
+                }
+                request.responder.reply(json!({}), b"{}".to_vec());
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let worker = Arc::new(Recording(Mutex::new(Vec::new())));
+        let link = link_to(worker.clone(), crate::model::protocol::IPC_VERSION);
+        let network = publishing(&link, home.path());
+        let (control, _server) = serve(&network, LaneRole::Control, LaneRole::Control);
+        for header in [
+            json!({"repo": "r1", "durable": true}),
+            json!({"repo": "r1"}),
+        ] {
+            ask(&control, "meta.exchange", header, b"{}".to_vec()).unwrap();
+        }
+        let seen = lock(&worker.0).clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0]["durable"], true, "{seen:?}");
+        assert!(seen[1].get("durable").is_none(), "{seen:?}");
+        control.close();
+    }
+
     /// A listener whose worker says it is of `ipc`.
     fn listener_of(ipc: u32) -> Listener {
         use crate::orchestrator::{
@@ -2109,51 +2192,8 @@ mod tests {
                 }
             })
             .to_vec();
-        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = format!("ws://{}", socket.local_addr().unwrap());
-        let handler: Arc<dyn Handler> = service.clone();
-        thread::spawn(move || {
-            let mut conns = Vec::new();
-            for stream in socket.incoming() {
-                let Ok(stream) = stream else { break };
-                if let Ok(conn) = session::accept_loopback(
-                    stream,
-                    Some(TOKEN),
-                    ConnOptions::for_role(LaneRole::Control),
-                ) {
-                    conn.serve(handler.clone());
-                    conns.push(conn);
-                }
-            }
-        });
-        let link = WorkerLink::connect(
-            &crate::orchestrator::worker::Ready {
-                ready: true,
-                repo: "r1".into(),
-                device: "device".into(),
-                instance: "instance".into(),
-                pid: 1,
-                address,
-                token: TOKEN.into(),
-                version: "test".into(),
-                ipc,
-                mounts: Vec::new(),
-            },
-            2,
-        )
-        .unwrap();
-        let mut config = Config::initialize(&home.path().join("orchestrator.toml")).unwrap();
-        config.network.listen = String::new();
-        let catalog = Catalog::open(&config.data_directory).unwrap();
-        catalog.save_paired("peer-a", [7; 32]).unwrap();
-        let network = start(
-            &config,
-            catalog,
-            Arc::new(Published(link.clone())),
-            Cancel::new(),
-            None,
-        )
-        .unwrap();
+        let link = link_to(service.clone(), ipc);
+        let network = publishing(&link, home.path());
         Listener {
             network,
             service,
@@ -2385,7 +2425,7 @@ mod tests {
     }
 
     #[test]
-    fn a_binary_store_reaches_an_older_worker_in_json_it_can_take() {
+    fn a_binary_store_through_a_link_to_an_older_worker_is_stored_whole() {
         let older = crate::model::protocol::IPC_BINARY_OBJECTS - 1;
         let listener = listener_of(older);
         let client = bulk(&listener);

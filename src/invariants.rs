@@ -523,12 +523,15 @@ fn sealing_releases_scratch_before_durability_and_recovers_a_concurrent_truncate
         .unwrap();
     });
     let deadline = Instant::now() + Duration::from_secs(2);
+    // Nothing is held across the sleep: a guard kept through it would starve the sealer.
     let entered = loop {
-        match scratch.try_lock() {
-            Err(TryLockError::WouldBlock) => break true,
-            _ if Instant::now() >= deadline => break false,
-            _ => std::thread::sleep(Duration::from_millis(1)),
+        if matches!(scratch.try_lock(), Err(TryLockError::WouldBlock)) {
+            break true;
         }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
     };
     drop(held);
     let deadline = Instant::now() + Duration::from_millis(500);

@@ -486,7 +486,7 @@ impl Service {
                 fetched.oversized.push(digest);
                 continue;
             }
-            // The first present object always goes, whatever its raw size.
+            // The first present object that passed the test above always goes, whatever its size.
             if !fetched.objects.is_empty()
                 && (raw + bytes.len() > MAX_BATCH_BYTES || encoded + size > MAX_REPLY_JSON)
             {

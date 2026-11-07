@@ -65,8 +65,9 @@ pub const REST_MAX: Duration = Duration::from_secs(60);
 /// listing, so a listener that does not answer this soon is not to hold up a
 /// reader that another peer can serve.
 pub const WANTED_DEADLINE: Duration = Duration::from_secs(3);
-/// Why what this side holds did not get across, when the listener did not refuse
-/// it: no reply can carry it.
+/// Why what this side holds did not get across: it is more than any one body can
+/// carry, the more so in JSON to a peer from before binary bodies. A listener says
+/// the same of what a worker it adopted from before them could not take.
 pub(super) const TOO_LARGE: &str = "SYNC_OBJECT_TOO_LARGE";
 /// What a pass remembers of a (folder, endpoint) lasts this long unused: past
 /// any backoff, so none is cut short.
