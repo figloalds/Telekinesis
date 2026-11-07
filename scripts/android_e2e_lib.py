@@ -734,6 +734,12 @@ class Device:
 
         return poll(ADB_BOUND, f"{name} scanned", scanned, interval=1)
 
+    def no_heads_up_notifications(self) -> None:
+        """Android's own, such as "Data warning" once this AVD's mobile data passes 2 GB, drop down over the
+        top of the screen for a few seconds, and a tap meant for what they cover lands on them. Scenarios
+        read notifications through `dumpsys`, and need none of them to show."""
+        self.shell("settings", "put", "global", "heads_up_notifications_enabled", "0").require_success()
+
     def clear_downloads(self) -> None:
         """What earlier scenarios shared in. This AVD's volume is small and the floor is 2 GiB, so that it
         does not count against a scenario that goes by how much is free."""

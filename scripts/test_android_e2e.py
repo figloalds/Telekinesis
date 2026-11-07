@@ -510,6 +510,20 @@ class RunningAScenario(unittest.TestCase):
         self.assertEqual(scenario["status"], "pass")
 
 
+class PreparingTheDevice(unittest.TestCase):
+    def test_no_notification_is_left_to_drop_down_over_a_tap(self):
+        device = MagicMock()
+        android_e2e.prepare_device(device, Path("app.apk"))
+        device.no_heads_up_notifications.assert_called_once_with()
+        device.install.assert_called_once_with(Path("app.apk"))
+
+    def test_it_asks_android_for_that(self):
+        device = Device(Path("adb"), "emulator-5554")
+        with patch.object(Device, "adb", return_value=Completed([], 0, b"", b"")) as adb:
+            device.no_heads_up_notifications()
+        self.assertIn("heads_up_notifications_enabled 0", adb.call_args.args[1])
+
+
 class TheSpeedScenario(unittest.TestCase):
     def test_a_reverse_that_will_not_go_does_not_hide_what_ended_it(self):
         session = MagicMock()
@@ -542,7 +556,7 @@ class StartingASession(unittest.TestCase):
     def test_a_filler_left_by_a_hard_kill_goes_before_anything_needs_the_room(self):
         device = MagicMock()
         android_e2e.prepare_device(device, Path("app.apk"))
-        self.assertEqual(device.method_calls, [call.remove_filler(), call.install(Path("app.apk"))])
+        self.assertEqual(device.method_calls, [call.remove_filler(), call.no_heads_up_notifications(), call.install(Path("app.apk"))])
 
 
 class CommandLine(unittest.TestCase):

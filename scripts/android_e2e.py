@@ -1636,6 +1636,9 @@ def scenario_ui_browse(s: Session) -> None:
     pc.wait_phase("Transfer", "Running")
     pc.write_file(folder.pc_state, "later.txt", b"Written while the screen was open.\n")
     pc.folder(folder.pc_state, "flush")
+    # The strip for a PC that is away goes once its lanes are back, and takes the folder's row up with it:
+    # a tap before that lands where the row was.
+    shown("the unreachable strip gone", lambda texts: not any("isn't reachable" in text for text in texts), SYNC_BOUND)
     device.tap_text("Transfer")
     shown("Browse", has("IMG_2041.png"))
     s.sync_with_the_pc_back(folder)
@@ -2351,6 +2354,7 @@ def tkfs_binary(release: bool = False) -> Path:
 def prepare_device(device: Device, apk: Path) -> None:
     """Before anything needs the room: a hard kill of an earlier run can leave the `space` scenario's filler."""
     device.remove_filler()
+    device.no_heads_up_notifications()
     device.install(apk)
 
 
