@@ -360,6 +360,7 @@ cargo fmt --check
 
 ## More documentation
 
+- [Android client](docs/ANDROID.md): build, install with `adb`, and what to expect
 - [Architecture](docs/ARCHITECTURE.md)
 - [Command reference](docs/CLI.md)
 - [Configuration](docs/CONFIGURATION.md)

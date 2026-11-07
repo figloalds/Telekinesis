@@ -1,5 +1,6 @@
 package dev.tkfs.ui
 
+import android.content.ClipData
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -18,10 +19,14 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.ClipEntry
+import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen(
@@ -33,12 +38,15 @@ fun SettingsScreen(
     onUnpair: (installation: String) -> Unit,
     onAllowBattery: () -> Unit = {},
     onFreeSpace: () -> Unit = {},
+    onResync: () -> Unit = {},
 ) {
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    var resyncing by remember { mutableStateOf(false) }
     val peers = ui.snapshot?.peers.orEmpty()
     Column(Modifier.fillMaxSize()) {
         ScreenBar("Settings", onBack = onBack)
         Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
-            // The rows below the PCs are the places later tasks fill in.
             Setting("Sync on mobile data", "Off: only file lists update. Files you open still download.") {
                 Switch(checked = ui.syncOnMobile, onCheckedChange = onSyncOnMobile)
             }
@@ -55,8 +63,28 @@ fun SettingsScreen(
             for (peer in peers) {
                 PcRow(pcName(peers.map { it.endpoint }, peer.endpoint), peer, ui.failure, onChangeAddress, onUnpair)
             }
-            Setting("Diagnostics", "Copy and Resync from the start arrive in a later update.")
+            Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                Text("Diagnostics", style = MaterialTheme.typography.bodyLarge)
+                Row {
+                    TextButton(onClick = {
+                        val text = diagnosticsText(ui.snapshot, ui.storage, ui.now)
+                        scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("Diagnostics", text))) }
+                    }) { Text("Copy") }
+                    TextButton(onClick = { resyncing = true }) { Text("Resync from the start") }
+                }
+                FailureNote(ui.failure.takeIf { peers.isEmpty() })
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         }
+    }
+    if (resyncing) {
+        AlertDialog(
+            onDismissRequest = { resyncing = false },
+            title = { Text("Resync from the start?") },
+            text = { Text("Every folder checks its whole history with the PC again. It can take a while.") },
+            confirmButton = { TextButton(onClick = { resyncing = false; onResync() }) { Text("Resync") } },
+            dismissButton = { TextButton(onClick = { resyncing = false }) { Text("Cancel") } },
+        )
     }
 }
 

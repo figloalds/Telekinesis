@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import sys
 import threading
 import time
@@ -195,6 +196,66 @@ def scenario_harness(s: Session) -> None:
     s.check("a frozen app still answers a provider request", len(device.content_query(ROOTS_URI)) == 1)
 
 
+def periodic_wait_minutes(device: Device) -> int:
+    """How long until the app's periodic background job next runs, in minutes: JobScheduler's own account of
+    it (`dumpsys jobscheduler`). WorkManager gives a periodic job a delay of its whole interval, so a
+    setting that only changed a label would show here."""
+    dump = device.shell("dumpsys", "jobscheduler").require_success().out
+    lines = [line for line in dump.splitlines() if f"@{PACKAGE}/androidx.work.impl.background.systemjob" in line
+             and "TIME=+" in line]
+    if len(lines) != 1:
+        raise HarnessError(f"expected one delayed job of the app, found {len(lines)}: {lines}")
+    window = re.search(r"TIME=\+(?:(\d+)h)?(?:(\d+)m)?", lines[0])
+    if not window:
+        raise HarnessError(f"no delay in {lines[0]}")
+    return int(window.group(1) or 0) * 60 + int(window.group(2) or 0)
+
+
+def check_settings_rows(s: Session, found: list[str]) -> None:
+    """The rows of Settings the mockup has, and that "Background check" changes the job and not only its label."""
+    device = s.device
+    for row in ("Sync on mobile data", "Background check", "Keep this much free", "Battery", "Diagnostics", "Copy",
+                "Resync from the start"):
+        s.check(f"Settings has {row!r}", row in found)
+    s.check("Background check starts at 30 min", "Every 30 min" in found)
+    before = poll(UI_BOUND, "the periodic job queued", lambda: (m := periodic_wait_minutes(device)) >= 0 and m)
+    s.check("the periodic job is due within 30 min", before <= 30, f"{before} min")
+    device.tap_text("Change")
+    device.wait_screen("the new interval", lambda t: "Every 1 h" in t)
+    after = poll(UI_BOUND, "the job to take the new interval", lambda: (m := periodic_wait_minutes(device)) > 30 and m)
+    s.check("the periodic job is now due within the hour", 30 < after <= 60, f"{before} -> {after} min")
+    device.tap_text("Change")
+    device.wait_screen("the next interval", lambda t: "Every 2 h" in t)
+    # Round to where it started, so what follows sees the default.
+    device.tap_text("Change")
+    device.wait_screen("the shortest interval", lambda t: "Every 15 min" in t)
+    device.tap_text("Change")
+    device.wait_screen("the first interval again", lambda t: "Every 30 min" in t)
+
+    # "Resync from the start" resets the cursors and runs a burst: a new exchange with the PC follows.
+    last_exchange = lambda: max(p["last_exchange_ms"] for f in device.shell_manage("status")["folders"]
+                                for p in f["sync"].values() if p.get("last_exchange_ms"))
+    exchanged = last_exchange()
+    device.tap_text("Resync from the start")
+    device.wait_screen("the confirmation", lambda t: "Resync from the start?" in t)
+    device.tap_text("Resync")
+    newer = poll(SYNC_BOUND, "an exchange after the resync", lambda: last_exchange() > exchanged and last_exchange(), interval=2)
+    s.check("Resync from the start runs a burst", True, f"{exchanged} -> {newer}")
+
+    # "Copy": what it put on the clipboard is pasted into a field of the app.
+    device.tap_text("Copy")
+    device.tap_text("Change address")
+    device.wait_screen("the address dialog", lambda t: "PC address" in t)
+    device.tap_text("PC address")
+    device.shell("input", "keyevent", "KEYCODE_PASTE").require_success()
+    pasted = " ".join(node.get("text") or "" for node in device.ui_dump().iter("node") if node.get("package") == PACKAGE)
+    s.check("Copy puts the status, the PC and the errors on the clipboard",
+            all(part in pasted for part in ("PCs: 1", "ws://10.0.2.2:", "Documents", "Recent errors:")), pasted[:300])
+    s.check("and no key or pairing code is in it", not re.search(r"[0-9a-fA-F]{64}", pasted), pasted[:100])
+    device.tap_text("Cancel")
+    device.wait_screen("the Settings screen", lambda t: "Diagnostics" in t and "Cancel" not in t)
+
+
 def scenario_ui_folders(s: Session) -> None:
     """The Folders, Add a PC and Settings screens, driven as a person would. A PC that is away,
     a PC that revoked the phone, and pairing again with the folder's bytes kept. Screenshots of
@@ -253,6 +314,7 @@ def scenario_ui_folders(s: Session) -> None:
     found = shown("the Settings screen", has("My PC", pc.endpoint, "Change address", "Unpair"))
     s.check("Settings names the PC with its address and the two actions", True, found)
     device.screenshot(shots / "settings.png")
+    check_settings_rows(s, found)
     device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
     shown("the Folders screen again", has("Telekinesis", "Sync now"))
 
@@ -1921,7 +1983,121 @@ def check_a_full_disk(s: Session, folder: Folder) -> None:
             and not any(name.endswith(".tmp") for name in drafts), drafts)
 
 
+# Longer than the session's DEAD_AFTER (20 s): a link that was kept alive by nothing would have been called dead.
+PAST_DEAD_AFTER = 30
+
+
+def worker_of(device: Device, folder: Folder) -> dict:
+    """Which worker is serving the folder: `inspect`'s instance, since `status` does not carry one, and when
+    it started."""
+    phase = device.shell_manage("inspect", {"state": folder.id})["phase"]
+    return {key: phase.get(key) for key in ("phase", "instance", "since_ms")}
+
+
+def scenario_freeze(s: Session) -> None:
+    """Acceptance 14. With the app in the background and Android's freezer on it, past what a session would
+    call dead, a file never opened opens with the right bytes. No worker restarted and the app is the
+    same process, which a restart of either would break; nothing was fetched twice. Then a writable
+    handle left open across the freeze goes on writing, once, and its bytes reach the PC."""
+    device = s.device
+    rng = random.Random(14)
+    files = {"seen.bin": rng.randbytes(3 * MIB), "never-opened.bin": rng.randbytes(2 * MIB),
+             "handle.txt": b"Held across the freeze.\n" * 50}
+    folder = s.folder_with(files, "Freeze")
+    seen = device.content_digest(folder.doc("seen.bin"))
+    s.check("a file opened before the freeze reads whole", seen == sha256(files["seen.bin"]), seen)
+    held = device.write_document(folder.doc("handle.txt"), "rw", b"BEFORE", close=False)
+    s.check("a writable handle is left open", held == 6, held)
+
+    device.start_app()
+    device.wait_screen("the Folders screen", lambda t: "Sync now" in t)
+    before = worker_of(device, folder)
+    pid = device.app_pid()
+    packs = device.pack_bytes(folder.state)
+    s.check("the worker has an instance to compare", bool(before["instance"]) and before["phase"] == "Running", before)
+    s.check("the app has a process", pid is not None, pid)
+
+    device.home()
+    took = device.wait_frozen(PACKAGE)
+    s.check("Android freezes the app in the background", True, f"after {took:.0f} s")
+    time.sleep(PAST_DEAD_AFTER)
+
+    fresh = device.content_read(folder.doc("never-opened.bin"))
+    s.check("a file never opened opens after the freeze with the right bytes",
+            sha256(fresh) == sha256(files["never-opened.bin"]), f"{len(fresh)} bytes")
+    again = device.content_read(folder.doc("seen.bin"))
+    s.check("a file opened before it still reads right", sha256(again) == sha256(files["seen.bin"]))
+    fetched = device.pack_bytes(folder.state) - packs
+    size = len(files["never-opened.bin"])
+    s.check("only the file never opened was fetched, once", size <= fetched < size * 1.5 + len(files["handle.txt"]),
+            f"{fetched} pack bytes for {size}")
+    s.check("no worker restarted", worker_of(device, folder) == before, f"{before} -> {worker_of(device, folder)}")
+    s.check("and the app is the same process", device.app_pid() == pid, f"{pid} -> {device.app_pid()}")
+
+    doc = folder.doc("handle.txt")
+    released = device.releases(doc)
+    device.write_document(doc, "rw", b"AFTER!", offset=6)
+    device.wait_release(doc, released)
+    want = b"BEFORE" + b"AFTER!" + files["handle.txt"][12:]
+    s.check("a handle open across the freeze goes on writing", device.content_read(doc) == want)
+    s.sync_with_the_pc_back(folder)
+    on_pc = s.pc.pc_cat(folder.pc_state, "handle.txt")
+    s.check("and what it wrote reaches the PC", on_pc == want, on_pc[:80])
+    s.check("still the same worker and process", worker_of(device, folder) == before and device.app_pid() == pid)
+
+
+def scenario_reinstall(s: Session) -> None:
+    """Review Focus 3. `adb install -r` of the same APK over a phone with a folder, a pairing, a mark and a
+    file waiting for a PC that is away keeps all four and the config on disk, and the file reaches the PC."""
+    device, pc = s.device, s.pc
+    files = {"marked.txt": b"Keep me on the phone.\n" * 40, "other.txt": b"Not marked.\n"}
+    folder = s.folder_with(files, "Reinstall")
+    device.start_app()
+    device.wait_screen("the folder on Folders", lambda t: "Reinstall" in t)
+    device.tap_text("Reinstall")
+    device.wait_screen("the files", lambda t: "marked.txt" in t)
+    press_action(s, "marked.txt", "Keep on this phone")
+    poll(SYNC_BOUND, "the mark kept", lambda: entry_in(s, folder, "marked.txt")["kept"], interval=2)
+    s.check("a file is marked to keep", True)
+
+    failures, summary = pc.stop()
+    s.check("the PC stops cleanly", not failures, failures or summary)
+    waiting = b"Written on the phone, the PC away.\n" * 20
+    made = device.create_document(folder.doc(), "waiting.txt")
+    device.content_write(made, waiting)
+    poll(ADB_BOUND, "the new file waiting", lambda: device.confirm(folder.id)["waiting"] == 1, interval=2)
+    s.check("a file waits to send", [f["path"] for f in device.waiting_files(folder.id)] == ["/waiting.txt"])
+
+    config = f"/data/user/0/{PACKAGE}/files/orchestrator.toml"
+    stat = lambda: device.shell("run-as", PACKAGE, "stat", "-c", "%Y %s", config).require_success().out
+    written, peers = stat(), device.shell_manage("status")["peers"]
+    s.check("there is a pairing to keep", any(peer.get("endpoint") == pc.endpoint for peer in peers), [p.get("endpoint") for p in peers])
+    time.sleep(1.1)  # stat's times have one-second steps.
+    installed = device.app_pid()
+    device.install(APK)
+    s.check("the install ended the running app", device.app_pid() != installed or installed is None, installed)
+
+    roots = device.content_query(ROOTS_URI)
+    s.check("the folder is still there", [root["title"] for root in roots] == ["Reinstall"], roots)
+    peers = device.shell_manage("status")["peers"]
+    s.check("the pairing is still there", any(peer.get("endpoint") == pc.endpoint for peer in peers), [p.get("endpoint") for p in peers])
+    s.check("the mark is still there", entry_in(s, folder, "marked.txt")["kept"])
+    s.check("the file is still waiting", [f["path"] for f in device.waiting_files(folder.id)] == ["/waiting.txt"])
+    s.check("and reads as it was", device.content_read(folder.doc("waiting.txt")) == waiting)
+    s.check("the config on disk is the one from before", stat() == written, f"{written} -> {stat()}")
+
+    pc.start()
+    pc.wait_phase(folder.label, "Running")
+    s.sync_with_the_pc_back(folder)
+    on_pc = pc.pc_cat(folder.pc_state, "waiting.txt")
+    s.check("the waiting file reaches the PC", on_pc == waiting, f"{len(on_pc)} of {len(waiting)} bytes")
+    s.check("the marked file is still marked and the PC still has it", entry_in(s, folder, "marked.txt")["kept"]
+            and pc.pc_cat(folder.pc_state, "marked.txt") == files["marked.txt"])
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
+    "freeze": scenario_freeze,
+    "reinstall": scenario_reinstall,
     "ui_folders": scenario_ui_folders,
     "ui_browse": scenario_ui_browse,
     "conflicts": scenario_conflicts,

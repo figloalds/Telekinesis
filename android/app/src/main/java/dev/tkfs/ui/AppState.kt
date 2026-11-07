@@ -258,6 +258,20 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         SyncCoordinator.schedulePeriodic(getApplication(), replace = true)
     }
 
+    /** "Resync from the start": every folder forgets how far it got with each PC, then one burst runs. */
+    fun resync() {
+        mutable.update { it.copy(failure = null) }
+        viewModelScope.launch {
+            try {
+                call("reset-cursors")
+            } catch (error: IOException) {
+                mutable.update { it.copy(failure = Failure.of(error)) }
+                return@launch
+            }
+            SyncCoordinator.syncNow(getApplication())
+        }
+    }
+
     fun pair(endpoint: String, code: String) {
         mutable.update { it.copy(pairing = Pairing.Working, failure = null) }
         viewModelScope.launch {

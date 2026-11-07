@@ -142,7 +142,12 @@ def main():
         print(f"\nNative libraries in {PROJECT / 'app/src/main/jniLibs'}", flush=True)
         return
     apk = build_apk(sdk, abis, args.output.resolve(), ndk)
-    print(f"\nCreated {apk}\nInstall with: adb install -r \"{apk}\"", flush=True)
+    print(
+        f"\nCreated {apk}\nInstall with: adb install -r \"{apk}\"\n"
+        "A phone that has the app signed with another key needs `adb uninstall dev.tkfs` first, "
+        "which deletes files not yet sent. See docs/ANDROID.md.",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

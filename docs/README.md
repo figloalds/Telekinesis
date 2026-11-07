@@ -1,5 +1,6 @@
 # Documentation
 
+- [Android client](ANDROID.md)
 - [Architecture](ARCHITECTURE.md)
 - [Command reference](CLI.md)
 - [Configuration](CONFIGURATION.md)

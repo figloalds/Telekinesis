@@ -85,6 +85,7 @@ class MainActivity : ComponentActivity() {
                             onUnpair = model::unpair,
                             onAllowBattery = ::askForBatteryExemption,
                             onFreeSpace = model::freeSpace,
+                            onResync = model::resync,
                         )
                     }
                 }
