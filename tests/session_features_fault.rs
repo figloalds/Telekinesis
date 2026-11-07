@@ -71,6 +71,7 @@ fn the_fault_is_evaluated_once_per_side_and_agrees_with_what_each_side_sent() {
         vec![
             features::CONTENT_PUSH.to_string(),
             features::CONTENT_HAVE.to_string(),
+            features::CONTENT_BINARY.to_string(),
             features::NOTIFY.to_string()
         ]
     );
@@ -113,11 +114,54 @@ fn the_no_content_have_fault_drops_only_that_feature_from_the_listener() {
         server_hello.features,
         vec![
             features::CONTENT_PUSH.to_string(),
+            features::CONTENT_BINARY.to_string(),
             features::NOTIFY.to_string()
         ]
     );
     assert!(!client.peer().has_feature(features::CONTENT_HAVE));
     assert!(client.peer().has_feature(features::CONTENT_PUSH));
+    client.close();
+    server_conn.close();
+}
+
+#[test]
+fn the_no_content_binary_fault_drops_only_that_feature_from_the_listener() {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+    let (code, verifier) = Verifier::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let policy: Arc<dyn AcceptPolicy> = Arc::new(Policy(verifier));
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        session::accept(stream, policy, ConnOptions::default())
+    });
+    fault::configure(Some(FaultConfig::new(
+        features::FAULT_NO_BINARY,
+        FaultAction::Fail,
+    )));
+    let mut hello = handshake::client_hello("client", LaneRole::Control, None, 3);
+    hello.features = vec![features::CONTENT_BINARY.into()];
+    let (client, server_hello) = session::dial(
+        &endpoint,
+        hello,
+        &CodeAuth { code },
+        None,
+        ConnOptions::default(),
+    )
+    .unwrap();
+    let (server_conn, _) = server.join().unwrap().unwrap();
+    fault::configure(None);
+    assert_eq!(
+        server_hello.features,
+        vec![
+            features::CONTENT_PUSH.to_string(),
+            features::CONTENT_HAVE.to_string(),
+            features::NOTIFY.to_string()
+        ]
+    );
+    assert!(!client.peer().has_feature(features::CONTENT_BINARY));
+    // What the dialer said of itself is untouched.
+    assert!(server_conn.peer().has_feature(features::CONTENT_BINARY));
     client.close();
     server_conn.close();
 }

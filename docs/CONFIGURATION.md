@@ -76,11 +76,12 @@ request grows it back by a quarter. The sending side never fails a request for
 its size: it answers with what fits (8 MiB of object bytes, and a reply body
 within the 16 MiB session bound) and the rest is asked again at once.
 
-Limit of this release: an object whose encoding alone exceeds the reply bound
-is never sent (`SYNC_OBJECT_TOO_LARGE` on the receiving side). Object bytes
-travel as JSON number arrays (about 3.6 bytes per byte), so this is a
-manifest larger than about 4 MiB, that is a single file larger than about
-8 GiB: such a file cannot be replicated until binary bodies arrive.
+Limit of this release: an object that no reply or `objects.write` can hold is
+never sent (`SYNC_OBJECT_TOO_LARGE` on the receiving side). That is a manifest
+larger than 8 MiB, that is a single file larger than about 16 GiB. With a peer,
+or an adopted worker, from before binary object bodies, object bytes travel as
+JSON number arrays (about 3.6 bytes per byte), and the limit is a manifest of
+about 4 MiB, that is a single file of about 8 GiB.
 
 ## Environment variables
 

@@ -88,11 +88,15 @@ python scripts/android_e2e.py --scenario freeze --skip-build --keep-emulator
 
 `scripts/android_e2e.py` runs the emulator (AVD `Medium_Phone_API_36.0`) against a headless
 orchestrator on this PC. It never mounts anything, every wait is bounded, and a process left behind
-is a failure. `--scenario all` builds, boots the AVD and runs every scenario but `speed`, which is
-run by name. The freeze scenario alone waits over two minutes for Android to freeze the app. Each
-run writes `test-runs/android-e2e/<UTC>/` with `report.json`, `logcat.txt` and each scenario's
-orchestrator home. The harness's own tests are `python -m unittest test_android_e2e`, run from
-`scripts/`.
+is a failure. `--scenario all` builds, boots the AVD and runs every scenario. The freeze scenario
+alone waits over two minutes for Android to freeze the app. Each run writes
+`test-runs/android-e2e/<UTC>/` with `report.json`, `logcat.txt` and each scenario's orchestrator
+home. The harness's own tests are `python -m unittest test_android_e2e`, run from `scripts/`.
+
+The `speed` scenario reads a new 64 MiB random file from a release-built PC, by two roads. Through
+`adb reverse` a first read must reach 10 MiB/s: that leaves out the emulator's network, so it comes
+down to the app's own limit. Over the emulator's normal network, which carries only 8.4 to
+10.2 MiB/s raw, the rate is only reported, since a bound there would measure the emulator.
 
 ### What only a real phone can test
 
@@ -100,6 +104,8 @@ None of this has been tested, and acceptance 19 and 20 are **not done**:
 
 - Real Wi-Fi: pairing, opening a photo in a viewer, sharing a photo in and seeing it on the PC. The
   emulator reaches the PC through the host's loopback.
+- The first-read target of at least 10 MiB/s over home Wi-Fi. The `speed` scenario shows that the
+  app's own limit is past it, and not that a real phone on Wi-Fi gets there.
 - Battery use and data used over a day of ordinary use, and how the background check behaves under
   the phone's own battery optimization.
 - Scanning the pairing QR with the camera. The harness checks that the PC draws a QR and that

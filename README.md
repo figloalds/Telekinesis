@@ -270,8 +270,9 @@ deletes, `flush`, `gc` and raw `rpc`.
 
 ### Limits of this release
 
-- A single file larger than about 8 GiB cannot be replicated
-  (`SYNC_OBJECT_TOO_LARGE`).
+- A single file larger than about 16 GiB cannot be replicated
+  (`SYNC_OBJECT_TOO_LARGE`), or larger than about 8 GiB with a peer from before
+  binary object bodies.
 - Mount points must not exist yet (`MOUNT_POINT_EXISTS`), and two folders
   cannot share one (`MOUNT_IN_USE`).
 - At most `maximum_running` folders (default 8) run at once (`WORKER_LIMIT`).
@@ -340,7 +341,7 @@ The desktop app shows the same codes. The code tells you what to do:
 | `SYNC_PUSH_FAILED` | Logged once per distinct error: pushing objects to a peer failed or timed out. That peer rests briefly and is tried again. | Nothing if it clears. |
 | `SYNC_PUSH_REFUSED` | Logged: a peer refused a pushed object (for example `OBJECT_NOT_WANTED`). Only that object is dropped. It is offered again after a backoff (5 s doubling to 5 minutes) if still wanted, and `manage sync-now` reports its code. | None. |
 | `SYNC_FETCH_FAILED` | Logged: fetching objects from a peer failed or timed out. On a timeout the folder asks that peer for smaller batches and grows them back as replies arrive. | Nothing if it clears. |
-| `SYNC_OBJECT_TOO_LARGE` | Logged: a peer holds an object too large for any reply, the content list (manifest) of a file larger than about 8 GiB. It is not replicated in this release. | Keep such files out of synced folders for now. |
+| `SYNC_OBJECT_TOO_LARGE` | Logged: a peer holds an object too large for any reply, the content list (manifest) of a file larger than about 16 GiB, or about 8 GiB with a peer from before binary object bodies. It is not replicated in this release. | Keep such files out of synced folders for now. |
 | `DESKTOP_REQUIRES_WINDOWS` | `gui` (or `tkfs` with no command) on a non-Windows host. | Use `manage`. |
 
 ---

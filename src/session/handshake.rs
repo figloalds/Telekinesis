@@ -940,6 +940,7 @@ fn server_auth(
     // behaves as an older peer, advertising and recording no features.
     let older = fault::hit(features::FAULT_NONE).is_some();
     let without_have = fault::hit(features::FAULT_NO_HAVE).is_some();
+    let without_binary = fault::hit(features::FAULT_NO_BINARY).is_some();
     let server = ServerHello {
         protocol: PROTOCOL_NAME.to_owned(),
         version: PROTOCOL_VERSION,
@@ -954,10 +955,12 @@ fn server_auth(
             [
                 features::CONTENT_PUSH,
                 features::CONTENT_HAVE,
+                features::CONTENT_BINARY,
                 features::NOTIFY,
             ]
             .into_iter()
             .filter(|feature| !(without_have && *feature == features::CONTENT_HAVE))
+            .filter(|feature| !(without_binary && *feature == features::CONTENT_BINARY))
             .map(String::from)
             .collect()
         },

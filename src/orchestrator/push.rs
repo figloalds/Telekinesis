@@ -37,7 +37,7 @@
 use super::{
     demand::Seq,
     network::StoreReply,
-    sync::{MAX_EXCLUDE, OBJECT_BATCH, Object, WantedPage},
+    sync::{MAX_EXCLUDE, OBJECT_BATCH, Object, WantedPage, objects_body},
     sync_driver::{
         Failure, FetchFailure, Lanes, PEER_DEADLINE, SyncFolder, UNAVAILABLE_FIRST,
         UNAVAILABLE_MAX, Unavailable, fetch_deadline, grown_batch, halved_batch, lanes_for,
@@ -67,7 +67,7 @@ pub const REST_MAX: Duration = Duration::from_secs(60);
 pub const WANTED_DEADLINE: Duration = Duration::from_secs(3);
 /// Why what this side holds did not get across, when the listener did not refuse
 /// it: no reply can carry it.
-const TOO_LARGE: &str = "SYNC_OBJECT_TOO_LARGE";
+pub(super) const TOO_LARGE: &str = "SYNC_OBJECT_TOO_LARGE";
 /// What a pass remembers of a (folder, endpoint) lasts this long unused: past
 /// any backoff, so none is cut short.
 const FORGET_AFTER: Duration = Duration::from_secs(2 * UNAVAILABLE_MAX.as_secs());
@@ -649,10 +649,12 @@ impl Pass<'_> {
                 }
                 let limit = self.peer.batch.min(queue.len());
                 let asked: Vec<(Digest, Kind)> = queue.drain(..limit).collect();
+                // Cut to what the body it becomes can hold.
+                let binary = conn.peer().has_feature(features::CONTENT_BINARY);
                 let fetched = self
                     .folder
                     .link
-                    .fetch_reply(&asked)
+                    .fetch_reply(&asked, binary)
                     .map_err(|error| worker_failure("objects.fetch", error))?;
                 // The worker cut its reply to its byte bounds: what it did not
                 // look at is read next. It looked at one object at least, so
@@ -712,7 +714,9 @@ impl Pass<'_> {
     /// stays missing there and is listed again.
     fn store(&mut self, conn: &Conn, objects: Vec<Object>) -> Result<(), FetchFailure> {
         let sent: Vec<(Digest, Kind)> = objects.iter().map(|o| (o.digest, o.kind)).collect();
-        let body = serde_json::to_vec(&objects).map_err(|e| worker_failure("objects.store", e))?;
+        let binary = conn.peer().has_feature(features::CONTENT_BINARY);
+        let body =
+            objects_body(&objects, binary).map_err(|e| worker_failure("objects.store", e))?;
         drop(objects);
         let deadline = (self.deadline)(&sent);
         let reply = call(

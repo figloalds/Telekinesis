@@ -1495,6 +1495,78 @@ mod tests {
         assert!(stub.kills().is_empty());
     }
 
+    /// A launcher that adopts the worker of `record`, whose events stay open as a
+    /// watcher's do, and connects for real.
+    struct Adopting {
+        record: WorkerRecord,
+        sink: Mutex<Option<Sender<ProcessEvent>>>,
+    }
+
+    impl Launcher for Adopting {
+        fn spawn(&self, _: &LaunchSpec, _: Sender<ProcessEvent>) -> Result<WorkerProcess> {
+            anyhow::bail!("an adopting launcher spawns nothing")
+        }
+
+        fn adopt(
+            &self,
+            _state: &Path,
+            sink: Sender<ProcessEvent>,
+        ) -> Result<Option<(WorkerRecord, WorkerProcess)>> {
+            *lock(&self.sink) = Some(sink);
+            let process = WorkerProcess::detached(self.record.pid);
+            Ok(Some((self.record.clone(), process)))
+        }
+
+        fn connect(&self, ready: &Ready, lanes: usize) -> Result<Arc<WorkerLink>, CallError> {
+            WorkerLink::connect(ready, lanes)
+        }
+
+        fn kill_verified(&self, _: &WorkerRecord) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn an_adopted_worker_says_by_its_record_whether_it_takes_binary_objects() {
+        use crate::model::protocol::IPC_BINARY_OBJECTS;
+        for (ipc, takes_binary) in [(IPC_BINARY_OBJECTS - 1, false), (IPC_BINARY_OBJECTS, true)] {
+            let state = tempfile::tempdir().unwrap();
+            fs::write(state.path().join(TOKEN_FILE), TOKEN).unwrap();
+            let adopting = Arc::new(Adopting {
+                record: WorkerRecord {
+                    format: 1,
+                    pid: PID,
+                    start_ms: 1,
+                    image: PathBuf::from("tkfs-test"),
+                    version: "test".into(),
+                    instance: "instance".into(),
+                    address: fake_worker(false),
+                    ipc,
+                },
+                sink: Mutex::new(None),
+            });
+            let mut c = Controller::new(
+                FolderRecord {
+                    state: state.path().to_owned(),
+                    ..folder()
+                },
+                PathBuf::from("tkfs-test"),
+                1,
+                adopting,
+                Arc::new(ManualClock::default()),
+            )
+            .with_jitter(0.0);
+            c.start();
+            c.tick();
+            assert!(
+                matches!(c.phase(), Phase::Running { adopted: true, .. }),
+                "{:?}",
+                c.phase()
+            );
+            assert_eq!(c.link().unwrap().takes_binary(), takes_binary, "ipc {ipc}");
+        }
+    }
+
     #[test]
     fn backoff_curve() {
         assert_eq!(backoff_delay(1, 0.0), Duration::from_secs(1));

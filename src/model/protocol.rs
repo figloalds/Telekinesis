@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 pub const PROTOCOL_NAME: &str = "tkfs-peer";
 pub const PROTOCOL_VERSION: u32 = 4;
-pub const IPC_VERSION: u32 = 4;
+pub const IPC_VERSION: u32 = 5;
+/// The first [`IPC_VERSION`] whose workers take `objects.write` with a binary
+/// body. A worker adopted from before it says less in its record and keeps JSON.
+pub const IPC_BINARY_OBJECTS: u32 = 5;
 pub const SUPPORTED_VERSIONS: &[u32] = &[4];
 pub const UPGRADE_HEADER: &str = "X-Tkfs-Sync";
 pub const UPGRADE_V3: &str = "4";
@@ -77,6 +80,10 @@ pub mod features {
     pub const CONTENT_PUSH: &str = "content-push";
     /// The listener answers `objects.have`: which digests it durably holds.
     pub const CONTENT_HAVE: &str = "content-have";
+    /// This side reads binary object bodies (`sync::encode_objects`), so the
+    /// other may send them in `objects.store` and ask for them in `objects.fetch`
+    /// replies. Advertised by dialers and listeners alike.
+    pub const CONTENT_BINARY: &str = "content-binary";
     /// The listener sends `notify` to the dialer when its folders change.
     pub const NOTIFY: &str = "notify";
     /// The dialer makes no sync requests of its own unless asked to, and wants
@@ -88,6 +95,9 @@ pub mod features {
     /// Fault point: a listener advertises everything but `content-have`, which
     /// simulates a peer between pushes and `objects.have`.
     pub const FAULT_NO_HAVE: &str = "session.features.no-content-have";
+    /// Fault point: a listener advertises everything but `content-binary`, which
+    /// simulates a peer from before binary object bodies that does take pushes.
+    pub const FAULT_NO_BINARY: &str = "session.features.no-content-binary";
 }
 
 pub mod ops {
@@ -453,11 +463,11 @@ mod tests {
     }
 
     #[test]
-    fn protocol_is_version_4() {
+    fn the_peer_protocol_is_version_4_and_the_worker_ipc_5() {
         assert_eq!(SUPPORTED_VERSIONS, &[4]);
         assert_eq!(UPGRADE_V3, "4");
         assert_eq!(UPGRADE_LOOPBACK, "4-loopback");
-        assert_eq!(IPC_VERSION, 4);
+        assert_eq!(IPC_VERSION, 5);
     }
 
     #[test]

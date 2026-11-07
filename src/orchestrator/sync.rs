@@ -20,18 +20,20 @@
 //!   `{demand, missing, cursor}`: what this worker's readers are blocked on,
 //!   then what they hinted (at most [`BATCH`], whatever `limit` is) and an
 //!   `objects.missing` page (`limit` 0: none).
-//! - `objects.fetch {repo}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`,
+//! - `objects.fetch {repo, binary?}`, body `Vec<(Digest, Kind)>` → `Vec<Object>`,
 //!   at most [`OBJECT_BATCH`] objects, in request order, absent ones left
-//!   out. The reply is cut to fit the byte bounds, never refused for size
-//!   (see [`Fetched`]): its header is `{truncated_at, oversized}`.
-//! - `objects.write {repo}`, body `Vec<Object>` → `{"stored": usize}`, at
-//!   most [`OBJECT_BATCH`] objects.
+//!   out, as a binary body only when `binary` asks for one. The reply is cut
+//!   to fit the byte bounds, never refused for size (see [`Fetched`]): its
+//!   header is `{truncated_at, oversized}`.
+//! - `objects.write {repo}`, body `Vec<Object>`, binary or JSON → `{"stored":
+//!   usize}`, at most [`OBJECT_BATCH`] objects.
 //! - `objects.have {repo}`, body `Vec<Digest>` → [`HaveReply`], at most
 //!   [`HAVE_BATCH`] digests: the ones the packs hold, durably (they are
 //!   flushed before the reply).
 //!
-//! Object bytes travel as JSON number arrays (up to 4 bytes per byte), so the
-//! batch bounds are set to what fits `protocol::max_body` of each op.
+//! Object bytes travel as binary bodies ([`encode_objects`]), or as JSON number
+//! arrays (up to 4 bytes per byte) with what cannot read those. The batch bounds
+//! are set to what fits `protocol::max_body` of each op in either.
 use super::demand::Demand;
 use crate::{
     content::{Kind, working::lock},
@@ -40,7 +42,7 @@ use crate::{
     runtime::Engine,
     session::{Handler, Incoming},
 };
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -58,8 +60,8 @@ pub const MAX_EXCLUDE: usize = 256;
 pub const OBJECT_BATCH: usize = BATCH / 2;
 /// Most raw object bytes one `objects.fetch` reply or `objects.write` carries.
 pub const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
-/// Most encoded bytes one `objects.fetch` reply gives its objects: the 16 MiB
-/// session body bound (`ConnOptions::max_body`) less room for the rest.
+/// Most encoded bytes one JSON `objects.fetch` reply gives its objects: the
+/// 16 MiB session body bound (`ConnOptions::max_body`) less room for the rest.
 pub const MAX_REPLY_JSON: usize = 15 * 1024 * 1024;
 /// The JSON of one object beyond its byte array (digest, kind, keys).
 const OBJECT_JSON_OVERHEAD: usize = 128;
@@ -78,12 +80,113 @@ pub struct Object {
     pub kind: Kind,
     pub bytes: Vec<u8>,
 }
+/// What starts a binary object body. Its first byte starts no JSON, which is how
+/// [`decode_objects`] tells the two apart.
+pub const BINARY_MAGIC: [u8; 4] = [0xB1, b'T', b'K', b'O'];
+/// What one object adds in a binary body: digest, kind and length.
+const BINARY_OBJECT_OVERHEAD: usize = 32 + 1 + 4;
+/// `objects` as a binary body: [`BINARY_MAGIC`], their count as a u32, then each
+/// one's digest, kind, length as a u32 and bytes, numbers little-endian. The count
+/// makes a body cut between two objects an error like any other cut.
+pub fn encode_objects(objects: &[Object]) -> Vec<u8> {
+    let bytes: usize = objects
+        .iter()
+        .map(|object| object.bytes.len() + BINARY_OBJECT_OVERHEAD)
+        .sum();
+    let mut body = Vec::with_capacity(BINARY_MAGIC.len() + 4 + bytes);
+    body.extend_from_slice(&BINARY_MAGIC);
+    body.extend_from_slice(&(objects.len() as u32).to_le_bytes());
+    for object in objects {
+        body.extend_from_slice(&object.digest.0);
+        body.push(object.kind as u8);
+        // Within a session's body bound, far below a u32.
+        body.extend_from_slice(&(object.bytes.len() as u32).to_le_bytes());
+        body.extend_from_slice(&object.bytes);
+    }
+    body
+}
+/// The objects of a body of either encoding, all of them or an error. This does
+/// not check digests: what stores them does.
+pub fn decode_objects(body: &[u8]) -> Result<Vec<Object>> {
+    if body.first() != Some(&BINARY_MAGIC[0]) {
+        return Ok(serde_json::from_slice(body)?);
+    }
+    let mut rest = body
+        .strip_prefix(&BINARY_MAGIC)
+        .context("a binary object body with the wrong magic")?;
+    let count = u32::from_le_bytes(take(&mut rest)?);
+    let mut objects = Vec::new();
+    for _ in 0..count {
+        let digest = Digest(take(&mut rest)?);
+        let [kind] = take(&mut rest)?;
+        let kind = crate::content::local::kind(kind)?;
+        let len = u32::from_le_bytes(take(&mut rest)?) as usize;
+        ensure!(rest.len() >= len, "a binary object body ends in an object");
+        let (bytes, after) = rest.split_at(len);
+        rest = after;
+        objects.push(Object {
+            digest,
+            kind,
+            bytes: bytes.to_vec(),
+        });
+    }
+    ensure!(
+        rest.is_empty(),
+        "a binary object body goes on {} bytes past its last object",
+        rest.len()
+    );
+    Ok(objects)
+}
+/// Takes the next `N` bytes of a binary body.
+fn take<const N: usize>(rest: &mut &[u8]) -> Result<[u8; N]> {
+    let (head, tail) = rest
+        .split_first_chunk::<N>()
+        .context("a binary object body ends in an object")?;
+    *rest = tail;
+    Ok(*head)
+}
+/// `objects` as a body: binary, or JSON for what reads nothing else.
+pub fn objects_body(objects: &[Object], binary: bool) -> serde_json::Result<Vec<u8>> {
+    if binary {
+        Ok(encode_objects(objects))
+    } else {
+        serde_json::to_vec(objects)
+    }
+}
+/// Whether a request wants the objects of its reply binary.
+pub fn asks_binary(header: &Value) -> bool {
+    header["binary"].as_bool().unwrap_or(false)
+}
+/// `objects`, in order, cut into runs whose JSON fits one body. A worker that
+/// takes only JSON can need several bodies for what fits one binary body. An object
+/// that does not fit alone ([`fits_json`]) is a run of its own, which a session
+/// refuses.
+pub fn json_runs(objects: &[Object]) -> Vec<&[Object]> {
+    let mut runs = Vec::new();
+    let (mut start, mut encoded) = (0, 0);
+    for (index, object) in objects.iter().enumerate() {
+        let size = encoded_len(&object.bytes);
+        if index > start && encoded + size > MAX_REPLY_JSON {
+            runs.push(&objects[start..index]);
+            (start, encoded) = (index, 0);
+        }
+        encoded += size;
+    }
+    if start < objects.len() {
+        runs.push(&objects[start..]);
+    }
+    runs
+}
+/// Whether the JSON of `object` fits one body.
+pub fn fits_json(object: &Object) -> bool {
+    encoded_len(&object.bytes) <= MAX_REPLY_JSON
+}
 /// One `objects.fetch` reply. The objects are taken in request order until
-/// the next present one would pass [`MAX_BATCH_BYTES`] raw or
+/// the next present one would pass [`MAX_BATCH_BYTES`] raw or, in a JSON reply,
 /// [`MAX_REPLY_JSON`] encoded; `truncated_at` is then the index (in the
 /// request) of the first digest not looked at, which the client asks again.
-/// An object whose encoding alone cannot fit a reply is never sent: it is
-/// listed in `oversized` and treated as absent.
+/// An object that cannot fit a reply alone, or an `objects.write`, is never
+/// sent: it is listed in `oversized` and treated as absent.
 #[derive(Default)]
 pub struct Fetched {
     pub objects: Vec<Object>,
@@ -99,7 +202,7 @@ impl Fetched {
     /// and body.
     pub fn from_reply(header: &Value, body: &[u8]) -> Result<Self> {
         Ok(Self {
-            objects: serde_json::from_slice(body)?,
+            objects: decode_objects(body)?,
             truncated_at: header
                 .get("truncated_at")
                 .and_then(Value::as_u64)
@@ -366,9 +469,9 @@ impl Service {
             cursor: None,
         })
     }
-    /// The present objects of `wanted`, cut to the reply bounds (see
-    /// [`Fetched`]); never an error for their size.
-    fn fetch(&self, wanted: Vec<(Digest, Kind)>) -> Result<Fetched> {
+    /// The present objects of `wanted`, cut to the bounds of a reply that is
+    /// `binary` or not (see [`Fetched`]); never an error for their size.
+    fn fetch(&self, wanted: Vec<(Digest, Kind)>, binary: bool) -> Result<Fetched> {
         ensure!(wanted.len() <= OBJECT_BATCH, "OBJECT_BATCH_TOO_LARGE");
         let content = self.engine.working.content();
         let _pins = content.packs.pin(wanted.iter().map(|(d, _)| *d));
@@ -378,8 +481,8 @@ impl Service {
             let Ok(bytes) = content.packs.get(digest) else {
                 continue;
             };
-            let size = encoded_len(&bytes);
-            if size > MAX_REPLY_JSON {
+            let size = if binary { 0 } else { encoded_len(&bytes) };
+            if size > MAX_REPLY_JSON || bytes.len() > MAX_BATCH_BYTES {
                 fetched.oversized.push(digest);
                 continue;
             }
@@ -471,8 +574,9 @@ impl Service {
             );
         }
         if op == FETCH_OP {
-            let fetched = self.fetch(serde_json::from_slice(body)?)?;
-            return Ok((fetched.header(), serde_json::to_vec(&fetched.objects)?));
+            let binary = asks_binary(header);
+            let fetched = self.fetch(serde_json::from_slice(body)?, binary)?;
+            return Ok((fetched.header(), objects_body(&fetched.objects, binary)?));
         }
         let body: Result<Vec<u8>> = match op {
             "feed.outgoing" => Ok(serde_json::to_vec(
@@ -511,9 +615,10 @@ impl Service {
                     cursor: page.cursor,
                 })?)
             }
-            "objects.write" => Ok(serde_json::to_vec(
-                &json!({"stored":self.write(serde_json::from_slice(body)?)?}),
-            )?),
+            "objects.write" => {
+                let objects = decode_objects(body).context("INVALID_REQUEST")?;
+                Ok(serde_json::to_vec(&json!({"stored":self.write(objects)?}))?)
+            }
             "objects.have" => Ok(serde_json::to_vec(&HaveReply {
                 held: self.have(serde_json::from_slice(body)?)?,
             })?),
@@ -1555,6 +1660,234 @@ mod tests {
         assert!(plain.oversized.is_empty());
         engine.shutdown()?;
         Ok(())
+    }
+
+    /// An object of `kind` holding `bytes`.
+    fn object(kind: Kind, bytes: &[u8]) -> Object {
+        Object {
+            digest: Digest::bytes(bytes),
+            kind,
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    /// What can be compared of `objects`.
+    fn fields(objects: &[Object]) -> Vec<(Digest, Kind, &[u8])> {
+        objects
+            .iter()
+            .map(|object| (object.digest, object.kind, object.bytes.as_slice()))
+            .collect()
+    }
+
+    #[test]
+    fn objects_round_trip_through_the_binary_body() -> Result<()> {
+        let objects = vec![
+            object(Kind::Chunk, b"a chunk"),
+            object(Kind::Manifest, &vec![0xFF; 70_000]),
+            object(Kind::Tree, b""),
+        ];
+        let body = encode_objects(&objects);
+        assert_eq!(body[..BINARY_MAGIC.len()], BINARY_MAGIC);
+        let raw: usize = objects.iter().map(|object| object.bytes.len()).sum();
+        assert!(body.len() < raw + 128, "{} bytes for {raw}", body.len());
+        assert_eq!(fields(&decode_objects(&body)?), fields(&objects));
+        assert!(decode_objects(&encode_objects(&[]))?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_objects_still_reads_json() -> Result<()> {
+        let objects = vec![object(Kind::Chunk, b"a chunk"), object(Kind::Tree, b"")];
+        let body = serde_json::to_vec(&objects)?;
+        assert_eq!(fields(&decode_objects(&body)?), fields(&objects));
+        let spaced = [b" \n".as_slice(), &body].concat();
+        assert_eq!(fields(&decode_objects(&spaced)?), fields(&objects));
+        assert!(decode_objects(b"[]")?.is_empty());
+        assert!(decode_objects(b"").is_err());
+        assert!(decode_objects(b"[{").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_truncated_binary_body_is_an_error_and_never_a_partial_object() {
+        let body = encode_objects(&[object(Kind::Chunk, b"first"), object(Kind::Tree, b"second")]);
+        assert_eq!(body[0], BINARY_MAGIC[0]);
+        // Wherever it is cut, between objects too.
+        for cut in 0..body.len() {
+            assert!(
+                decode_objects(&body[..cut]).is_err(),
+                "cut at {cut} of {}",
+                body.len()
+            );
+        }
+        let corrupted = |at: usize, with: &[u8]| {
+            let mut changed = body.clone();
+            changed[at..at + with.len()].copy_from_slice(with);
+            decode_objects(&changed).is_err()
+        };
+        let count = BINARY_MAGIC.len();
+        let digest = count + 4;
+        let kind = digest + 32;
+        let length = kind + 1;
+        assert!(corrupted(1, b"X"), "the rest of the magic");
+        assert!(
+            corrupted(count, &u32::MAX.to_le_bytes()),
+            "a count too high"
+        );
+        assert!(corrupted(count, &1u32.to_le_bytes()), "a count too low");
+        assert!(corrupted(kind, &[0]), "no such kind");
+        assert!(
+            corrupted(length, &u32::MAX.to_le_bytes()),
+            "a length too long"
+        );
+        assert!(
+            decode_objects(&[body.as_slice(), &[0]].concat()).is_err(),
+            "bytes past the last object"
+        );
+        // A reply is no different.
+        assert!(Fetched::from_reply(&json!({}), &body[..body.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_binary_reply_is_sent_only_when_asked() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+        let digest = engine
+            .working
+            .content()
+            .packs
+            .put(Kind::Chunk, b"asked for")?;
+        let wanted = serde_json::to_vec(&[(digest, Kind::Chunk)])?;
+        for header in [
+            json!({"repo": "repo"}),
+            json!({"repo": "repo", "binary": false}),
+        ] {
+            let body = call(&service, FETCH_OP, header, &wanted)?;
+            let objects: Vec<Object> = serde_json::from_slice(&body)?;
+            assert_eq!(
+                fields(&objects),
+                [(digest, Kind::Chunk, b"asked for".as_slice())]
+            );
+        }
+        let (header, body) =
+            service.handle_reply(FETCH_OP, &json!({"repo": "repo", "binary": true}), &wanted)?;
+        assert_eq!(body[..BINARY_MAGIC.len()], BINARY_MAGIC);
+        let fetched = Fetched::from_reply(&header, &body)?;
+        assert_eq!(
+            fields(&fetched.objects),
+            [(digest, Kind::Chunk, b"asked for".as_slice())]
+        );
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// An `objects.fetch` of `wanted` asking for binary, and its body's size.
+    fn binary_fetch_reply(
+        service: &Service,
+        wanted: &[(Digest, Kind)],
+    ) -> Result<(Fetched, usize)> {
+        let (header, body) = service.handle_reply(
+            FETCH_OP,
+            &json!({"repo": "repo", "binary": true}),
+            &serde_json::to_vec(wanted)?,
+        )?;
+        Ok((Fetched::from_reply(&header, &body)?, body.len()))
+    }
+
+    #[test]
+    fn a_binary_fetch_is_cut_by_raw_bytes_alone() -> Result<()> {
+        const MIB: usize = 1024 * 1024;
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+
+        // 2 × 3 MiB of 0xFF, about 24 MiB as JSON: one fits a JSON reply, both a
+        // binary one, whose body stays close to their size.
+        let wide = stored_objects(&engine, 2, 3 * MIB, 0xFF)?;
+        assert_eq!(fetch_reply(&service, &wide)?.0.truncated_at, Some(1));
+        let (fetched, body) = binary_fetch_reply(&service, &wide)?;
+        assert_eq!(fetched.objects.len(), 2);
+        assert_eq!(fetched.truncated_at, None);
+        assert!(body < 6 * MIB + 1024, "{body} bytes");
+
+        // MAX_BATCH_BYTES still cuts: 4 × 3 MiB gives the first two.
+        let four = stored_objects(&engine, 4, 3 * MIB, 1)?;
+        let (fetched, body) = binary_fetch_reply(&service, &four)?;
+        assert_eq!(fetched.objects.len(), 2);
+        assert_eq!(fetched.truncated_at, Some(2));
+        assert!(body <= session_limit(FETCH_OP), "{body} bytes");
+
+        // Too wide for any JSON reply, and it goes in binary.
+        let five = stored_objects(&engine, 1, 5 * MIB, 0xFF)?;
+        let (fetched, _) = fetch_reply(&service, &five)?;
+        assert_eq!(fetched.oversized, vec![five[0].0]);
+        let (fetched, _) = binary_fetch_reply(&service, &five)?;
+        assert_eq!(fetched.objects.len(), 1);
+        assert!(fetched.oversized.is_empty());
+
+        // More than a write takes is never sent, and does not fail the batch.
+        let huge = stored_objects(&engine, 1, MAX_BATCH_BYTES + 1, 0)?;
+        let small = stored_objects(&engine, 1, 1024, 7)?;
+        let (fetched, body) = binary_fetch_reply(&service, &[huge[0], small[0]])?;
+        assert_eq!(fetched.oversized, vec![huge[0].0]);
+        assert_eq!(fetched.objects.len(), 1);
+        assert_eq!(fetched.objects[0].digest, small[0].0);
+        assert!(body <= session_limit(FETCH_OP), "{body} bytes");
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn objects_write_takes_a_binary_body_and_stores_nothing_of_a_bad_one() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), Some("repo"))?;
+        let service = service(&engine);
+        let packs = engine.working.content().packs.clone();
+        let write = |body: &[u8]| call(&service, "objects.write", json!({"repo": "repo"}), body);
+
+        // One wrong digest refuses the batch, its valid neighbour too.
+        let neighbour = object(Kind::Chunk, b"neighbour");
+        let bad = Object {
+            digest: Digest::bytes(b"something else"),
+            ..object(Kind::Chunk, b"bad")
+        };
+        let error = write(&encode_objects(&[neighbour.clone(), bad])).unwrap_err();
+        assert_eq!(code(&error), "INVALID_PEER_OBJECT", "{error:#}");
+        assert!(!packs.contains(neighbour.digest)?);
+
+        // Cut after its first object: not that object either.
+        let whole = encode_objects(&[neighbour.clone(), object(Kind::Chunk, b"next")]);
+        let error = write(&whole[..whole.len() - 1]).unwrap_err();
+        assert_eq!(code(&error), "INVALID_REQUEST", "{error:#}");
+        assert!(!packs.contains(neighbour.digest)?);
+
+        let reply: Value = serde_json::from_slice(&write(&whole)?)?;
+        assert_eq!(reply, json!({"stored": 2}));
+        assert!(packs.contains(neighbour.digest)?);
+        assert!(indexed(home.path(), neighbour.digest)?, "write flushes");
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_widest_binary_batch_fits_its_session_body_bound() {
+        let objects: Vec<Object> = (0..OBJECT_BATCH)
+            .map(|n| {
+                let mut bytes = vec![0xFF; MAX_BATCH_BYTES / OBJECT_BATCH];
+                bytes[..8].copy_from_slice(&(n as u64).to_le_bytes());
+                Object {
+                    digest: Digest::bytes(&bytes),
+                    kind: Kind::Manifest,
+                    bytes,
+                }
+            })
+            .collect();
+        let body = encode_objects(&objects).len();
+        assert!(body > MAX_BATCH_BYTES, "{body} bytes");
+        for op in [FETCH_OP, "objects.write", "objects.store"] {
+            assert!(body <= session_limit(op), "{op}: {body} bytes");
+        }
     }
 
     #[test]

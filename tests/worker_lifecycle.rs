@@ -13,7 +13,10 @@ use std::{
 };
 use tkfs::{
     content::Kind,
-    model::{content::Digest, protocol::LaneRole},
+    model::{
+        content::Digest,
+        protocol::{IPC_VERSION, LaneRole},
+    },
     orchestrator::{
         control,
         process::{self, LaunchSpec, ObservedProcess, ProcessEvent},
@@ -206,7 +209,7 @@ fn worker_writes_runtime_files_and_ready_line_then_removes_them_on_shutdown() {
     let state = home.path().join("s");
     let (mut child, ready) = spawn_worker(&state, true, &[]);
     assert!(ready.ready);
-    assert_eq!(ready.ipc, 4);
+    assert_eq!(ready.ipc, IPC_VERSION);
     assert!(
         ready.address.starts_with("ws://127.0.0.1:"),
         "{}",
@@ -220,7 +223,7 @@ fn worker_writes_runtime_files_and_ready_line_then_removes_them_on_shutdown() {
     assert_eq!(runtime["address"], ready.address);
     assert_eq!(runtime["pid"], ready.pid);
     assert_eq!(runtime["instance"], ready.instance);
-    assert_eq!(runtime["ipc"], 4);
+    assert_eq!(runtime["ipc"], IPC_VERSION);
     assert_eq!(runtime["mounts"], json!([]));
     assert!(
         !runtime.to_string().contains(&ready.token),
@@ -233,7 +236,7 @@ fn worker_writes_runtime_files_and_ready_line_then_removes_them_on_shutdown() {
     assert_eq!(record.instance, ready.instance);
     assert_eq!(record.address, ready.address);
     assert_eq!(record.version, ready.version);
-    assert_eq!(record.ipc, 4);
+    assert_eq!(record.ipc, IPC_VERSION);
     assert!(record.start_ms >= tkfs::clock::FLOOR_MS);
 
     assert_eq!(
@@ -260,7 +263,7 @@ fn worker_writes_runtime_files_and_ready_line_then_removes_them_on_shutdown() {
     assert_eq!(hello["instance"], ready.instance);
     assert_eq!(hello["pid"], ready.pid);
     assert_eq!(hello["version"], ready.version);
-    assert_eq!(hello["ipc"], 4);
+    assert_eq!(hello["ipc"], IPC_VERSION);
     assert_eq!(hello["mounts"], json!([]));
 
     // Filesystem commands keep working through the loopback session.
@@ -461,7 +464,7 @@ impl Reaper {
             version: String::new(),
             instance: String::new(),
             address: String::new(),
-            ipc: 4,
+            ipc: IPC_VERSION,
         };
         Reaper { record, observed }
     }
@@ -750,6 +753,8 @@ fn worker_link_uses_control_for_rpc_and_bulk_for_objects() {
 
     // A batch's object bytes travel on the bulk lane of its first digest;
     // the control lane carries none of them.
+    // Spawned from this build, the worker takes them as binary.
+    assert!(link.takes_binary());
     let objects = one_mib_of_chunks();
     let object = objects[0].clone();
     let lane = link.lane_for(&object.digest);

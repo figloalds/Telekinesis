@@ -265,7 +265,7 @@ fn a_sequential_read_gets_the_bytes_of_a_file_past_its_first_window() -> Result<
 #[test]
 #[cfg_attr(
     debug_assertions,
-    ignore = "the JSON of an unoptimized build is its limit, not wake-ups: use --release"
+    ignore = "an unoptimized build's own hashing and copying is its limit, not wake-ups: use --release"
 )]
 fn a_sequential_first_read_is_at_least_five_times_faster_than_plain_reads() -> Result<()> {
     const FASTER_THAN_PLAIN: f64 = 5.0;

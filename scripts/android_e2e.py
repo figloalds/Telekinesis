@@ -12,9 +12,9 @@ scenario's orchestrator home.
 
 This file holds the command line and the scenarios; android_e2e_lib.py holds what they work
 with. To add a scenario, write `def scenario_name(s: Session)` and list it in SCENARIOS, which
-`all` runs but for those in BY_NAME_ONLY. It starts
-with the app cleared and a new orchestrator on the PC, and `s.folder_with(files)` gives it a
-folder the phone has received. `s.check` records what it finds; a failed check ends the scenario.
+`all` runs. It starts with the app cleared and a new orchestrator on the PC, and
+`s.folder_with(files)` gives it a folder the phone has received. `s.check` records what it finds;
+a failed check ends the scenario.
 """
 from __future__ import annotations
 
@@ -422,24 +422,46 @@ SPEED_FILE_BYTES = 64 * 1024 * 1024
 SPEED_WANTED_MIB_S = 10
 
 
-def scenario_speed(s: Session) -> None:
-    """A first read of a new 64 MiB random file through the provider, from a release-built PC. It
-    crosses the emulator's own network, so it says nothing of Wi-Fi. The second read comes from
-    the phone, which shows what the rest of the path allows.
-
-    Not part of `--scenario all`, so that `all` stays a meaningful gate: this network carries
-    about 9 MiB/s raw and object bytes cost 3.57 times that as JSON, so this fails its bound of
-    10 MiB/s for now. It still runs by name and the bound stands. Task 21, binary object bodies,
-    comes after Task 20 and puts it back."""
-    content = random.Random(11).randbytes(SPEED_FILE_BYTES)
-    folder = s.folder_with({"big.bin": content})
-    read, took = s.device.content_read_timed(folder.doc("big.bin"))
-    s.check("the file reads the same on the phone", sha256(read) == sha256(content), f"{len(read)} bytes")
-    _, again = s.device.content_read_timed(folder.doc("big.bin"))
+def first_read_rate(s: Session, folder: Folder, path: str) -> tuple[float, str]:
+    """Reads `path` for the first time, and again from the phone, which shows what the rest of the
+    path allows. The first read's MiB/s, and both in words."""
+    content = folder.files[path]
+    read, took = s.device.content_read_timed(folder.doc(path))
+    s.check(f"{path} reads the same on the phone", sha256(read) == sha256(content), f"{len(read)} bytes")
+    _, again = s.device.content_read_timed(folder.doc(path))
     rate = len(read) / (1024 * 1024) / took
-    cached = len(read) / (1024 * 1024) / again
-    s.check(f"a first read goes at least {SPEED_WANTED_MIB_S} MiB/s", rate >= SPEED_WANTED_MIB_S,
-            f"{rate:.1f} MiB/s ({took:.2f} s) over the emulator's network, not Wi-Fi; {cached:.1f} MiB/s read again")
+    return rate, f"{rate:.1f} MiB/s ({took:.2f} s); {len(read) / (1024 * 1024) / again:.1f} MiB/s read again"
+
+
+def lanes_all_ready(device: Device) -> bool:
+    peers = device.shell_manage("peers")
+    return bool(peers) and all(peer["lanes"] and all(lane["state"] == "Ready" for lane in peer["lanes"])
+                               for peer in peers)
+
+
+def scenario_speed(s: Session) -> None:
+    """A first read of a new 64 MiB random file through the provider, from a release-built PC, by
+    two roads, neither of which says anything of Wi-Fi (docs/ANDROID.md says what stays to measure).
+
+    The emulator's normal network carries only 8.4 to 10.2 MiB/s raw, so a bound of 10 MiB/s there
+    would measure the emulator: that rate is only reported. The bound is on a read through `adb
+    reverse`, which leaves that network out and so comes down to the app's own limit."""
+    device, pc = s.device, s.pc
+    folder = s.folder_with({"normal.bin": random.Random(11).randbytes(SPEED_FILE_BYTES),
+                            "reverse.bin": random.Random(12).randbytes(SPEED_FILE_BYTES)})
+    _, normal = first_read_rate(s, folder, "normal.bin")
+    s.check("the rate over the emulator's normal network, reported and not judged", True, normal)
+
+    port = device.reverse(pc.port)
+    try:
+        installation = device.shell_manage("peers")[0]["installation"]
+        device.shell_manage("set-endpoint", {"installation": installation, "endpoint": f"ws://127.0.0.1:{port}"})
+        poll(SYNC_BOUND, "the lanes through adb reverse", lambda: lanes_all_ready(device), interval=1)
+        rate, reverse = first_read_rate(s, folder, "reverse.bin")
+        s.check(f"a first read through adb reverse goes at least {SPEED_WANTED_MIB_S} MiB/s",
+                rate >= SPEED_WANTED_MIB_S, reverse)
+    finally:
+        device.remove_reverse(port)
 
 
 # The flags Android gives these in DocumentsContract.
@@ -2113,19 +2135,15 @@ SCENARIOS: dict[str, Callable[[Session], None]] = {
     "speed": scenario_speed,
 }
 
-# A debug PC spends its time on its own JSON, so these would measure that.
+# A debug PC spends its time on its own hashing and copying, so these would measure that.
 RELEASE_PC_SCENARIOS = {"speed"}
-# Scenarios `all` leaves out. See scenario_speed.
-BY_NAME_ONLY = {"speed"}
 
 
 # ---- running ------------------------------------------------------------------------------
 
 
 def chosen_scenarios(scenario: str) -> list[str]:
-    if scenario == "all":
-        return [name for name in SCENARIOS if name not in BY_NAME_ONLY]
-    return [scenario]
+    return list(SCENARIOS) if scenario == "all" else [scenario]
 
 
 def uses_release_pc(name: str, release_pc: bool) -> bool:
@@ -2192,7 +2210,7 @@ def run_scenario(name: str, device: Device, report: Report, run_dir: Path, reset
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scenario", default="all",
-                        help=f"{'|'.join(SCENARIOS)}|all (default: all, which leaves out {', '.join(BY_NAME_ONLY)})")
+                        help=f"{'|'.join(SCENARIOS)}|all (default: all)")
     parser.add_argument("--avd", default=DEFAULT_AVD)
     parser.add_argument("--keep-emulator", action="store_true", help="Leave an emulator this run booted running")
     parser.add_argument("--skip-build", action="store_true", help="Use the APK and tkfs already built")

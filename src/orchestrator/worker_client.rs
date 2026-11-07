@@ -5,12 +5,19 @@
 //! lane's op policy; the link also refuses object ops on the control lane
 //! itself, before anything is sent.
 use super::{
-    sync::{Fetched, HAVE_BATCH, HaveReply, MissingPage, OBJECT_BATCH, Object, WantedPage},
+    sync::{
+        Fetched, HAVE_BATCH, HaveReply, MissingPage, OBJECT_BATCH, Object, WantedPage,
+        encode_objects, json_runs,
+    },
     worker::Ready,
 };
 use crate::{
     content::Kind,
-    model::{content::Digest, errors::ErrorWire, protocol::LaneRole},
+    model::{
+        content::Digest,
+        errors::ErrorWire,
+        protocol::{IPC_BINARY_OBJECTS, LaneRole},
+    },
     session::{self, CallError, Conn, ConnHealth, ConnOptions, Priority, Reply},
 };
 use serde::Deserialize;
@@ -159,15 +166,28 @@ impl WorkerLink {
         parse("objects.wanted", &reply.body)
     }
 
+    /// Whether this worker takes a binary `objects.write` body. A worker adopted
+    /// from before that says so in its record. It reads only JSON, and answers
+    /// `objects.fetch` in JSON whatever it is asked.
+    pub fn takes_binary(&self) -> bool {
+        self.ready.ipc >= IPC_BINARY_OBJECTS
+    }
+
     /// Reads up to [`OBJECT_BATCH`] objects from the worker on the bulk lane
     /// of the first digest; absent ones are left out of the reply.
     pub fn fetch(&self, wanted: &[(Digest, Kind)]) -> Result<Vec<Object>, CallError> {
-        self.fetch_reply(wanted).map(|fetched| fetched.objects)
+        self.fetch_reply(wanted, self.takes_binary())
+            .map(|fetched| fetched.objects)
     }
 
     /// [`Self::fetch`] with where the worker cut the reply to its byte
-    /// bounds ([`Fetched`]).
-    pub fn fetch_reply(&self, wanted: &[(Digest, Kind)]) -> Result<Fetched, CallError> {
+    /// bounds ([`Fetched`]): those of a binary reply when `binary`, else those of
+    /// JSON, for a caller that has to pass them on as JSON.
+    pub fn fetch_reply(
+        &self,
+        wanted: &[(Digest, Kind)],
+        binary: bool,
+    ) -> Result<Fetched, CallError> {
         let Some((first, _)) = wanted.first() else {
             return Ok(Fetched::default());
         };
@@ -175,7 +195,7 @@ impl WorkerLink {
         let body = encode("objects.fetch", &wanted)?;
         let reply = self.bulk[self.lane_for(first)].call(
             "objects.fetch",
-            json!({"repo": self.ready.repo}),
+            json!({"repo": self.ready.repo, "binary": binary}),
             body,
             Priority::Data,
             CALL_DEADLINE,
@@ -185,15 +205,28 @@ impl WorkerLink {
     }
 
     /// Stores up to [`OBJECT_BATCH`] objects in the worker on the bulk lane of
-    /// the first digest; the number stored.
+    /// the first digest; the number stored. To a worker that takes only JSON
+    /// ([`Self::takes_binary`]) this can be several requests.
     pub fn write(&self, objects: Vec<Object>) -> Result<usize, CallError> {
         let Some(first) = objects.first() else {
             return Ok(0);
         };
         check_batch(objects.len())?;
         let lane = self.lane_for(&first.digest);
-        let body = encode("objects.write", &objects)?;
-        drop(objects);
+        if self.takes_binary() {
+            let body = encode_objects(&objects);
+            drop(objects);
+            return self.write_body(lane, body);
+        }
+        let mut stored = 0;
+        for run in json_runs(&objects) {
+            stored += self.write_body(lane, encode("objects.write", &run)?)?;
+        }
+        Ok(stored)
+    }
+
+    /// One `objects.write` of `body` on `lane`; the number stored.
+    fn write_body(&self, lane: usize, body: Vec<u8>) -> Result<usize, CallError> {
         let reply = self.bulk[lane].call(
             "objects.write",
             json!({"repo": self.ready.repo}),
@@ -293,4 +326,140 @@ fn bad_reply(op: &str, detail: &str) -> CallError {
         "PROTOCOL_VIOLATION",
         format!("malformed {op} reply: {detail}"),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        orchestrator::sync::{BINARY_MAGIC, MAX_REPLY_JSON, decode_objects},
+        session::{Handler, Incoming},
+    };
+    use std::{net::TcpListener, sync::Mutex, thread};
+
+    const TOKEN: &str = "worker-client-test-token";
+
+    /// A loopback worker that keeps each `objects.write` body and each
+    /// `objects.fetch` header, stores whatever decodes, and fetches nothing.
+    #[derive(Default)]
+    struct Recording {
+        written: Mutex<Vec<Vec<u8>>>,
+        fetched: Mutex<Vec<Value>>,
+    }
+
+    impl Handler for Recording {
+        fn handle(&self, req: Incoming) {
+            match req.op.as_str() {
+                "objects.write" => {
+                    let stored = decode_objects(&req.body).unwrap().len();
+                    self.written.lock().unwrap().push(req.body);
+                    let reply = serde_json::to_vec(&json!({"stored": stored})).unwrap();
+                    req.responder.reply(json!({}), reply);
+                }
+                _ => {
+                    self.fetched.lock().unwrap().push(req.header.clone());
+                    req.responder.reply(json!({}), b"[]".to_vec());
+                }
+            }
+        }
+    }
+
+    /// A link to a new [`Recording`] worker that says it is of `ipc`.
+    fn link_to(ipc: u32) -> (Arc<WorkerLink>, Arc<Recording>) {
+        let worker = Arc::new(Recording::default());
+        let handler: Arc<dyn Handler> = worker.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!("ws://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            let mut conns = Vec::new();
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                if let Ok(conn) = session::accept_loopback(
+                    stream,
+                    Some(TOKEN),
+                    ConnOptions::for_role(LaneRole::Bulk),
+                ) {
+                    conn.serve(handler.clone());
+                    conns.push(conn);
+                }
+            }
+        });
+        let ready = Ready {
+            ready: true,
+            repo: "repo".into(),
+            device: "device".into(),
+            instance: "instance".into(),
+            pid: 1,
+            address,
+            token: TOKEN.into(),
+            version: "test".into(),
+            ipc,
+            mounts: Vec::new(),
+        };
+        (WorkerLink::connect(&ready, 1).unwrap(), worker)
+    }
+
+    fn object(bytes: Vec<u8>) -> Object {
+        Object {
+            digest: Digest::bytes(&bytes),
+            kind: Kind::Manifest,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn a_worker_gets_binary_from_the_ipc_that_takes_it_and_json_before_that() {
+        let (current, worker) = link_to(IPC_BINARY_OBJECTS);
+        assert!(current.takes_binary());
+        assert_eq!(current.write(vec![object(vec![1, 2, 3])]).unwrap(), 1);
+        assert_eq!(
+            worker.written.lock().unwrap()[0][..BINARY_MAGIC.len()],
+            BINARY_MAGIC
+        );
+
+        let (older, worker) = link_to(IPC_BINARY_OBJECTS - 1);
+        assert!(!older.takes_binary());
+        assert_eq!(older.write(vec![object(vec![1, 2, 3])]).unwrap(), 1);
+        let written = worker.written.lock().unwrap();
+        let sent: Vec<Object> = serde_json::from_slice(&written[0]).unwrap();
+        assert_eq!(sent[0].bytes, [1, 2, 3]);
+    }
+
+    #[test]
+    fn an_older_worker_gets_as_many_json_bodies_as_a_batch_needs() {
+        // Fine as one binary body, and about 32 MiB as JSON, twice what a session
+        // carries.
+        let mib = 1024 * 1024;
+        let objects: Vec<Object> = (0..4)
+            .map(|n| {
+                let mut bytes = vec![0xFF; 2 * mib];
+                bytes[0] = n;
+                object(bytes)
+            })
+            .collect();
+        let (older, worker) = link_to(IPC_BINARY_OBJECTS - 1);
+        assert_eq!(older.write(objects.clone()).unwrap(), 4);
+        let written = worker.written.lock().unwrap();
+        assert!(written.len() > 1, "{} bodies", written.len());
+        let mut delivered = Vec::new();
+        for body in written.iter() {
+            assert!(body.len() <= MAX_REPLY_JSON, "{} bytes", body.len());
+            let sent: Vec<Object> = serde_json::from_slice(body).unwrap();
+            delivered.extend(sent.into_iter().map(|object| object.digest));
+        }
+        let all: Vec<Digest> = objects.iter().map(|object| object.digest).collect();
+        assert_eq!(delivered, all);
+    }
+
+    #[test]
+    fn a_fetch_says_which_encoding_its_bounds_are_for() {
+        // An older worker ignores this and answers JSON, which reads the same.
+        let (link, worker) = link_to(IPC_BINARY_OBJECTS - 1);
+        let wanted = [(Digest::bytes(b"x"), Kind::Chunk)];
+        assert!(link.fetch_reply(&wanted, true).unwrap().objects.is_empty());
+        assert!(link.fetch_reply(&wanted, false).unwrap().objects.is_empty());
+        let fetched = worker.fetched.lock().unwrap();
+        assert_eq!(fetched[0]["binary"], true);
+        assert_eq!(fetched[1]["binary"], false);
+    }
 }

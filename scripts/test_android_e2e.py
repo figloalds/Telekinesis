@@ -435,13 +435,36 @@ class CommandLine(unittest.TestCase):
         self.assertTrue(android_e2e.parse_args(["--release-pc"]).release_pc)
 
 
+class AdbReverse(unittest.TestCase):
+    def setUp(self):
+        self.device = Device(Path("adb"), "emulator-5554")
+
+    def test_the_port_is_the_one_adb_picked(self):
+        with patch.object(Device, "adb", return_value=Completed([], 0, b"43211\r\n", b"")) as adb:
+            self.assertEqual(self.device.reverse(5000), 43211)
+        adb.assert_called_once_with("reverse", "tcp:0", "tcp:5000")
+
+    def test_anything_but_a_port_is_an_error(self):
+        with patch.object(Device, "adb", return_value=Completed([], 0, b"error: more than one device", b"")):
+            with self.assertRaisesRegex(HarnessError, "more than one device"):
+                self.device.reverse(5000)
+
+    def test_a_refusal_is_an_error(self):
+        with patch("android_e2e_lib.run_bounded", return_value=Completed(["adb"], 1, b"", b"closed")):
+            with self.assertRaisesRegex(HarnessError, "closed"):
+                self.device.reverse(5000)
+            with self.assertRaisesRegex(HarnessError, "closed"):
+                self.device.remove_reverse(43211)
+
+
 class WhichScenarios(unittest.TestCase):
-    def test_all_leaves_out_speed_until_binary_object_bodies(self):
+    def test_all_runs_every_scenario(self):
         chosen = android_e2e.chosen_scenarios("all")
-        self.assertNotIn("speed", chosen)
+        self.assertEqual(chosen, list(android_e2e.SCENARIOS))
+        self.assertIn("speed", chosen)
         self.assertIn("read", chosen)
 
-    def test_speed_still_runs_by_name(self):
+    def test_speed_runs_by_name(self):
         self.assertEqual(android_e2e.parse_args(["--scenario", "speed"]).scenario, "speed")
         self.assertEqual(android_e2e.chosen_scenarios("speed"), ["speed"])
 

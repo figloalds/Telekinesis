@@ -336,6 +336,17 @@ class Device:
     def install(self, apk: Path) -> None:
         self.adb("install", "-r", apk, bound=INSTALL_BOUND).require_success()
 
+    def reverse(self, pc_port: int) -> int:
+        """A port on the device, which adb picks, that leads to `pc_port` on this PC through adb
+        itself and not the emulator's network."""
+        printed = self.adb("reverse", "tcp:0", f"tcp:{pc_port}").require_success().out
+        if not printed.isdigit():
+            raise HarnessError(f"adb reverse printed: {printed}")
+        return int(printed)
+
+    def remove_reverse(self, port: int) -> None:
+        self.adb("reverse", "--remove", f"tcp:{port}").require_success()
+
     def reset_app(self) -> None:
         cleared = self.shell("pm", "clear", PACKAGE).require_success()
         if "Success" not in cleared.out:

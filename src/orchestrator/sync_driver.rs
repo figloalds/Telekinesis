@@ -118,7 +118,10 @@ use crate::{
     model::{
         content::Digest,
         orchestrator::CallError,
-        protocol::frame::{Notify, NotifyReason},
+        protocol::{
+            features,
+            frame::{Notify, NotifyReason},
+        },
     },
     session::{Conn, Priority},
     util::{cancel::Cancel, fault, lock::lock, log::event, time::now_ms},
@@ -1102,7 +1105,11 @@ impl Driver {
             if settled && !probing {
                 break None;
             }
-            if lock(&self.due).bursts.get(&burst).is_none_or(|open| open.ended) {
+            if lock(&self.due)
+                .bursts
+                .get(&burst)
+                .is_none_or(|open| open.ended)
+            {
                 break Some("SYNC_NOW_ENDED: ended by `end-bursts`".to_owned());
             }
             let left = end.saturating_duration_since(Instant::now());
@@ -2075,6 +2082,9 @@ impl Driver {
                         || matches!(asking, Asking::Background { seen }
                             if self.wake.current() != seen)
                 };
+                // A worker that takes only JSON needs a batch cut to fit JSON.
+                let binary =
+                    conn.peer().has_feature(features::CONTENT_BINARY) && folder.link.takes_binary();
                 while let Some(&(_, kind)) = queue.front() {
                     if stop() {
                         result.interrupted = true;
@@ -2095,7 +2105,8 @@ impl Driver {
                     if hurried {
                         deadline = deadline.min(DEMAND_TRY);
                     }
-                    let fetched = match fetch(&conn, &folder.repo, &chunk, deadline, &stop) {
+                    let fetched = match fetch(&conn, &folder.repo, &chunk, binary, deadline, &stop)
+                    {
                         Ok(fetched) => {
                             state.grow(&folder.id, endpoint);
                             state.push.answered(endpoint);
@@ -2529,12 +2540,14 @@ pub fn fetch_deadline(wanted: &[(Digest, Kind)]) -> Duration {
     (PEER_DEADLINE + extra).min(FETCH_DEADLINE_MAX)
 }
 
-/// `objects.fetch` of ≤ [`OBJECT_BATCH`] objects on a peer bulk lane, within
-/// `deadline`, until `stop`.
+/// `objects.fetch` of ≤ [`OBJECT_BATCH`] objects on a peer bulk lane, its reply
+/// asked to be `binary`, within `deadline`, until `stop`. A peer that does not know
+/// of that answers JSON, which reads the same.
 fn fetch(
     conn: &Conn,
     repo: &str,
     wanted: &[(Digest, Kind)],
+    binary: bool,
     deadline: Duration,
     stop: &dyn Fn() -> bool,
 ) -> Result<Fetched, FetchFailure> {
@@ -2542,7 +2555,7 @@ fn fetch(
     let reply = conn
         .call_cancellable(
             "objects.fetch",
-            json!({"repo": repo}),
+            json!({"repo": repo, "binary": binary}),
             body,
             Priority::Data,
             deadline,
@@ -2609,7 +2622,10 @@ mod tests {
     use super::*;
     use crate::orchestrator::{
         network::{Refused, StoreReply},
-        sync::{FEED_PAGE, MissingPage, Object, Service, WantedPage},
+        sync::{
+            BINARY_MAGIC, FEED_PAGE, MissingPage, Object, Service, WantedPage, decode_objects,
+            encode_objects,
+        },
     };
     use crate::{
         core::EntryKind,
@@ -2804,6 +2820,8 @@ mod tests {
         during_read: Option<Hook>,
         /// What `objects.fetch` leaves out as too large for any reply.
         oversized: Vec<Digest>,
+        /// Whether each `objects.write` body was binary.
+        written_binary: Mutex<Vec<bool>>,
     }
 
     /// Something that happens while a request is being served.
@@ -2848,7 +2866,8 @@ mod tests {
                     serde_json::to_vec(&page).unwrap()
                 }
                 "objects.write" => {
-                    let objects: Vec<Object> = serde_json::from_slice(&req.body).unwrap();
+                    lock(&self.written_binary).push(req.body[0] == BINARY_MAGIC[0]);
+                    let objects = decode_objects(&req.body).unwrap();
                     let now = Instant::now();
                     lock(&self.written).extend(objects.iter().map(|o| (o.digest, now)));
                     serde_json::to_vec(&json!({"stored": objects.len()})).unwrap()
@@ -2900,6 +2919,11 @@ mod tests {
 
     /// A loopback worker whose every request goes to `handler`, and its link.
     fn worker_serving(handler: Arc<dyn Handler>) -> Arc<WorkerLink> {
+        worker_of_ipc(handler, 1)
+    }
+
+    /// [`worker_serving`], a worker that says it is of `ipc`.
+    fn worker_of_ipc(handler: Arc<dyn Handler>, ipc: u32) -> Arc<WorkerLink> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = format!("ws://{}", listener.local_addr().unwrap());
         thread::spawn(move || {
@@ -2925,7 +2949,7 @@ mod tests {
             address,
             token: TOKEN.into(),
             version: "test".into(),
-            ipc: 1,
+            ipc,
             mounts: Vec::new(),
         };
         WorkerLink::connect(&ready, 2).unwrap()
@@ -3438,6 +3462,10 @@ mod tests {
         stored: Mutex<Vec<(Digest, Kind)>>,
         calls: Mutex<Vec<String>>,
         store_sizes: Mutex<Vec<usize>>,
+        /// Whether each `objects.store` body was binary.
+        store_binary: Mutex<Vec<bool>>,
+        /// What each `objects.fetch` said of binary.
+        fetch_binary: Mutex<Vec<bool>>,
         excludes: Mutex<Vec<Vec<Digest>>>,
     }
 
@@ -3482,12 +3510,19 @@ mod tests {
                         return;
                     }
                     let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&req.body).unwrap();
-                    let objects: Vec<&Object> = wanted
+                    let objects: Vec<Object> = wanted
                         .iter()
                         .filter_map(|(digest, _)| self.held.iter().find(|o| o.digest == *digest))
+                        .cloned()
                         .collect();
-                    req.responder
-                        .reply(json!({}), serde_json::to_vec(&objects).unwrap());
+                    let binary = req.header["binary"] == true;
+                    lock(&self.fetch_binary).push(binary);
+                    let body = if binary {
+                        encode_objects(&objects)
+                    } else {
+                        serde_json::to_vec(&objects).unwrap()
+                    };
+                    req.responder.reply(json!({}), body);
                 }
                 op => {
                     let error = ErrorWire::coded("UNSUPPORTED_OPERATION", op);
@@ -3534,7 +3569,8 @@ mod tests {
 
         fn store(&self, req: Incoming) {
             lock(&self.calls).push("store".into());
-            let objects: Vec<Object> = serde_json::from_slice(&req.body).unwrap();
+            lock(&self.store_binary).push(req.body[0] == BINARY_MAGIC[0]);
+            let objects = decode_objects(&req.body).unwrap();
             lock(&self.store_sizes).push(objects.len());
             if objects
                 .iter()
@@ -3630,6 +3666,71 @@ mod tests {
             .peers
             .get_mut(&(folder.id.clone(), ENDPOINT.to_owned()))
             .unwrap()
+    }
+
+    #[test]
+    fn a_pull_is_binary_only_with_a_peer_that_offers_it_and_a_worker_that_takes_it() {
+        let older = crate::model::protocol::IPC_BINARY_OBJECTS - 1;
+        let current = crate::model::protocol::IPC_BINARY_OBJECTS;
+        let (with, without): (&[&str], &[&str]) = (
+            &[features::CONTENT_PUSH, features::CONTENT_BINARY],
+            &[features::CONTENT_PUSH],
+        );
+        // A worker that takes only JSON gets it from a peer asked for JSON, whose
+        // cut to fit JSON still holds; what comes as JSON goes on as binary.
+        for (advertised, ipc, asked, written) in [
+            (with, current, true, true),
+            (without, current, false, true),
+            (with, older, false, false),
+            (without, older, false, false),
+        ] {
+            let all = objects("pulled", 2);
+            let folder = Arc::new(FakeFolder {
+                missing: wanted_of(&all),
+                ..FakeFolder::default()
+            });
+            let serving = folder.clone();
+            let link = worker_of_ipc(
+                Arc::new(FnHandler(move |req: Incoming| serving.serve(req))),
+                ipc,
+            );
+            let listener = Arc::new(Listener {
+                held: all.clone(),
+                ..Listener::default()
+            });
+            let folders = Arc::new(Folders(vec![("f1".into(), link, Mutex::new(Vec::new()))]));
+            let lanes = OneLane(listener.lane_with("session", advertised));
+            let (driver, _root) = driver(lanes, folders, Seq::new());
+            let seen = driver.wake.current();
+            assert_eq!(driver.pump_round(&mut PumpState::default(), seen), 2);
+            let case = format!("{advertised:?}, ipc {ipc}");
+            assert_eq!(*lock(&listener.fetch_binary), [asked], "{case}");
+            assert_eq!(*lock(&folder.written_binary), [written], "{case}");
+            let digests: Vec<Digest> = all.iter().map(|object| object.digest).collect();
+            assert_eq!(folder.written(), digests, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_push_is_binary_only_toward_a_listener_that_advertises_it() {
+        for (advertised, binary) in [
+            (
+                [features::CONTENT_PUSH, features::CONTENT_BINARY].as_slice(),
+                true,
+            ),
+            ([features::CONTENT_PUSH].as_slice(), false),
+        ] {
+            let held = objects("pushed", 2);
+            let listener = Arc::new(Listener {
+                demand: wanted_of(&held),
+                ..Listener::default()
+            });
+            let lanes = OneLane(listener.lane_with("session", advertised));
+            let folder = pushing_folder("repo-1", &held);
+            let outcome = push_once(&lanes, &mut PushState::default(), &folder, PushMode::Demand);
+            assert_eq!(outcome.pushed, 2, "{advertised:?}");
+            assert_eq!(*lock(&listener.store_binary), [binary], "{advertised:?}");
+        }
     }
 
     #[test]
@@ -4859,7 +4960,10 @@ mod tests {
         let key = pair(ENDPOINT, "repo-1");
         open_burst(&driver, std::slice::from_ref(&key));
         let calls = calls_of_round(&driver, &mut state, &listener);
-        assert!(calls_named(&calls, "store") > 0, "the burst pushes: {calls:?}");
+        assert!(
+            calls_named(&calls, "store") > 0,
+            "the burst pushes: {calls:?}"
+        );
         // Ended while marks are still due: nothing more is pushed.
         driver.end_bursts();
         lock(&driver.due).background.insert(key.clone());

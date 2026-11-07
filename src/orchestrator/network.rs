@@ -42,7 +42,10 @@ use super::{
     catalog::Peer,
     config::{Config, SyncProfile},
     demand::{Seq, SeqMark},
-    sync::{HaveReply, MAX_BATCH_BYTES, OBJECT_BATCH, Object},
+    sync::{
+        HaveReply, MAX_BATCH_BYTES, OBJECT_BATCH, Object, asks_binary, decode_objects, fits_json,
+        objects_body,
+    },
     worker_client::WorkerLink,
 };
 use crate::{
@@ -322,13 +325,15 @@ struct Target {
 
 type NotifySlot = Arc<OnceLock<Arc<dyn NotifySink>>>;
 
-/// What a dialer asks of its listeners: an active one wants notifications, a
-/// passive one says so and syncs only when it is asked to.
+/// What a dialer says to its listeners: an active one wants notifications, a
+/// passive one says so and syncs only when it is asked to, and both read binary
+/// objects.
 fn dialer_features(profile: SyncProfile) -> Vec<String> {
-    match profile {
-        SyncProfile::Active => vec![features::NOTIFY.into()],
-        SyncProfile::Passive => vec![features::PROFILE_PASSIVE.into()],
-    }
+    let profile = match profile {
+        SyncProfile::Active => features::NOTIFY,
+        SyncProfile::Passive => features::PROFILE_PASSIVE,
+    };
+    vec![profile.into(), features::CONTENT_BINARY.into()]
 }
 
 /// The lanes of one outbound peer.
@@ -1560,8 +1565,9 @@ impl PeerService {
     }
 
     /// `objects.store`: refuses, per object, a digest that does not match its
-    /// bytes (`INVALID_PEER_OBJECT`) and one this host did not list to the
-    /// peer (`OBJECT_NOT_WANTED`); the rest are written and fsynced by the
+    /// bytes (`INVALID_PEER_OBJECT`), one this host did not list to the peer
+    /// (`OBJECT_NOT_WANTED`) and one a worker that takes only JSON has no body for
+    /// (`SYNC_OBJECT_TOO_LARGE`); the rest are written and fsynced by the
     /// worker before the reply names them. A batch over the worker's bounds
     /// is a dialer bug and is refused whole.
     fn store(
@@ -1594,6 +1600,9 @@ impl PeerService {
                     match listed.and_then(|set| set.kind(&object.digest)) {
                         None => Some("OBJECT_NOT_WANTED"),
                         Some(kind) if kind != object.kind => Some("INVALID_PEER_OBJECT"),
+                        Some(_) if !link.takes_binary() && !fits_json(&object) => {
+                            Some(super::push::TOO_LARGE)
+                        }
                         Some(_) => None,
                     }
                 };
@@ -1685,9 +1694,15 @@ impl PeerService {
                 let link = self.link(header)?;
                 let wanted: Vec<(Digest, Kind)> = serde_json::from_slice(&body)
                     .map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))?;
-                // The worker's cut (`truncated_at`, `oversized`) goes along.
-                let fetched = link.fetch_reply(&wanted).map_err(|error| error.to_wire())?;
-                Ok((fetched.header(), encode(&fetched.objects)?))
+                // The worker cuts for what this reply will be, and its cut
+                // (`truncated_at`, `oversized`) goes along.
+                let binary = asks_binary(header);
+                let fetched = link
+                    .fetch_reply(&wanted, binary)
+                    .map_err(|error| error.to_wire())?;
+                let body = objects_body(&fetched.objects, binary)
+                    .map_err(|error| ErrorWire::coded("INTERNAL_ERROR", error))?;
+                Ok((fetched.header(), body))
             }
             "objects.wanted" => {
                 self.require_paired()?;
@@ -1727,7 +1742,7 @@ impl PeerService {
             "objects.store" => {
                 self.require_paired()?;
                 let link = self.link(header)?;
-                let objects: Vec<Object> = serde_json::from_slice(&body)
+                let objects = decode_objects(&body)
                     .map_err(|error| ErrorWire::coded("INVALID_REQUEST", error))?;
                 let repo = header["repo"].as_str().unwrap_or_default();
                 let reply = self.store(&link, repo, objects)?;
@@ -1793,11 +1808,17 @@ mod tests {
     fn a_passive_dialer_never_asks_for_notify() {
         assert_eq!(
             dialer_features(SyncProfile::Active),
-            vec![features::NOTIFY.to_string()]
+            vec![
+                features::NOTIFY.to_string(),
+                features::CONTENT_BINARY.to_string()
+            ]
         );
         assert_eq!(
             dialer_features(SyncProfile::Passive),
-            vec![features::PROFILE_PASSIVE.to_string()]
+            vec![
+                features::PROFILE_PASSIVE.to_string(),
+                features::CONTENT_BINARY.to_string()
+            ]
         );
     }
 
@@ -2042,6 +2063,11 @@ mod tests {
     const TOKEN: &str = "network-test-token";
 
     fn listener() -> Listener {
+        listener_of(crate::model::protocol::IPC_VERSION)
+    }
+
+    /// A listener whose worker says it is of `ipc`.
+    fn listener_of(ipc: u32) -> Listener {
         use crate::orchestrator::{
             demand::{Demand, Seq},
             sync::{Object, Service},
@@ -2110,7 +2136,7 @@ mod tests {
                 address,
                 token: TOKEN.into(),
                 version: "test".into(),
-                ipc: 1,
+                ipc,
                 mounts: Vec::new(),
             },
             2,
@@ -2185,6 +2211,17 @@ mod tests {
         client: &Conn,
         objects: &[crate::orchestrator::sync::Object],
     ) -> std::result::Result<Stored, String> {
+        store_body(client, serde_json::to_vec(objects).unwrap())
+    }
+
+    fn store_binary(
+        client: &Conn,
+        objects: &[crate::orchestrator::sync::Object],
+    ) -> std::result::Result<Stored, String> {
+        store_body(client, crate::orchestrator::sync::encode_objects(objects))
+    }
+
+    fn store_body(client: &Conn, body: Vec<u8>) -> std::result::Result<Stored, String> {
         #[derive(serde::Deserialize)]
         struct Wire {
             stored: Vec<Digest>,
@@ -2195,13 +2232,7 @@ mod tests {
             digest: Digest,
             code: String,
         }
-        ask(
-            client,
-            "objects.store",
-            json!({"repo": "r1"}),
-            serde_json::to_vec(objects).unwrap(),
-        )
-        .map(|body| {
+        ask(client, "objects.store", json!({"repo": "r1"}), body).map(|body| {
             let wire: Wire = serde_json::from_slice(&body).unwrap();
             Stored {
                 stored: wire.stored,
@@ -2260,6 +2291,137 @@ mod tests {
         };
         assert_eq!(store(&client, &[object]).unwrap().stored, vec![demanded]);
         reader.join().unwrap().unwrap();
+    }
+
+    /// An object of `size` bytes of 0xFF, the widest in JSON, marked by `n`.
+    fn wide(size: usize, n: u8) -> crate::orchestrator::sync::Object {
+        let mut bytes = vec![0xFF; size];
+        bytes[0] = n;
+        crate::orchestrator::sync::Object {
+            digest: Digest::bytes(&bytes),
+            kind: Kind::Manifest,
+            bytes,
+        }
+    }
+
+    /// Lists `objects` to the peer, as `objects.wanted` does.
+    fn listed(listener: &Listener, objects: &[crate::orchestrator::sync::Object]) {
+        let wanted: Vec<(Digest, Kind)> = objects.iter().map(|o| (o.digest, o.kind)).collect();
+        listener.network.record_listed("peer-a", "r1", &wanted);
+    }
+
+    #[test]
+    fn store_takes_a_binary_body_and_still_checks_each_object() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let (good, other) = (listener.objects[0].clone(), listener.objects[1].clone());
+        wanted(&client, 64, None).unwrap();
+        let forged = crate::orchestrator::sync::Object {
+            bytes: b"not those bytes".to_vec(),
+            ..other.clone()
+        };
+        let reply = store_binary(&client, &[good.clone(), forged]).unwrap();
+        assert_eq!(reply.stored, vec![good.digest]);
+        assert_eq!(
+            reply.refused,
+            vec![(other.digest, "INVALID_PEER_OBJECT".to_owned())]
+        );
+        assert!(held(&listener, good.digest));
+        assert!(!held(&listener, other.digest));
+    }
+
+    #[test]
+    fn a_cut_binary_store_is_refused_and_stores_nothing() {
+        let listener = listener();
+        let client = bulk(&listener);
+        let objects = &listener.objects[..2];
+        wanted(&client, 64, None).unwrap();
+        let body = crate::orchestrator::sync::encode_objects(objects);
+        let cut = store_body(&client, body[..body.len() - 1].to_vec());
+        assert_eq!(cut.err().as_deref(), Some("INVALID_REQUEST"));
+        assert!(!held(&listener, objects[0].digest));
+        // The session is still usable, and they are still wanted.
+        assert_eq!(store_body(&client, body).unwrap().stored.len(), 2);
+        assert!(held(&listener, objects[0].digest));
+    }
+
+    #[test]
+    fn fetch_answers_in_binary_only_when_asked_and_cuts_what_it_answers_to_fit() {
+        use crate::orchestrator::sync::{BINARY_MAGIC, Fetched};
+        let listener = listener();
+        let client = bulk(&listener);
+        // 2 × 3 MiB, about 24 MiB as JSON, which one reply cannot hold.
+        let objects = [wide(3 * 1024 * 1024, 1), wide(3 * 1024 * 1024, 2)];
+        let packs = listener.service.engine.working.content().packs.clone();
+        let wanted: Vec<(Digest, Kind)> = objects
+            .iter()
+            .map(|o| (packs.put(o.kind, &o.bytes).unwrap(), o.kind))
+            .collect();
+        packs.flush().unwrap();
+        let fetch = |header: Value| {
+            let body = serde_json::to_vec(&wanted).unwrap();
+            client
+                .call(
+                    "objects.fetch",
+                    header,
+                    body,
+                    Priority::Data,
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+        };
+        let reply = fetch(json!({"repo": "r1"}));
+        let plain: Vec<crate::orchestrator::sync::Object> =
+            serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(plain.len(), 1);
+        assert_eq!(reply.header["truncated_at"], 1);
+
+        let reply = fetch(json!({"repo": "r1", "binary": true}));
+        assert_eq!(reply.body[..BINARY_MAGIC.len()], BINARY_MAGIC);
+        let fetched = Fetched::from_reply(&reply.header, &reply.body).unwrap();
+        assert_eq!(fetched.objects.len(), 2);
+        assert_eq!(fetched.truncated_at, None);
+        assert_eq!(fetched.objects[1].bytes, objects[1].bytes);
+    }
+
+    #[test]
+    fn a_binary_store_reaches_an_older_worker_in_json_it_can_take() {
+        let older = crate::model::protocol::IPC_BINARY_OBJECTS - 1;
+        let listener = listener_of(older);
+        let client = bulk(&listener);
+        // About 32 MiB as JSON: more than one body holds.
+        let objects: Vec<_> = (0..4).map(|n| wide(2 * 1024 * 1024, n)).collect();
+        listed(&listener, &objects);
+        let reply = store_binary(&client, &objects).unwrap();
+        assert_eq!(reply.stored.len(), 4, "refused {:?}", reply.refused);
+        for object in &objects {
+            assert!(held(&listener, object.digest));
+        }
+    }
+
+    #[test]
+    fn a_binary_store_refuses_only_what_no_json_body_could_take_to_an_older_worker() {
+        let older = crate::model::protocol::IPC_BINARY_OBJECTS - 1;
+        let listener = listener_of(older);
+        let client = bulk(&listener);
+        // About 20 MiB as JSON, past any body. A current worker takes it.
+        let too_wide = wide(5 * 1024 * 1024, 1);
+        let small = wide(1024, 2);
+        let objects = [too_wide.clone(), small.clone()];
+        listed(&listener, &objects);
+        let reply = store_binary(&client, &objects).unwrap();
+        assert_eq!(reply.stored, vec![small.digest]);
+        assert_eq!(
+            reply.refused,
+            vec![(too_wide.digest, "SYNC_OBJECT_TOO_LARGE".to_owned())]
+        );
+        assert!(!held(&listener, too_wide.digest));
+
+        let current = self::listener();
+        let client = bulk(&current);
+        listed(&current, std::slice::from_ref(&too_wide));
+        let reply = store_binary(&client, std::slice::from_ref(&too_wide)).unwrap();
+        assert_eq!(reply.stored, vec![too_wide.digest]);
     }
 
     #[test]

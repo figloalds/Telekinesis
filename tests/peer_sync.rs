@@ -2069,7 +2069,7 @@ fn peers_and_sync_views_report_features_profile_and_pushes() -> Result<()> {
     let seen_by_b = row_of(&b, &a)?;
     ensure!(seen_by_b["profile"] == "passive", "{seen_by_b}");
     ensure!(
-        seen_by_b["features"] == serde_json::json!(["profile-passive"]),
+        seen_by_b["features"] == serde_json::json!(["content-binary", "profile-passive"]),
         "{seen_by_b}"
     );
     ensure!(seen_by_b["two_way_content"] == true, "{seen_by_b}");
@@ -2083,6 +2083,160 @@ fn peers_and_sync_views_report_features_profile_and_pushes() -> Result<()> {
     ensure!(sync["last_push_error"].is_null(), "{view}");
     a.shutdown()?;
     b.shutdown()?;
+    Ok(())
+}
+
+/// 2.5 MiB: a manifest and 40 chunks, more than one object batch.
+const WIRE_FILE: usize = 5 * 512 * 1024;
+/// Binary objects cross the wire within this factor of their size.
+const BINARY_FACTOR: f64 = 1.1;
+/// JSON number arrays cost 3.57 wire bytes per random byte, so anything above
+/// this went as JSON.
+const JSON_FACTOR: f64 = 3.0;
+
+/// `len` random bytes, every value alike, as a photo's or a video's are.
+fn random_bytes(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 32) as u8
+        })
+        .collect()
+}
+
+/// A and B sharing an empty folder, A dialing B through a proxy that counts.
+fn counted_pair(a: TestDaemon, b: TestDaemon) -> Result<(Shared, FaultProxy)> {
+    let proxy = FaultProxy::try_start(&b.listen_endpoint()?)?;
+    let shared = shared_pair_via(a, b, &[], &proxy.endpoint())?;
+    Ok((shared, proxy))
+}
+
+/// Imports `content` as `path` at `from` and waits until `to` lacks none of it.
+/// Wire bytes per byte of it, in both directions together.
+fn wire_cost(
+    proxy: &FaultProxy,
+    (daemon, from): (&TestDaemon, &Path),
+    to: &Path,
+    path: &str,
+    content: &[u8],
+) -> Result<f64> {
+    let before = bytes_moved(proxy);
+    let source = daemon.home().join(format!("source-{path}"));
+    fs::write(&source, content)?;
+    folder(from, &["import", path, source.to_str().unwrap()])?;
+    wait_entry(to, path, content.len(), REPLICATED)?;
+    wait_settled(to, path, REPLICATED)?;
+    let moved = bytes_moved(proxy) - before;
+    let cost = moved as f64 / content.len() as f64;
+    println!(
+        "{path}: {} bytes moved {moved} on the wire, {cost:.3} per byte",
+        content.len()
+    );
+    Ok(cost)
+}
+
+#[test]
+fn binary_objects_move_within_a_small_margin_of_their_size() -> Result<()> {
+    let (
+        Shared {
+            a,
+            b,
+            state_a,
+            state_b,
+            ..
+        },
+        proxy,
+    ) = counted_pair(TestDaemon::start()?, TestDaemon::start()?)?;
+    let (pulled, pushed) = (random_bytes(WIRE_FILE, 301), random_bytes(WIRE_FILE, 303));
+    let cost = wire_cost(&proxy, (&b, &state_b), &state_a, "pulled.bin", &pulled)?;
+    ensure!(cost < BINARY_FACTOR, "a pull cost {cost:.3} per byte");
+    ensure!(
+        cost >= 1.0,
+        "only {cost:.3} per byte: not through the proxy"
+    );
+    let cost = wire_cost(&proxy, (&a, &state_a), &state_b, "pushed.bin", &pushed)?;
+    ensure!(cost < BINARY_FACTOR, "a push cost {cost:.3} per byte");
+    ensure!(
+        cost >= 1.0,
+        "only {cost:.3} per byte: not through the proxy"
+    );
+    let (_home_a, _home_b) = (a.shutdown_keep_home()?, b.shutdown_keep_home()?);
+    ensure!(
+        stored_file(&state_a, "pulled.bin")? == pulled,
+        "pulled.bin differs"
+    );
+    ensure!(
+        stored_file(&state_b, "pushed.bin")? == pushed,
+        "pushed.bin differs"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_older_peer_still_syncs_with_json_objects() -> Result<()> {
+    // Either side older: the dialer does not ask, or the listener does not offer.
+    for (a, b) in [
+        (TestDaemon::start_env("", &[OLDER])?, TestDaemon::start()?),
+        (TestDaemon::start()?, TestDaemon::start_env("", &[OLDER])?),
+    ] {
+        let (
+            Shared {
+                a,
+                b,
+                state_a,
+                state_b,
+                ..
+            },
+            proxy,
+        ) = counted_pair(a, b)?;
+        let content = random_bytes(WIRE_FILE, 305);
+        let cost = wire_cost(&proxy, (&b, &state_b), &state_a, "older.bin", &content)?;
+        ensure!(cost > JSON_FACTOR, "only {cost:.3} per byte: not JSON");
+        let (_home_a, _home_b) = (a.shutdown_keep_home()?, b.shutdown_keep_home()?);
+        ensure!(
+            stored_file(&state_a, "older.bin")? == content,
+            "older.bin differs"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn a_listener_that_takes_pushes_but_not_binary_gets_them_as_json() -> Result<()> {
+    let between = ("TKFS_FAULT_POINT", "session.features.no-content-binary");
+    let (
+        Shared {
+            a,
+            b,
+            state_a,
+            state_b,
+            ..
+        },
+        proxy,
+    ) = counted_pair(TestDaemon::start()?, TestDaemon::start_env("", &[between])?)?;
+    let (pushed, pulled) = (random_bytes(WIRE_FILE, 307), random_bytes(WIRE_FILE, 309));
+    let cost = wire_cost(&proxy, (&a, &state_a), &state_b, "pushed.bin", &pushed)?;
+    ensure!(
+        cost > JSON_FACTOR,
+        "a push cost only {cost:.3} per byte: not JSON"
+    );
+    let cost = wire_cost(&proxy, (&b, &state_b), &state_a, "pulled.bin", &pulled)?;
+    ensure!(
+        cost > JSON_FACTOR,
+        "a pull cost only {cost:.3} per byte: not JSON"
+    );
+    let (_home_a, _home_b) = (a.shutdown_keep_home()?, b.shutdown_keep_home()?);
+    ensure!(
+        stored_file(&state_b, "pushed.bin")? == pushed,
+        "pushed.bin differs"
+    );
+    ensure!(
+        stored_file(&state_a, "pulled.bin")? == pulled,
+        "pulled.bin differs"
+    );
     Ok(())
 }
 

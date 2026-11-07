@@ -415,6 +415,7 @@ fn features_are_exchanged_in_both_directions() {
     .unwrap();
     let (server_conn, _) = server.join().unwrap().unwrap();
     assert!(client_conn.peer().has_feature(features::CONTENT_PUSH));
+    assert!(client_conn.peer().has_feature(features::CONTENT_BINARY));
     assert!(client_conn.peer().has_feature(features::NOTIFY));
     assert!(!client_conn.peer().has_feature(features::PROFILE_PASSIVE));
     assert!(server_conn.peer().has_feature(features::NOTIFY));

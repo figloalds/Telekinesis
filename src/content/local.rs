@@ -158,7 +158,7 @@ fn append_file(root: &Path, segment: u64) -> Result<File> {
         .read(true)
         .open(segment_path(root, segment))?)
 }
-fn kind(value: u8) -> Result<Kind> {
+pub(crate) fn kind(value: u8) -> Result<Kind> {
     match value {
         1 => Ok(Kind::Chunk),
         2 => Ok(Kind::Manifest),

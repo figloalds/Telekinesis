@@ -65,9 +65,19 @@ and verifies each digest (`OBJECT_NOT_WANTED`, `INVALID_PEER_OBJECT`), so a
 pair made by `pair` then `receive` is two-way. A listener hints at a change
 with a `notify` frame; this is the only message it originates, and it carries
 no data. Both sides negotiate features in the handshake: `content-push` and
-`content-have` (listener), `notify` (active dialer) and `profile-passive`
-(passive dialer). A peer that advertises none is an older one: it is pulled
-from, never pushed to, and polled every `sync_interval_ms`.
+`content-have` (listener), `notify` (active dialer), `profile-passive`
+(passive dialer) and `content-binary` (both). A peer that advertises none is an
+older one: it is pulled from, never pushed to, and polled every
+`sync_interval_ms`.
+
+Objects travel as binary bodies: magic bytes, a count, then each object's digest,
+kind, length and bytes. A random file costs under 1.01 wire bytes per byte this
+way, against about 3.6 as the JSON number arrays that an older side still gets. An
+`objects.fetch` reply is binary only when its request asks with `binary: true`,
+and a request body (`objects.store`, `objects.write`) only toward a peer
+advertising `content-binary` or a worker whose `ipc` is 5 or more, which an
+adopted older worker's is not. Whoever asks for JSON gets a batch cut to fit it.
+The first byte tells the two apart on receipt, and a digest is verified either way.
 
 A dialer that needs to know the listener durably holds some objects (to free
 its own copy, or to say a file was sent) asks `objects.have {repo}` with a
