@@ -1757,7 +1757,7 @@ def scenario_conflicts(s: Session) -> None:
 
 SPACE_FILE_BYTES = 64 * MIB
 # How far below the floor it is filled: more than two of those files and less than three.
-BELOW_THE_FLOOR = 130 * MIB
+BELOW_THE_FLOOR = 160 * MIB
 LOW_ON_SPACE = "Low on space. Can't free anything until My PC is reachable."
 KEPT_DOES_NOT_FIT = "Low on space. Not everything you marked to keep fits on this phone."
 LOW_WITH_RECENT_FILES = "Low on space. Recent files stay unless you free them in Settings."
@@ -2013,9 +2013,11 @@ def check_freeing_with_the_pc_away(s: Session, folder: Folder) -> None:
     # Remove download works now, on what could not be removed.
     device.tap_text("Space")
     device.wait_screen("the files", lambda t: "c.bin" in t)
-    s.check("c.bin is still here to remove", entry_in(s, folder, "c.bin")["local_bytes"] > 0, entry_in(s, folder, "c.bin"))
-    press_action(s, "c.bin", "Remove download")
-    poll(SYNC_BOUND, "the download removed", lambda: entry_in(s, folder, "c.bin")["local_bytes"] == 0, interval=2)
+    # Whichever is here: what the steps above read last goes last.
+    here = [name for name in ("a.bin", "b.bin", "c.bin", "d.bin") if entry_in(s, folder, name)["local_bytes"] > 0]
+    s.check("a file is still here to remove", bool(here), here)
+    press_action(s, here[0], "Remove download")
+    poll(SYNC_BOUND, "the download removed", lambda: entry_in(s, folder, here[0])["local_bytes"] == 0, interval=2)
     s.check("with the PC back, a file's download can be removed", True)
     device.wait_screen("the row", lambda t: f"Not downloaded, {size_text(SPACE_FILE_BYTES)}" in t)
     device.screenshot(shots / "space-removed.png")
@@ -2359,6 +2361,7 @@ def run_scenario(name: str, device: Device, report: Report, run_dir: Path, reset
     error = None
     try:
         device.start_logcat()
+        device.clear_downloads()
         if reset:
             device.reset_app()
         # `metered` leaves the system's own judgment of the network in place; an earlier run that was

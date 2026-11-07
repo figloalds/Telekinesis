@@ -47,6 +47,7 @@ PROVIDER_BOUND = 120
 # How long a request keeps trying while Android cannot bring the provider up, and how often.
 PROVIDER_START_BOUND = 60
 PROVIDER_RETRY = 1
+LOGCAT_BUFFER = "64M"
 # sync-now gives up by itself after 175 s.
 SYNC_BOUND = 185
 PC_START_BOUND = 30
@@ -322,7 +323,8 @@ def sha256(data: bytes) -> str:
 
 def crashes_in(logcat: str, package: str = PACKAGE) -> list[str]:
     """The crashes of `package` in a logcat dump: an uncaught exception, whose first lines say whose
-    it is and what it was, and a native one, whose own line does. Other processes' are not its."""
+    it is and what it was, and a native one, whose own line does, or the tombstone's if a busy main
+    buffer has lost that. Other processes' are not its."""
     lines = logcat.splitlines()
     found = []
     for at, line in enumerate(lines):
@@ -330,6 +332,8 @@ def crashes_in(logcat: str, package: str = PACKAGE) -> list[str]:
             if f"Process: {package}," in "".join(lines[at + 1:at + 2]):
                 found.append(" ".join(text.split(": ", 1)[-1].strip() for text in lines[at:at + 3]))
         elif "Fatal signal" in line and f"({package})" in line:
+            found.append(line.strip())
+        elif f">>> {package} <<<" in line:
             found.append(line.strip())
     return found
 
@@ -730,6 +734,11 @@ class Device:
 
         return poll(ADB_BOUND, f"{name} scanned", scanned, interval=1)
 
+    def clear_downloads(self) -> None:
+        """What earlier scenarios shared in. This AVD's volume is small and the floor is 2 GiB, so that it
+        does not count against a scenario that goes by how much is free."""
+        self.adb("shell", "rm -rf /sdcard/Download/*; sync", bound=FILL_BOUND).require_success()
+
     def start_share(self, uri: str, mime: str = "application/octet-stream") -> None:
         """Another app sharing one stream: ACTION_SEND to ShareActivity. `am` does not move
         EXTRA_STREAM into ClipData as an app's startActivity does, so the grant rides on the intent's
@@ -808,8 +817,10 @@ class Device:
         return sum(int(size) for size in found.out.split())
 
     def start_logcat(self) -> None:
-        """A scenario begins: what logcat holds now is no part of it."""
+        """A scenario begins: what logcat holds now is no part of it. A long scenario's lines must not
+        fall out of the main buffer before it ends, as what a failure leaves is all there is to go by."""
         self.cleared_logcat.clear()
+        self.adb("logcat", "-G", LOGCAT_BUFFER)
         self.adb("logcat", "-c")
 
     def clear_logcat(self) -> None:

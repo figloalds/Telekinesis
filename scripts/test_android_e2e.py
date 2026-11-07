@@ -401,6 +401,11 @@ class FindingCrashes(unittest.TestCase):
     def test_a_fatal_signal_of_the_app_is_one(self):
         self.assertEqual(len(crashes_in(QUIET + OWN_SIGNAL)), 1)
 
+    def test_a_tombstone_of_the_app_is_one_when_its_signal_line_is_gone(self):
+        tombstone = "11-06 23:53:49.900  7000  7000 F DEBUG   : pid: 6752, tid: 6790, name: tkfs-sealer  >>> dev.tkfs <<<\n"
+        self.assertEqual(len(crashes_in(tombstone)), 1)
+        self.assertEqual(crashes_in(tombstone.replace("dev.tkfs", "com.android.other")), [])
+
     def test_those_of_other_processes_are_not(self):
         self.assertEqual(crashes_in(OTHER_EXCEPTION + OTHER_SIGNAL + QUIET), [])
 
