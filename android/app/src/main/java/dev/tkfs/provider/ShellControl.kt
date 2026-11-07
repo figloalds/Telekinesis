@@ -40,8 +40,10 @@ internal object ShellControl {
     private const val CONFIRM = "tkfs.confirm"
     private const val SPACE = "tkfs.space"
     private const val FREE = "tkfs.free"
+    private const val A_DAY_LATER = "tkfs.a_day_later"
     private const val ROOT_UID = 0
     private const val SHELL_UID = 2000
+    private const val A_DAY_MS = 25 * 60 * 60 * 1000L
 
     /** Descriptors a `write` was told to leave open, by document, for a kill to find or the next `write` to use. */
     private val leftOpen = HashMap<String, ParcelFileDescriptor>()
@@ -108,6 +110,12 @@ internal object ShellControl {
         FREE -> reply {
             val freed = SyncCoordinator.freeUp(context) ?: throw IOException("UNKNOWN_ERROR: it could not ask")
             JSONObject().put("bytes", freed.bytes).put("blocked", freed.blocked ?: JSONObject.NULL).toString()
+        }
+        // As if a day had passed for what goes by it: when files were last opened, and the last check of the floor.
+        A_DAY_LATER -> reply {
+            Native.ageOpenedForTest(A_DAY_MS)
+            Settings.of(context).floorChecked = null
+            "{}"
         }
         else -> null
     }

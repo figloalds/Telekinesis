@@ -708,6 +708,34 @@ impl Phone {
         peers: &dyn Confirmer,
         need_bytes: u64,
     ) -> Result<Freed> {
+        self.free_opened_before(folder, repo, engine, peers, need_bytes, u64::MAX)
+    }
+
+    /// [`Self::free_oldest`] with no one asking, at the end of a burst. It leaves a file opened in the
+    /// last [`RECENTLY_OPENED_MS`]: a phone below the floor because of other apps would otherwise empty
+    /// the downloads over and over, each to be downloaded again when next opened.
+    pub fn free_unasked(
+        &self,
+        folder: &str,
+        repo: &str,
+        engine: &Engine,
+        peers: &dyn Confirmer,
+        need_bytes: u64,
+        now_ms: u64,
+    ) -> Result<Freed> {
+        let opened_before = now_ms.saturating_sub(RECENTLY_OPENED_MS).saturating_add(1);
+        self.free_opened_before(folder, repo, engine, peers, need_bytes, opened_before)
+    }
+
+    fn free_opened_before(
+        &self,
+        folder: &str,
+        repo: &str,
+        engine: &Engine,
+        peers: &dyn Confirmer,
+        need_bytes: u64,
+        opened_before: u64,
+    ) -> Result<Freed> {
         let _one = lock(&self.freeing);
         let deadline = Instant::now() + self.budget.time;
         let packs = &engine.working.content().packs;
@@ -739,6 +767,7 @@ impl Phone {
                 engine,
                 peers,
                 need_bytes,
+                opened_before,
                 deadline,
                 &so_far,
                 &mut failure,
@@ -761,6 +790,15 @@ impl Phone {
         }
     }
 
+    /// Moves every file's last opening `by_ms` into the past, which is how a test has a day pass.
+    pub fn age_opened(&self, by_ms: u64) -> Result<()> {
+        lock(&self.db).execute(
+            "UPDATE opened SET at_ms = MAX(at_ms - ?1, 0)",
+            params![by_ms],
+        )?;
+        Ok(())
+    }
+
     /// The last step of [`Self::free_oldest`]. Each batch is asked about and evicted as one, since
     /// many small evicts would copy what is left of a segment again each time, and it has a size,
     /// since one evict holds the store and the packs for as long as it copies. This can go on for a
@@ -774,6 +812,7 @@ impl Phone {
         engine: &Engine,
         peers: &dyn Confirmer,
         need_bytes: u64,
+        opened_before: u64,
         deadline: Instant,
         so_far: &dyn Fn() -> Result<u64>,
         failure: &mut Option<anyhow::Error>,
@@ -783,6 +822,7 @@ impl Phone {
             .files(folder, engine)?
             .into_iter()
             .map(|file| (opened.get(&file.entity).copied().unwrap_or(0), file.entity))
+            .filter(|(opened, _)| *opened < opened_before)
             .collect();
         queue.sort();
         let mut queue = queue.into_iter().map(|(_, entity)| entity);
@@ -906,6 +946,8 @@ impl Phone {
 /// About how much one evict is asked to free. It holds the store and the packs while it copies what
 /// else is in the segments it touches, and everything that reads waits for that.
 const EVICT_BATCH_BYTES: u64 = 256 * 1024 * 1024;
+/// How long a file opened stays out of what [`Phone::free_unasked`] frees.
+pub const RECENTLY_OPENED_MS: u64 = 24 * 60 * 60 * 1000;
 /// How many kept files may fail in one [`Phone::hydrate_kept`], each after a wait of its own.
 const HYDRATE_FAILURES: usize = 3;
 /// Deleted files looked at for one call of [`Engine::deleted_heads`].
@@ -2074,6 +2116,61 @@ mod tests {
         f.phone.mark(FOLDER, &f.id("/kept"), false).unwrap();
         f.free(FILE_BYTES);
         assert_eq!(f.here("/kept"), 0);
+    }
+
+    /// Low on space because of other apps, with no one asking: what was opened in the last day stays,
+    /// or each re-open would only download it again. The owner asking is another matter.
+    #[test]
+    fn freeing_with_no_one_asking_leaves_what_was_opened_lately() {
+        let f = fixture();
+        f.write("/never", &distinct(1, CHUNKS));
+        f.write("/old", &distinct(2, CHUNKS));
+        f.write("/recent", &distinct(3, CHUNKS));
+        f.on_the_pc(&["/never", "/old", "/recent"]);
+        let now = 10 * RECENTLY_OPENED_MS;
+        let old = now - RECENTLY_OPENED_MS;
+        f.phone.opened(FOLDER, &f.id("/old"), old).unwrap();
+        f.phone.opened(FOLDER, &f.id("/recent"), old + 1).unwrap();
+        let freed = f
+            .phone
+            .free_unasked(FOLDER, REPO, &f.engine, &f.peers, 10 * FILE_BYTES, now)
+            .unwrap();
+        assert_eq!(f.here("/never"), 0);
+        assert_eq!(f.here("/old"), 0);
+        assert!(f.is_whole("/recent"));
+        assert_eq!(freed.blocked, None, "being spared is not being blocked");
+        assert!(freed.bytes >= 2 * FILE_BYTES && freed.bytes < 3 * FILE_BYTES);
+
+        // Nothing else is left to it now, and that is no failure either.
+        let again = f
+            .phone
+            .free_unasked(FOLDER, REPO, &f.engine, &f.peers, 10 * FILE_BYTES, now)
+            .unwrap();
+        assert_eq!(again, Freed::default());
+        assert!(f.is_whole("/recent"));
+
+        // A day passes for it.
+        f.phone.age_opened(1).unwrap();
+        f.phone
+            .free_unasked(FOLDER, REPO, &f.engine, &f.peers, 10 * FILE_BYTES, now)
+            .unwrap();
+        assert_eq!(f.here("/recent"), 0);
+    }
+
+    /// "Free up space now" and "Remove download" are the owner asking, so they still may.
+    #[test]
+    fn the_owner_asking_may_free_what_was_opened_a_minute_ago() {
+        let f = fixture();
+        f.write("/one", &distinct(1, CHUNKS));
+        f.write("/two", &distinct(2, CHUNKS));
+        f.on_the_pc(&["/one", "/two"]);
+        let now = 10 * RECENTLY_OPENED_MS;
+        f.phone.opened(FOLDER, &f.id("/one"), now).unwrap();
+        f.phone.opened(FOLDER, &f.id("/two"), now).unwrap();
+        f.free(FILE_BYTES);
+        assert_eq!(f.here("/one"), 0);
+        assert!(f.remove("/two").bytes > 0);
+        assert_eq!(f.here("/two"), 0);
     }
 
     #[test]

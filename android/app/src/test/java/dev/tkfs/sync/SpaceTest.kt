@@ -1,10 +1,13 @@
 package dev.tkfs.sync
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SpaceTest {
     private val gib = 1024L * 1024 * 1024
+    private val MIB = 1024L * 1024
 
     @Test fun theFloorIsTwoGibOrATenthOfTheVolumeIfThatIsMore() {
         assertEquals(2 * gib, floorBytes(6 * gib))
@@ -116,6 +119,32 @@ class SpaceTest {
         )
         assertEquals(Kept.Done, outcome)
         assertEquals(2, asked)
+    }
+
+    @Test fun theFirstCheckBelowTheFloorIsDue() {
+        assertTrue(floorCheckDue(null, 1_000, 5))
+    }
+
+    @Test fun belowTheFloorTheCheckRunsOnceAnHour() {
+        val last = FloorChecked(atMs = 1_000_000, freeBytes = 500 * MIB)
+        assertFalse(floorCheckDue(last, last.atMs + 1, last.freeBytes))
+        assertFalse(floorCheckDue(last, last.atMs + FLOOR_CHECK_EVERY_MS - 1, last.freeBytes))
+        assertTrue(floorCheckDue(last, last.atMs + FLOOR_CHECK_EVERY_MS, last.freeBytes))
+    }
+
+    @Test fun freeSpaceMovingByMoreThan100MiBRunsItSooner() {
+        val last = FloorChecked(atMs = 1_000_000, freeBytes = 500 * MIB)
+        val soon = last.atMs + 60_000
+        assertFalse(floorCheckDue(last, soon, last.freeBytes + 100 * MIB))
+        assertFalse(floorCheckDue(last, soon, last.freeBytes - 100 * MIB))
+        assertTrue(floorCheckDue(last, soon, last.freeBytes + 100 * MIB + 1))
+        assertTrue(floorCheckDue(last, soon, last.freeBytes - 100 * MIB - 1))
+    }
+
+    /** It says nothing of how long it has been, and a clock set far ahead must not stop checks for good. */
+    @Test fun aClockThatWentBackCountsAsTimeUp() {
+        val last = FloorChecked(atMs = 1_000_000, freeBytes = 500 * MIB)
+        assertTrue(floorCheckDue(last, last.atMs - 1, last.freeBytes))
     }
 
     @Test fun anAnswerSaysWhatLeftAndWhyNoMoreCould() {

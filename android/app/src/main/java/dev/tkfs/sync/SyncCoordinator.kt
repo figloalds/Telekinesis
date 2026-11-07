@@ -54,6 +54,7 @@ object SyncCoordinator {
     private val confirmed = MutableStateFlow<Map<String, Confirmed>>(emptyMap())
 
     private val lowSpace = MutableStateFlow<String?>(null)
+    private val belowFloor = MutableStateFlow(false)
     private val keptShort = MutableStateFlow(false)
     private val freeing = Any()
 
@@ -65,6 +66,9 @@ object SyncCoordinator {
 
     /** Why free space stays below the floor, when only a PC could change that: `PC_UNREACHABLE`, `PC_TOO_OLD`, or null. */
     val spaceBlocked: StateFlow<String?> get() = lowSpace
+
+    /** Free space stayed below the floor after freeing, for whatever reason. */
+    val stillBelowFloor: StateFlow<Boolean> get() = belowFloor
 
     /** Something marked to keep is not all here, and there is no room for it above the floor. */
     val keptDoesNotFit: StateFlow<Boolean> get() = keptShort
@@ -153,7 +157,7 @@ object SyncCoordinator {
                 hydrate = ::hydrateOnce,
                 missing = ::keptMissing,
                 belowFloor = { spaceNeededNow(app) > 0 },
-                freeUp = { freeUp(app) },
+                freeUp = { free(app, unasked = true) },
                 stop = stop,
             )
             Log.i(TAG, "kept: $ended")
@@ -170,25 +174,38 @@ object SyncCoordinator {
     }
 
     /**
-     * Frees space if the volume is below the floor. It is a look at the volume and nothing else above
-     * it, so it can follow every burst.
+     * Frees space if the volume is below the floor, leaving what was opened lately. It is a look at the
+     * volume and nothing else above it, so it can follow every burst. Below the floor it does more than
+     * look only when [floorCheckDue] says so.
      */
     internal fun checkFloor(ctx: Context) {
         val app = ctx.applicationContext
+        val settings = Settings.of(app)
         if (spaceNeededNow(app) == 0L) {
             lowSpace.value = null
+            belowFloor.value = false
+            settings.floorChecked = null
             return
         }
-        freeUp(app)
+        val now = System.currentTimeMillis()
+        if (floorCheckDue(settings.floorChecked, now, StatFs(app.filesDir.path).availableBytes)) {
+            free(app, unasked = true)
+            val after = StatFs(app.filesDir.path)
+            val stillLow = spaceNeeded(after.availableBytes, after.totalBytes) > 0
+            settings.floorChecked = if (stillLow) FloorChecked(now, after.availableBytes) else null
+        } else {
+            belowFloor.value = true
+        }
     }
 
     /** "Free up space now", on this thread: up to the floor, or if it is met only what nothing needs. Null if it could not ask. */
-    fun freeUp(ctx: Context): Freed? {
-        val app = ctx.applicationContext
-        return synchronized(freeing) {
+    fun freeUp(ctx: Context): Freed? = free(ctx.applicationContext, unasked = false)
+
+    private fun free(app: Context, unasked: Boolean): Freed? =
+        synchronized(freeing) {
             val freed = try {
                 Native.ensureStarted(app)
-                parseFreed(Native.freeSpace(spaceNeededNow(app)))
+                parseFreed(Native.freeSpace(spaceNeededNow(app), unasked))
             } catch (error: IOException) {
                 Log.i(TAG, "free: ${error.message}")
                 return@synchronized null
@@ -198,10 +215,10 @@ object SyncCoordinator {
             }
             val stillLow = spaceNeededNow(app) > 0
             lowSpace.value = if (stillLow) freed.blocked else null
-            Log.i(TAG, "free: ${freed.bytes} bytes, blocked ${freed.blocked}, still low: $stillLow")
+            belowFloor.value = stillLow
+            Log.i(TAG, "free: ${freed.bytes} bytes, blocked ${freed.blocked}, still low: $stillLow, unasked: $unasked")
             freed
         }
-    }
 
     /** How far the volume is below the floor. */
     fun spaceNeededNow(ctx: Context): Long {

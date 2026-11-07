@@ -51,7 +51,7 @@ fun FoldersScreen(
             Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
                 ShareFailureStrip(ui.shareFailures, onDismissShareFailures)
                 OpenFailureStrip(ui.openFailures, onDismissOpenFailures)
-                LowSpaceStrip(ui.spaceBlocked, ui.keptDoesNotFit)
+                LowSpaceStrip(ui.spaceBlocked, ui.keptDoesNotFit, ui.belowFloor)
                 when {
                     snapshot == null -> Text("Starting...", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     snapshot.folders.isEmpty() -> Empty(snapshot, onAddPc)
@@ -161,10 +161,10 @@ private fun Strips(snapshot: Snapshot, onAddPc: () -> Unit) {
     }
 }
 
-/** Low on space, and only a PC could change that, or what is marked does not fit. It goes by itself once there is room. */
+/** Low on space after freeing, and why if it can say. It goes by itself once there is room. */
 @Composable
-private fun LowSpaceStrip(blocked: String?, keptDoesNotFit: Boolean) {
-    val text = lowSpaceStrip(blocked, keptDoesNotFit) ?: return
+private fun LowSpaceStrip(blocked: String?, keptDoesNotFit: Boolean, belowFloor: Boolean) {
+    val text = lowSpaceStrip(blocked, keptDoesNotFit, belowFloor) ?: return
     Text(
         text,
         style = MaterialTheme.typography.bodyMedium,

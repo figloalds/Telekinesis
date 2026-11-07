@@ -1648,6 +1648,7 @@ SPACE_FILE_BYTES = 64 * MIB
 BELOW_THE_FLOOR = 130 * MIB
 LOW_ON_SPACE = "Low on space. Can't free anything until My PC is reachable."
 KEPT_DOES_NOT_FIT = "Low on space. Not everything you marked to keep fits on this phone."
+LOW_WITH_RECENT_FILES = "Low on space. Recent files stay unless you free them in Settings."
 BACK_IN_SPACE = 256 * MIB
 
 
@@ -1771,8 +1772,9 @@ def check_keeping(s: Session, folder: Folder) -> None:
 
 
 def check_freeing(s: Session, folder: Folder) -> None:
-    """Below the floor at the end of a burst: unmarked files go oldest first, up to what is needed. On a
-    metered network the burst takes only names, so a new file has a row here and its bytes nowhere else."""
+    """Below the floor at the end of a burst: unmarked files go oldest first, up to what is needed, but
+    not those opened in the last day, and not at every burst. On a metered network the burst takes only
+    names, so a new file has a row here and its bytes nowhere else."""
     device = s.device
     device.set_metered(True)
     unsent = random.Random(21).randbytes(8 * MIB)
@@ -1786,6 +1788,28 @@ def check_freeing(s: Session, folder: Folder) -> None:
     free = device.fill_until_free(floor - BELOW_THE_FLOOR)
     s.check("the filler takes free space below the floor", free < floor, f"{free} free, floor {floor}")
     held = what_is_here(s, folder, ("kept.bin", "a.bin", "b.bin", "c.bin", "d.bin", "unsent.bin"))
+
+    # They were all opened minutes ago. With no one asking they stay, and the Folders screen says it is low.
+    device.clear_logcat()
+    trigger_foreground(device)
+    to_folders(s)
+    found = device.wait_screen("the strip that says space stays low", lambda t: LOW_WITH_RECENT_FILES in t, SYNC_BOUND)
+    s.check("still below the floor after freeing, the Folders screen says so", True, found)
+    now = what_is_here(s, folder, held)
+    s.check("and what was opened minutes ago stays", now == held, now)
+    logged = [line for line in device.provider_log() if line.startswith("free:")]
+    s.check("freeing with no one asking ran", len(logged) == 1 and "unasked: true" in logged[0], logged)
+
+    # Free space has not moved, so the next burst within the hour does not try again.
+    device.clear_logcat()
+    trigger_foreground(device)
+    poll(SYNC_BOUND, "the next burst", lambda: any(line.startswith("confirm ") for line in device.provider_log()), interval=1)
+    time.sleep(SYNC_SETTLE)
+    logged = [line for line in device.provider_log() if line.startswith("free:")]
+    s.check("the next burst within the hour does not free", not logged, logged)
+
+    # A day on, they are the oldest files like any others.
+    device.a_day_later()
     trigger_foreground(device)
     poll(SYNC_BOUND, "the oldest files freed", lambda: not any(what_is_here(s, folder, ("a.bin", "b.bin", "c.bin")).values()), interval=2)
     s.check("the unmarked files opened longest ago are gone from the phone", True)
@@ -1804,6 +1828,15 @@ def check_freeing(s: Session, folder: Folder) -> None:
         s.check(f"{name}, freed, reads back identically", digest == sha256(folder.files[name]), digest)
     s.check("that took it below the floor again", device.free_bytes() < floor, device.free_bytes())
 
+    # "Free up space now" is the owner asking, so what was opened a minute ago goes too.
+    digest = device.content_digest(folder.doc("d.bin"))
+    s.check("d.bin reads the same", digest == sha256(folder.files["d.bin"]), digest)
+    answer = device.free_now()
+    s.check("Free up space now frees", answer["bytes"] > 0 and answer["blocked"] is None, answer)
+    s.check("and takes what was opened a minute ago", not is_here(s, folder, "a.bin"), entry_in(s, folder, "a.bin"))
+    digest = device.content_digest(folder.doc("a.bin"))
+    s.check("a.bin reads back identically again", digest == sha256(folder.files["a.bin"]), digest)
+
 
 def check_freeing_with_the_pc_away(s: Session, folder: Folder) -> None:
     """Nothing leaves, the Folders screen says why, and the actions on one file each say why."""
@@ -1813,6 +1846,8 @@ def check_freeing_with_the_pc_away(s: Session, folder: Folder) -> None:
     held = what_is_here(s, folder, names)
     failures, summary = pc.stop()
     s.check("the PC stops cleanly", not failures, failures or summary)
+    # So that these are for a PC to confirm, and not left alone for having been opened lately.
+    device.a_day_later()
     to_folders(s)
     device.tap_text("Sync now")
     found = device.wait_screen("the strip that says why", lambda t: LOW_ON_SPACE in t, SYNC_BOUND)
@@ -1855,6 +1890,7 @@ def check_freeing_with_the_pc_away(s: Session, folder: Folder) -> None:
     device.set_metered(False)
     s.sync_with_the_pc_back(folder)
     poll(SYNC_BOUND, "the new file confirmed", lambda: device.confirm(folder.id)["waiting"] == 0, interval=2)
+    device.a_day_later()
     to_folders(s)
     device.tap_text("Sync now")
     device.wait_screen("the strip gone", lambda t: LOW_ON_SPACE not in t and "Sync now" in t, SYNC_BOUND)

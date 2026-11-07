@@ -125,10 +125,11 @@ object Native {
     /**
      * Gives back about `needBytes` of the disk, oldest opened first, with only what a PC has just said
      * it holds: `{bytes, blocked}`, where `blocked` is `PC_UNREACHABLE`, `PC_TOO_OLD` or null. With 0 it
-     * only removes what nothing needs. It rewrites packs and waits for a PC: off the main thread.
+     * only removes what nothing needs. `unasked` is freeing the owner did not ask for just now, which
+     * leaves a file opened in the last 24 hours. It rewrites packs and waits for a PC: off the main thread.
      */
     @JvmStatic @Throws(IOException::class)
-    external fun freeSpace(needBytes: Long): String
+    external fun freeSpace(needBytes: Long, unasked: Boolean): String
 
     /**
      * Downloads what is kept and is not all here, and returns how many bytes came. `stop` is asked
@@ -144,6 +145,10 @@ object Native {
     /** Always throws: a panic with a Java exception pending. See `ShellControl`. */
     @JvmStatic @Throws(IOException::class)
     external fun faultForTest()
+
+    /** Has every file's last opening be `byMs` earlier. See `ShellControl`. */
+    @JvmStatic @Throws(IOException::class)
+    external fun ageOpenedForTest(byMs: Long)
 
     /**
      * Every way into the process calls this. It writes the configuration on first run,

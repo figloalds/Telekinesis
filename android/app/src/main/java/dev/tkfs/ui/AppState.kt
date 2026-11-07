@@ -76,6 +76,8 @@ data class AppUi(
     val spaceBlocked: String? = null,
     /** Something marked to keep has no room above that. */
     val keptDoesNotFit: Boolean = false,
+    /** Free space stayed below that after freeing. */
+    val belowFloor: Boolean = false,
     /** What the last "Free up space now" did, or that it is at it. */
     val spaceNote: String? = null,
     val freeingSpace: Boolean = false,
@@ -125,6 +127,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { SyncCoordinator.finished.collect { it?.let { finished -> burstEnded(finished) } } }
         viewModelScope.launch { SyncCoordinator.spaceBlocked.collect { blocked -> mutable.update { it.copy(spaceBlocked = blocked) } } }
         viewModelScope.launch { SyncCoordinator.keptDoesNotFit.collect { short -> mutable.update { it.copy(keptDoesNotFit = short) } } }
+        viewModelScope.launch { SyncCoordinator.stillBelowFloor.collect { low -> mutable.update { it.copy(belowFloor = low) } } }
     }
 
     fun startPolling() {

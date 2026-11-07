@@ -493,6 +493,11 @@ class Device:
         """What "Free up space now" answers, `{bytes, blocked}`, when asked of it directly (a debug build)."""
         return json.loads(parse_call(self.call_method("tkfs.free")))
 
+    def a_day_later(self) -> None:
+        """As if a day had passed for what goes by it in the app: when files were last opened, and its
+        last check of the floor (a debug build)."""
+        parse_call(self.call_method("tkfs.a_day_later"))
+
     def document(self, operation: str, **request) -> dict:
         """A document operation `content` has no way to ask for, done inside the app through
         Android's own API, as another app would (debug builds only). The provider's refusal

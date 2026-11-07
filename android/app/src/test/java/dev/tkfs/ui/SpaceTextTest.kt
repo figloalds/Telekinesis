@@ -26,6 +26,22 @@ class SpaceTextTest {
         )
     }
 
+    /** Below the floor after freeing, whatever else is so, a strip says it. */
+    @Test fun theStripSaysSoWheneverSpaceStaysBelowTheFloor() {
+        val low = "Low on space. Recent files stay unless you free them in Settings."
+        assertEquals(low, lowSpaceStrip(null, belowFloor = true))
+        assertNull(lowSpaceStrip(null, belowFloor = false))
+        // What it can say of why comes first.
+        assertEquals(
+            "Low on space. Can't free anything until My PC is reachable.",
+            lowSpaceStrip("PC_UNREACHABLE", belowFloor = true),
+        )
+        assertEquals(
+            "Low on space. Not everything you marked to keep fits on this phone.",
+            lowSpaceStrip(null, keptDoesNotFit = true, belowFloor = true),
+        )
+    }
+
     @Test fun removeDownloadHasASentenceForEachWayItCanBeRefused() {
         assertEquals("Not on My PC yet, so it can't be removed.", removeSentence("a.bin", Freed(0, "NOT_ON_PC")))
         val away = removeSentence("a.bin", Freed(0, "PC_UNREACHABLE"))

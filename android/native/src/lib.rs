@@ -128,8 +128,9 @@ fn remove_download(folder: &str, entity: &str) -> Result<Value> {
 }
 
 /// Gives back about `need` bytes, folder by folder until it has. What one folder could not do is
-/// said once, and does not stop the next.
-fn free_space(need: u64) -> Result<Value> {
+/// said once, and does not stop the next. `unasked` is freeing no one asked for just now, which
+/// leaves what was opened lately.
+fn free_space(need: u64, unasked: bool) -> Result<Value> {
     let daemon = host()?.daemon()?;
     let phone = phone()?;
     let mut total = Freed::default();
@@ -147,7 +148,12 @@ fn free_space(need: u64) -> Result<Value> {
             };
             let peers = ReachingPeers::new(peers, REACH_WITHIN);
             let left = need.saturating_sub(total.bytes);
-            phone.free_oldest(&record.id, &record.repo, &engine, &peers, left)
+            if unasked {
+                let now = tkfs::util::time::now_ms();
+                phone.free_unasked(&record.id, &record.repo, &engine, &peers, left, now)
+            } else {
+                phone.free_oldest(&record.id, &record.repo, &engine, &peers, left)
+            }
         });
         match freed {
             Ok(freed) => {
@@ -779,10 +785,24 @@ pub extern "system" fn Java_dev_tkfs_Native_freeSpace(
     mut env: JNIEnv,
     _: JClass,
     need: jlong,
+    unasked: jboolean,
 ) -> jstring {
     guard_string(&mut env, |_| {
         ensure!(need >= 0, "INVALID_PARAMETER: freeing {need} bytes");
-        Ok(free_space(need as u64)?.to_string())
+        Ok(free_space(need as u64, unasked != JNI_FALSE)?.to_string())
+    })
+}
+
+/// Has every file's last opening be `by_ms` earlier, for a test of what a day changes.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_ageOpenedForTest(
+    mut env: JNIEnv,
+    _: JClass,
+    by_ms: jlong,
+) {
+    guard(&mut env, (), |_| {
+        ensure!(by_ms >= 0, "INVALID_PARAMETER: {by_ms} ms");
+        phone()?.age_opened(by_ms as u64)
     })
 }
 
@@ -1236,7 +1256,8 @@ mod tests {
             assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
 
             let class = env.find_class("java/lang/Object").unwrap();
-            let value = Java_dev_tkfs_Native_freeSpace(unsafe { env.unsafe_clone() }, class, 1);
+            let value =
+                Java_dev_tkfs_Native_freeSpace(unsafe { env.unsafe_clone() }, class, 1, JNI_TRUE);
             assert!(value.is_null());
             assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
 
@@ -1256,7 +1277,8 @@ mod tests {
     fn freeing_a_negative_amount_is_refused_before_anything_else() {
         with_env(|env| {
             let class = env.find_class("java/lang/Object").unwrap();
-            let value = Java_dev_tkfs_Native_freeSpace(unsafe { env.unsafe_clone() }, class, -1);
+            let value =
+                Java_dev_tkfs_Native_freeSpace(unsafe { env.unsafe_clone() }, class, -1, JNI_FALSE);
             assert!(value.is_null());
             let pending = thrown(env);
             assert!(

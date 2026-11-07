@@ -323,6 +323,13 @@ Freeing happens only for digests a peer named in an `objects.have` reply, and on
 This needs a reachable PC. Offline and low on space, nothing is freed and the app says why. To
 avoid arriving there, the check also runs at the end of a burst whenever the floor is close.
 
+A phone can stay below the floor because of other apps, for as long as they like, and without
+care that would empty its downloads over and over, each to be downloaded again when next opened. So
+freeing that nobody just asked for also leaves any file opened in the last 24 hours, and below the
+floor it runs at most once an hour, unless free space moved by more than 100 MiB. "Free up space now"
+and "Remove download" still take what they are asked to. Whenever free space stays below the floor
+after freeing, the Folders screen has a "Low on space" strip.
+
 The space itself comes back through `PackStore::collect` with the live set minus what is being
 freed, since packs are 64 MiB segments and freed objects only leave when a segment is rewritten.
 Rewriting needs some free space, which the floor provides.
