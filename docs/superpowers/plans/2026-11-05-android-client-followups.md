@@ -1,0 +1,131 @@
+# Android client: follow-ups
+
+Left open when the build finished on 2026-11-07. The final review triaged these as safe to leave, except where marked. They are worth checking when the app goes on a real phone.
+
+## Open
+
+- **Worker kill under a long store hold (parked, real).** See the Final line below. Measure on the phone.
+- **Acceptance 19 and 20:** the owner's phone, real Wi-Fi, battery and data use, the QR scan, third-party file managers.
+- **First reads over a real network:** the emulator's normal network gave about 6 MiB/s against about 26 MiB/s through `adb reverse`, unexplained. Measure on real Wi-Fi.
+- **History:** commit `c21d0bfb` holds about 60 MiB of build output and must be dealt with before merging to `master`.
+
+## Deferred items
+
+- Task 1: build_android.py: user RUSTFLAGS overrides the page-size flag (check catches it); ELF parser no bounds check, failure branch untested.
+- Task 1: arm64 alignment unverified until T20's two-ABI build.
+- Task 1: worker registered in WORKERS only after Ready; kill_verified before then returns Ok(false).
+- Task 2: Host::engine can wait 2 x START_WAIT (daemon, then worker); use one deadline.
+- Task 2: second Host::stop calls shutdown again; no Drop, so an early test failure leaves a host running.
+- Task 2: hub.rs doc comment long line; orchestrator-thread timeout reuses STRANDED_WORKER.
+- Task 2: spawn-failure cleanup has no test (thread spawn failure not injectable cheaply).
+- Task 3: a_silent_peer_is_still_dead_across_repeated_stalls does not separate old rule from new; fire stalls separately and assert timing.
+- Task 3: no test for hold_progress or upload.active across a stall; tx_held branch unexercised.
+- Task 3: sanitized() allows dead_after small enough that every idle turn looks like a stall; clamp or assert heartbeat < dead_after / 2.
+- Task 3: ws_pair duplicated from store_write_fault.rs; fired() == 2 does not prove one stall per side.
+- Task 3: request deadlines and GOAWAY grace are not shifted by a stall; probably intended, undocumented.
+- Task 4: start-over ending at the same numbers looks like no movement, so a restored-PC burst can report clean with objects unpushed until the next burst (sync_driver.rs:1285); have exchange report it started over.
+- Task 4: apply_batch always updates the clock, so every echo page costs a real wal_checkpoint(FULL) on a first sync (core.rs:868).
+- Task 4: killing_the_listener test cannot fail for the rule it names (plan-mandated); real proof at sync_driver.rs:7086. Add a comment or rename.
+- Task 4: no test that `durable` crosses PeerService (network.rs:1593).
+- Task 4: save_cursor holds jobs across a synchronous commit; sync_driver.rs now about 7,180 lines, CursorStore and friends could move out.
+- Task 5: record_finish drops the background mark while push_held instead of holding it; an active driver then waits for its poll. Always insert and rely on the take_* gates.
+- Task 5: an active driver's background pull is not gated by metadata-only, and its demand pushes are held during one. Only passive phones use this today.
+- Task 6: no test proves the old lanes stopped dialing after a move.
+- Task 6: a failed reopen after the catalog commit is only logged, and set-endpoint returns Ok.
+- Task 6: probe is a blocking dial in the management handler (like pair); extra peers rows are discarded silently, docs could say so.
+- Task 7: --qr with --json mixes the QR into stdout, so the output is not JSON.
+- Task 7: pairing_qr failure in gui.rs after the code rotated would lose the new code; degrade to the code alone.
+- Task 7: configured_advertise nearly duplicates advertise; qr test not cfg-gated for Android test builds; GUI clear path and layout only compiled, not seen on screen.
+- Task 8: boot wait is two stacked BOOT_BOUND polls (600 s worst case vs 300 s).
+- Task 8: `-avd X` also matches `-avd X_2` in Emulator.stop; match the whole word.
+- Task 8: cold-start read would pass by re-downloading; frozen check would pass after a restart. Compare pack bytes and pid.
+- Task 8: logcat is saved but not scanned for FATAL EXCEPTION or Fatal signal; retry on `Could not find provider` is not recorded in report.json and could hide an intermittent startup crash.
+- Task 8: ensureStarted can throw from provider onCreate on a first-run disk failure; malformed manage payload surfaces raw serde text with no code.
+- Task 8: test_android_e2e `..._and_is_gone` never asserts gone; KILL_BOUND 0.2 s may flake.
+- Task 8: faultForTest JNI symbol ships in every library, reachable only through the shell gate; ARGUMENT_REQUIRED in hub.rs unregistered; tests/contracts.rs named in errors.rs header does not exist.
+- Task 8: the app was once killed by the low-memory killer on the 2 GB AVD between two calls (first `all` run); memory footprint needs a look on the owner's phone.
+- Task 9: JSONException from a malformed native reply escapes the coroutine and crashes (AppState.kt:456,482,511).
+- Task 9: burst error stays on a folder until the next burst, outranks real status (AppState.kt:391,510).
+- Task 9: storageLine walks filesDir every 10 s while showing (AppState.kt:521-528); ask Rust or compute on entry.
+- Task 9: a revoked peer puts its error on every folder, wrong with several PCs (Snapshot.kt:959,982); unreachable is true for any lane not Ready, so the strip can flash while connecting.
+- Task 9: rotation clears the endpoint field; Add a PC gives no message when nothing new is published; Pair again does not prefill the endpoint; Scan QR untested on the emulator.
+- Task 10: SyncCoordinator scope has no exception handler; a JSONException in a listing-triggered burst crashes the app. Same family as T9's JSONException note.
+- Task 10: lastListingBurstMs is global and check-then-set not atomic; Foreground reads newest lastSync across folders, skipping a new folder.
+- Task 10: periodic job scheduled only from MainActivity.onCreate; background burst replaces the error map with empty; pull-to-refresh spinner shows for background bursts; no unit coverage of SyncCoordinator; `results` unused in BurstsTest.
+- Task 11: 5x speed check runs only with --release; T20's final gate must run cargo test --release --test embedded.
+- Task 11: close reads hinted without taking it (engine.rs:897), so a concurrent read_ahead can double-unhint; TTL limits it.
+- Task 11: READ_AHEAD_FAILED not in README table (engine.rs:513); speed docstring says "took on the device" but times adb shell on the PC.
+- Task 11: rare 2 s reader stall in 2 of 11 plain runs, cause unconfirmed (hypothesis: busy controller skips a folder, pump sleeps until DEMAND_NOTIFY_EVERY).
+- Task 11: a hint batch asks only the first peer not at rest and a digest it omits is backed off; a reader's own fetch still asks all.
+- Task 12: held_by has no overall deadline (10 s per page), page.contains is O(n^2), no test of more than HAVE_BATCH digests; docs should say Err also means not confirmed.
+- Task 12: wire-level ARGUMENT_TOO_LARGE through PeerService untested; unpaired test only covers revoked-after-pairing.
+- Task 13: retry can wait for a fetch holding the publication lock when a waiting draft's manifest is absent (engine.rs:257, seal.rs:441-442); set next_retry after the call, return false from scratch_matches when the manifest is absent. Stalls, no loss.
+- Task 13: a failed whole-chunk write's bytes can read back behind a mid-chunk cut; zero the rest of the chunk in hydrate_base (working.rs:211-215). `w` whose truncate works and whose first write fails seals empty.
+- Task 13: a waiting draft keeps the watch thread polling about 10 times a second since its hint is refreshed every 5 s (seal.rs:373).
+- Task 13: FileProxy.kt:125-127 and design line 196 overclaim a killed client leaves the file as it was; client death runs onRelease.
+- Task 13: burst check's create debounce can carry the write; fsync check passes on a no-op onFsync; release-seal check passes via recovery; label at android_e2e.py:676 says I/O error while asserting OBJECT_MISSING.
+- Task 13: failed delete_tree skips sync_namespace and changed(); numberedName lowercase vs core char::to_lowercase on final sigma, 255-char clash fails INVALID_NAME; no test of create retry or two writers.
+- Task 13: a running draft that cannot seal still fails the sealer's whole batch and flush(None); predates this work.
+- Task 14: running() read outside the ledger lock in recover; kill between rename and ledger.done reports a saved file as failed; done(name) before finish(failed) can lose an earlier failure in a kill; catch(Throwable) reports already-saved names as failed; dismiss clears unseen notices.
+- Task 14: startForeground refusal can still end in ForegroundServiceDidNotStartInTimeException and a kill, reported at next start; end-bursts misses a burst queued in Bursts.request behind a running one.
+- Task 14: a user file starting with .tkfs-part- is hidden from listings; stopSelf race with a new onStartCommand; RuntimeException from onLocalChange kills the worker task; SecurityException branch dead for read-time failures; ShareActivity only catches IOException; text share shows "0 files" with no explanation; broad <queries> entry; unused import in MainActivity.
+- Task 14: Browse must skip PART_PREFIX.
+- Task 14: foreground and periodic triggers enqueuing the job tested at the gate only; share kill step needs a 448 MiB source, fails loudly if the copy wins.
+- Task 15: waiting can clear falsely in a narrow case: a push stops partway, the PC edits in place, and its event's manifest lists chunks only the phone has; walk says peer-origin, digests empty, row clears on exchange. Option: require any chunk of a peer-origin head that also belongs to this device's earlier content.
+- Task 15: a failed confirm can still show Synced before the first answer (Snapshot.kt:89, SyncCoordinator.kt:149-153); treat no answer as unknown.
+- Task 15: stale comments engine.rs:1187-1194, lib.rs:69; SQL strings with long space runs phone.rs:210,215,225; no phone-level test stopping mid-scan or confirming after a start-over.
+- Task 15: set_metered(False) runs for every scenario and fails on a device with no saved Wi-Fi; metered override reappearing after a reboot unexplained.
+- Task 15: directories, renames and deletes count as "files" in the line; objects.have costs up to about 1.1 MB per confirm per folder on metered networks; table lags the journal while the screen stays open on metered; no test of sent from A and held from B; metered scenario lacks a positive control.
+- Task 16: Native.stat runs before the 3 s reach and can wait on a cold process up to 15 s, so the 5 s open bound is shown warm only (TkfsProvider.kt:463-468); cold measured 4.9 s.
+- Task 16: partial presence recomputed per list, stat and open at one SQLite lookup per chunk; provider only needs wholeness.
+- Task 16: android_e2e.py:2112 check always True; PC_UNREACHABLE listed under app-only codes though the core raises it; ThumbnailsTest sampleSize assertion obscure; OpenNotices dedupes by bare name; share and ACTION_VIEW grants not exercised end to end.
+- Task 17: codeOf change makes bare all-caps text show twice in FailureNote; four new codes registered Transient by default though a refused resolution cannot succeed on retry; working stays true if syncNow throws non-IOException.
+- Task 17: file name taken from the first head, wrong in a rename conflict; a failed reload has no retry until back and re-enter; absent-version preview with the PC away has no timeout; f-string with no placeholders android_e2e.py:641; keep/preview state flow and delete-head path have no automated test.
+- Task 18: a corrupt live chunk no longer heals itself through closure; rewrite_segment fails without dropping the row, so that segment errors on every gc or evict until read (local.rs:642), desktop gc too; ObjectKind::Chunk arm in closure unreachable (core.rs:1469).
+- Task 18: orphan segments and unindexed copies after a kill are not reclaimed (local.rs:675); hydrate reports on the entry captured at start, so a moved head can report whole (engine.rs:1361,1372); a sync-before-collect test only checks afterwards (engine.rs:2764).
+- Task 19: pre-cut seal can publish another open writer's half-written bytes (FileProxy.kt:214), needs two writers at once, nothing lost.
+- Task 19: a download finishing below the floor runs no floor check; Free up space now does not re-evaluate kept files; marking below the floor shows the strip without freeing first; no test of a stop arriving during a real hydrate.
+- Task 19: freeing can fail when a segment rewrite no longer fits (under some tens of MiB free) and at exactly 0 bytes with database or disk is full; a ballast file or dropping wholly dead segments first would help.
+- Task 19: any successful flush resets seal backoff; a pre-cut seal triggers no burst if its replacement fails; free_files and remove_download keep plain evict, with a re-download at worst.
+- Task 19: ForegroundServiceDidNotStartInTimeException crash seen once in ui_browse; cause unconfirmed (suspected WorkManager race after a kill). Likely fix: a short delay before a job's first setForeground.
+- Task 19: oldest-first is per folder; a bad manifest stops a folder's freeing; opened rows never pruned; Native.opened does one FULL commit per open; "write fails, not its seal" path has no e2e, keep one wa case; space scenario records some answers unconditionally.
+- Task 20: reinstall's "install ended the running app" check passes when installed is None; freeze scenario does not re-check frozen after the 30 s sleep; read handle across a freeze not exercised and not stated in docs/ANDROID.md; Diagnostics backstop only knows 64 contiguous hex digits; Resync can be tapped repeatedly.
+- Task 21: README.md:274,344 advice names only an older peer, not an adopted worker; stale docs push.rs:68-70, sync.rs:489; test name network.rs:2388 over-claims; remove_reverse failure in finally masks the scenario's failure (android_e2e.py:464); decoder can build many empty objects before OBJECT_BATCH refuses (sync.rs:110).
+- Task 21: flaky invariants::sealing_releases_scratch_before_durability_and_recovers_a_concurrent_truncate, a test problem present on the base too (2-4 of 25). The match's `_` arm keeps the guard across the 1 ms sleep, starving the sealer; one-hunk fix verified 0 of 100.
+- Final: item 7, a store held past about 20 s still gets its worker killed (watch calls blocked on the store fill the 4 control handlers, so hello queues and times out; reproduced at 21 s and 24 s; the 8-segment evict cap works, Engine::collect is uncapped) — Ruling: real and deferred; the final wave is one pass, no second wave; a kill costs a worker restart and fails an open writer's call, drafts recover and nothing is lost; measure on the phone and fix by answering hello on the I/O thread with a ceiling for a truly hung store — cost if wrong: on a phone with many dead segments, freeing could restart the worker and interrupt a save in progress.
+- Final: stale Low on space reason can outlast the PC's return by up to an hour (SyncCoordinator.kt:201-209); Sync now pressed during an automatic Full burst is dropped, so a metered flip ends it (Burst.kt:120,124,147); crash scan misses a crash during PC stop and dump-then-clear gaps (android_e2e.py:2384,2392); a read error also drops a row in rewrite_segment (local.rs:681-685); design.md:400 overclaims; refused comment stale (engine.rs:1349); docs/ANDROID.md:76 omits that Sync now moves files on metered; ShareActivity catches only IOException on native replies; docs/revamp/notes still describe HMAC.
+
+## Rulings made during the build
+
+- Ruling: R1 T1 removes the BACKGROUND_PREFETCH use from android/native/src/lib.rs and adds sync_profile = "passive" to the spike Native.kt config, so the spike app keeps its behaviour until T8 — the plan's Step 6 needs it to build — cost if wrong: none, the code is deleted in T8.
+- Ruling: R2 T20 reads the worker instance from `inspect` if `status` does not carry it — the check needs the id, not a particular action — cost if wrong: one extra manage call.
+- Ruling: R3 T20 runs only suites that do not pass --mount, checking with grep first, and reports any it skips — AGENTS.md outranks the plan's list — cost if wrong: one suite unrun, reported.
+- Ruling: R4 Work in place on branch android-client, no worktree — EnterWorktree is reserved for an explicit worktree request, the user did not ask for one, and the existing caches save long rebuilds. The owner was told not to switch branches here meanwhile — cost if wrong: an outside checkout switch would disturb a running task, recoverable from git.
+- Ruling: R5 Execution by subagents without a separate plan-review stop — the owner said to build now and chose subagents for the previous plan — cost if wrong: the owner reads the plan after the fact and rework follows.
+- Task 3: Ruling: clocks move forward by the gap, not to now — a plan-mandated reset would let repeated short thaws hide a silent remote peer, and the spec needs both a harmless thaw and a detected peer — cost if wrong: a loopback session could die if more than dead_after of counted silence precedes a freeze, which heartbeats prevent.
+- Task 3: Ruling: the stall rule applies on desktop too — a stopped thread is no evidence about its peer, and it is the rule desktop tests exercise. A desktop waking from sleep may wait up to 20 s to notice a gone peer instead of redialing at once, though a queued heartbeat usually gets a reset sooner — cost if wrong: a slightly slower reconnect after sleep, against the "active dialers behave exactly as today" constraint; revert by gating on a ConnOptions flag.
+- Task 4: Ruling: spec updated to the stricter durable-exchange rules the implementer added (listener syncs when its reply hands out events; dialer re-applies its own page; top read before apply) — the reviewer traced each as necessary to keep a saved cursor from passing non-durable events — cost if wrong: extra checkpoints per page on a first sync.
+- Task 8: Ruling: keep the debug-only path-permission on ACCESS_CONTENT_PROVIDERS_EXTERNALLY so adb shell content reaches the provider — the plan's premise (shell holds MANAGE_DOCUMENTS) was false on this image, the permission is signature level and held by the shell, and debug is what the phone gets in v1 — cost if wrong: on a debug install, only the shell and platform-signed callers gain provider access, and USB debugging must already be authorized.
+- Task 8: Ruling: T20's freeze bound becomes 120 s, not 60 s — wait_frozen measured about 71 s here — cost if wrong: a slower failing test.
+- Task 8: Ruling: stay on the owner's AVD Medium_Phone_API_36.0 as the approved design says, always cold-booting with -no-snapshot — cost if wrong: the AVD keeps the app and harness leftovers until cleaned, and a quick boot loses the adb authorization.
+- Task 8: Ruling: split the harness into scripts/android_e2e_lib.py (helpers) and scripts/android_e2e.py (CLI, scenarios) before ten more scenarios arrive — reviewer's size note, cheap now — cost if wrong: one more file than the plan named.
+- Task 9: Ruling: "Not synced yet" comes before "PC unreachable" in folderLine, against the brief's order — "Synced at <time>" needs a time — cost if wrong: none visible.
+- Task 10: warning resolved: notifyChange on the bare authority URI reaches registered descendants by ContentService's collect-under-final-node rule; no ContentObserver test observes it. Ruling: accept, and T16's ui_browse or T20 may observe it live — cost if wrong: an open Files window does not refresh until re-entered.
+- Task 11: Ruling: hurried keeps the 3 s cap when another peer exists and gives a lone PC its full deadline, adjusting the plan's rule — the design requires this only for a phone with one PC, and the plan's rule let a hung peer use up a reader's wait — cost if wrong: a slow peer holding the only copy, among two or more peers, keeps today's cap.
+- Task 11: Ruling: speed scenario leaves --scenario all, still runs by name against the unchanged 10 MiB/s bound; new Task 21 (binary object bodies) added after Task 20 — objects travel as JSON number arrays at 3.57 wire bytes per byte, capping the emulator network at about 2.7 MiB/s and an unlimited link at about 8.4 MiB/s; the owner's rule is performance last — cost if wrong: first reads stay under target until Task 21 lands; if Task 21 stalls, the target goes to the owner as unmet.
+- Task 13: Ruling: `rw` open of a file with no local manifest fails at the open with OBJECT_MISSING, not at the write as the brief said — the manifest is needed to open it, the file stays unchanged either way, design note added — cost if wrong: a less precise error for the writer.
+- Task 13: Ruling: a kill partway through a `w` copy publishes the bytes so far over the old file, with the old version kept as its parent in history — recovery cannot tell a kill from a closed writer whose release has not run, and refusing would lose finished writes — cost if wrong: a rare partly written file on a force-stop or crash mid-overwrite; to be told to the owner.
+- Task 14: Ruling: added a small core action `end-bursts`, not in the plan, so a stopped job's burst stops carrying bytes on a metered network — the design's anti-goal is spending mobile data without permission — cost if wrong: one more manage action.
+- Task 14: Ruling: share outcomes persist and show as a strip on Folders, with `.tkfs-part-*` hidden from listings and swept through the engine — notifications may be denied and a kill loses the grant, so reporting replaces resuming — cost if wrong: a re-share is needed after a kill.
+- Task 18: Ruling: evict rewrites only segments holding a digest it was asked to remove, plus segments needing no copy, instead of the plan's collect(&live, 1.0) — freeing a small file must not copy the whole store under the pack lock on a nearly full disk — cost if wrong: other dead objects wait for gc.
+- Task 18: Ruling: deleted files' bytes are freed first by T19, and need no peer confirmation when the delete is the only head — the owner chose "Delete everywhere", and otherwise those bytes could never leave the phone, while conflicts stay protected — cost if wrong: an unsent file deleted on the phone cannot be restored from the phone's history, which has no restore screen anyway; this narrows the design's "anything no peer has just confirmed holding", so tell the owner.
+- Task 19: Ruling: a failing seal backs off 1 to 5 s on every platform, not just Android — this task makes a full disk a supported state, and the retry holds the locks freeing needs; a failed seal is rare on desktop and explicit flush still seals at once — cost if wrong: a desktop draft whose seal failed retries a little later.
+- Task 19: Ruling: accept the write scenario's change to expect PC_UNREACHABLE at open — rw now fails fast through reachPeer, Task 16's bound — cost if wrong: the "write fails, not its seal" path loses end-to-end coverage (deferred minor).
+- Task 21: Ruling: speed gates on the app's own limit, measured dialing through adb reverse, and also reports the emulator-network rate — that network carries only 8.4 to 10.2 MiB/s raw, so a 10 MiB/s bound over it measures the emulator, not the app; real Wi-Fi is for the owner's phone — cost if wrong: the design's Wi-Fi target stays unmeasured until the phone step, which docs must say.
+- Final: Ruling: reverse the T13 ruling: a replacement killed before it sealed recovers as `name (recovered).ext`, keeping the original — the final reviewer showed the old version has no single-file restore — cost if wrong: a finished write whose release never ran also lands under the recovered name, with nothing lost.
+- Final: Ruling: the 10% floor stays as approved, but automatic freeing skips files opened in the last 24 hours, a Low on space strip shows below the floor, and the check runs at most hourly unless free space moves 100 MiB — otherwise a phone full of other apps empties its downloads repeatedly and silently — cost if wrong: a little less freed automatically.
+- Final: Ruling: a network callback ends bursts and drops queued Full bursts when the network turns metered with sync off — mobile-data anti-goal — cost if wrong: an in-flight call still finishes.
+- Final: Ruling: ws:// gets a doc warning and a Settings note, with no protocol change — an existing transport decision, phone-specific risk surfaced to the owner — cost if wrong: credential exposure on a hostile network until the owner uses a VPN or wss.
+- Final: Ruling: history rewrite of c21d0bfb stays with the owner; it blocks merging to master, not this work.
+- Final: Ruling: T15's narrow false "sent" stays, documented — freeing re-asks per digest and the next Full burst pushes what the PC wants, so only the line is briefly wrong — cost if wrong: a brief false "Synced" in a narrow race.
+- Final: parked — item 7, a store held past about 20 s still gets its worker killed (watch calls blocked on the store fill the 4 control handlers, so hello queues and times out; reproduced at 21 s and 24 s; the 8-segment evict cap works, Engine::collect is uncapped) — Ruling: real and deferred; the final wave is one pass, no second wave; a kill costs a worker restart and fails an open writer's call, drafts recover and nothing is lost; measure on the phone and fix by answering hello on the I/O thread with a ceiling for a truly hung store — cost if wrong: on a phone with many dead segments, freeing could restart the worker and interrupt a save in progress.
