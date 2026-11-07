@@ -2484,7 +2484,7 @@ mod tests {
         f.write("/two", &distinct(2, CHUNKS));
         f.on_the_pc(&["/one", "/two"]);
         let now = 10 * RECENTLY_OPENED_MS;
-        f.phone.opened(FOLDER, &f.id("/one"), now).unwrap();
+        f.phone.opened(FOLDER, &f.id("/one"), now - 1).unwrap();
         f.phone.opened(FOLDER, &f.id("/two"), now).unwrap();
         f.free(FILE_BYTES);
         assert_eq!(f.here("/one"), 0);
