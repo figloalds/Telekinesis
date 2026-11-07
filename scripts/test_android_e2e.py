@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, call, patch
 
 import android_e2e
 from android_e2e_lib import (Completed, ContentError, Device, Emulator, GiveUp, HarnessError, ManageError, PcHost, Proc, Report,
-                             Session, bounds_center, children_uri, document_uri, emulator_processes, encode_payload,
+                             Session, bounds_center, children_uri, crashes_in, document_uri, emulator_processes, encode_payload,
                              is_frozen, parse_call, parse_df_available, parse_rows, png_noise, poll, run_bounded, shell_line, size_text, split_qr,
                              watched_processes, with_parents)
 
@@ -377,15 +377,122 @@ class StoppingTheEmulator(unittest.TestCase):
             self.assertEqual(self.emulator.stop(), [])
 
 
+# What an API 36 emulator logs for each, at threadtime.
+OWN_EXCEPTION = """11-06 23:53:49.792  6752  6752 E AndroidRuntime: FATAL EXCEPTION: main
+11-06 23:53:49.792  6752  6752 E AndroidRuntime: Process: dev.tkfs, PID: 6752
+11-06 23:53:49.792  6752  6752 E AndroidRuntime: android.app.RemoteServiceException: did not then call Service.startForeground()
+11-06 23:53:49.792  6752  6752 E AndroidRuntime: 	at android.app.ActivityThread.generateForegroundServiceDidNotStartInTimeException(ActivityThread.java:2391)
+"""
+OTHER_EXCEPTION = """11-06 23:53:49.792  6752  6752 E AndroidRuntime: FATAL EXCEPTION: main
+11-06 23:53:49.792  6752  6752 E AndroidRuntime: Process: com.android.other, PID: 6752
+11-06 23:53:49.792  6752  6752 E AndroidRuntime: java.lang.IllegalStateException: not ours
+"""
+OWN_SIGNAL = "11-06 23:53:49.792  6752  6790 F libc    : Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR), fault addr 0x0 in tid 6790 (tkfs-sealer), pid 6752 (dev.tkfs)\n"
+OTHER_SIGNAL = "11-06 23:53:49.792  6752  6790 F libc    : Fatal signal 6 (SIGABRT), code -1 (SI_QUEUE) in tid 6790 (x), pid 6752 (dev.tkfs.other)\n"
+QUIET = "11-06 23:53:49.792  6752  6752 I tkfs    : transfer: foreground\n"
+
+
+class FindingCrashes(unittest.TestCase):
+    def test_an_uncaught_exception_of_the_app_is_one(self):
+        found = crashes_in(QUIET + OWN_EXCEPTION + QUIET)
+        self.assertEqual(len(found), 1)
+        self.assertIn("did not then call Service.startForeground()", found[0])
+
+    def test_a_fatal_signal_of_the_app_is_one(self):
+        self.assertEqual(len(crashes_in(QUIET + OWN_SIGNAL)), 1)
+
+    def test_those_of_other_processes_are_not(self):
+        self.assertEqual(crashes_in(OTHER_EXCEPTION + OTHER_SIGNAL + QUIET), [])
+
+    def test_each_counts(self):
+        self.assertEqual(len(crashes_in(OWN_EXCEPTION + OWN_SIGNAL + OWN_EXCEPTION)), 3)
+
+    def test_a_dump_that_ends_on_the_first_line_still_says_so(self):
+        self.assertEqual(len(crashes_in(OWN_EXCEPTION.splitlines()[0])), 0, "it does not say whose it is")
+        self.assertEqual(len(crashes_in("\n".join(OWN_EXCEPTION.splitlines()[:2]))), 1)
+
+
+class KeepingLogcat(unittest.TestCase):
+    def device(self, *dumps):
+        device = Device(Path("adb"), "emulator-5554")
+        answers = iter(dumps)
+
+        def adb(*args, **_):
+            return Completed([], 0, next(answers).encode() if "-d" in args else b"", b"")
+
+        device.adb = adb
+        return device
+
+    def test_what_a_scenario_clears_still_counts(self):
+        device = self.device(OWN_EXCEPTION, QUIET)
+        device.start_logcat()
+        device.clear_logcat()
+        with tempfile.TemporaryDirectory(prefix="tkfs-e2e-test-") as temp:
+            log = Path(temp) / "logcat.txt"
+            logged = device.append_logcat(log, "x")
+            self.assertEqual(len(crashes_in(logged)), 1)
+            self.assertIn("FATAL EXCEPTION", log.read_text())
+
+    def test_what_came_before_a_scenario_does_not(self):
+        device = self.device(OWN_EXCEPTION, QUIET)
+        device.clear_logcat()
+        device.start_logcat()
+        with tempfile.TemporaryDirectory(prefix="tkfs-e2e-test-") as temp:
+            self.assertEqual(crashes_in(device.append_logcat(Path(temp) / "logcat.txt", "x")), [])
+
+
+class RetryingTheProvider(unittest.TestCase):
+    def test_a_retry_is_on_record_and_taken_once(self):
+        device = Device(Path("adb"), "emulator-5554")
+        answers = iter([Completed([], 0, b"", b"Could not find provider"), Completed([], 0, b"Result: done", b"")])
+        device.adb = lambda *_, **__: next(answers)
+        with patch("android_e2e_lib.PROVIDER_RETRY", 0), patch("builtins.print"):
+            self.assertEqual(device.call_method("tkfs.fault"), "Result: done")
+        taken = device.take_retries()
+        self.assertEqual(len(taken), 1)
+        self.assertIn("tkfs.fault", taken[0])
+        self.assertEqual(device.take_retries(), [])
+
+    def test_no_retry_is_none_on_record(self):
+        device = Device(Path("adb"), "emulator-5554")
+        device.adb = lambda *_, **__: Completed([], 0, b"Result: done", b"")
+        device.call_method("tkfs.fault")
+        self.assertEqual(device.take_retries(), [])
+
+
 class RunningAScenario(unittest.TestCase):
-    def run_one(self, stop):
+    def run_one(self, stop=None, logcat="", retries=(), provoked=None):
+        stop = [([], "1 process(es) ran, none left")] if stop is None else stop
+        device = MagicMock()
+        device.append_logcat.return_value = logcat
+        device.take_retries.return_value = list(retries)
         with tempfile.TemporaryDirectory(prefix="tkfs-e2e-test-") as temp:
             report = Report(Path(temp), {})
             with (patch.dict(android_e2e.SCENARIOS, {"x": lambda s: s.check("ran", True)}),
+                  patch.dict(android_e2e.PROVOKED_CRASHES, provoked or {}),
                   patch.object(PcHost, "start"), patch.object(Session, "check_pairing_qr"),
                   patch.object(PcHost, "stop", side_effect=stop), patch("builtins.print")):
-                android_e2e.run_scenario("x", MagicMock(), report, Path(temp), reset=True)
+                android_e2e.run_scenario("x", device, report, Path(temp), reset=True)
             return report.data["scenarios"][0]
+
+    def test_a_crash_in_its_logcat_fails_it(self):
+        scenario = self.run_one(logcat=QUIET + OWN_EXCEPTION)
+        self.assertEqual(scenario["status"], "fail")
+        crash = next(check for check in scenario["checks"] if check["name"] == "the app did not crash")
+        self.assertEqual(crash["status"], "fail")
+        self.assertIn("startForeground", crash["detail"])
+
+    def test_a_crash_of_another_process_does_not(self):
+        self.assertEqual(self.run_one(logcat=OTHER_EXCEPTION)["status"], "pass")
+
+    def test_a_crash_it_provokes_itself_does_not(self):
+        scenario = self.run_one(logcat=OWN_SIGNAL, provoked={"x": ["SIGSEGV"]})
+        self.assertEqual(scenario["status"], "pass")
+        self.assertEqual(self.run_one(logcat=OWN_EXCEPTION, provoked={"x": ["SIGSEGV"]})["status"], "fail")
+
+    def test_its_retries_are_in_the_report(self):
+        self.assertEqual(self.run_one(retries=["content call"])["retries"], ["content call"])
+        self.assertEqual(self.run_one()["retries"], [])
 
     def test_a_crash_while_stopping_the_pc_still_ends_the_scenario_as_failed(self):
         scenario = self.run_one(ValueError("not JSON"))
@@ -394,7 +501,7 @@ class RunningAScenario(unittest.TestCase):
         self.assertIn("not JSON", scenario["checks"][-1]["detail"])
 
     def test_a_clean_run_passes(self):
-        scenario = self.run_one([([], "1 process(es) ran, none left")])
+        scenario = self.run_one()
         self.assertEqual(scenario["status"], "pass")
 
 

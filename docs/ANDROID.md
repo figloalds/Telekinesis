@@ -108,7 +108,9 @@ orchestrator on this PC. It never mounts anything, every wait is bounded, and a 
 is a failure. `--scenario all` builds, boots the AVD and runs every scenario. The freeze scenario
 alone waits over two minutes for Android to freeze the app. Each run writes
 `test-runs/android-e2e/<UTC>/` with `report.json`, `logcat.txt` and each scenario's orchestrator
-home. The harness's own tests are `python -m unittest test_android_e2e`, run from `scripts/`.
+home. A crash of the app in a scenario's logcat fails that scenario, and what the harness tried again
+is under its `retries` in `report.json`. The harness's own tests are `python -m unittest
+test_android_e2e`, run from `scripts/`.
 
 The `speed` scenario reads a new 64 MiB random file from a release-built PC, by two roads. Through
 `adb reverse` a first read must reach 10 MiB/s: that leaves out the emulator's network, so it comes

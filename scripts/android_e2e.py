@@ -8,7 +8,8 @@ It drives the app from outside with adb: `content` reaches the provider, and `co
 with method tkfs.manage reaches the orchestrator inside it (debug builds only). It never
 mounts anything. Every wait is bounded, and a process left behind is a failure. Each run writes
 test-runs/android-e2e/<UTC>/: report.json, logcat.txt, the build and emulator logs and each
-scenario's orchestrator home.
+scenario's orchestrator home. A crash of the app in its logcat fails a scenario, unless the scenario
+provoked it (PROVOKED_CRASHES), and what was tried again is under its `retries` in the report.
 
 This file holds the command line and the scenarios; android_e2e_lib.py holds what they work
 with. To add a scenario, write `def scenario_name(s: Session)` and list it in SCENARIOS, which
@@ -33,7 +34,7 @@ from typing import Callable
 
 from android_e2e_lib import (ADB_BOUND, BUILD_BOUND, CONTROL_URI, DEFAULT_AVD, DIRECTORY_MIME, FOLDER_READY_BOUND, PACKAGE, ROOT, ROOTS_URI,
                              ContentError, Device, Emulator, Folder, HarnessError, ManageError, PcHost, Report,
-                             Session, SYNC_BOUND, UI_BOUND, children_uri, document_uri, png_noise, poll, run_bounded, sha256,
+                             Session, SYNC_BOUND, UI_BOUND, children_uri, crashes_in, document_uri, png_noise, poll, run_bounded, sha256,
                              bounds_center, size_text, with_parents)
 from build_android import APK, find_sdk
 
@@ -2237,6 +2238,9 @@ SCENARIOS: dict[str, Callable[[Session], None]] = {
     "speed": scenario_speed,
 }
 
+# Crashes of the app that a scenario causes on purpose, by something in their text. So far, none does.
+PROVOKED_CRASHES: dict[str, list[str]] = {}
+
 # A debug PC spends its time on its own hashing and copying, so these would measure that.
 RELEASE_PC_SCENARIOS = {"speed"}
 
@@ -2281,7 +2285,7 @@ def run_scenario(name: str, device: Device, report: Report, run_dir: Path, reset
     pc = PcHost(tkfs_binary(uses_release_pc(name, release_pc)), run_dir / name)
     error = None
     try:
-        device.clear_logcat()
+        device.start_logcat()
         if reset:
             device.reset_app()
         # `metered` leaves the system's own judgment of the network in place; an earlier run that was
@@ -2297,9 +2301,13 @@ def run_scenario(name: str, device: Device, report: Report, run_dir: Path, reset
         error = traceback.format_exc()
     finally:
         try:
-            device.append_logcat(run_dir / "logcat.txt", name)
+            logged = device.append_logcat(run_dir / "logcat.txt", name)
+            crashes = [crash for crash in crashes_in(logged)
+                       if not any(text in crash for text in PROVOKED_CRASHES.get(name, []))]
+            report.record("the app did not crash", not crashes, "; ".join(crashes))
         except Exception as failure:
             report.fail(f"logcat: {failure}")
+        report.scenario["retries"] = device.take_retries()
         try:
             failures, summary = pc.stop()
         except Exception as failure:

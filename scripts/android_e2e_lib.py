@@ -320,11 +320,28 @@ def sha256(data: bytes) -> str:
 # ---- the phone ----------------------------------------------------------------------------
 
 
+def crashes_in(logcat: str, package: str = PACKAGE) -> list[str]:
+    """The crashes of `package` in a logcat dump: an uncaught exception, whose first lines say whose
+    it is and what it was, and a native one, whose own line does. Other processes' are not its."""
+    lines = logcat.splitlines()
+    found = []
+    for at, line in enumerate(lines):
+        if "FATAL EXCEPTION" in line:
+            if f"Process: {package}," in "".join(lines[at + 1:at + 2]):
+                found.append(" ".join(text.split(": ", 1)[-1].strip() for text in lines[at:at + 3]))
+        elif "Fatal signal" in line and f"({package})" in line:
+            found.append(line.strip())
+    return found
+
+
 class Device:
     """One emulator through adb."""
 
     def __init__(self, adb: Path, serial: str):
         self.adb_path, self.serial = adb, serial
+        # What a scenario cleared of logcat so far, for its log and for finding crashes.
+        self.cleared_logcat: list[bytes] = []
+        self.retries: list[str] = []
 
     def adb(self, *args, bound: float = ADB_BOUND) -> Completed:
         return run_bounded([self.adb_path, "-s", self.serial, *args], bound)
@@ -389,7 +406,13 @@ class Device:
             if "Could not find provider" not in done.err + done.out or time.monotonic() >= end:
                 return done
             print(f"  ({self.serial}: Android could not start the provider; trying again)", flush=True)
+            self.retries.append(f"Android could not start the provider for: {line[:200]}")
             time.sleep(PROVIDER_RETRY)
+
+    def take_retries(self) -> list[str]:
+        """What was tried again since the last time this was asked."""
+        taken, self.retries = self.retries, []
+        return taken
 
     def _content(self, *words, bound: float = PROVIDER_BOUND) -> Completed:
         """`content` exits 0 after a provider's failure and says so in its output."""
@@ -772,18 +795,27 @@ class Device:
                            "-exec", "stat", "-c", "%s", "{}", "+").require_success()
         return sum(int(size) for size in found.out.split())
 
+    def start_logcat(self) -> None:
+        """A scenario begins: what logcat holds now is no part of it."""
+        self.cleared_logcat.clear()
+        self.adb("logcat", "-c")
+
     def clear_logcat(self) -> None:
+        """`provider_log` and its like start over. The scenario's log still has what they no longer see."""
+        self.cleared_logcat.append(self.adb("logcat", "-d", "-v", "threadtime").stdout)
         self.adb("logcat", "-c")
 
     def logged_errors(self, tag: str) -> str:
         """What `tag` has logged at error level since the last `clear_logcat`."""
         return self.adb("logcat", "-d", "-s", f"{tag}:E").require_success().out
 
-    def append_logcat(self, path: Path, title: str) -> None:
-        dump = self.adb("logcat", "-d", "-v", "threadtime")
+    def append_logcat(self, path: Path, title: str) -> str:
+        """Saves all a scenario logged, and returns it."""
+        whole = b"".join([*self.cleared_logcat, self.adb("logcat", "-d", "-v", "threadtime").stdout])
         with open(path, "ab") as log:
             log.write(f"\n===== {title} =====\n".encode())
-            log.write(dump.stdout)
+            log.write(whole)
+        return whole.decode("utf-8", errors="replace")
 
 
 class Emulator:
