@@ -127,12 +127,11 @@ class BurstsTest {
     }
 
     @Test fun aMalformedReplyIsABurstThatFailed() {
-        val garbled = reportOf { BurstResult.parse("not json", emptyMap()) }
-        assertTrue(garbled.failure!!, garbled.failure!!.startsWith("UNREADABLE_REPLY"))
+        assertEquals(UNREADABLE_BURST, reportOf { BurstResult.parse("not json", emptyMap()) }.failure)
         val wrongShape = reportOf { BurstResult.parse("""{"folders": [{"exchanged": 1}]}""", emptyMap()) }
-        assertTrue(wrongShape.failure!!.startsWith("UNREADABLE_REPLY"))
+        assertEquals(UNREADABLE_BURST, wrongShape.failure)
         assertEquals("BOOM: x", reportOf { throw java.io.IOException("BOOM: x") }.failure)
-        assertTrue(reportOf { throw IllegalStateException("x") }.failure!!.startsWith("UNREADABLE_REPLY"))
+        assertEquals(UNREADABLE_BURST, reportOf { throw IllegalStateException("x") }.failure)
         assertNull(reportOf { BurstResult() }.failure)
     }
 

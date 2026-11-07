@@ -77,7 +77,9 @@ pin a PC yet: with `wss://` the phone checks the proxy's certificate against the
   open still download.
 - Background check: every 15, 30, 60 or 120 minutes, and only with a network. Android runs a
   periodic job no more often than every 15 minutes.
-- Keep this much free, with Free up space now; Battery, with a way to allow background running.
+- Keep this much free, with Free up space now; Battery, with a way to allow background running. When
+  space runs low the app frees what the PC holds by itself, at most once an hour, and leaves what you
+  opened in the last day. Free up space now and Remove download do not leave those.
 - Each PC, with Change address and Unpair.
 - Diagnostics. Copy puts the state of each PC and folder, and the errors still showing, on the
   clipboard; it holds no pairing code or credential. Resync from the start makes every folder check
@@ -93,6 +95,9 @@ pin a PC yet: with `wss://` the phone checks the proxy's certificate against the
 - One address per PC. If a PC has two, pick the one the phone can reach with Change address.
 - With the PC away nothing leaves the phone. What you save waits, the Folders screen says so, and it
   goes when the PC is back. Opening a file that was never downloaded needs the PC.
+- If this app is killed while another app is overwriting a file, the file stays as it was and what
+  had been written is saved beside it as `name (recovered).ext`, and syncs like any file. If the other
+  app is what dies, Android reports that as a close, so what it wrote becomes the file.
 
 ## Running the tests
 

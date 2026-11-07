@@ -202,6 +202,8 @@ object SyncCoordinator {
             free(app, unasked = true)
             val after = StatFs(app.filesDir.path)
             val stillLow = spaceNeeded(after.availableBytes, after.totalBytes) > 0
+            // Whether or not it could ask anyone: this goes by the volume.
+            belowFloor.value = stillLow
             settings.floorChecked = if (stillLow) FloorChecked(now, after.availableBytes) else null
         } else {
             belowFloor.value = true

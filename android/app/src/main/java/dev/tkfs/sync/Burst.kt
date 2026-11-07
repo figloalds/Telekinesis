@@ -75,10 +75,12 @@ internal fun reportOf(ask: () -> BurstResult): BurstResult = try {
 } catch (error: IOException) {
     BurstResult(failure = error.message ?: "The burst failed.")
 } catch (error: JSONException) {
-    BurstResult(failure = "UNREADABLE_REPLY: ${error.message}")
+    BurstResult(failure = UNREADABLE_BURST)
 } catch (error: RuntimeException) {
-    BurstResult(failure = "UNREADABLE_REPLY: ${error.javaClass.simpleName}: ${error.message}")
+    BurstResult(failure = UNREADABLE_BURST)
 }
+
+internal const val UNREADABLE_BURST = "The app could not read the answer to a sync."
 
 /**
  * Where the app's background work runs: nothing that fails there takes the others with it or, as an

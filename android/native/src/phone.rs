@@ -186,6 +186,7 @@ impl Phone {
         })
     }
 
+    #[cfg(test)]
     pub fn with_budget(mut self, budget: Budget) -> Phone {
         self.budget = budget;
         self
@@ -198,6 +199,7 @@ impl Phone {
     }
 
     /// Takes all of this device's events since the last scan into the table.
+    #[cfg(test)]
     pub fn scan(&self, folder: &str, engine: &Engine) -> Result<()> {
         self.scan_until(folder, engine, Instant::now() + Duration::from_secs(86_400))?;
         Ok(())
@@ -352,6 +354,7 @@ impl Phone {
     }
 
     /// [`Self::confirm_on`] on a network whose cost does not count.
+    #[cfg(test)]
     pub fn confirm(
         &self,
         folder: &str,
@@ -1435,7 +1438,7 @@ mod tests {
         );
 
         let mut failure = None;
-        evict_in_turns(|| Err(anyhow::anyhow!("NO_ROOM")), far, &mut failure);
+        evict_in_turns(|| Err(anyhow::anyhow!("no room")), far, &mut failure);
         assert!(failure.is_some());
     }
 

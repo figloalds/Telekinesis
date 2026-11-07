@@ -2280,7 +2280,7 @@ fn replacing_a_file_never_downloaded_asks_for_nothing() -> Result<()> {
     Ok(())
 }
 
-//// The same, dying before the seal, for a new file shorter than, as long as and longer than the
+/// The same, dying before the seal, for a new file shorter than, as long as and longer than the
 /// old one, and when the draft's timestamp cannot tell it from a clean one. Nothing says its writer
 /// finished, so what it wrote goes beside the file, which stays as it was.
 #[test]
