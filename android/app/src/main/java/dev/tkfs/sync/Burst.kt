@@ -1,8 +1,14 @@
 package dev.tkfs.sync
 
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import org.json.JSONException
 import org.json.JSONObject
+import java.io.IOException
 
 /**
  * The error a burst gave one folder. It stays on the folder until the folder reports an
@@ -59,6 +65,27 @@ data class BurstResult(
         }
     }
 }
+
+/**
+ * What a burst reports, whatever comes of asking for it. This runs in the background, so a reply that
+ * cannot be read or anything else that goes wrong with it is a burst that failed, and goes no further.
+ */
+internal fun reportOf(ask: () -> BurstResult): BurstResult = try {
+    ask()
+} catch (error: IOException) {
+    BurstResult(failure = error.message ?: "The burst failed.")
+} catch (error: JSONException) {
+    BurstResult(failure = "UNREADABLE_REPLY: ${error.message}")
+} catch (error: RuntimeException) {
+    BurstResult(failure = "UNREADABLE_REPLY: ${error.javaClass.simpleName}: ${error.message}")
+}
+
+/**
+ * Where the app's background work runs: nothing that fails there takes the others with it or, as an
+ * uncaught exception would in the background, the whole app.
+ */
+internal fun backgroundScope(uncaught: (Throwable) -> Unit): CoroutineScope =
+    CoroutineScope(SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, error -> uncaught(error) })
 
 /**
  * At most one app-driven burst at a time. A request that wants nothing more than the running

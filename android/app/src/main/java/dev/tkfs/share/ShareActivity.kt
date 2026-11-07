@@ -3,6 +3,7 @@ package dev.tkfs.share
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.core.content.IntentCompat
@@ -57,7 +58,14 @@ private data class Target(val id: String, val label: String)
 class ShareActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val uris = sharedUris(intent)
+        val shared = sharedUris(intent)
+        val uris = shared.filter { isShareableScheme(it.scheme) }
+        if (uris.size < shared.size) Log.w("tkfs", "share: refused ${shared.size - uris.size} that were not content streams")
+        if (shared.isNotEmpty() && uris.isEmpty()) {
+            Toast.makeText(this, "Telekinesis cannot read what was shared.", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        }
         val mimeTypes = sharedMimeTypes(intent, uris)
         val source = referrerLabel()
         // Taken now: a file that goes away before Save still has a name to be told of.

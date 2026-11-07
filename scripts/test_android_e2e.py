@@ -505,6 +505,19 @@ class RunningAScenario(unittest.TestCase):
         self.assertEqual(scenario["status"], "pass")
 
 
+class TheSpeedScenario(unittest.TestCase):
+    def test_a_reverse_that_will_not_go_does_not_hide_what_ended_it(self):
+        session = MagicMock()
+        session.device.remove_reverse.side_effect = HarnessError("adb: no such reverse")
+        ended = HarnessError("the first read failed")
+        with (patch.object(android_e2e, "first_read_rate", side_effect=[(1.0, "normal"), ended]),
+              patch.object(android_e2e, "poll"), patch.object(android_e2e.random, "Random")):
+            with self.assertRaises(HarnessError) as raised:
+                android_e2e.scenario_speed(session)
+        self.assertIs(raised.exception, ended)
+        session.report.record.assert_called_once_with("the adb reverse is removed", False, "adb: no such reverse")
+
+
 class ReadingOnAFullDisk(unittest.TestCase):
     def refused(self, digest=None, error=None):
         device = MagicMock()

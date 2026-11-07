@@ -1,6 +1,7 @@
 package dev.tkfs.ui
 
 import dev.tkfs.sync.BurstError
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -8,6 +9,36 @@ import org.junit.Test
 
 /** The shapes `status` really sends: `folder_entry` and `Network::peers`, as seen in ui_folders. */
 class SnapshotTest {
+    private fun pairing(remoteList: String, held: Set<String> = emptySet()) = runBlocking {
+        pairWith("ws://pc", "code", held) { action, _ ->
+            when (action) {
+                "pair" -> "{}"
+                "remote-list" -> remoteList
+                else -> error(action)
+            }
+        }
+    }
+
+    @Test fun pairingOffersWhatIsNotHereYet() {
+        val published = """[{"repo": "a", "label": "A"}, {"repo": "b", "label": "B"}]"""
+        assertEquals(PairingEnd.Choose(listOf(Published("b", "B"))), pairing(published, setOf("a")))
+        assertEquals(PairingEnd.AlreadyHere, pairing(published, setOf("a", "b")))
+    }
+
+    /** It runs on the main thread's scope, where an exception nothing catches ends the app. */
+    @Test fun aListThatCannotBeReadIsAFailureToShow() {
+        val failed = pairing("not json") as PairingEnd.Failed
+        assertEquals("The PC gave an answer the app could not read.", failed.failure.sentence)
+        assertTrue(pairing("""[{"label": "no repo"}]""") is PairingEnd.Failed)
+    }
+
+    @Test fun aRefusalIsShownAsItWas() {
+        val refused = runBlocking {
+            pairWith("ws://pc", "code", emptySet()) { _, _ -> throw java.io.IOException("INVALID_PAIRING_CODE: no") }
+        }
+        assertEquals("INVALID_PAIRING_CODE", (refused as PairingEnd.Failed).failure.code)
+    }
+
     private fun synced(sync: String) = """{"folders": [{"record": {"id": "f", "label": "L"}, "sync": $sync}], "peers": []}"""
 
     /** After a process death nothing in memory has it, and what is stored is still true. */

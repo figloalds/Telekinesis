@@ -13,6 +13,30 @@ class SyncPolicyTest {
         assertEquals(Mode.Full, policy.decide(Trigger.Foreground, now, 0, metered = false, syncOnMobile = false))
     }
 
+    /** With the PC away nothing ever counts as synced, and the app coming to the front must not ask each time. */
+    @Test fun theForegroundIsHeldToHowOftenItTriesAsWell() {
+        val attempts = SyncPolicy.Attempts()
+        fun decide(at: Long) = attempts.decide(Trigger.Foreground, at, lastSyncMs = 0, metered = false, syncOnMobile = false)
+        assertEquals(Mode.Full, decide(now))
+        assertEquals(Mode.Skip, decide(now + 29_999))
+        assertEquals("a skip is no attempt", Mode.Full, decide(now + 30_000))
+        assertEquals(Mode.Skip, decide(now + 30_001))
+    }
+
+    @Test fun aRealSyncStillCounts() {
+        val attempts = SyncPolicy.Attempts()
+        assertEquals(Mode.Skip, attempts.decide(Trigger.Foreground, now, now - 1, metered = false, syncOnMobile = false))
+    }
+
+    @Test fun forgettingLeavesOnlyTheLastSync() {
+        val attempts = SyncPolicy.Attempts()
+        fun decide(synced: Long) = attempts.decide(Trigger.Foreground, now, synced, metered = false, syncOnMobile = false)
+        assertEquals(Mode.Full, decide(0))
+        assertEquals(Mode.Skip, decide(0))
+        attempts.forget()
+        assertEquals(Mode.Full, decide(now - 60_000))
+    }
+
     @Test fun aListingSyncsOnlyWhenOlderThanTwoMinutes() {
         assertEquals(Mode.Skip, policy.decide(Trigger.Listing, now, now - 119_999, metered = false, syncOnMobile = false))
         assertEquals(Mode.Full, policy.decide(Trigger.Listing, now, now - 120_000, metered = false, syncOnMobile = false))

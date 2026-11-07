@@ -1,9 +1,18 @@
 package dev.tkfs.share
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ShareTextTest {
+    @Test fun onlyContentStreamsAreTaken() {
+        assertTrue(isShareableScheme("content"))
+        for (scheme in listOf("file", "FILE", "android.resource", "http", "", null)) {
+            assertFalse("$scheme", isShareableScheme(scheme))
+        }
+    }
+
     @Test fun theLeadNamesWhatIsSharedAndWhoSharesIt() {
         assertEquals("2 photos from Photos", leadLine(listOf("image/jpeg", "image/png"), "Photos"))
         assertEquals("1 photo", leadLine(listOf("image/jpeg"), null))

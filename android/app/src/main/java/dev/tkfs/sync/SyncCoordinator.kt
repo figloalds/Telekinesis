@@ -21,10 +21,7 @@ import dev.tkfs.provider.TkfsProvider
 import dev.tkfs.ui.Confirmed
 import dev.tkfs.ui.parseConfirmed
 import dev.tkfs.ui.parseExchanges
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -46,7 +43,8 @@ data class Finished(val serial: Long, val trigger: Trigger, val result: BurstRes
  */
 object SyncCoordinator {
     private val policy = SyncPolicy()
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val foregroundAttempts = SyncPolicy.Attempts(policy)
+    private val scope = backgroundScope { Log.e(TAG, "sync: ${it.javaClass.simpleName}: ${it.message}", it) }
     private val bursts = Bursts(::runNative)
     private val done = MutableStateFlow<Finished?>(null)
     /** What `onLocalChange` and the transfer job agree on. */
@@ -357,9 +355,12 @@ object SyncCoordinator {
     fun runTrigger(ctx: Context, trigger: Trigger, decided: Mode? = null): BurstResult {
         val app = ctx.applicationContext
         val settings = Settings.of(app)
-        val mode = decided ?: policy.decide(
-            trigger, System.currentTimeMillis(), settings.lastSyncMs(), metered(app), settings.syncOnMobile,
-        )
+        val now = System.currentTimeMillis()
+        val mode = decided ?: if (trigger == Trigger.Foreground) {
+            foregroundAttempts.decide(trigger, now, settings.lastSyncMs(), metered(app), settings.syncOnMobile)
+        } else {
+            policy.decide(trigger, now, settings.lastSyncMs(), metered(app), settings.syncOnMobile)
+        }
         val result = burst(app, mode, asked = trigger == Trigger.Manual)
         if (!result.dropped) done.value = Finished((done.value?.serial ?: 0) + 1, trigger, result)
         if (mode == Mode.Full && (trigger == Trigger.Foreground || trigger == Trigger.Periodic)) sendWhatIsLeft(app, result)
@@ -405,6 +406,9 @@ object SyncCoordinator {
         }
     }
 
+    /** What `tkfs.set_last_sync` is for: the next foreground goes by the clock it set. */
+    internal fun forgetForegroundAttempts() = foregroundAttempts.forget()
+
     /** Every 30 min by default and only with a network; `replace` after the interval changes. */
     fun schedulePeriodic(ctx: Context, replace: Boolean = false) {
         val minutes = Settings.of(ctx).periodMinutes.toLong()
@@ -425,15 +429,13 @@ object SyncCoordinator {
 
     private fun runNative(mode: Mode): BurstResult {
         val payload = JSONObject().put("metadata_only", mode == Mode.MetadataOnly)
-        return try {
+        return reportOf {
             val reply = Native.manage("sync-now", payload.toString())
             val first = BurstResult.parse(reply, emptyMap())
             if (first.errors.isEmpty()) first else {
                 // Read after the burst, so an error goes only when a later exchange is newer.
                 BurstResult.parse(reply, parseExchanges(Native.manage("status", "{}")))
             }
-        } catch (error: IOException) {
-            BurstResult(failure = error.message ?: "The burst failed.")
         }
     }
 

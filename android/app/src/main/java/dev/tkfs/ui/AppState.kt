@@ -92,6 +92,36 @@ data class AppUi(
     val now: Long = System.currentTimeMillis(),
 )
 
+/** What came of pairing with a PC. */
+internal sealed interface PairingEnd {
+    /** The same PC again: its folders are already here. */
+    data object AlreadyHere : PairingEnd
+
+    /** Its folders that are not here yet. */
+    data class Choose(val fresh: List<Published>) : PairingEnd
+
+    data class Failed(val failure: Failure) : PairingEnd
+}
+
+/**
+ * Pairs through `call` and asks the PC what it publishes. A reply that cannot be read is a failure to
+ * show like any refusal: this runs on the main thread's scope, where it would otherwise bring the app down.
+ */
+internal suspend fun pairWith(
+    endpoint: String,
+    code: String,
+    held: Set<String>,
+    call: suspend (action: String, payload: JSONObject) -> String,
+): PairingEnd = try {
+    call("pair", JSONObject().put("endpoint", endpoint).put("code", code))
+    val fresh = parsePublished(call("remote-list", JSONObject().put("endpoint", endpoint))).filter { it.repo !in held }
+    if (fresh.isEmpty()) PairingEnd.AlreadyHere else PairingEnd.Choose(fresh)
+} catch (error: IOException) {
+    PairingEnd.Failed(Failure.of(error))
+} catch (error: JSONException) {
+    PairingEnd.Failed(Failure(null, "The PC gave an answer the app could not read."))
+}
+
 /** The state after a `status` poll that worked: its answer in, its failure gone. */
 fun AppUi.polled(snapshot: Snapshot, storage: String, now: Long) =
     copy(snapshot = snapshot, storage = storage, now = now, pollFailure = null)
@@ -278,22 +308,17 @@ class AppModel(application: Application) : AndroidViewModel(application) {
     fun pair(endpoint: String, code: String) {
         mutable.update { it.copy(pairing = Pairing.Working, failure = null) }
         viewModelScope.launch {
-            try {
-                call("pair", JSONObject().put("endpoint", endpoint).put("code", code))
-                val held = mutable.value.snapshot?.folders.orEmpty().map { it.repo }.toSet()
-                val fresh = parsePublished(call("remote-list", JSONObject().put("endpoint", endpoint)))
-                    .filter { it.repo !in held }
-                if (fresh.isEmpty()) {
-                    // The same PC again: its folders are already here, and a burst resumes them.
+            val held = mutable.value.snapshot?.folders.orEmpty().map { it.repo }.toSet()
+            when (val end = pairWith(endpoint, code, held) { action, payload -> call(action, payload) }) {
+                PairingEnd.AlreadyHere -> {
+                    // A burst resumes its folders.
                     mutable.update { it.copy(screen = Screen.Folders, pairing = Pairing.Fields) }
                     SyncCoordinator.syncNow(getApplication())
-                } else {
-                    mutable.update {
-                        it.copy(pairing = Pairing.Choose(endpoint, fresh, fresh.map { f -> f.repo }.toSet()))
-                    }
                 }
-            } catch (error: IOException) {
-                mutable.update { it.copy(pairing = Pairing.Fields, failure = Failure.of(error)) }
+                is PairingEnd.Choose -> mutable.update {
+                    it.copy(pairing = Pairing.Choose(endpoint, end.fresh, end.fresh.map { f -> f.repo }.toSet()))
+                }
+                is PairingEnd.Failed -> mutable.update { it.copy(pairing = Pairing.Fields, failure = end.failure) }
             }
             refresh()
         }

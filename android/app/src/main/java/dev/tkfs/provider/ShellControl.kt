@@ -71,6 +71,7 @@ internal object ShellControl {
             val settings = Settings.of(context)
             val folders = JSONArray(Native.manage("list", "{}"))
             for (index in 0 until folders.length()) settings.setLastSyncMs(folders.getJSONObject(index).getString("id"), ms)
+            SyncCoordinator.forgetForegroundAttempts()
             "{}"
         }
         // What `content` cannot do, the way another app would: `--arg OPERATION`, and a payload.

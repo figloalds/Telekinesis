@@ -180,6 +180,9 @@ internal fun unencryptedNote(endpoint: String): String? =
         null
     }
 
+/** Whether adding a PC goes on to ask for the battery exemption: once, and not of an app that has it. The row stays either way. */
+internal fun asksForBattery(alreadyAsked: Boolean, allowed: Boolean): Boolean = !alreadyAsked && !allowed
+
 /** What the Battery row says; when it is not allowed, Android may hold syncing back until the phone is awake. */
 internal fun batteryLine(allowed: Boolean): String =
     if (allowed) "Allowed to run in the background" else "Not allowed. Sending files can wait until the phone is in use."

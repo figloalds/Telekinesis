@@ -1,12 +1,15 @@
 package dev.tkfs.ui
 
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings as AndroidSettings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -29,7 +32,9 @@ class MainActivity : ComponentActivity() {
     private val model: AppModel by viewModels()
 
     /** The answer changes nothing here: without it the jobs still run, only without a visible notification. */
-    private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+        askForBatteryOnce()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -42,9 +47,9 @@ class MainActivity : ComponentActivity() {
             TkfsTheme {
                 Surface(Modifier.fillMaxSize()) {
                     val ui by model.state.collectAsState()
-                    // The owner has just added a PC: the first moment a notification has a use.
+                    // The owner has just added a PC: the first moment either has a use.
                     val choosing = ui.pairing is Pairing.Choose
-                    LaunchedEffect(choosing) { if (choosing) askForNotifications() }
+                    LaunchedEffect(choosing) { if (choosing && !askForNotifications()) askForBatteryOnce() }
                     BackHandler(enabled = ui.screen != Screen.Folders) { model.show(Screen.Folders) }
                     when (val screen = ui.screen) {
                         Screen.Folders -> FoldersScreen(
@@ -94,20 +99,35 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Once, from Android 13, where it is a runtime permission. */
-    private fun askForNotifications() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+    /** Once, from Android 13, where it is a runtime permission. Whether it asked: its answer comes later. */
+    private fun askForNotifications(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
         val settings = Settings.of(this)
-        if (settings.notificationsAsked) return
-        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return
+        if (settings.notificationsAsked) return false
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) return false
         settings.notificationsAsked = true
         notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        return true
+    }
+
+    /** After notifications, so that it is not one dialog on top of another. The app works without it, only later. */
+    private fun askForBatteryOnce() {
+        val settings = Settings.of(this)
+        val allowed = getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        if (!asksForBattery(settings.batteryAsked, allowed)) return
+        settings.batteryAsked = true
+        askForBatteryExemption()
     }
 
     private fun askForBatteryExemption() {
-        startActivity(
-            Intent(AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")),
-        )
+        try {
+            startActivity(
+                Intent(AndroidSettings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")),
+            )
+        } catch (error: ActivityNotFoundException) {
+            // A phone maker can leave this screen out, and the Battery row then has nothing to offer.
+            Log.i("tkfs", "battery: no screen to ask with: ${error.message}")
+        }
     }
 
     override fun onStart() {

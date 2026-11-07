@@ -1,5 +1,8 @@
 package dev.tkfs.sync
 
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -121,6 +124,28 @@ class BurstsTest {
         release.countDown()
         assertFalse(bursts.request(Mode.Full).dropped)
         assertEquals(listOf(Mode.Full), started.toList())
+    }
+
+    @Test fun aMalformedReplyIsABurstThatFailed() {
+        val garbled = reportOf { BurstResult.parse("not json", emptyMap()) }
+        assertTrue(garbled.failure!!, garbled.failure!!.startsWith("UNREADABLE_REPLY"))
+        val wrongShape = reportOf { BurstResult.parse("""{"folders": [{"exchanged": 1}]}""", emptyMap()) }
+        assertTrue(wrongShape.failure!!.startsWith("UNREADABLE_REPLY"))
+        assertEquals("BOOM: x", reportOf { throw java.io.IOException("BOOM: x") }.failure)
+        assertTrue(reportOf { throw IllegalStateException("x") }.failure!!.startsWith("UNREADABLE_REPLY"))
+        assertNull(reportOf { BurstResult() }.failure)
+    }
+
+    /** One that nothing caught in the background is logged, and the next still runs. */
+    @Test fun whatFailsInTheBackgroundIsHeardAndTheRestGoesOn() {
+        val heard = CopyOnWriteArrayList<Throwable>()
+        val scope = backgroundScope { heard += it }
+        runBlocking {
+            scope.launch { throw IllegalStateException("not caught") }.join()
+            val next = scope.async { "still running" }
+            assertEquals("still running", next.await())
+        }
+        assertEquals(listOf("not caught"), heard.map { it.message })
     }
 
     @Test fun skipRunsNothing() {

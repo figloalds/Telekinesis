@@ -2,6 +2,13 @@ package dev.tkfs.share
 
 /** The words of the share screen and its notifications, as the mockup has them. */
 
+/**
+ * Whether a stream of this scheme can be taken from another app. Only `content` comes with a grant from
+ * its sender. `file` and the like are read with this app's own rights, so another app could have this
+ * one read its private files, such as `folders.sqlite`, and save them where that app can get them.
+ */
+internal fun isShareableScheme(scheme: String?): Boolean = scheme == "content"
+
 /** "2 photos from Photos". */
 internal fun leadLine(mimeTypes: List<String>, source: String?): String {
     val count = mimeTypes.size

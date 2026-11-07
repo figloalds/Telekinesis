@@ -262,6 +262,8 @@ def scenario_ui_folders(s: Session) -> None:
     a PC that revoked the phone, and pairing again with the folder's bytes kept. Screenshots of
     each screen are in this run's `screens` directory."""
     device, pc = s.device, s.pc
+    # Another scenario may have left the app exempt, and this one sees it asked for.
+    device.battery_exempt(False)
     shots = s.report.path.parent / "screens"
     files = {"notes.txt": b"Notes from the PC.\n" * 50, "photo.bin": random.Random(9).randbytes(600 * 1024)}
     repo, pc_state = pc.create_folder("Documents", files)
@@ -294,6 +296,10 @@ def scenario_ui_folders(s: Session) -> None:
     # The first PC is the moment the app asks to show notifications (Android 13 and later).
     shown("the notification permission request", has("Allow Telekinesis to send you notifications?", "Allow"))
     device.tap_text("Allow")
+    # Then, once, for running in the background. It works without, only later, and Settings keeps the way to allow it.
+    found = shown("the battery exemption request", has_part("always run in background"))
+    s.check("the first PC goes on to ask for the battery exemption", "Deny" in found, found)
+    device.tap_text("Deny")
     found = shown("the PC's folders", has("Receive 1 folder"))
     s.check("pairing lists the PC's folder with a checkbox", "Documents" in found, found)
     device.screenshot(shots / "add-pc-choose.png")
@@ -313,6 +319,7 @@ def scenario_ui_folders(s: Session) -> None:
 
     device.tap_text("Settings")
     found = shown("the Settings screen", has("My PC", pc.endpoint, "Change address", "Unpair"))
+    s.check("with the exemption refused, Settings still has the way to allow it", "Allow" in found, found)
     s.check("Settings names the PC with its address and the two actions", True, found)
     s.check("and says a ws:// connection is not encrypted",
             "This connection isn't encrypted. Use it only on your own network or a VPN." in found, found)
@@ -346,7 +353,7 @@ def scenario_ui_folders(s: Session) -> None:
                                                          for _, error in lanes), seen)
     device.screenshot(shots / "folders-revoked.png")
 
-    # Pair again: the folder and its bytes stay, and sync works.
+    # Pair again: the folder and its bytes stay, and sync works. Nothing is asked for again.
     device.tap_text("Pair again")
     shown("the Add a PC screen", has("Scan QR code"))
     pair_with_fields(new_code)
@@ -464,7 +471,11 @@ def scenario_speed(s: Session) -> None:
         s.check(f"a first read through adb reverse goes at least {SPEED_WANTED_MIB_S} MiB/s",
                 rate >= SPEED_WANTED_MIB_S, reverse)
     finally:
-        device.remove_reverse(port)
+        # A failure here is its own, and must not take the place of what ended the scenario.
+        try:
+            device.remove_reverse(port)
+        except HarnessError as failure:
+            s.report.record("the adb reverse is removed", False, str(failure))
 
 
 # The flags Android gives these in DocumentsContract.
@@ -947,6 +958,15 @@ def scenario_share(s: Session) -> None:
     share_one(s, "share-one.bin", one)
     poll(SHARE_BOUND, "the shared file in the folder", lambda: "share-one.bin" in names())
     s.check("a shared file is kept with the PC away", device.content_read(folder.doc("share-one.bin")) == one)
+
+    # A stream that comes with no grant from its sender would be read with this app's own rights, and could
+    # hand another app its private files.
+    private_file = f"file:///data/user/0/{PACKAGE}/files/orchestrator.toml"
+    device.start_share(private_file)
+    time.sleep(2)
+    shown = device.screen_texts()
+    s.check("a file:// stream gets no share screen", not any(text.startswith("Save ") for text in shown), shown)
+    s.check("and saves nothing", "orchestrator.toml" not in names(), sorted(names()))
 
     # What has not reached the PC is said on the Folders screen, from a table on disk: after a kill too.
     says = lambda text: lambda texts: any(text in shown for shown in texts)
