@@ -3,6 +3,7 @@ package dev.tkfs
 import android.content.Context
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** The Rust side. Failures arrive as IOException carrying the tkfs error code. */
 object Native {
@@ -18,9 +19,10 @@ object Native {
     external fun manage(action: String, payload: String): String
 
     /**
-     * The directory's entries: `[{id, name, directory, size, local_bytes, modified_ms}]`. `id` is the
-     * entity, which a rename keeps, and `local_bytes` is how much of the file is on this phone. Asks
-     * no PC for anything, so it answers at once with none.
+     * The directory's entries: `[{id, name, directory, size, local_bytes, modified_ms, marked, kept}]`.
+     * `id` is the entity, which a rename keeps, and `local_bytes` is how much of the file is on this
+     * phone. `marked` is the owner's mark on it, and `kept` is that or its folder's. Asks no PC for
+     * anything, so it answers at once with none.
      */
     @JvmStatic @Throws(IOException::class)
     external fun list(folder: String, path: String): String
@@ -66,6 +68,13 @@ object Native {
     @JvmStatic @Throws(IOException::class)
     external fun sync(folder: String, token: Long)
 
+    /**
+     * Takes back all that the handle's draft holds since its last seal, for a writer replacing a file
+     * that was told a write failed: the file stays as that seal left it, for a flush or a kill too.
+     */
+    @JvmStatic @Throws(IOException::class)
+    external fun abandon(folder: String, token: Long)
+
     @JvmStatic @Throws(IOException::class)
     external fun close(folder: String, token: Long)
 
@@ -96,6 +105,40 @@ object Native {
      */
     @JvmStatic @Throws(IOException::class)
     external fun confirm(folder: String): String
+
+    /** Keeps a file or directory on this phone, by its entity, or stops. A directory's mark covers what later arrives in it. */
+    @JvmStatic @Throws(IOException::class)
+    external fun mark(folder: String, entity: String, keep: Boolean)
+
+    /** The owner opened the file at `path` now, which decides what leaves first. It writes to disk: not on the main thread. */
+    @JvmStatic @Throws(IOException::class)
+    external fun opened(folder: String, path: String)
+
+    /**
+     * Frees one file's bytes here, if a PC says it holds them: `{bytes, blocked}`, where `blocked` is
+     * `NOT_ON_PC`, `PC_UNREACHABLE`, `PC_TOO_OLD` or null. It waits for a PC: off the main thread.
+     */
+    @JvmStatic @Throws(IOException::class)
+    external fun removeDownload(folder: String, entity: String): String
+
+    /**
+     * Gives back about `needBytes` of the disk, oldest opened first, with only what a PC has just said
+     * it holds: `{bytes, blocked}`, where `blocked` is `PC_UNREACHABLE`, `PC_TOO_OLD` or null. With 0 it
+     * only removes what nothing needs. It rewrites packs and waits for a PC: off the main thread.
+     */
+    @JvmStatic @Throws(IOException::class)
+    external fun freeSpace(needBytes: Long): String
+
+    /**
+     * Downloads what is kept and is not all here, and returns how many bytes came. `stop` is looked
+     * at between steps, each of which takes at most some seconds, and what came stays.
+     */
+    @JvmStatic @Throws(IOException::class)
+    external fun hydrateKept(stop: AtomicBoolean): Long
+
+    /** Whether anything kept is not all here. It asks no PC. */
+    @JvmStatic @Throws(IOException::class)
+    external fun keptMissing(): Boolean
 
     /** Always throws: a panic with a Java exception pending. See `ShellControl`. */
     @JvmStatic @Throws(IOException::class)

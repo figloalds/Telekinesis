@@ -32,6 +32,7 @@ fun SettingsScreen(
     onChangeAddress: (installation: String, endpoint: String) -> Unit,
     onUnpair: (installation: String) -> Unit,
     onAllowBattery: () -> Unit = {},
+    onFreeSpace: () -> Unit = {},
 ) {
     val peers = ui.snapshot?.peers.orEmpty()
     Column(Modifier.fillMaxSize()) {
@@ -44,7 +45,7 @@ fun SettingsScreen(
             Setting("Background check", "Every ${periodWords(ui.periodMinutes)}") {
                 TextButton(onClick = { onPeriod(nextPeriod(ui.periodMinutes)) }) { Text("Change") }
             }
-            Setting("Keep this much free", "Oldest downloads go first.")
+            KeepFree(ui, onFreeSpace)
             Setting("Battery", batteryLine(ui.batteryAllowed)) {
                 if (!ui.batteryAllowed) TextButton(onClick = onAllowBattery) { Text("Allow") }
             }
@@ -57,6 +58,17 @@ fun SettingsScreen(
             Setting("Diagnostics", "Copy and Resync from the start arrive in a later update.")
         }
     }
+}
+
+@Composable
+private fun KeepFree(ui: AppUi, onFreeSpace: () -> Unit) {
+    Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+        Text("Keep this much free", style = MaterialTheme.typography.bodyLarge)
+        Text(floorLine(ui.floorBytes), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        TextButton(onClick = onFreeSpace, enabled = !ui.freeingSpace) { Text("Free up space now") }
+        ui.spaceNote?.let { Text(it, style = MaterialTheme.typography.bodyMedium) }
+    }
+    HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 }
 
 @Composable

@@ -123,7 +123,7 @@ class TkfsProvider : DocumentsProvider() {
         val open = parseOpenMode(mode)
         Log.i(TAG, "open $documentId $mode")
         val storage = requireNotNull(context).getSystemService(StorageManager::class.java)
-        return orNotFound {
+        val descriptor = orNotFound {
             // Bytes the phone lacks come from a PC, and with none there a read would wait for it.
             // A truncating open needs nothing of the old bytes, so it never asks.
             if (open.read && !open.truncate) failFastWithoutAPC(documentId, signal)
@@ -131,6 +131,20 @@ class TkfsProvider : DocumentsProvider() {
                 FileProxy.openForWrite(storage, documentId, open) { changed(DocumentIds.parent(documentId)) }
             } else {
                 FileProxy.openForRead(storage, documentId)
+            }
+        }
+        noteOpened(documentId)
+        return descriptor
+    }
+
+    /** What leaves first when space runs low. The caller waits for none of it, and a failure only costs a little of the order. */
+    private fun noteOpened(documentId: String) {
+        val (folder, path) = DocumentIds.split(documentId)
+        waits.execute {
+            try {
+                Native.opened(folder, path)
+            } catch (error: IOException) {
+                Log.i(TAG, "opened $documentId: ${error.message}")
             }
         }
     }

@@ -37,6 +37,9 @@ internal interface WritableDocument : OpenDocument {
     fun write(token: Long, offset: Long, data: ByteArray, size: Int, append: Boolean): Int
     fun truncate(token: Long)
     fun sync(token: Long)
+
+    /** Takes back all that the handle's draft holds since its last seal: see `Engine::abandon_draft`. */
+    fun abandon(token: Long)
 }
 
 /** What a descriptor's callbacks do, for either kind of open. */
@@ -125,6 +128,12 @@ internal class RecoveringReader(
  * A truncating open changes nothing until the first write, fsync or release, and until then only
  * says it is empty: a client that holds its descriptor and is killed, or a descriptor that could
  * not be made, leaves the file as it was.
+ *
+ * It also replaces the file whole or not at all. A write that fails, as on a full disk, takes back
+ * what went before it since the last fsync, at once, so that half a file does not stand in for a good
+ * one at a release, a flush or a kill. Nothing more is taken after that: going on would leave a hole
+ * where the failed bytes were to go. An open that keeps the contents edits them in place, and what
+ * it wrote before a failure stays.
  */
 internal class DocumentWriter(
     private val document: WritableDocument,
@@ -135,8 +144,15 @@ internal class DocumentWriter(
 ) : ProxiedFile {
     private val token = document.open()
 
+    private val replacing = truncate
     private var truncatePending = truncate
     private var truncateFailed = false
+
+    /** What ended this replacement, which every later call is told. */
+    private var failure: IOException? = null
+
+    /** An fsync made what came before it a version of the file, so a burst has something to carry. */
+    private var sealed = false
 
     override fun length(): Long = if (truncatePending) 0 else document.length(token)
 
@@ -144,13 +160,27 @@ internal class DocumentWriter(
         if (truncatePending) 0 else document.read(token, offset, out, size)
 
     override fun write(offset: Long, data: ByteArray, size: Int): Int {
+        failure?.let { throw it }
         truncateIfPending()
-        return document.write(token, offset, data, size, append)
+        try {
+            return document.write(token, offset, data, size, append)
+        } catch (error: IOException) {
+            if (replacing) giveUp(error)
+            throw error
+        }
     }
 
     override fun sync() {
+        failure?.let { throw it }
         truncateIfPending()
         document.sync(token)
+        sealed = true
+    }
+
+    private fun giveUp(error: IOException) {
+        failure = error
+        attempt("abandon") { document.abandon(token) }
+        truncatePending = true
     }
 
     /**
@@ -158,13 +188,14 @@ internal class DocumentWriter(
      * moments later. No writer is left to tell of a failure: the draft stays on disk for the
      * sealer or the next start, so a burst and a new listing still follow. A truncate that
      * already failed the writer is not tried again here, as it would empty the file of someone
-     * who was told it failed, and then nothing changed for a burst to carry.
+     * who was told it failed, and then nothing changed for a burst to carry. The same goes for a
+     * replacement that a failed write ended.
      */
     override fun release() {
-        val changed = !(truncatePending && truncateFailed) && attempt("truncate") { truncateIfPending() }
+        val changed = failure == null && !(truncatePending && truncateFailed) && attempt("truncate") { truncateIfPending() }
         if (changed) attempt("sync") { document.sync(token) }
         attempt("close") { document.close(token) }
-        if (changed) released()
+        if (changed || sealed) released()
     }
 
     override fun abandon() {
@@ -246,6 +277,8 @@ internal class FileProxy private constructor(
         override fun truncate(token: Long) = Native.truncate(folder, token, 0)
 
         override fun sync(token: Long) = Native.sync(folder, token)
+
+        override fun abandon(token: Long) = Native.abandon(folder, token)
     }
 
     companion object {

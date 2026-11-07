@@ -1430,6 +1430,24 @@ impl Store {
         }
         self.closure(pending)
     }
+    /// The objects of every head that is not a delete, on any branch. It asks no one, so what an
+    /// absent manifest would name is not in it.
+    pub fn live_head_objects(&self) -> Result<BTreeSet<Digest>> {
+        let mut pending = Vec::new();
+        for view in self.views.values() {
+            for heads in view.heads.values() {
+                for head in heads {
+                    if let Some(event) = self.version(head)?
+                        && !event.state.deleted
+                        && let Some(content) = event.state.content
+                    {
+                        pending.push(content_root(&content));
+                    }
+                }
+            }
+        }
+        self.closure(pending)
+    }
     /// The objects of every version of an entity with more than one head, on any branch: what the
     /// owner has yet to choose between. It asks no one, so what an absent manifest would name is not
     /// in it.

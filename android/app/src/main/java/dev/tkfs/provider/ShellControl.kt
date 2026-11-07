@@ -5,10 +5,12 @@ import android.database.ContentObserver
 import android.os.Binder
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
+import android.os.StatFs
 import android.provider.DocumentsContract
 import dev.tkfs.Native
 import dev.tkfs.Settings
 import dev.tkfs.sync.SyncCoordinator
+import dev.tkfs.sync.floorBytes
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.FileOutputStream
@@ -36,6 +38,8 @@ internal object ShellControl {
     private const val METERED = "tkfs.metered"
     private const val WAITING = "tkfs.waiting"
     private const val CONFIRM = "tkfs.confirm"
+    private const val SPACE = "tkfs.space"
+    private const val FREE = "tkfs.free"
     private const val ROOT_UID = 0
     private const val SHELL_UID = 2000
 
@@ -90,6 +94,21 @@ internal object ShellControl {
         WAITING -> reply { Native.waiting(arg ?: throw IOException("MISSING_ARGUMENT: folder")) }
         // Asks the PCs now, as after a burst: `--arg FOLDER`, answering `{waiting, unsupported}`.
         CONFIRM -> reply { Native.confirm(arg ?: throw IOException("MISSING_ARGUMENT: folder")) }
+        // What the app sees of the volume, and what its last check of the floor left: `{free, total, floor, blocked}`.
+        SPACE -> reply {
+            val volume = StatFs(context.filesDir.path)
+            JSONObject()
+                .put("free", volume.availableBytes)
+                .put("total", volume.totalBytes)
+                .put("floor", floorBytes(volume.totalBytes))
+                .put("blocked", SyncCoordinator.spaceBlocked.value ?: JSONObject.NULL)
+                .toString()
+        }
+        // What "Free up space now" does, with no screen to show it.
+        FREE -> reply {
+            val freed = SyncCoordinator.freeUp(context) ?: throw IOException("UNKNOWN_ERROR: it could not ask")
+            JSONObject().put("bytes", freed.bytes).put("blocked", freed.blocked ?: JSONObject.NULL).toString()
+        }
         else -> null
     }
 

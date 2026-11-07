@@ -39,6 +39,8 @@ class DocumentWriterTest {
         override fun truncate(token: Long) = call("truncate")
 
         override fun sync(token: Long) = call("sync")
+
+        override fun abandon(token: Long) = call("abandon")
     }
 
     private val calls = mutableListOf<String>()
@@ -169,6 +171,83 @@ class DocumentWriterTest {
         writer(truncate = true, log = { logged += it }).release()
         assertEquals(listOf("open", "truncate", "close"), calls)
         assertEquals(listOf("truncate: INVALID_HANDLE: truncate"), logged)
+    }
+
+    /** A full disk at the first write: the file stays as it was, not empty and not half of anything. */
+    @Test fun aFailedFirstWriteTakesTheCutBackAtOnce() {
+        val writer = writer(truncate = true)
+        document.failing += "write 100@0 8"
+        assertThrows(IOException::class.java) { writer.write(0, data, 8) }
+        assertEquals(listOf("open", "truncate", "write 100@0 8", "abandon"), calls)
+    }
+
+    @Test fun aReleaseAfterAFailedFirstWriteOnlyClosesAndIsNotAChange() {
+        val writer = writer(truncate = true)
+        document.failing += "write 100@0 8"
+        assertThrows(IOException::class.java) { writer.write(0, data, 8) }
+        calls.clear()
+        writer.release()
+        assertEquals(listOf("close"), calls)
+    }
+
+    /** A copy that ran out of room partway leaves no part of itself to replace what was there. */
+    @Test fun aFailedLaterWriteTakesBackWhatWentBefore() {
+        val writer = writer(truncate = true)
+        writer.write(0, data, 8)
+        document.failing += "write 100@8 8"
+        assertThrows(IOException::class.java) { writer.write(8, data, 8) }
+        assertEquals("abandon", calls.last())
+        calls.clear()
+        writer.release()
+        assertEquals(listOf("close"), calls)
+    }
+
+    /** What it was told failed stays failed: going on would leave a hole where the bytes it lost go. */
+    @Test fun afterAFailedWriteEverythingFailsUntilItCloses() {
+        val writer = writer(truncate = true)
+        document.failing += "write 100@0 8"
+        val failure = assertThrows(IOException::class.java) { writer.write(0, data, 8) }
+        document.failing.clear()
+        calls.clear()
+        assertEquals(failure.message, assertThrows(IOException::class.java) { writer.write(8, data, 8) }.message)
+        assertEquals(failure.message, assertThrows(IOException::class.java) { writer.sync() }.message)
+        assertEquals(emptyList<String>(), calls)
+        assertEquals(0, writer.length())
+        assertEquals(0, writer.read(0, data, 8))
+    }
+
+    /** An fsync told it those bytes were safe, so they stay; a burst still has them to carry. */
+    @Test fun whatAnFsyncSealedStaysAChangeAfterALaterFailure() {
+        val writer = writer(truncate = true)
+        writer.write(0, data, 8)
+        writer.sync()
+        document.failing += "write 100@8 8"
+        assertThrows(IOException::class.java) { writer.write(8, data, 8) }
+        calls.clear()
+        writer.release()
+        assertEquals(listOf("close", "released"), calls)
+    }
+
+    @Test fun aFailedTakeBackIsLoggedAndTheWriterStillGetsTheFailure() {
+        val logged = mutableListOf<String>()
+        val writer = writer(truncate = true, log = { logged += it })
+        document.failing += setOf("write 100@0 8", "abandon")
+        val failure = assertThrows(IOException::class.java) { writer.write(0, data, 8) }
+        assertEquals("INVALID_HANDLE: write 100@0 8", failure.message)
+        assertEquals(listOf("abandon: INVALID_HANDLE: abandon"), logged)
+    }
+
+    /** Only a replacement is all or nothing. An edit in place keeps what it wrote before the failure. */
+    @Test fun aFailedWriteOfAnOpenThatKeepsTheContentsTakesNothingBack() {
+        val writer = writer()
+        writer.write(0, data, 8)
+        document.failing += "write 100@8 8"
+        assertThrows(IOException::class.java) { writer.write(8, data, 8) }
+        document.failing.clear()
+        assertEquals(8, writer.write(16, data, 8))
+        writer.release()
+        assertEquals(0, calls.count { it == "abandon" })
+        assertEquals(listOf("sync", "close", "released"), calls.takeLast(3))
     }
 
     /** No descriptor could be made, so nothing was written and nobody is told of a change. */

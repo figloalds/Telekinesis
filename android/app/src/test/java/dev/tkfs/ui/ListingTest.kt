@@ -22,6 +22,14 @@ class ListingTest {
         assertEquals(FileEntry("e1", "a.bin", false, 10, 4, 7), entry)
     }
 
+    @Test fun anEntrySaysWhatIsMarkedAndWhatIsKept() {
+        val mark = """{"id":"e","name":"a","directory":false,"size":1,"local_bytes":1,"modified_ms":1,"marked":true,"kept":true}"""
+        val covered = """{"id":"f","name":"b","directory":false,"size":1,"local_bytes":1,"modified_ms":1,"marked":false,"kept":true}"""
+        val entries = parseEntries("[$mark,$covered]")
+        assertEquals(listOf(true, false), entries.map { it.marked })
+        assertEquals(listOf(true, true), entries.map { it.kept })
+    }
+
     @Test fun theWaitingFilesAreNamedByEntity() {
         assertEquals(setOf("e1", "e2"), parseWaitingEntities("""[{"entity":"e1","path":"/a"},{"entity":"e2","path":"/b"}]"""))
         assertEquals(emptySet<String>(), parseWaitingEntities("[]"))

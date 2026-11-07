@@ -12,6 +12,8 @@ const SOURCES: &[&str] = &["android/app/src/main/java", "android/native/src"];
 const ONLY_THE_APP_RAISES: &[&str] = &[
     "INVALID_DOCUMENT_ID",
     "NATIVE_PANIC",
+    "NOT_ON_PC",
+    "PC_TOO_OLD",
     "PC_UNREACHABLE",
     "PHONE_DB_UNAVAILABLE",
 ];

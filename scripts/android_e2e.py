@@ -690,19 +690,19 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
                 f"{time.monotonic() - started:.1f} s")
         s.check("and lists with its new size", names_in(s, folder.doc())[path]["_size"] == str(len(content)))
 
-    # The small file opens, and its write fails. The large one's manifest is not here, so its open does.
-    for path, wanted in (("edited-away.txt", "I/O error"), ("edited-away.bin", "OBJECT_MISSING")):
+    # An open that keeps the contents and is not all here asks for a PC first, and fails with none.
+    for path in ("edited-away.txt", "edited-away.bin"):
         doc = folder.doc(path)
         started = time.monotonic()
         failed = refusal(lambda: device.write_document(doc, "rw", b"part", offset=3))
-        s.check(f"rw writing part of {path}, never downloaded, fails with an I/O error", wanted in failed,
+        s.check(f"rw writing part of {path}, never downloaded, fails with the PC away", "PC_UNREACHABLE" in failed,
                 f"{time.monotonic() - started:.1f} s: {failed[:300]}")
         s.check("and its listed size stays", names_in(s, folder.doc())[path]["_size"] == str(len(files[path])))
 
-    # Past the end of a file whose short last chunk is not here: the write fails, not its seal.
+    # Past the end of a file whose short last chunk is not here: the same, and no seal to fail.
     doc, past = folder.doc("edited-away.txt"), 2 * CHUNK_BYTES
     failed = refusal(lambda: device.write_document(doc, "rw", b"past", offset=past))
-    s.check("rw past the end of a short file never downloaded fails with an I/O error", "I/O error" in failed, failed[:300])
+    s.check("rw past the end of a short file never downloaded fails with the PC away", "PC_UNREACHABLE" in failed, failed[:300])
     size = names_in(s, folder.doc())["edited-away.txt"]["_size"]
     s.check("and its listed size stays", size == str(len(files["edited-away.txt"])), size)
 
@@ -731,6 +731,8 @@ def check_the_pc_away(s: Session, folder: Folder) -> None:
 SHARE_BOUND = 1800
 SHARE_BYTES = 256 * 1024 * 1024
 MIB = 1024 * 1024
+# How long a burst a change started takes to be over with.
+SYNC_SETTLE = 10
 
 
 def random_bytes(rng: random.Random, size: int) -> bytes:
@@ -1293,14 +1295,12 @@ def scenario_ui_browse(s: Session) -> None:
     s.check("a file made on the phone and not yet sent says it is waiting", True, found)
     device.screenshot(shots / "browse-waiting.png")
 
-    # The long press: the actions and their wording, two of them not available yet.
+    # The long press: the actions and their wording.
     device.long_press_text("IMG_2041.png")
     actions = ("Keep on this phone", "Remove download", "Share", "Rename", "Delete everywhere")
     found = shown("the actions", has("IMG_2041.png", *actions))
     s.check("the sheet holds the mockup's five actions, in its words", True, found)
-    s.check("Keep on this phone and Remove download are off", not device.is_enabled("Keep on this phone")
-            and not device.is_enabled("Remove download"))
-    s.check("Share, Rename and Delete everywhere are on", all(device.is_enabled(a) for a in actions[2:]))
+    s.check("for a file that is on the phone, every one of them is on", all(device.is_enabled(a) for a in actions))
     device.screenshot(shots / "browse-sheet.png")
     device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
     shown("the sheet gone", lambda t: "Keep on this phone" not in t)
@@ -1528,10 +1528,367 @@ def scenario_conflicts(s: Session) -> None:
     s.check("and the Folders screen no longer shows a conflict", True, found)
 
 
+# ---- keeping and freeing space ----
+
+
+SPACE_FILE_BYTES = 64 * MIB
+# How far below the floor it is filled: more than two of those files and less than three.
+BELOW_THE_FLOOR = 130 * MIB
+LOW_ON_SPACE = "Low on space. Can't free anything until My PC is reachable."
+BACK_IN_SPACE = 256 * MIB
+
+
+def scenario_space(s: Session) -> None:
+    """Acceptance 16 and Review Focus 4. Files are downloaded and marked, /data is filled with `dd` in
+    the shared storage it shares a partition with, and a burst frees what it may, oldest first. With
+    the PC away nothing leaves and the Folders screen says why. Then the volume is filled to under
+    1 MiB: a write and a receive fail and say so, nothing is corrupted, and once the filler goes they
+    both work with no folder in need of repair. The filler goes whatever happens: other scenarios run
+    on this AVD after this one."""
+    device = s.device
+    rng = random.Random(19)
+    device.remove_filler()
+    files = {name: random_bytes(rng, SPACE_FILE_BYTES) for name in ("kept.bin", "a.bin", "b.bin", "c.bin", "d.bin")}
+    files |= {
+        "dir/inside.bin": rng.randbytes(3 * MIB),
+        "not-here.bin": rng.randbytes(8 * MIB),
+        "good.txt": b"The good contents of this file.\n" * 100,
+    }
+    folder = s.folder_with(files, "Space")
+    before = device.free_bytes()
+    try:
+        check_keeping(s, folder)
+        check_freeing(s, folder)
+        check_freeing_with_the_pc_away(s, folder)
+        check_a_full_disk(s, folder)
+    finally:
+        # Each on its own: one failing must not leave the other undone, or hide what ended the scenario.
+        try:
+            device.remove_filler()
+            s.report.record("the filler is gone", not device.fillers(), device.fillers())
+        except HarnessError as failure:
+            s.report.record("the filler is gone", False, str(failure))
+        try:
+            device.set_metered(False)
+        except HarnessError as failure:
+            s.report.record("the network is no longer metered", False, str(failure))
+    after = device.free_bytes()
+    s.check("the AVD has its space back, less what the app holds now", after >= before - 512 * MIB, f"{before} -> {after}")
+
+
+def entry_in(s: Session, folder: Folder, path: str) -> dict:
+    """What `Native.list` says of the file. A listing through the provider could start a burst, and a burst frees."""
+    parent, _, name = path.rpartition("/")
+    for entry in s.device.entries(folder.id, "/" + parent):
+        if entry["name"] == name:
+            return entry
+    raise HarnessError(f"{path} is not listed")
+
+
+def is_here(s: Session, folder: Folder, path: str) -> bool:
+    entry = entry_in(s, folder, path)
+    return entry["local_bytes"] >= entry["size"]
+
+
+def what_is_here(s: Session, folder: Folder, paths) -> dict[str, int]:
+    return {path: entry_in(s, folder, path)["local_bytes"] for path in paths}
+
+
+def press_action(s: Session, name: str, action: str) -> list[str]:
+    """Long-presses `name` on Browse and taps `action` in the sheet."""
+    device = s.device
+    device.long_press_text(name)
+    device.wait_screen(f"the sheet of {name}", lambda t: action in t)
+    device.tap_text(action)
+    return device.wait_screen("the sheet gone", lambda t: action not in t)
+
+
+def to_folders(s: Session) -> None:
+    """The Folders screen, from wherever the app is."""
+    device = s.device
+    device.start_app()
+    for _ in range(5):
+        if "Sync now" in device.screen_texts():
+            return
+        device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
+        time.sleep(1)
+    device.start_app()
+    device.wait_screen("the Folders screen", lambda t: "Sync now" in t)
+
+
+def check_keeping(s: Session, folder: Folder) -> None:
+    """Marks on the screen, and a job that downloads what they cover, a folder's later arrivals too."""
+    device, pc = s.device, s.pc
+    shots = s.report.path.parent / "screens"
+    # In this order, so that the file marked is the one opened longest ago.
+    for name in ("kept.bin", "a.bin", "b.bin", "c.bin", "d.bin"):
+        digest = device.content_digest(folder.doc(name))
+        s.check(f"{name} downloads whole", digest == sha256(folder.files[name]), digest)
+    s.check("what was not opened is not here", not is_here(s, folder, "dir/inside.bin"))
+    device.start_app()
+    device.wait_screen("the folder on Folders", lambda t: "Space" in t)
+    device.tap_text("Space")
+    device.wait_screen("the files", lambda t: "kept.bin" in t and "dir" in t)
+    press_action(s, "kept.bin", "Keep on this phone")
+    kept_line = f"Kept on this phone, {size_text(SPACE_FILE_BYTES)}"
+    device.wait_screen("the kept file", lambda t: kept_line in t)
+    s.check("a kept file says so on Browse", True, kept_line)
+    device.screenshot(shots / "space-kept.png")
+    device.long_press_text("kept.bin")
+    device.wait_screen("the sheet", lambda t: "Stop keeping on this phone" in t)
+    s.check("a kept file's download cannot be removed until it stops being kept", not device.is_enabled("Remove download"))
+    device.shell("input", "keyevent", "KEYCODE_BACK").require_success()
+    device.wait_screen("the sheet gone", lambda t: "Stop keeping on this phone" not in t)
+
+    # A marked folder's files come in the transfer job, with nothing opening them.
+    press_action(s, "dir", "Keep on this phone")
+    poll(SYNC_BOUND, "the marked folder's file on the phone", lambda: is_here(s, folder, "dir/inside.bin"), interval=2)
+    s.check("what a marked folder holds downloads by itself", True)
+    # And what later arrives in it.
+    arrives = random.Random(20).randbytes(2 * MIB)
+    pc.write_file(folder.pc_state, "dir/arrives.bin", arrives)
+    pc.folder(folder.pc_state, "flush")
+    to_folders(s)
+    device.tap_text("Sync now")
+    poll(SYNC_BOUND, "the later arrival on the phone", lambda: is_here(s, folder, "dir/arrives.bin"), interval=2)
+    s.check("a marked folder covers what arrives later", entry_in(s, folder, "dir/arrives.bin")["kept"])
+    digest = device.content_digest(folder.doc("dir/arrives.bin"))
+    s.check("and it reads the same", digest == sha256(arrives), digest)
+
+
+def check_freeing(s: Session, folder: Folder) -> None:
+    """Below the floor at the end of a burst: unmarked files go oldest first, up to what is needed. On a
+    metered network the burst takes only names, so a new file has a row here and its bytes nowhere else."""
+    device = s.device
+    device.set_metered(True)
+    unsent = random.Random(21).randbytes(8 * MIB)
+    made = device.create_document(folder.doc(), "unsent.bin")
+    device.content_write(made, unsent)
+    # The table takes in what this phone made when it is next asked.
+    poll(ADB_BOUND, "the new file waiting", lambda: device.confirm(folder.id)["waiting"] == 1, interval=2)
+    s.check("the new file is waiting to send", [f["path"] for f in device.waiting_files(folder.id)] == ["/unsent.bin"])
+
+    floor = device.space()["floor"]
+    free = device.fill_until_free(floor - BELOW_THE_FLOOR)
+    s.check("the filler takes free space below the floor", free < floor, f"{free} free, floor {floor}")
+    held = what_is_here(s, folder, ("kept.bin", "a.bin", "b.bin", "c.bin", "d.bin", "unsent.bin"))
+    trigger_foreground(device)
+    poll(SYNC_BOUND, "the oldest files freed", lambda: not any(what_is_here(s, folder, ("a.bin", "b.bin", "c.bin")).values()), interval=2)
+    s.check("the unmarked files opened longest ago are gone from the phone", True)
+    now = what_is_here(s, folder, held)
+    s.check("the next one stays, as enough was freed", now["d.bin"] == held["d.bin"], now)
+    s.check("the marked file stays, though it was opened before them all", now["kept.bin"] == held["kept.bin"], now)
+    s.check("a file not yet on the PC stays", now["unsent.bin"] == held["unsent.bin"], now)
+    s.check("and it is still waiting", [f["path"] for f in device.waiting_files(folder.id)] == ["/unsent.bin"])
+    free = poll(ADB_BOUND, "free space above the floor", lambda: (found := device.free_bytes()) >= floor and found)
+    s.check("free space is above the floor again", True, f"{free} free, floor {floor}")
+    s.check("nothing says it cannot free", device.space()["blocked"] is None, device.space())
+
+    # What left comes back from the PC, and is the same.
+    for name in ("a.bin", "b.bin", "c.bin"):
+        digest = device.content_digest(folder.doc(name))
+        s.check(f"{name}, freed, reads back identically", digest == sha256(folder.files[name]), digest)
+    s.check("that took it below the floor again", device.free_bytes() < floor, device.free_bytes())
+
+
+def check_freeing_with_the_pc_away(s: Session, folder: Folder) -> None:
+    """Nothing leaves, the Folders screen says why, and the actions on one file each say why."""
+    device, pc = s.device, s.pc
+    shots = s.report.path.parent / "screens"
+    names = ("kept.bin", "a.bin", "b.bin", "c.bin", "d.bin", "unsent.bin")
+    held = what_is_here(s, folder, names)
+    failures, summary = pc.stop()
+    s.check("the PC stops cleanly", not failures, failures or summary)
+    to_folders(s)
+    device.tap_text("Sync now")
+    found = device.wait_screen("the strip that says why", lambda t: LOW_ON_SPACE in t, SYNC_BOUND)
+    s.check("offline and low on space, the Folders screen says why", True, found)
+    device.screenshot(shots / "space-offline.png")
+    now = what_is_here(s, folder, names)
+    s.check("offline, nothing was freed", now == held, now)
+    s.check("the app says the same", device.space()["blocked"] == "PC_UNREACHABLE", device.space())
+
+    device.tap_text("Space")
+    device.wait_screen("the files", lambda t: "a.bin" in t)
+    press_action(s, "a.bin", "Remove download")
+    away = "My PC isn't reachable, so the download of a.bin can't be removed yet."
+    device.wait_screen("the sentence for a PC that is away", lambda t: away in t, UI_BOUND)
+    s.check("Remove download with the PC away says so", True, away)
+    device.tap_text("Dismiss")
+    press_action(s, "unsent.bin", "Remove download")
+    not_there = "Not on My PC yet, so it can't be removed."
+    device.wait_screen("the sentence for a file not on the PC", lambda t: not_there in t, UI_BOUND)
+    s.check("Remove download of a file not on the PC says so", True, not_there)
+    device.screenshot(shots / "space-not-on-pc.png")
+    device.tap_text("Dismiss")
+    now = what_is_here(s, folder, names)
+    s.check("and neither was removed", now == held, now)
+
+    # On Settings: what it keeps free, and the same refusal.
+    to_folders(s)
+    device.tap_text("Settings")
+    device.wait_screen("the row", lambda t: "Keep this much free" in t and "Free up space now" in t)
+    floor_line = next(text for text in device.screen_texts() if text.endswith("Oldest downloads go first."))
+    s.check("Settings says how much it keeps free", floor_line == f"{size_text(device.space()['floor'])}. Oldest downloads go first.", floor_line)
+    device.tap_text("Free up space now")
+    found = device.wait_screen("what freeing did", lambda t: "Can't free more until My PC is reachable." in t, SYNC_BOUND)
+    s.check("Free up space now says why it could not", True, found)
+    device.screenshot(shots / "space-settings.png")
+
+    # The PC is back: what was held back goes, the file reaches it, and the strip goes by itself.
+    pc.start()
+    pc.wait_phase("Space", "Running")
+    device.set_metered(False)
+    s.sync_with_the_pc_back(folder)
+    poll(SYNC_BOUND, "the new file confirmed", lambda: device.confirm(folder.id)["waiting"] == 0, interval=2)
+    to_folders(s)
+    device.tap_text("Sync now")
+    device.wait_screen("the strip gone", lambda t: LOW_ON_SPACE not in t and "Sync now" in t, SYNC_BOUND)
+    floor = device.space()["floor"]
+    poll(SYNC_BOUND, "free space above the floor", lambda: device.free_bytes() >= floor, interval=2)
+    s.check("with the PC back it frees, and the strip goes", is_here(s, folder, "kept.bin"), device.free_bytes())
+
+    # Remove download works now, on what could not be removed.
+    device.tap_text("Space")
+    device.wait_screen("the files", lambda t: "c.bin" in t)
+    s.check("c.bin is still here to remove", entry_in(s, folder, "c.bin")["local_bytes"] > 0, entry_in(s, folder, "c.bin"))
+    press_action(s, "c.bin", "Remove download")
+    poll(SYNC_BOUND, "the download removed", lambda: entry_in(s, folder, "c.bin")["local_bytes"] == 0, interval=2)
+    s.check("with the PC back, a file's download can be removed", True)
+    device.wait_screen("the row", lambda t: f"Not downloaded, {size_text(SPACE_FILE_BYTES)}" in t)
+    device.screenshot(shots / "space-removed.png")
+    digest = device.content_digest(folder.doc("unsent.bin"))
+    s.check("and the new file reads the same, whether or not it was freed", digest == sha256(random.Random(21).randbytes(8 * MIB)), digest)
+    to_folders(s)
+
+
+def check_a_full_disk(s: Session, folder: Folder) -> None:
+    """Review Focus 4. /data is filled until an app has less than 1 MiB of it, with what is reserved
+    for the system left to the system, which runs on it. Nothing here may start a burst: at its end
+    the app would free space, so the file listings are through `entry_in` and a document's own row."""
+    device, pc = s.device, s.pc
+    good = folder.doc("good.txt")
+    payload = random.Random(22).randbytes(16 * MIB)
+    fresh = device.create_document(folder.doc(), "fresh.bin")
+    late = device.create_document(folder.doc(), "late.bin")
+    s.check("good.txt is on the phone", device.content_digest(good) == sha256(folder.files["good.txt"]))
+    s.check("not-here.bin is not", not entry_in(s, folder, "not-here.bin")["local_bytes"])
+    # On /data, so before there is no room for it.
+    upload = device.push_upload(payload)
+    # What the creates above started, and its floor check, come before the disk fills.
+    poll(SYNC_BOUND, "the new files on the PC", lambda: pc.pc_has(folder.pc_state, "late.bin"), interval=2)
+    time.sleep(2 * SYNC_SETTLE)
+
+    def on_the_pc() -> bool:
+        s.sync_with_the_pc_back(folder)
+        return device.confirm(folder.id)["waiting"] == 0
+
+    # Room for the write and not for its seal. Nothing is left to tell by then, and nothing is lost:
+    # it reads whole from its draft, and seals once there is room.
+    device.fill_until_free(24 * MIB)
+    device.content_write_upload(late, upload)
+    s.check("a write with no room for its seal reads back whole", device.content_digest(late) == sha256(payload))
+    device.remove_filler()
+    poll(SYNC_BOUND, "that write confirmed by the PC", on_the_pc, interval=2)
+    s.check("and it seals and reaches the PC once there is room", True)
+    # Its burst's floor check comes before the next fill.
+    time.sleep(2 * SYNC_SETTLE)
+    names = set(device.raw_names(folder.id))
+
+    # Room for part of it: the write gets some way and then fails.
+    free = device.fill_until_free(6 * MIB)
+    s.check("there is less room than the write needs", free < len(payload), f"{free} bytes")
+    refused = refusal(lambda: device.content_write_upload(good, upload))
+    s.check("a write that runs out of room partway returns an error", bool(refused), refused)
+    s.check("and the file holds all of what it held", device.content_digest(good) == sha256(folder.files["good.txt"]))
+    row = device.content_query(document_uri(good))[0]
+    s.check("at its old size", row["_size"] == str(len(folder.files["good.txt"])), row)
+    s.check("what it wrote does not stay to take up the room", device.free_bytes() >= free - MIB, device.free_bytes())
+    # Freeing has a little room to work in, where the floor would have left it plenty.
+    freed = device.free_now()
+    s.check("with a few MiB free, space can still be freed", freed["bytes"] > 0, freed)
+    # It may have taken this file with the rest, and what comes next needs it here.
+    s.check("the file reads the same after that", device.content_digest(good) == sha256(folder.files["good.txt"]))
+    # Hardly any room at all.
+    free = device.fill_until_free(0)
+    s.check("there is less than 1 MiB free", free < MIB, f"{free} bytes")
+    refused = refusal(lambda: device.content_write_upload(good, upload))
+    s.check("a write onto a file with a full disk returns an error", bool(refused), refused)
+    refused = refusal(lambda: device.content_write_upload(fresh, upload))
+    s.check("so does one onto an empty file", bool(refused), refused)
+    s.check("the file holds what it held", device.content_digest(good) == sha256(folder.files["good.txt"]))
+    row = device.content_query(document_uri(good))[0]
+    s.check("at its old size", row["_size"] == str(len(folder.files["good.txt"])), row)
+    s.check("no partial file shows", entry_in(s, folder, "fresh.bin")["size"] == 0, entry_in(s, folder, "fresh.bin"))
+    s.check("and no other name", set(device.raw_names(folder.id)) == names, device.raw_names(folder.id))
+
+    def refused_receive() -> str:
+        try:
+            digest = device.content_digest(folder.doc("not-here.bin"))
+        except ContentError as error:
+            return str(error)
+        return "" if digest == sha256(folder.files["not-here.bin"]) else f"a read of other bytes: {digest}"
+
+    refused = refused_receive()
+    s.check("a receive with a full disk reports an error", bool(refused), refused)
+    # A full burst, and freeing, with no room at all: they may do nothing, and must say so.
+    pc.write_file(folder.pc_state, "while-full.txt", b"Written while the phone was full.\n")
+    pc.folder(folder.pc_state, "flush")
+    try:
+        burst = device.shell_manage("sync-now", {"state": folder.id}, bound=SYNC_BOUND)["folders"][0]
+    except ManageError as error:
+        burst = str(error)
+    s.report.record("a burst with a full disk answers", True, burst)
+    # Android clears other apps' caches on its own when it is this full, so this is only what the next step finds.
+    s.report.record("what is free for the step after", True, device.free_bytes())
+    # Freeing with next to no room: a rewrite cannot copy, and it may do little. It must say so, and break nothing.
+    try:
+        freed = device.free_now()
+    except ManageError as error:
+        freed = str(error)
+    s.report.record("freeing with a full disk answers", True, freed)
+
+    device.remove_filler()
+    free = device.free_bytes()
+    s.check("the filler is removed, and there is room again", free > BACK_IN_SPACE, f"{free} bytes")
+    device.content_write_upload(good, upload)
+    s.check("a write works once space returns", device.content_digest(good) == sha256(payload))
+    device.content_write_upload(fresh, upload)
+    s.check("onto the other file too", device.content_digest(fresh) == sha256(payload))
+    digest = poll(SYNC_BOUND, "the receive to work", lambda: device.content_digest(folder.doc("not-here.bin")), interval=2)
+    s.check("a receive works once space returns", digest == sha256(folder.files["not-here.bin"]), digest)
+    s.sync_with_the_pc_back(folder)
+    poll(SYNC_BOUND, "what was written while full", lambda: "while-full.txt" in device.raw_names(folder.id), interval=2)
+    s.check("the burst it could not finish finishes", True)
+    poll(SYNC_BOUND, "the new contents confirmed by the PC", on_the_pc, interval=2)
+    content = json.loads(pc.pc_content(folder.pc_state, "good.txt"))
+    s.check("the PC has the file at its new size", content["total_len"] == len(payload), content)
+
+    # What freeing with no room did, it left readable.
+    for name in ("kept.bin", "a.bin", "d.bin"):
+        digest = device.content_digest(folder.doc(name))
+        s.check(f"{name} reads the same after all that", digest == sha256(folder.files[name]), digest)
+
+    # No folder needed repair: running with no error, also from a cold start, and nothing set aside.
+    device.shell("rm", "-f", upload)
+    s.check("nothing panicked", "panic" not in device.logged_errors("tkfs"), device.logged_errors("tkfs")[-500:])
+    device.force_stop()
+    digest = poll(FOLDER_READY_BOUND, "the folder after a cold start", lambda: device.content_digest(good), interval=2)
+    s.check("from a cold start the file reads the same", digest == sha256(payload), digest)
+    inspected = device.shell_manage("inspect", {"state": folder.id})
+    s.check("the folder is running", inspected["phase"]["phase"] == "Running", inspected["phase"])
+    status = [row for row in device.shell_manage("status")["folders"] if row["record"]["id"] == folder.id][0]
+    s.check("with no error", status.get("error") is None, status.get("error"))
+    drafts = device.shell("run-as", PACKAGE, "ls", "-a", f"{folder.state}/scratch").out.split()
+    s.check("no draft was set aside, and no working file left", "quarantine" not in drafts
+            and not any(name.endswith(".tmp") for name in drafts), drafts)
+
+
 SCENARIOS: dict[str, Callable[[Session], None]] = {
     "ui_folders": scenario_ui_folders,
     "ui_browse": scenario_ui_browse,
     "conflicts": scenario_conflicts,
+    "space": scenario_space,
     "read": scenario_read,
     "write": scenario_write,
     "share": scenario_share,

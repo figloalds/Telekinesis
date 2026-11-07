@@ -84,6 +84,7 @@ class MainActivity : ComponentActivity() {
                             onChangeAddress = model::changeAddress,
                             onUnpair = model::unpair,
                             onAllowBattery = ::askForBatteryExemption,
+                            onFreeSpace = model::freeSpace,
                         )
                     }
                 }

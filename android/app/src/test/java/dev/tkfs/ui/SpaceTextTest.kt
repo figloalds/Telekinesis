@@ -1,0 +1,55 @@
+package dev.tkfs.ui
+
+import dev.tkfs.sync.Freed
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
+import org.junit.Test
+
+class SpaceTextTest {
+    @Test fun theStripSaysWhatOnlyAPcCanChange() {
+        assertEquals("Low on space. Can't free anything until My PC is reachable.", lowSpaceStrip("PC_UNREACHABLE"))
+        assertEquals("Low on space. Can't free anything until My PC is updated.", lowSpaceStrip("PC_TOO_OLD"))
+        assertNull(lowSpaceStrip(null))
+        // Of one file: it says nothing of the rest.
+        assertNull(lowSpaceStrip("NOT_ON_PC"))
+    }
+
+    @Test fun removeDownloadHasASentenceForEachWayItCanBeRefused() {
+        assertEquals("Not on My PC yet, so it can't be removed.", removeSentence("a.bin", Freed(0, "NOT_ON_PC")))
+        val away = removeSentence("a.bin", Freed(0, "PC_UNREACHABLE"))
+        val old = removeSentence("a.bin", Freed(0, "PC_TOO_OLD"))
+        assertEquals("My PC isn't reachable, so the download of a.bin can't be removed yet.", away)
+        assertEquals("My PC needs an update before the download of a.bin can be removed.", old)
+        assertNotEquals(away, old)
+    }
+
+    @Test fun aRemovedDownloadNeedsNoSentenceAndOneThatStayedSaysWhy() {
+        assertNull(removeSentence("a.bin", Freed(10, null)))
+        assertEquals("a.bin is in use or has a conflict to settle, so it stays.", removeSentence("a.bin", Freed(0, null)))
+    }
+
+    @Test fun freeingNowSaysWhatItDidAndWhyNoMore() {
+        assertEquals("Freed 3.4 MB.", freedSentence(Freed(3_400_000, null), stillLow = false))
+        assertEquals("Enough is free already.", freedSentence(Freed(0, null), stillLow = false))
+        assertEquals(
+            "Freed 3.4 MB. Can't free more until My PC is reachable.",
+            freedSentence(Freed(3_400_000, "PC_UNREACHABLE"), stillLow = true),
+        )
+        assertEquals("Can't free more until My PC is updated.", freedSentence(Freed(0, "PC_TOO_OLD"), stillLow = true))
+        assertEquals(
+            "Nothing else can be freed: the rest is kept, in use, or not on My PC yet.",
+            freedSentence(Freed(0, null), stillLow = true),
+        )
+    }
+
+    @Test fun theSettingsLineIsTheMockups() {
+        assertEquals("13 GB. Oldest downloads go first.", floorLine(12_800_000_000))
+    }
+
+    @Test fun whatKeepingOffersDependsOnWhoMarkedIt() {
+        assertEquals("Keep on this phone", keepAction(marked = false, kept = false))
+        assertEquals("Stop keeping on this phone", keepAction(marked = true, kept = true))
+        assertEquals("Kept with its folder", keepAction(marked = false, kept = true))
+    }
+}

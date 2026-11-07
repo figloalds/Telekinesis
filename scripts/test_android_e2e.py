@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 import android_e2e
 from android_e2e_lib import (Completed, Device, Emulator, GiveUp, HarnessError, ManageError, PcHost, Proc, Report,
                              Session, bounds_center, children_uri, document_uri, emulator_processes, encode_payload,
-                             is_frozen, parse_call, parse_rows, png_noise, poll, run_bounded, shell_line, size_text, split_qr,
+                             is_frozen, parse_call, parse_df_available, parse_rows, png_noise, poll, run_bounded, shell_line, size_text, split_qr,
                              watched_processes, with_parents)
 
 
@@ -100,6 +100,38 @@ class PairingQr(unittest.TestCase):
 class Trees(unittest.TestCase):
     def test_every_directory_above_a_file_is_expected(self):
         self.assertEqual(with_parents(["a/b/c.txt", "d.txt"]), {"a", "a/b", "a/b/c.txt", "d.txt"})
+
+
+class FillingTheVolume(unittest.TestCase):
+    def device(self, *free: int) -> Device:
+        device = Device(Path("adb"), "serial")
+        device.free_bytes = MagicMock(side_effect=list(free))
+        device.shell = MagicMock()
+        return device
+
+    def test_df_says_what_an_app_can_use(self):
+        output = "Filesystem 1K-blocks Used Available Use% Mounted on\n/dev/block/dm-55 6082144 5939940 7 100% /data/user/0"
+        self.assertEqual(parse_df_available(output), 7 * 1024)
+
+    def test_nothing_is_written_at_or_below_what_is_wanted(self):
+        device = self.device(100)
+        self.assertEqual(device.fill_until_free(100), 100)
+        device.shell.assert_not_called()
+
+    def test_it_writes_what_takes_it_past_what_is_wanted(self):
+        mib = 1024 * 1024
+        device = self.device(10 * mib, mib // 2)
+        self.assertEqual(device.fill_until_free(mib), mib // 2)
+        words = device.shell.call_args_list[0].args
+        self.assertEqual(words[:1], ("dd",))
+        self.assertIn("count=10", words)
+        self.assertTrue(any(word.startswith("of=/sdcard/Download/tkfs_e2e_filler-") for word in words), words)
+
+    def test_it_gives_up_with_how_far_it_got(self):
+        device = self.device(*[10] * 3)
+        with patch("android_e2e_lib.time.monotonic", side_effect=[0, 0, 1000]):
+            with self.assertRaisesRegex(HarnessError, "10 bytes are free"):
+                device.fill_until_free(1, bound=5)
 
 
 class Screen(unittest.TestCase):

@@ -11,6 +11,10 @@ data class FileEntry(
     val size: Long,
     val localBytes: Long,
     val modifiedMs: Long,
+    /** The owner marked this one to keep. */
+    val marked: Boolean = false,
+    /** It stays on this phone: that, or its folder's mark. */
+    val kept: Boolean = false,
 )
 
 /**
@@ -30,6 +34,8 @@ fun parseEntries(json: String): List<FileEntry> {
                 size = it.getLong("size"),
                 localBytes = it.getLong("local_bytes"),
                 modifiedMs = it.getLong("modified_ms"),
+                marked = it.optBoolean("marked", false),
+                kept = it.optBoolean("kept", false),
             )
         }
         .sortedWith(compareByDescending<FileEntry> { it.directory }.thenBy { it.name.lowercase() }.thenBy { it.name })

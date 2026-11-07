@@ -2484,6 +2484,61 @@ fn a_failed_spanning_write_killed_leaves_nothing_to_publish() -> Result<()> {
     Ok(())
 }
 
+/// A writer replacing a file was told a write failed. What it wrote before that goes, and the file is
+/// what it was, for a flush, a stop and a kill alike: a full disk must not leave half a file over a
+/// good one.
+#[test]
+fn a_replacement_abandoned_leaves_the_file_as_it_was() -> Result<()> {
+    use crate::runtime::Engine;
+    let original = b"the good bytes".to_vec();
+    let home = tempfile::tempdir()?;
+    let version = {
+        let engine = Engine::open(home.path(), None)?;
+        let token = engine.open_file("file", true, false, true)?;
+        engine.write(token, 0, &original, false, false)?;
+        engine.flush(Some(token))?;
+        engine.close(token)?;
+        let id = engine.lookup("file")?.id;
+        let version = lock(&engine.store).basis(&id)?.version;
+
+        let writer = engine.open_to_replace("file")?;
+        engine.truncate(writer, 0, false)?;
+        engine.write(writer, 0, b"half", false, false)?;
+        engine.abandon_draft(writer)?;
+        // Whatever else asks for everything to be sealed in the meantime.
+        engine.flush(None)?;
+        assert_eq!(lock(&engine.store).basis(&id)?.version, version);
+        assert_eq!(file_bytes(&lock(&engine.store), "file")?, original);
+        engine.close(writer)?;
+        engine.flush(None)?;
+        assert_eq!(lock(&engine.store).basis(&id)?.version, version);
+
+        // Failed before any byte went in: the same.
+        let writer = engine.open_to_replace("file")?;
+        engine.truncate(writer, 0, false)?;
+        engine.abandon_draft(writer)?;
+        engine.close(writer)?;
+        engine.flush(None)?;
+        assert_eq!(lock(&engine.store).basis(&id)?.version, version);
+
+        // Left open and killed: nothing was left for a start to seal.
+        let writer = engine.open_to_replace("file")?;
+        engine.truncate(writer, 0, false)?;
+        engine.write(writer, 0, b"half", false, false)?;
+        engine.abandon_draft(writer)?;
+        assert_eq!(drafts_on_disk(home.path())?, 0);
+        engine.close(writer)?;
+        engine.shutdown()?;
+        version
+    };
+    let (store, _layer, recovered) = recover_after_a_crash(home.path())?;
+    assert_eq!(recovered, 0);
+    let id = lock(&store).lookup("file")?.id;
+    assert_eq!(lock(&store).basis(&id)?.version, version);
+    assert_eq!(file_bytes(&lock(&store), "file")?, original);
+    Ok(())
+}
+
 /// A write of whole chunks that cannot put them on record fails, and they read as they were.
 #[test]
 fn a_whole_chunk_write_whose_record_fails_leaves_what_the_file_reads_as() -> Result<()> {
@@ -2852,6 +2907,48 @@ fn evict_keeps_the_basis_of_a_draft_kept_for_a_retry() -> Result<()> {
     let evicted = engine.evict(&BTreeSet::from([other.digest]))?;
     assert_eq!(evicted.removed, 1, "{evicted:?}");
     assert!(content.packs.contains(first)?, "the draft's basis went");
+    assert_eq!(drafts_on_disk(root.path())?, 1);
+    engine.shutdown()?;
+    Ok(())
+}
+
+/// `Engine::collect` goes by the same rule as `evict`. A draft kept for a retry holds no pin, and once
+/// a peer's edit has moved the file on no head names what it was made from.
+#[test]
+fn collect_keeps_the_basis_of_a_draft_kept_for_a_retry() -> Result<()> {
+    use crate::model::content::{CHUNK_SIZE, Digest};
+    use crate::runtime::Engine;
+    let root = tempfile::tempdir()?;
+    let (first, other) = {
+        let mut metadata = Store::open(root.path(), None)?;
+        let (entity, chunks) = seed_file_on_a_peer(&mut metadata, "big", 4, 1, true)?;
+        let layer = WorkingLayer::new(root.path(), metadata.content.clone())?;
+        let cut = layer.open(metadata.basis(&entity)?, true)?;
+        lock(&cut).truncate(CHUNK_SIZE + 17)?;
+        let other = metadata.content.import(b"the peer's bytes")?;
+        // Dead, and most of the segment, so that a collect rewrites it.
+        metadata.content.import(&vec![3; 4 * CHUNK_SIZE as usize])?;
+        metadata.content.packs.flush()?;
+        (Digest::bytes(&chunks[0]), other)
+    };
+    let engine = Engine::open(root.path(), None)?;
+    assert_eq!(drafts_on_disk(root.path())?, 1);
+    let entity = engine.lookup("big")?.id;
+    {
+        let mut store = lock(&engine.store);
+        let mut state = store.entry(&entity)?;
+        state.content = Some(other);
+        let heads = store.projection().heads[&entity].iter().cloned().collect();
+        let branch = store.active.clone();
+        let mut event = store.event(&branch, state, heads, Operation::Content);
+        event.author = "a peer".into();
+        store.apply(&[event])?;
+    }
+    assert!(engine.collect()? > 0, "what is dead around it stayed");
+    assert!(
+        engine.working.content().packs.contains(first)?,
+        "the draft's basis went"
+    );
     assert_eq!(drafts_on_disk(root.path())?, 1);
     engine.shutdown()?;
     Ok(())

@@ -15,6 +15,7 @@ import dev.tkfs.sync.BurstError
 import dev.tkfs.sync.Finished
 import dev.tkfs.sync.SyncCoordinator
 import dev.tkfs.sync.Trigger
+import dev.tkfs.sync.floorBytes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -69,6 +70,13 @@ data class AppUi(
     val pollFailure: Failure? = null,
     val pairing: Pairing = Pairing.Fields,
     val storage: String = "",
+    /** How much the app keeps free on the volume; 0 until it has looked. */
+    val floorBytes: Long = 0,
+    /** Why space stays below that, when only a PC could change it. */
+    val spaceBlocked: String? = null,
+    /** What the last "Free up space now" did, or that it is at it. */
+    val spaceNote: String? = null,
+    val freeingSpace: Boolean = false,
     val syncOnMobile: Boolean = false,
     val periodMinutes: Int = 30,
     /** Whether Android lets the app run while the phone is idle (the battery-optimization exemption). */
@@ -113,6 +121,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         mutable.update { it.copy(syncOnMobile = settings.syncOnMobile, periodMinutes = settings.periodMinutes) }
         viewModelScope.launch { SyncCoordinator.running.collect { running -> mutable.update { it.copy(syncing = running) } } }
         viewModelScope.launch { SyncCoordinator.finished.collect { it?.let { finished -> burstEnded(finished) } } }
+        viewModelScope.launch { SyncCoordinator.spaceBlocked.collect { blocked -> mutable.update { it.copy(spaceBlocked = blocked) } } }
     }
 
     fun startPolling() {
@@ -148,7 +157,7 @@ class AppModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun show(screen: Screen) = mutable.update {
-        it.copy(screen = screen, failure = null, pairing = Pairing.Fields)
+        it.copy(screen = screen, failure = null, pairing = Pairing.Fields, spaceNote = null)
     }
 
     fun dismissFailure() = mutable.update { it.copy(failure = null) }
@@ -177,7 +186,8 @@ class AppModel(application: Application) : AndroidViewModel(application) {
         val allowed = getApplication<Application>().getSystemService(PowerManager::class.java)
             .isIgnoringBatteryOptimizations(getApplication<Application>().packageName)
         val storage = if (polls++ % STORAGE_EVERY == 0) storageLine() else mutable.value.storage
-        mutable.update { it.polled(shown, storage, System.currentTimeMillis()).copy(batteryAllowed = allowed, shareFailures = ShareLedger.of(getApplication()).notices(), openFailures = OpenNotices.of(getApplication()).names()) }
+        val floor = floorBytes(withContext(Dispatchers.IO) { StatFs(getApplication<Application>().filesDir.path).totalBytes })
+        mutable.update { it.polled(shown, storage, System.currentTimeMillis()).copy(floorBytes = floor, batteryAllowed = allowed, shareFailures = ShareLedger.of(getApplication()).notices(), openFailures = OpenNotices.of(getApplication()).names()) }
     }
 
     /** The folders' waiting files, read from the table on disk: no PC is asked. */
@@ -216,6 +226,21 @@ class AppModel(application: Application) : AndroidViewModel(application) {
             mutable.update { it.copy(failure = Failure.of(IOException(failure))) }
         }
         refresh()
+    }
+
+    /** "Free up space now": up to the floor, whatever the last burst left. */
+    fun freeSpace() {
+        if (mutable.value.freeingSpace) return
+        mutable.update { it.copy(freeingSpace = true, spaceNote = "Freeing space...") }
+        viewModelScope.launch {
+            val note = withContext(Dispatchers.IO) {
+                val app = getApplication<Application>()
+                val freed = SyncCoordinator.freeUp(app)
+                if (freed == null) "Could not free space. Try again." else freedSentence(freed, SyncCoordinator.spaceNeededNow(app) > 0)
+            }
+            mutable.update { it.copy(freeingSpace = false, spaceNote = note) }
+            refresh()
+        }
     }
 
     fun setSyncOnMobile(on: Boolean) {

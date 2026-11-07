@@ -50,6 +50,7 @@ import dev.tkfs.provider.DocumentIds
 import dev.tkfs.provider.TkfsProvider
 import dev.tkfs.provider.mimeOf
 import dev.tkfs.sync.SyncCoordinator
+import dev.tkfs.sync.parseFreed
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -132,10 +133,36 @@ fun BrowseScreen(folder: String, label: String, waitingFiles: Int, onBack: () ->
         ModalBottomSheet(onDismissRequest = { sheet = null }) {
             Column(Modifier.navigationBarsPadding().padding(bottom = 16.dp)) {
                 Text(entry.name, style = MaterialTheme.typography.titleMedium, maxLines = 1, modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp))
+                // A folder's mark is lifted on the folder.
+                Action(R.drawable.ic_pin, keepAction(entry.marked, entry.kept), enabled = entry.marked || !entry.kept) {
+                    sheet = null
+                    scope.launch {
+                        val failure = withContext(Dispatchers.IO) {
+                            try {
+                                Native.mark(folder, entry.id, !entry.marked)
+                                SyncCoordinator.onKeptChanged(context)
+                                null
+                            } catch (error: IOException) {
+                                Failure.of(error)
+                            }
+                        }
+                        note = failure?.sentence
+                        changes++
+                    }
+                }
                 if (!entry.directory) {
-                    // Both arrive with keeping and freeing space, which is not built yet.
-                    Action(R.drawable.ic_pin, "Keep on this phone", enabled = false) {}
-                    Action(R.drawable.ic_cloud, "Remove download", enabled = false) {}
+                    Action(R.drawable.ic_cloud, "Remove download", enabled = !entry.kept && entry.localBytes > 0) {
+                        sheet = null
+                        note = "Asking My PC..."
+                        scope.launch {
+                            note = withContext(Dispatchers.IO) { removeDownload(folder, entry) }
+                            context.contentResolver.notifyChange(
+                                DocumentsContract.buildChildDocumentsUri(TkfsProvider.AUTHORITY, DocumentIds.make(folder, path)),
+                                null,
+                            )
+                            changes++
+                        }
+                    }
                     Action(R.drawable.ic_share, "Share") {
                         sheet = null
                         note = share(context, folder, child, entry.name)
@@ -208,6 +235,15 @@ fun BrowseScreen(folder: String, label: String, waitingFiles: Int, onBack: () ->
     }
 }
 
+/** What Browse says after "Remove download": null when the download went. */
+private fun removeDownload(folder: String, entry: FileEntry): String? = try {
+    removeSentence(entry.name, parseFreed(Native.removeDownload(folder, entry.id)))
+} catch (error: IOException) {
+    Failure.of(error).sentence
+} catch (error: JSONException) {
+    "The app could not read what happened to ${entry.name}."
+}
+
 private fun read(folder: String, path: String): Listed = try {
     Listed.Files(parseEntries(Native.list(folder, path)), parseWaitingEntities(Native.waiting(folder)))
 } catch (error: IOException) {
@@ -220,7 +256,11 @@ private fun read(folder: String, path: String): Listed = try {
 @Composable
 private fun FileRow(entry: FileEntry, waiting: Boolean, onClick: () -> Unit, onLongClick: () -> Unit) {
     val mime = mimeOf(entry.name, entry.directory)
-    val line = if (entry.directory) null else rowLine(entry.name, entry.size, entry.localBytes, waiting, kept = false)
+    val line = when {
+        !entry.directory -> rowLine(entry.name, entry.size, entry.localBytes, waiting, entry.kept)
+        entry.kept -> Line("Kept on this phone", Tone.Ok)
+        else -> null
+    }
     Row(
         Modifier.fillMaxWidth()
             .combinedClickable(role = Role.Button, onClick = onClick, onLongClick = onLongClick)
@@ -249,6 +289,7 @@ private fun FileRow(entry: FileEntry, waiting: Boolean, onClick: () -> Unit, onL
             // The same word as the line, as a mark: sending, here, or not yet.
             val mark = when {
                 waiting -> R.drawable.ic_up
+                entry.kept && (entry.directory || isOnThisPhone(entry.size, entry.localBytes)) -> R.drawable.ic_pin
                 isOnThisPhone(entry.size, entry.localBytes) -> R.drawable.ic_check
                 else -> R.drawable.ic_cloud
             }

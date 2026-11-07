@@ -457,6 +457,22 @@ impl PackStore {
             digests,
         }
     }
+    /// How many bytes the object takes in the packs, if it is here.
+    pub fn object_len(&self, digest: Digest) -> Result<Option<u64>> {
+        Ok(Self::location(&mut guard(&self.inner.state), digest)?
+            .map(|location| location.len as u64))
+    }
+    /// What every segment takes on disk. A segment a rewrite removes as this looks counts for nothing.
+    pub fn disk_bytes(&self) -> Result<u64> {
+        let mut total = 0;
+        for entry in fs::read_dir(&self.inner.root)? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|e| e == "pack") {
+                total += entry.metadata().map_or(0, |metadata| metadata.len());
+            }
+        }
+        Ok(total)
+    }
     /// A number that changes whenever objects may have been removed (`collect`, or a corrupt object
     /// dropped). An answer to "is this here" that was true under one generation holds only while it
     /// stays. Adding objects does not change it.

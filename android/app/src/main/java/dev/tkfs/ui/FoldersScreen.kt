@@ -51,6 +51,7 @@ fun FoldersScreen(
             Column(Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
                 ShareFailureStrip(ui.shareFailures, onDismissShareFailures)
                 OpenFailureStrip(ui.openFailures, onDismissOpenFailures)
+                LowSpaceStrip(ui.spaceBlocked)
                 when {
                     snapshot == null -> Text("Starting...", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     snapshot.folders.isEmpty() -> Empty(snapshot, onAddPc)
@@ -158,6 +159,19 @@ private fun Strips(snapshot: Snapshot, onAddPc: () -> Unit) {
                 .padding(horizontal = 12.dp, vertical = 10.dp),
         )
     }
+}
+
+/** Low on space, and only a PC could change that. It goes by itself once the floor is met. */
+@Composable
+private fun LowSpaceStrip(blocked: String?) {
+    val text = lowSpaceStrip(blocked) ?: return
+    Text(
+        text,
+        style = MaterialTheme.typography.bodyMedium,
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 4.dp)
+            .background(amber().soft, RoundedCornerShape(12.dp))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+    )
 }
 
 /** Files shared in that were not saved, until dismissed. It does not depend on the notification permission. */

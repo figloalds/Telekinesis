@@ -57,6 +57,10 @@ FROZEN_BOUND = 120
 UI_BOUND = 30
 KILL_BOUND = 10
 POLL = 0.25
+# How long filling the volume may take, and where the filler goes: /sdcard is on the same partition
+# as the app, and a shell may write there.
+FILL_BOUND = 300
+FILLER = "/sdcard/Download/tkfs_e2e_filler"
 
 
 class HarnessError(Exception):
@@ -283,6 +287,11 @@ def parse_rows(output: str) -> list[dict[str, str]]:
     return rows
 
 
+def parse_df_available(output: str) -> int:
+    """The bytes `df -k` says are available, from its only volume's row."""
+    return int(output.splitlines()[-1].split()[3]) * 1024
+
+
 def is_frozen(dump: str, package: str) -> bool:
     """Whether `dumpsys activity processes` shows `package`'s main process frozen. Its record
     starts `*APP* UID 10217 ProcessRecord{860d2a 5647:dev.tkfs/u0a217}`, and the first
@@ -409,15 +418,69 @@ class Device:
     def content_write(self, doc: str, data: bytes, bound: float = PROVIDER_BOUND) -> None:
         """Replaces the document's bytes with `data`, through the provider. `content write`
         copies its stdin, which is the device's, so the bytes go there first."""
+        remote = self.push_upload(data, bound)
+        try:
+            self.content_write_upload(doc, remote, bound)
+        finally:
+            self.shell("rm", "-f", remote)
+
+    def push_upload(self, data: bytes, bound: float = PROVIDER_BOUND) -> str:
+        """Puts `data` on the device for `content_write_upload`: where, which is on /data."""
         remote = f"{REMOTE_TMP}/tkfs_e2e_upload"
         with tempfile.TemporaryDirectory(prefix="tkfs-e2e-") as local:
             source = Path(local) / "upload"
             source.write_bytes(data)
             self.adb("push", source, remote, bound=bound).require_success()
+        return remote
+
+    def content_write_upload(self, doc: str, remote: str, bound: float = PROVIDER_BOUND) -> None:
+        """Replaces the document's bytes with those of the file `remote`, through the provider."""
         done = self._provider(f"content write --uri {shlex.quote(document_uri(doc))} < {remote}", bound=bound)
-        self.shell("rm", "-f", remote)
         if done.code != 0 or done.err or done.out:
             raise ContentError(f"content write {doc}: {done.err or done.out}")
+
+    def content_digest(self, doc: str, bound: float = PROVIDER_BOUND) -> str:
+        """The SHA-256 of the document's bytes through the provider, worked out on the device, so
+        that it takes no room there and no time to bring here. A read that fails raises."""
+        done = self._provider(f"content read --uri {shlex.quote(document_uri(doc))} | sha256sum", bound=bound)
+        if done.err:
+            raise ContentError(f"content read {doc}: {done.err}")
+        return done.out.split()[0]
+
+    def free_bytes(self) -> int:
+        """What an app can still use of /data, by `df`. It leaves out what is reserved for the system."""
+        return parse_df_available(self.shell("df", "-k", "/data").require_success().out)
+
+    def fill_until_free(self, target: int, bound: float = FILL_BOUND) -> int:
+        """Writes filler until at most `target` bytes are free, and returns how many are. A write
+        past the end of the volume is what fills it, so `dd`'s own failure means nothing."""
+        end = time.monotonic() + bound
+        while True:
+            free = self.free_bytes()
+            if free <= target:
+                return free
+            if time.monotonic() >= end:
+                raise HarnessError(f"{free} bytes are free, {bound} s on from filling to {target}")
+            count = (free - target) // (1024 * 1024) + 1
+            name = f"{FILLER}-{time.monotonic_ns()}"
+            self.shell("dd", "if=/dev/zero", f"of={name}", "bs=1048576", f"count={count}", "conv=fsync", bound=bound)
+            self.shell("sync", bound=bound)
+
+    def remove_filler(self, bound: float = FILL_BOUND) -> None:
+        """Every file `fill_until_free` wrote, from this run or one cut short. A glob, so not through `shell`."""
+        self.adb("shell", f"rm -f {FILLER}-*; sync", bound=bound).require_success()
+
+    def fillers(self) -> str:
+        """What is left of the filler, as `ls` lists it; empty when none is."""
+        return self.adb("shell", f"ls {FILLER}-* 2>/dev/null").out
+
+    def space(self) -> dict:
+        """What the app sees of the volume: `{free, total, floor, blocked}` (a debug build)."""
+        return json.loads(parse_call(self.call_method("tkfs.space")))
+
+    def free_now(self) -> dict:
+        """What "Free up space now" answers, `{bytes, blocked}`, when asked of it directly (a debug build)."""
+        return json.loads(parse_call(self.call_method("tkfs.free")))
 
     def document(self, operation: str, **request) -> dict:
         """A document operation `content` has no way to ask for, done inside the app through
@@ -640,10 +703,14 @@ class Device:
     def raw_names(self, folder: str, path: str = "/") -> list[str]:
         """Every name in a directory of a folder, including the working files of a share that the provider
         hides (a debug build)."""
+        return [entry["name"] for entry in self.entries(folder, path)]
+
+    def entries(self, folder: str, path: str = "/") -> list[dict]:
+        """A directory of a folder as `Native.list` gives it, with no listing to start a burst (a debug build)."""
         line = shell_line(["content", "call", "--uri", CONTROL_URI, "--method", "tkfs.list_all", "--arg", folder,
                            "--extra", "payload:s:" + encode_payload({"path": path})])
         called = self._provider(line)
-        return [entry["name"] for entry in json.loads(parse_call(called.out or called.err))]
+        return json.loads(parse_call(called.out or called.err))
 
     def app_sees_metered(self) -> bool:
         """What the app's own `ConnectivityManager.isActiveNetworkMetered` says now (a debug build)."""

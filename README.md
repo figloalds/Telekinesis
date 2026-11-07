@@ -311,7 +311,9 @@ The desktop app shows the same codes. The code tells you what to do:
 | `ROOT_IMMUTABLE` | Something asked to rename or delete a folder's root. | Rename or delete what is inside it. |
 | `NATIVE_PANIC` | A call into the Android app's native code hit a bug. The call failed and the app kept running. The panic is in logcat under the tag `tkfs`. | Retry; if it repeats, report it with `adb logcat -s tkfs`. |
 | `PHONE_DB_UNAVAILABLE` | The Android app could not open `phone.sqlite`, where it keeps the files not yet confirmed by a PC. | Free space on the phone and retry; the files themselves are safe. |
-| `PC_UNREACHABLE` | The Android app was asked to open a file it does not hold all of, and no PC that has the folder answered within 3 s. The app names the file in a notification and on its Folders screen. | Wait for the PC to be reachable (same network, PC running), then open the file again. |
+| `PC_UNREACHABLE` | The Android app was asked to open a file it does not hold all of, and no PC that has the folder answered within 3 s. The app names the file in a notification and on its Folders screen. Freeing space on the phone stops with this too: nothing that only a PC could give back leaves without one saying it holds it. | Wait for the PC to be reachable (same network, PC running), then open the file again, or free space again. |
+| `NOT_ON_PC` | The Android app was asked to remove a file's download, and no PC holds all of it yet. | Sync, and try again once the file is no longer waiting to send. |
+| `PC_TOO_OLD` | The Android app was asked to free space, and the PC cannot say what it holds. Nothing that only a PC could give back leaves the phone. | Update the PC. |
 | `WORKER_LIMIT` | `maximum_running` folders already have a worker. | Stop one, or raise `maximum_running` and restart. |
 | `FOLDER_REQUIRED` | A folder command has neither `--state` nor `--runtime`. | Give `--state DIR` or `--runtime STATE/runtime.json`. |
 | `FOLDER_NOT_FOUND`, `AMBIGUOUS_FOLDER` | The folder argument matches no folder, or more than one. | Use more of the id, or the exact label (`manage list`). |

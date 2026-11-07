@@ -7,22 +7,29 @@
 //! else leaves the row: an error, an unreachable peer, a peer that predates `objects.have`, a
 //! digest the peer lacks, a budget that ran out. Clearing too early would tell the owner a file
 //! reached the PC when it may not have, so every doubt is a row that stays.
+//!
+//! The same file holds what the owner marked to keep and when each file was last opened, for what
+//! leaves when space runs low: dead objects, then deleted files, and then the files opened longest
+//! ago, only if a PC has just said it holds them. A file with a row here has not been confirmed, and
+//! does not leave.
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 use tkfs::{
+    core::{Entry, EntryKind, ROOT},
     model::content::Digest,
     orchestrator::{
         catalog::Catalog,
         hub::{Daemon, Held},
         sync::HAVE_BATCH,
     },
-    runtime::Engine,
+    runtime::{Engine, Presence},
 };
 
 /// The working name a shared-in file has until it is complete (`PART_PREFIX` in the share code).
@@ -70,10 +77,27 @@ pub struct Confirmed {
     pub scanning: bool,
 }
 
+/// What freeing space did: what left the packs, and why it could not do what was asked.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Freed {
+    pub bytes: u64,
+    /// [`PC_UNREACHABLE`], [`PC_TOO_OLD`] or [`NOT_ON_PC`].
+    pub blocked: Option<String>,
+}
+
+/// No PC answered, so nothing it holds can be counted on.
+pub const PC_UNREACHABLE: &str = "PC_UNREACHABLE";
+/// The PC cannot say what it holds until it is updated.
+pub const PC_TOO_OLD: &str = "PC_TOO_OLD";
+/// The PC answered, and it does not hold all of the file.
+pub const NOT_ON_PC: &str = "NOT_ON_PC";
+
 pub struct Phone {
     db: Mutex<Connection>,
     /// One confirmation at a time: two would ask the PC the same questions.
     confirming: Mutex<()>,
+    /// One freeing at a time: two would rewrite the same segments, for the same bytes.
+    freeing: Mutex<()>,
     budget: Budget,
 }
 
@@ -100,6 +124,17 @@ CREATE TABLE IF NOT EXISTS unconfirmed(
     peer TEXT NOT NULL DEFAULT '',
     checked INTEGER NOT NULL DEFAULT 0,
     total INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(folder, entity)
+);
+CREATE TABLE IF NOT EXISTS marks(
+    folder TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    PRIMARY KEY(folder, entity)
+);
+CREATE TABLE IF NOT EXISTS opened(
+    folder TEXT NOT NULL,
+    entity TEXT NOT NULL,
+    at_ms INTEGER NOT NULL,
     PRIMARY KEY(folder, entity)
 );";
 
@@ -136,6 +171,7 @@ impl Phone {
         Ok(Phone {
             db: Mutex::new(db),
             confirming: Mutex::new(()),
+            freeing: Mutex::new(()),
             budget: Budget::default(),
         })
     }
@@ -439,6 +475,521 @@ impl Phone {
             })
             .collect())
     }
+
+    /// [`Self::scan_until`] with no confirmation running: a scan beside one could put back a row it
+    /// has just cleared.
+    fn scan_alone(&self, folder: &str, engine: &Engine, deadline: Instant) -> Result<bool> {
+        let _one = lock(&self.confirming);
+        self.scan_until(folder, engine, deadline)
+    }
+
+    /// Keeps a file or directory on this phone, or stops. A mark goes by entity, so a rename keeps
+    /// it, and a directory's covers what later arrives in it.
+    pub fn mark(&self, folder: &str, entity: &str, keep: bool) -> Result<()> {
+        let db = lock(&self.db);
+        if keep {
+            db.execute(
+                "INSERT OR IGNORE INTO marks(folder,entity) VALUES(?1,?2)",
+                params![folder, entity],
+            )?;
+        } else {
+            db.execute(
+                "DELETE FROM marks WHERE folder=?1 AND entity=?2",
+                params![folder, entity],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// What the owner marked in the folder, by entity.
+    pub fn marks(&self, folder: &str) -> Result<BTreeSet<String>> {
+        let db = lock(&self.db);
+        let mut query = db.prepare_cached("SELECT entity FROM marks WHERE folder=?1")?;
+        Ok(query
+            .query_map([folder], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether `entity` is marked, or is in a directory that is. `ancestors` are the directories it
+    /// is in.
+    pub fn is_kept(&self, folder: &str, entity: &str, ancestors: &[String]) -> Result<bool> {
+        let marks = self.marks(folder)?;
+        Ok(marks.contains(entity) || ancestors.iter().any(|id| marks.contains(id)))
+    }
+
+    /// The owner opened the file now. Losing this to a kill costs only a little of the order.
+    pub fn opened(&self, folder: &str, entity: &str, now_ms: u64) -> Result<()> {
+        lock(&self.db).execute(
+            "INSERT INTO opened(folder,entity,at_ms) VALUES(?1,?2,?3) \
+             ON CONFLICT(folder,entity) DO UPDATE SET at_ms=excluded.at_ms",
+            params![folder, entity, now_ms],
+        )?;
+        Ok(())
+    }
+
+    fn opened_times(&self, folder: &str) -> Result<HashMap<String, u64>> {
+        let db = lock(&self.db);
+        let mut query = db.prepare_cached("SELECT entity,at_ms FROM opened WHERE folder=?1")?;
+        Ok(query
+            .query_map([folder], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Every file of the folder that shows, and what freeing has to know of it.
+    fn files(&self, folder: &str, engine: &Engine) -> Result<Vec<FileInFolder>> {
+        let marks = self.marks(folder)?;
+        let store = lock(&engine.store);
+        let projection = store.projection();
+        Ok(projection
+            .entries
+            .values()
+            .filter(|entry| entry.kind == EntryKind::File && !entry.deleted)
+            .filter(|entry| entry.content.is_some())
+            .map(|entry| FileInFolder {
+                entity: entry.id.clone(),
+                kept: !marks.is_empty() && is_covered(&marks, &projection.entries, entry),
+                conflict: projection
+                    .heads
+                    .get(&entry.id)
+                    .is_some_and(|heads| heads.len() > 1),
+            })
+            .collect())
+    }
+
+    /// The chunks that stay whatever else leaves: those of a kept file, and those of a file a PC has
+    /// not confirmed, which has yet to send them from here.
+    fn chunks_that_stay(
+        &self,
+        folder: &str,
+        files: &[FileInFolder],
+        engine: &Engine,
+    ) -> Result<BTreeSet<Digest>> {
+        let waiting = self.rows(folder)?;
+        let kept = files.iter().filter(|file| file.kept).map(|f| &f.entity);
+        let mut stay = BTreeSet::new();
+        for entity in kept.chain(waiting.iter().map(|row| &row.entity)) {
+            // A directory has none, and a file whose manifest is not here has none here to name.
+            if let Ok(Some(chunks)) = engine.head_chunks(entity) {
+                stay.extend(chunks);
+            }
+        }
+        Ok(stay)
+    }
+
+    /// Which of `digests` a PC holds now, and why none could say. What one PC does not name, the
+    /// next one is asked about.
+    fn ask_peers(
+        &self,
+        sent: &[(String, u64)],
+        digests: &[Digest],
+        peers: &dyn Confirmer,
+        deadline: Instant,
+    ) -> (BTreeSet<Digest>, Option<&'static str>) {
+        let mut known = BTreeSet::new();
+        let (mut answered, mut too_old) = (false, false);
+        'peers: for (peer, _) in sent {
+            let left: Vec<Digest> = digests
+                .iter()
+                .filter(|digest| !known.contains(*digest))
+                .copied()
+                .collect();
+            for page in left.chunks(HAVE_BATCH) {
+                if Instant::now() >= deadline {
+                    break 'peers;
+                }
+                match peers.held(peer, page) {
+                    Held::Known(held) => {
+                        answered = true;
+                        known.extend(held);
+                    }
+                    Held::NoFeature => {
+                        too_old = true;
+                        continue 'peers;
+                    }
+                    Held::Unreachable(_) => continue 'peers,
+                }
+            }
+        }
+        let blocked = match (answered, too_old) {
+            (true, _) => None,
+            (false, true) => Some(PC_TOO_OLD),
+            (false, false) => Some(PC_UNREACHABLE),
+        };
+        (known, blocked)
+    }
+
+    /// Frees the chunks of one file, if no doubt holds them here: it has not been confirmed, it is
+    /// kept, or the PC does not say it holds them all. Those it shares with a kept file stay.
+    /// What an open handle, a draft or an unresolved conflict needs stays too, inside `evict`.
+    pub fn remove_download(
+        &self,
+        folder: &str,
+        repo: &str,
+        entity: &str,
+        engine: &Engine,
+        peers: &dyn Confirmer,
+    ) -> Result<Freed> {
+        let _one = lock(&self.freeing);
+        let deadline = Instant::now() + self.budget.time;
+        let not_on_pc = || Freed {
+            bytes: 0,
+            blocked: Some(NOT_ON_PC.to_owned()),
+        };
+        // A table still catching up says nothing about this file, which may be on what it has not read.
+        if !self.scan_alone(folder, engine, deadline)? {
+            return Ok(not_on_pc());
+        }
+        if self.rows(folder)?.iter().any(|row| row.entity == entity) {
+            return Ok(not_on_pc());
+        }
+        let files = self.files(folder, engine)?;
+        if files.iter().any(|file| file.entity == entity && file.kept) {
+            return Ok(Freed::default());
+        }
+        let Some(chunks) = engine.head_chunks(entity)? else {
+            return Ok(Freed::default());
+        };
+        let stay = self.chunks_that_stay(folder, &files, engine)?;
+        let mut named = Vec::new();
+        for digest in chunks {
+            if !stay.contains(&digest) && takes_room(engine, digest)? > 0 {
+                named.push(digest);
+            }
+        }
+        if named.is_empty() {
+            return Ok(Freed::default());
+        }
+        let (held, blocked) = self.ask_peers(&peers.sent(repo), &named, peers, deadline);
+        if let Some(blocked) = blocked {
+            return Ok(Freed {
+                bytes: 0,
+                blocked: Some(blocked.to_owned()),
+            });
+        }
+        if !named.iter().all(|digest| held.contains(digest)) {
+            return Ok(not_on_pc());
+        }
+        let mut failure = None;
+        let bytes = evict_counted(engine, &named.into_iter().collect(), &mut failure)?;
+        match failure {
+            Some(error) if bytes == 0 => Err(error),
+            _ => Ok(Freed {
+                bytes,
+                blocked: None,
+            }),
+        }
+    }
+
+    /// Gives back at least `need_bytes` of the packs if it can. First what is dead, which is nobody's
+    /// and asks no one. Then what only a deleted file holds, which the owner deleted everywhere. Then
+    /// the files opened longest ago, those never opened first, whose chunks a PC has just said it
+    /// holds. The bytes are what left the disk, whatever each step said, as an evict that failed may
+    /// have freed other segments. Out of time, it stops with what it has.
+    pub fn free_oldest(
+        &self,
+        folder: &str,
+        repo: &str,
+        engine: &Engine,
+        peers: &dyn Confirmer,
+        need_bytes: u64,
+    ) -> Result<Freed> {
+        let _one = lock(&self.freeing);
+        let deadline = Instant::now() + self.budget.time;
+        let packs = &engine.working.content().packs;
+        let before = packs.disk_bytes()?;
+        let so_far = || -> Result<u64> { Ok(before.saturating_sub(packs.disk_bytes()?)) };
+        let mut failure = None;
+        // A collect seals every draft, and half of a file that is still being written is no version.
+        if engine.writable_tokens().is_empty()
+            && let Err(error) = engine.collect()
+        {
+            failure.get_or_insert(error);
+        }
+        let mut freed = Freed {
+            bytes: so_far()?,
+            blocked: None,
+        };
+        if freed.bytes < need_bytes {
+            if let Err(error) =
+                free_deleted(engine, need_bytes - freed.bytes, deadline, &mut failure)
+            {
+                failure.get_or_insert(error);
+            }
+            freed.bytes = so_far()?;
+        }
+        if freed.bytes < need_bytes {
+            // What has not been read of the table may be what has not been confirmed.
+            let files = self
+                .scan_alone(folder, engine, deadline)
+                .and_then(|scanned| {
+                    if !scanned {
+                        return Ok(None);
+                    }
+                    self.free_files(
+                        folder,
+                        repo,
+                        engine,
+                        peers,
+                        need_bytes,
+                        deadline,
+                        &so_far,
+                        &mut failure,
+                    )
+                });
+            match files {
+                Ok(blocked) => freed.blocked = blocked,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+            freed.bytes = so_far()?;
+        }
+        match failure {
+            Some(error) if freed.bytes == 0 && freed.blocked.is_none() => Err(error),
+            Some(error) => {
+                crate::log_error(&format!("freeing {folder}: {error:#}"));
+                Ok(freed)
+            }
+            None => Ok(freed),
+        }
+    }
+
+    /// The last step of [`Self::free_oldest`]. Each batch is asked about and evicted as one, since
+    /// many small evicts would copy what is left of a segment again each time.
+    #[allow(clippy::too_many_arguments)]
+    fn free_files(
+        &self,
+        folder: &str,
+        repo: &str,
+        engine: &Engine,
+        peers: &dyn Confirmer,
+        need_bytes: u64,
+        deadline: Instant,
+        so_far: &dyn Fn() -> Result<u64>,
+        failure: &mut Option<anyhow::Error>,
+    ) -> Result<Option<String>> {
+        let opened = self.opened_times(folder)?;
+        let files = self.files(folder, engine)?;
+        let stay = self.chunks_that_stay(folder, &files, engine)?;
+        let waiting: BTreeSet<String> = self.rows(folder)?.into_iter().map(|r| r.entity).collect();
+        let mut queue: Vec<(u64, String)> = files
+            .into_iter()
+            .filter(|file| !file.kept && !file.conflict && !waiting.contains(&file.entity))
+            .map(|file| (opened.get(&file.entity).copied().unwrap_or(0), file.entity))
+            .collect();
+        queue.sort();
+        let mut queue = queue.into_iter().map(|(_, entity)| entity);
+        let sent = peers.sent(repo);
+        loop {
+            let want = need_bytes.saturating_sub(so_far()?);
+            let mut batch: Vec<Vec<Digest>> = Vec::new();
+            let mut planned = 0;
+            while planned < want && Instant::now() < deadline {
+                let Some(entity) = queue.next() else {
+                    break;
+                };
+                let mut own = Vec::new();
+                for digest in engine.head_chunks(&entity)?.unwrap_or_default() {
+                    let len = takes_room(engine, digest)?;
+                    if !stay.contains(&digest) && len > 0 {
+                        planned += len;
+                        own.push(digest);
+                    }
+                }
+                if !own.is_empty() {
+                    batch.push(own);
+                }
+            }
+            if batch.is_empty() {
+                return Ok(None);
+            }
+            let digests: Vec<Digest> = batch.iter().flatten().copied().collect();
+            let (held, blocked) = self.ask_peers(&sent, &digests, peers, deadline);
+            let named: BTreeSet<Digest> = batch
+                .into_iter()
+                .filter(|own| own.iter().all(|digest| held.contains(digest)))
+                .flatten()
+                .collect();
+            if !named.is_empty() {
+                evict_counted(engine, &named, failure)?;
+            }
+            if blocked.is_some() {
+                return Ok(blocked.map(str::to_owned));
+            }
+            if so_far()? >= need_bytes || Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Downloads what is kept and is not all here. One file a PC cannot give stops only itself, up
+    /// to a few, which is how a PC that went away shows. What came stays. `cancel` is looked at
+    /// between steps. It returns how many bytes came.
+    pub fn hydrate_kept(
+        &self,
+        folder: &str,
+        engine: &Engine,
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<u64> {
+        let mut brought = 0;
+        let mut failures = 0;
+        let mut first_failure = None;
+        for file in self.files(folder, engine)? {
+            if !file.kept {
+                continue;
+            }
+            if cancel() {
+                break;
+            }
+            let hydrated = presence_of(engine, &file.entity).and_then(|before| {
+                if before.is_whole() {
+                    return Ok(0);
+                }
+                let after = engine.hydrate(&file.entity, cancel)?;
+                Ok(after.local_bytes.saturating_sub(before.local_bytes))
+            });
+            match hydrated {
+                Ok(bytes) => brought += bytes,
+                Err(error) => {
+                    first_failure.get_or_insert(error);
+                    failures += 1;
+                    if failures == HYDRATE_FAILURES {
+                        break;
+                    }
+                }
+            }
+        }
+        match first_failure {
+            Some(error) if brought == 0 => Err(error),
+            _ => Ok(brought),
+        }
+    }
+
+    /// Whether anything kept is not all here: whether [`Self::hydrate_kept`] has work. It asks no one.
+    pub fn kept_missing(&self, folder: &str, engine: &Engine) -> Result<bool> {
+        for file in self.files(folder, engine)? {
+            if !file.kept {
+                continue;
+            }
+            if !presence_of(engine, &file.entity)?.is_whole() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// How many kept files may fail in one [`Phone::hydrate_kept`], each after a wait of its own.
+const HYDRATE_FAILURES: usize = 3;
+/// Deleted files looked at for one call of [`Engine::deleted_heads`].
+const DELETED_PAGE: usize = 256;
+
+/// One file of a folder, for [`Phone::free_oldest`].
+struct FileInFolder {
+    entity: String,
+    kept: bool,
+    conflict: bool,
+}
+
+/// Whether the file is marked, or is in a directory that is.
+fn is_covered(marks: &BTreeSet<String>, entries: &BTreeMap<String, Entry>, file: &Entry) -> bool {
+    let mut current = file;
+    // No cycle lasts past this: names are at most so deep, and it says "not kept" of what cannot be walked.
+    for _ in 0..4096 {
+        if marks.contains(&current.id) {
+            return true;
+        }
+        if current.id == ROOT {
+            return false;
+        }
+        match entries.get(&current.parent) {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The directories `entity` is in, nearest first.
+pub fn ancestors_of(engine: &Engine, entity: &str) -> Vec<String> {
+    let store = engine.store.lock().unwrap_or_else(PoisonError::into_inner);
+    let entries = &store.projection().entries;
+    let mut found = Vec::new();
+    let mut current = entries.get(entity);
+    while let Some(entry) = current {
+        if entry.id == ROOT || found.len() == 4096 {
+            break;
+        }
+        found.push(entry.parent.clone());
+        current = entries.get(&entry.parent);
+    }
+    found
+}
+
+/// What the object takes in the packs: nothing if it is not here. An empty file's one chunk takes
+/// nothing either, so it is worth neither a question nor a rewrite.
+fn takes_room(engine: &Engine, digest: Digest) -> Result<u64> {
+    let packs = &engine.working.content().packs;
+    Ok(packs.object_len(digest)?.unwrap_or(0))
+}
+
+/// How much of the file is here now. The store is not held while it looks in the packs.
+fn presence_of(engine: &Engine, entity: &str) -> Result<Presence> {
+    let entry = engine
+        .store
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(entity)?;
+    engine.entry_presence(&entry)
+}
+
+/// Evicts `named` once and says what left the disk. An evict that fails may still have freed other
+/// segments, so its failure goes in `failure` and the bytes are counted all the same.
+fn evict_counted(
+    engine: &Engine,
+    named: &BTreeSet<Digest>,
+    failure: &mut Option<anyhow::Error>,
+) -> Result<u64> {
+    let packs = &engine.working.content().packs;
+    let before = packs.disk_bytes()?;
+    if let Err(error) = engine.evict(named) {
+        failure.get_or_insert(error);
+    }
+    Ok(before.saturating_sub(packs.disk_bytes()?))
+}
+
+/// Frees what only deleted files hold, up to about `need_bytes`, with one evict. The owner deleted
+/// them everywhere, so no PC is asked. A chunk a live file names stays: a copy that was then deleted
+/// shares its chunks with a file that may be the only one holding them.
+fn free_deleted(
+    engine: &Engine,
+    need_bytes: u64,
+    deadline: Instant,
+    failure: &mut Option<anyhow::Error>,
+) -> Result<()> {
+    let live = engine.live_head_objects()?;
+    let mut named = BTreeSet::new();
+    let mut planned = 0;
+    let mut after: Option<String> = None;
+    loop {
+        let page = engine.deleted_heads(after.as_deref(), DELETED_PAGE)?;
+        for entity in &page.entities {
+            for digest in engine.head_chunks(entity)?.unwrap_or_default() {
+                let len = takes_room(engine, digest)?;
+                if !live.contains(&digest) && len > 0 && named.insert(digest) {
+                    planned += len;
+                }
+            }
+        }
+        after = page.next;
+        if after.is_none() || planned >= need_bytes || Instant::now() >= deadline {
+            break;
+        }
+    }
+    if !named.is_empty() {
+        evict_counted(engine, &named, failure)?;
+    }
+    Ok(())
 }
 
 /// The peers `repo`'s cursors name that count for this folder now: the cursor is of the
@@ -483,10 +1034,65 @@ impl Confirmer for DaemonPeers<'_> {
     }
 }
 
+/// [`DaemonPeers`] for freeing, which may come long after the last burst, when the lanes may be
+/// waiting out a backoff. The first PC with no lane gets one bounded wait for them, and from then
+/// on what it answers is the answer. Another call waits again.
+pub struct ReachingPeers<'a> {
+    pub peers: DaemonPeers<'a>,
+    /// How long to wait for a PC, and then for its bulk lane.
+    pub within: Duration,
+    waited: Cell<bool>,
+}
+
+impl<'a> ReachingPeers<'a> {
+    pub fn new(peers: DaemonPeers<'a>, within: Duration) -> Self {
+        Self {
+            peers,
+            within,
+            waited: Cell::new(false),
+        }
+    }
+
+    fn wait_for_lanes(&self, installation: &str) {
+        // Neither says anything: what counts is what the PC answers after them.
+        let _ = self
+            .peers
+            .daemon
+            .reach_a_peer(self.peers.folder, self.within);
+        let end = Instant::now() + self.within;
+        while matches!(self.peers.held(installation, &[]), Held::Unreachable(_))
+            && Instant::now() < end
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Confirmer for ReachingPeers<'_> {
+    fn sent(&self, repo: &str) -> Vec<(String, u64)> {
+        self.peers.sent(repo)
+    }
+
+    fn held(&self, installation: &str, digests: &[Digest]) -> Held {
+        let answer = self.peers.held(installation, digests);
+        if !matches!(answer, Held::Unreachable(_)) || self.waited.replace(true) {
+            return answer;
+        }
+        self.wait_for_lanes(installation);
+        self.peers.held(installation, digests)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::RefCell, sync::Arc};
+    use std::{
+        cell::RefCell,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
     use tkfs::{
         core::{EntryKind, Operation},
         model::content::{CHUNK_SIZE, ContentKind, FileContentRef},
@@ -625,6 +1231,64 @@ mod tests {
         }
 
         /// An event of another device on top of `path`'s head, as a feed brings it.
+        fn id(&self, path: &str) -> String {
+            self.engine.lookup(path).unwrap().id
+        }
+
+        /// How much of the file is here.
+        fn here(&self, path: &str) -> u64 {
+            self.engine.presence(path).unwrap().local_bytes
+        }
+
+        fn is_whole(&self, path: &str) -> bool {
+            self.engine.presence(path).unwrap().is_whole()
+        }
+
+        /// Everything so far has reached the PC and left the table.
+        fn on_the_pc(&self, paths: &[&str]) {
+            self.peers.sent(PC, self.top());
+            for path in paths {
+                self.peers.holds(PC, &self.digests(path));
+            }
+            assert_eq!(self.confirm().waiting, 0);
+        }
+
+        fn free(&self, need: u64) -> Freed {
+            self.phone
+                .free_oldest(FOLDER, REPO, &self.engine, &self.peers, need)
+                .unwrap()
+        }
+
+        fn remove(&self, path: &str) -> Freed {
+            self.phone
+                .remove_download(FOLDER, REPO, &self.id(path), &self.engine, &self.peers)
+                .unwrap()
+        }
+
+        /// A file's chunks go, as if freed, so that a test starts with them gone.
+        fn evicted(&self, path: &str) -> Vec<u8> {
+            let bytes = self.read(path);
+            let chunks = self.engine.head_chunks(&self.id(path)).unwrap().unwrap();
+            let named = chunks.into_iter().collect();
+            self.engine.evict(&named).unwrap();
+            bytes
+        }
+
+        fn read(&self, path: &str) -> Vec<u8> {
+            let token = self.engine.open_file(path, false, false, false).unwrap();
+            let (_, len) = self.engine.info(token).unwrap();
+            let mut bytes = vec![0; len as usize];
+            assert_eq!(
+                self.engine.read(token, 0, &mut bytes).unwrap(),
+                bytes.len(),
+                "a short read of {path}"
+            );
+            self.engine.close(token).unwrap();
+            // A draft that a reader left holds what it was made from for a while.
+            self.engine.working.reap_released().unwrap();
+            bytes
+        }
+
         fn peer_writes(&self, path: &str, bytes: &[u8]) {
             let id = self.engine.lookup(path).unwrap().id;
             let content = self.engine.working.content().import(bytes).unwrap();
@@ -835,15 +1499,6 @@ mod tests {
 
     #[test]
     fn an_unreachable_peer_clears_nothing() {
-        struct Down;
-        impl Confirmer for Down {
-            fn sent(&self, _: &str) -> Vec<(String, u64)> {
-                vec![("pc".into(), u64::MAX)]
-            }
-            fn held(&self, _: &str, _: &[Digest]) -> Held {
-                Held::Unreachable("no lane".into())
-            }
-        }
         let f = fixture();
         f.write("/a.txt", b"hello");
         let confirmed = f.phone.confirm(FOLDER, REPO, &f.engine, &Down).unwrap();
@@ -1226,6 +1881,681 @@ mod tests {
         let importer =
             std::fs::read_to_string("../app/src/main/java/dev/tkfs/share/Importer.kt").unwrap();
         assert!(importer.contains(&format!("PART_PREFIX = \"{PART_PREFIX}\"")));
+    }
+
+    /// `chunks` chunks and a little, none of them like another's or another `seed`'s.
+    fn distinct(seed: u8, chunks: usize) -> Vec<u8> {
+        let mut bytes = vec![seed; chunks * CHUNK_SIZE as usize + 10];
+        for (index, chunk) in bytes.chunks_mut(CHUNK_SIZE as usize).enumerate() {
+            chunk[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        }
+        bytes
+    }
+
+    const CHUNKS: usize = 8;
+    /// What a file of [`CHUNKS`] chunks gives back.
+    const FILE_BYTES: u64 = CHUNKS as u64 * CHUNK_SIZE + 10;
+
+    /// No PC there at all, with its cursor where it was.
+    struct Down;
+    impl Confirmer for Down {
+        fn sent(&self, _: &str) -> Vec<(String, u64)> {
+            vec![("pc".into(), u64::MAX)]
+        }
+        fn held(&self, _: &str, _: &[Digest]) -> Held {
+            Held::Unreachable("no lane".into())
+        }
+    }
+
+    #[test]
+    fn oldest_opened_goes_first_and_stops_when_enough_is_freed() {
+        let f = fixture();
+        for (seed, path) in ["/a", "/b", "/c", "/never"].iter().enumerate() {
+            f.write(path, &distinct(seed as u8 + 1, CHUNKS));
+        }
+        f.on_the_pc(&["/a", "/b", "/c", "/never"]);
+        f.phone.opened(FOLDER, &f.id("/a"), 100).unwrap();
+        f.phone.opened(FOLDER, &f.id("/b"), 300).unwrap();
+        f.phone.opened(FOLDER, &f.id("/c"), 200).unwrap();
+        // More than one file's worth and less than two.
+        let need = FILE_BYTES + CHUNK_SIZE;
+        let freed = f.free(need);
+        assert_eq!(freed.blocked, None);
+        assert!(freed.bytes >= need, "{freed:?}");
+        assert!(freed.bytes < 2 * FILE_BYTES + CHUNK_SIZE, "{freed:?}");
+        assert_eq!(f.here("/never"), 0, "one never opened goes first");
+        assert_eq!(f.here("/a"), 0, "then the one opened longest ago");
+        assert!(f.is_whole("/c"));
+        assert!(f.is_whole("/b"));
+        // A file opened again moves to the end, and the next to go is the one left oldest.
+        f.phone.opened(FOLDER, &f.id("/c"), 400).unwrap();
+        f.free(FILE_BYTES);
+        assert_eq!(f.here("/b"), 0);
+        assert!(f.is_whole("/c"));
+    }
+
+    /// A freed file comes back from the PC by the demand path, and reads the same.
+    #[test]
+    fn a_freed_file_reads_back_the_same_from_what_the_pc_holds() {
+        let f = fixture();
+        let bytes = distinct(1, CHUNKS);
+        f.write("/a", &bytes);
+        f.on_the_pc(&["/a"]);
+        let supplier = Supplier::of(&f, &bytes);
+        assert!(f.free(FILE_BYTES).bytes >= FILE_BYTES);
+        assert_eq!(f.here("/a"), 0);
+        f.engine.working.content().set_fetcher(supplier);
+        assert!(f.read("/a") == bytes);
+    }
+
+    #[test]
+    fn a_marked_file_is_never_freed() {
+        let f = fixture();
+        f.write("/kept", &distinct(1, CHUNKS));
+        f.write("/other", &distinct(2, CHUNKS));
+        f.on_the_pc(&["/kept", "/other"]);
+        f.phone.mark(FOLDER, &f.id("/kept"), true).unwrap();
+        let freed = f.free(10 * FILE_BYTES);
+        assert_eq!(f.here("/other"), 0);
+        assert!(f.is_whole("/kept"));
+        assert!(freed.bytes >= FILE_BYTES && freed.bytes < 2 * FILE_BYTES);
+        // With the mark gone it is a file like any other.
+        f.phone.mark(FOLDER, &f.id("/kept"), false).unwrap();
+        f.free(FILE_BYTES);
+        assert_eq!(f.here("/kept"), 0);
+    }
+
+    #[test]
+    fn a_marked_folder_covers_files_that_arrive_later() {
+        let f = fixture();
+        let directory = f.engine.open_file("/d", true, true, false).unwrap();
+        f.engine.close(directory).unwrap();
+        let inner = f.engine.open_file("/d/e", true, true, false).unwrap();
+        f.engine.close(inner).unwrap();
+        f.phone.mark(FOLDER, &f.id("/d"), true).unwrap();
+        f.write("/d/e/later", &distinct(1, CHUNKS));
+        f.write("/outside", &distinct(2, CHUNKS));
+        f.on_the_pc(&["/d/e/later", "/outside"]);
+        let later = f.id("/d/e/later");
+        assert_eq!(
+            ancestors_of(&f.engine, &later),
+            vec![f.id("/d/e"), f.id("/d"), ROOT.to_owned()]
+        );
+        let ancestors = ancestors_of(&f.engine, &later);
+        assert!(f.phone.is_kept(FOLDER, &later, &ancestors).unwrap());
+        assert!(
+            !f.phone
+                .is_kept(FOLDER, &f.id("/outside"), &[ROOT.to_owned()])
+                .unwrap()
+        );
+        f.free(10 * FILE_BYTES);
+        assert_eq!(f.here("/outside"), 0);
+        assert!(f.is_whole("/d/e/later"));
+    }
+
+    #[test]
+    fn a_mark_follows_a_rename() {
+        let f = fixture();
+        f.write("/before", &distinct(1, CHUNKS));
+        let id = f.id("/before");
+        f.phone.mark(FOLDER, &id, true).unwrap();
+        f.rename("/before", "/after");
+        f.on_the_pc(&["/after"]);
+        assert!(f.phone.is_kept(FOLDER, &id, &[]).unwrap());
+        assert_eq!(f.free(10 * FILE_BYTES).bytes, 0);
+        assert!(f.is_whole("/after"));
+    }
+
+    #[test]
+    fn a_chunk_shared_with_a_marked_file_stays() {
+        let f = fixture();
+        let kept = distinct(1, CHUNKS);
+        // The same chunks, and then some of its own.
+        let mut freed_file = kept[..CHUNKS * CHUNK_SIZE as usize].to_vec();
+        freed_file.extend(distinct(2, CHUNKS));
+        f.write("/kept", &kept);
+        f.write("/freed", &freed_file);
+        f.on_the_pc(&["/kept", "/freed"]);
+        f.phone.mark(FOLDER, &f.id("/kept"), true).unwrap();
+        f.free(10 * FILE_BYTES);
+        assert!(f.is_whole("/kept"));
+        assert!(f.read("/kept") == kept);
+        let left = f.here("/freed");
+        assert_eq!(left, CHUNKS as u64 * CHUNK_SIZE, "the shared part is here");
+    }
+
+    #[test]
+    fn a_file_the_peer_does_not_hold_is_not_freed() {
+        let f = fixture();
+        f.write("/lost", &distinct(1, CHUNKS));
+        f.write("/there", &distinct(2, CHUNKS));
+        f.on_the_pc(&["/lost", "/there"]);
+        // The PC lost most of one of them: none of it goes, and the other does.
+        let digests = f.digests("/lost");
+        f.peers
+            .held
+            .borrow_mut()
+            .get_mut(PC)
+            .unwrap()
+            .remove(&digests[1]);
+        let freed = f.free(10 * FILE_BYTES);
+        assert_eq!(freed.blocked, None);
+        assert!(f.is_whole("/lost"));
+        assert_eq!(f.here("/there"), 0);
+    }
+
+    #[test]
+    fn an_unreachable_peer_frees_nothing_and_says_why() {
+        let f = fixture();
+        f.write("/a", &distinct(1, CHUNKS));
+        f.on_the_pc(&["/a"]);
+        let freed = f
+            .phone
+            .free_oldest(FOLDER, REPO, &f.engine, &Down, FILE_BYTES)
+            .unwrap();
+        assert_eq!(
+            freed,
+            Freed {
+                bytes: 0,
+                blocked: Some("PC_UNREACHABLE".into())
+            }
+        );
+        assert!(f.is_whole("/a"));
+    }
+
+    #[test]
+    fn no_peer_with_the_folder_frees_nothing_and_says_why() {
+        let f = fixture();
+        f.write("/a", &distinct(1, CHUNKS));
+        f.on_the_pc(&["/a"]);
+        f.peers.sent.borrow_mut().clear();
+        let freed = f.free(FILE_BYTES);
+        assert_eq!(freed.blocked.as_deref(), Some("PC_UNREACHABLE"));
+        assert!(f.is_whole("/a"));
+    }
+
+    #[test]
+    fn a_peer_without_the_feature_frees_nothing_and_says_why() {
+        let f = fixture();
+        f.write("/a", &distinct(1, CHUNKS));
+        f.on_the_pc(&["/a"]);
+        f.peers.without_the_feature(PC);
+        let freed = f.free(FILE_BYTES);
+        assert_eq!(
+            freed,
+            Freed {
+                bytes: 0,
+                blocked: Some("PC_TOO_OLD".into())
+            }
+        );
+        assert!(f.is_whole("/a"));
+    }
+
+    /// One PC that is away says nothing of what another holds.
+    #[test]
+    fn a_second_peer_answers_for_one_that_cannot() {
+        let f = fixture();
+        f.write("/a", &distinct(1, CHUNKS));
+        f.on_the_pc(&["/a"]);
+        f.peers.without_the_feature(PC);
+        f.peers.sent("new", f.top());
+        f.peers.holds("new", &f.digests("/a"));
+        let freed = f.free(FILE_BYTES);
+        assert_eq!(freed.blocked, None);
+        assert_eq!(f.here("/a"), 0);
+    }
+
+    /// Its row says so without a question, and whatever a PC might say of its bytes.
+    #[test]
+    fn a_file_waiting_to_send_is_not_asked_about_and_stays() {
+        let f = fixture();
+        f.write("/sent", &distinct(1, CHUNKS));
+        f.on_the_pc(&["/sent"]);
+        f.write("/waiting", &distinct(2, CHUNKS));
+        f.peers.holds(PC, &f.digests("/waiting"));
+        let asked = f.peers.asked.borrow().iter().sum::<usize>();
+        f.free(10 * FILE_BYTES);
+        assert!(f.is_whole("/waiting"));
+        assert_eq!(f.here("/sent"), 0);
+        let digests = f.peers.asked.borrow().iter().sum::<usize>() - asked;
+        assert_eq!(digests, CHUNKS + 1, "only the sent file was asked about");
+    }
+
+    /// A change the table has not read yet is one nobody has confirmed.
+    #[test]
+    fn a_file_written_just_now_is_waiting_before_anything_asks() {
+        let f = fixture();
+        f.write("/a", &distinct(1, CHUNKS));
+        f.peers.sent(PC, f.top());
+        f.peers.holds(PC, &f.digests("/a"));
+        // No `confirm` has run since it was written.
+        assert_eq!(f.free(10 * FILE_BYTES).bytes, 0);
+        assert!(f.is_whole("/a"));
+    }
+
+    #[test]
+    fn a_file_held_open_stays_until_it_is_closed() {
+        let f = fixture();
+        f.write("/open", &distinct(1, CHUNKS));
+        let token = f.engine.open_file("/open", false, false, false).unwrap();
+        f.on_the_pc(&["/open"]);
+        f.free(10 * FILE_BYTES);
+        assert!(f.is_whole("/open"));
+        f.engine.close(token).unwrap();
+        f.engine.working.reap_released().unwrap();
+        f.free(10 * FILE_BYTES);
+        assert_eq!(f.here("/open"), 0);
+    }
+
+    /// Evict would refuse it anyway, so no question is spent on it.
+    #[test]
+    fn a_conflict_is_not_asked_about() {
+        let f = fixture();
+        f.write("/settle", &distinct(1, CHUNKS));
+        f.on_the_pc(&["/settle"]);
+        let id = f.id("/settle");
+        let parents: Vec<String> = f.engine.store.lock().unwrap().projection().heads[&id]
+            .iter()
+            .cloned()
+            .collect();
+        // Two edits by peers, of the same version.
+        for seed in [2, 3] {
+            let content = f
+                .engine
+                .working
+                .content()
+                .import(&distinct(seed, CHUNKS))
+                .unwrap();
+            let mut event = {
+                let mut store = f.engine.store.lock().unwrap();
+                let mut state = store.entry(&id).unwrap();
+                state.content = Some(content);
+                let branch = store.active.clone();
+                store.event(&branch, state, parents.clone(), Operation::Content)
+            };
+            event.author = format!("peer {seed}");
+            f.engine.apply_remote(&[event]).unwrap();
+        }
+        assert_eq!(
+            f.engine.store.lock().unwrap().projection().heads[&id].len(),
+            2
+        );
+        f.on_the_pc(&[]);
+        let asked = f.peers.calls();
+        f.free(10 * FILE_BYTES);
+        assert_eq!(f.peers.calls(), asked);
+        assert!(f.is_whole("/settle"));
+    }
+
+    /// Superseded versions cannot be named by a head, and the phone has no other collection.
+    #[test]
+    fn what_is_dead_goes_first_and_asks_no_one() {
+        let f = fixture();
+        f.write("/a", &distinct(1, 40));
+        f.rewrite("/a", b"small now");
+        f.write("/b", &distinct(2, 1));
+        f.on_the_pc(&["/a", "/b"]);
+        // A collect passes over the segment still being written.
+        let packs = &f.engine.working.content().packs;
+        let named = f.digests("/b").into_iter().collect();
+        packs.close_segment_holding(&named).unwrap();
+        let asked = f.peers.calls();
+        let freed = f.free(10 * CHUNK_SIZE);
+        assert!(freed.bytes >= 40 * CHUNK_SIZE, "{freed:?}");
+        assert_eq!(f.peers.calls(), asked);
+        assert!(f.is_whole("/a"));
+        assert!(f.is_whole("/b"));
+    }
+
+    #[test]
+    fn deleted_files_go_before_any_live_one_and_ask_no_one() {
+        let f = fixture();
+        f.write("/gone", &distinct(1, CHUNKS));
+        f.write("/old", &distinct(2, CHUNKS));
+        f.on_the_pc(&["/gone", "/old"]);
+        f.delete("/gone");
+        let asked = f.peers.calls();
+        let freed = f.free(FILE_BYTES);
+        assert!(freed.bytes >= FILE_BYTES, "{freed:?}");
+        assert_eq!(f.peers.calls(), asked);
+        assert!(f.is_whole("/old"));
+    }
+
+    /// A copy that was then deleted. The copy that stays has not gone anywhere, and this is all
+    /// there is of it.
+    #[test]
+    fn a_deleted_files_chunk_shared_with_a_live_unsent_file_stays() {
+        let f = fixture();
+        let bytes = distinct(1, CHUNKS);
+        f.write("/copy", &bytes);
+        f.write("/original", &bytes);
+        f.delete("/copy");
+        let freed = f
+            .phone
+            .free_oldest(FOLDER, REPO, &f.engine, &Down, 10 * FILE_BYTES)
+            .unwrap();
+        assert_eq!(freed.bytes, 0, "{freed:?}");
+        assert!(f.is_whole("/original"));
+        assert!(f.read("/original") == bytes);
+    }
+
+    /// What cannot leave does not stand in front of what can.
+    #[test]
+    fn a_deleted_file_that_must_stay_does_not_hide_those_after_it() {
+        let f = fixture();
+        let shared = distinct(1, 1);
+        f.write("/live", &shared);
+        // More than a page's worth that stays, whatever order they list in.
+        for index in 0..DELETED_PAGE + 20 {
+            let path = format!("/copy-{index}");
+            f.write(&path, &shared);
+            f.delete(&path);
+        }
+        f.write("/gone", &distinct(2, CHUNKS));
+        let gone = f.id("/gone");
+        f.delete("/gone");
+        let named: BTreeSet<Digest> = f
+            .engine
+            .head_chunks(&gone)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .collect();
+        let freed = f
+            .phone
+            .free_oldest(FOLDER, REPO, &f.engine, &Down, FILE_BYTES)
+            .unwrap();
+        assert!(freed.bytes >= FILE_BYTES, "{freed:?}");
+        let packs = &f.engine.working.content().packs;
+        for digest in named {
+            assert!(!packs.contains(digest).unwrap());
+        }
+        assert!(f.read("/live") == shared);
+    }
+
+    /// With the PC away there may still be bytes nobody needs.
+    #[test]
+    fn with_the_pc_away_what_needs_no_pc_still_goes_and_it_says_why_no_more_did() {
+        let f = fixture();
+        f.write("/gone", &distinct(1, CHUNKS));
+        f.write("/a", &distinct(2, CHUNKS));
+        f.on_the_pc(&["/gone", "/a"]);
+        f.delete("/gone");
+        let freed = f
+            .phone
+            .free_oldest(FOLDER, REPO, &f.engine, &Down, 2 * FILE_BYTES)
+            .unwrap();
+        assert!(freed.bytes >= FILE_BYTES, "{freed:?}");
+        assert_eq!(freed.blocked.as_deref(), Some("PC_UNREACHABLE"));
+        assert!(f.is_whole("/a"));
+    }
+
+    /// Out of time before it starts on the files: nothing asked, and the next call goes on.
+    #[test]
+    fn with_no_time_left_it_stops_with_what_it_has() {
+        let mut f = fixture();
+        f.write("/a", &distinct(1, CHUNKS));
+        f.on_the_pc(&["/a"]);
+        f.phone = Phone::open(&f._home.path().join("phone.sqlite"))
+            .unwrap()
+            .with_budget(Budget {
+                digests: 100,
+                time: Duration::ZERO,
+            });
+        let asked = f.peers.calls();
+        assert_eq!(f.free(FILE_BYTES), Freed::default());
+        assert_eq!(f.peers.calls(), asked);
+        assert!(f.is_whole("/a"));
+        f.phone = Phone::open(&f._home.path().join("phone.sqlite")).unwrap();
+        assert!(f.free(FILE_BYTES).bytes >= FILE_BYTES);
+    }
+
+    /// One free gives back all that is asked, however many files that takes.
+    #[test]
+    fn a_large_need_is_met_in_one_call() {
+        let f = fixture();
+        let paths: Vec<String> = (0..12).map(|index| format!("/f{index}")).collect();
+        for (index, path) in paths.iter().enumerate() {
+            f.write(path, &distinct(index as u8 + 1, CHUNKS));
+        }
+        f.on_the_pc(&paths.iter().map(String::as_str).collect::<Vec<_>>());
+        let need = 11 * FILE_BYTES;
+        assert!(f.free(need).bytes >= need);
+    }
+
+    #[test]
+    fn remove_download_frees_a_file_the_pc_holds() {
+        let f = fixture();
+        f.write("/a", &distinct(1, CHUNKS));
+        f.write("/b", &distinct(2, CHUNKS));
+        f.on_the_pc(&["/a", "/b"]);
+        let freed = f.remove("/a");
+        assert_eq!(freed.blocked, None);
+        assert!(
+            freed.bytes >= FILE_BYTES && freed.bytes < 2 * FILE_BYTES,
+            "{freed:?}"
+        );
+        assert_eq!(f.here("/a"), 0);
+        assert!(f.is_whole("/b"));
+        // Nothing left of it to remove, and no question to ask about it.
+        let asked = f.peers.calls();
+        assert_eq!(f.remove("/a"), Freed::default());
+        assert_eq!(f.peers.calls(), asked);
+    }
+
+    #[test]
+    fn remove_download_of_a_file_not_on_the_pc_says_so() {
+        let f = fixture();
+        f.write("/waiting", &distinct(1, CHUNKS));
+        let asked = f.peers.calls();
+        let freed = f.remove("/waiting");
+        assert_eq!(freed.blocked.as_deref(), Some("NOT_ON_PC"));
+        assert_eq!(f.peers.calls(), asked, "a row needs no question");
+        assert!(f.is_whole("/waiting"));
+        // No row, and the PC does not hold all of it.
+        f.on_the_pc(&["/waiting"]);
+        let digests = f.digests("/waiting");
+        f.peers
+            .held
+            .borrow_mut()
+            .get_mut(PC)
+            .unwrap()
+            .remove(&digests[1]);
+        assert_eq!(f.remove("/waiting").blocked.as_deref(), Some("NOT_ON_PC"));
+        assert!(f.is_whole("/waiting"));
+    }
+
+    #[test]
+    fn remove_download_with_the_pc_away_or_too_old_says_which() {
+        let f = fixture();
+        f.write("/a", &distinct(1, CHUNKS));
+        f.on_the_pc(&["/a"]);
+        let id = f.id("/a");
+        let away = f
+            .phone
+            .remove_download(FOLDER, REPO, &id, &f.engine, &Down)
+            .unwrap();
+        assert_eq!(away.blocked.as_deref(), Some("PC_UNREACHABLE"));
+        f.peers.without_the_feature(PC);
+        assert_eq!(f.remove("/a").blocked.as_deref(), Some("PC_TOO_OLD"));
+        assert!(f.is_whole("/a"));
+    }
+
+    #[test]
+    fn remove_download_leaves_a_kept_file_and_what_it_shares_with_one() {
+        let f = fixture();
+        let kept = distinct(1, CHUNKS);
+        let mut other = kept[..CHUNKS * CHUNK_SIZE as usize].to_vec();
+        other.extend(distinct(2, CHUNKS));
+        f.write("/kept", &kept);
+        f.write("/other", &other);
+        f.on_the_pc(&["/kept", "/other"]);
+        f.phone.mark(FOLDER, &f.id("/kept"), true).unwrap();
+        assert_eq!(f.remove("/kept"), Freed::default());
+        assert!(f.is_whole("/kept"));
+        f.remove("/other");
+        assert!(f.is_whole("/kept"));
+        assert_eq!(f.here("/other"), CHUNKS as u64 * CHUNK_SIZE);
+    }
+
+    /// One chunk that takes no room: no question, and nothing to rewrite.
+    #[test]
+    fn an_empty_file_is_not_asked_about() {
+        let f = fixture();
+        f.write("/empty", b"");
+        f.on_the_pc(&["/empty"]);
+        let asked = f.peers.calls();
+        assert_eq!(f.free(FILE_BYTES).bytes, 0);
+        assert_eq!(f.remove("/empty"), Freed::default());
+        assert_eq!(f.peers.calls(), asked);
+    }
+
+    /// Gives back what it was told of, as a PC would, and counts the fetches.
+    struct Supplier {
+        packs: tkfs::content::PackStore,
+        objects: BTreeMap<Digest, Vec<u8>>,
+        fetches: AtomicUsize,
+        /// Whether it has any of it: a PC that went away does not.
+        away: AtomicBool,
+    }
+
+    impl Supplier {
+        fn of(f: &Fixture, bytes: &[u8]) -> Arc<Supplier> {
+            let objects = bytes
+                .chunks(CHUNK_SIZE as usize)
+                .map(|chunk| (Digest::bytes(chunk), chunk.to_vec()))
+                .collect();
+            Arc::new(Supplier {
+                packs: f.engine.working.content().packs.clone(),
+                objects,
+                fetches: AtomicUsize::new(0),
+                away: AtomicBool::new(false),
+            })
+        }
+    }
+
+    impl tkfs::content::ObjectFetcher for Supplier {
+        fn fetch(&self, objects: &[(Digest, tkfs::content::Kind)]) -> Result<()> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            anyhow::ensure!(!self.away.load(Ordering::SeqCst), "the PC is away");
+            for (digest, kind) in objects {
+                if let Some(bytes) = self.objects.get(digest) {
+                    self.packs.put(*kind, bytes)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn what_is_kept_downloads_and_says_how_much_came() {
+        let f = fixture();
+        let bytes = distinct(1, CHUNKS);
+        f.write("/kept", &bytes);
+        f.write("/other", &distinct(2, CHUNKS));
+        f.on_the_pc(&["/kept", "/other"]);
+        let supplier = Supplier::of(&f, &bytes);
+        f.evicted("/kept");
+        f.evicted("/other");
+        f.engine.working.content().set_fetcher(supplier);
+        assert!(!f.phone.kept_missing(FOLDER, &f.engine).unwrap());
+        assert_eq!(
+            f.phone.hydrate_kept(FOLDER, &f.engine, &|| false).unwrap(),
+            0
+        );
+        f.phone.mark(FOLDER, &f.id("/kept"), true).unwrap();
+        assert!(f.phone.kept_missing(FOLDER, &f.engine).unwrap());
+        let brought = f.phone.hydrate_kept(FOLDER, &f.engine, &|| false).unwrap();
+        assert_eq!(brought, FILE_BYTES);
+        assert!(f.is_whole("/kept"));
+        assert_eq!(f.here("/other"), 0, "only what is marked comes");
+        assert!(!f.phone.kept_missing(FOLDER, &f.engine).unwrap());
+        // Nothing left to do is no work.
+        assert_eq!(
+            f.phone.hydrate_kept(FOLDER, &f.engine, &|| false).unwrap(),
+            0
+        );
+        assert!(f.read("/kept") == bytes);
+    }
+
+    #[test]
+    fn a_marked_folder_downloads_what_arrives_in_it() {
+        let f = fixture();
+        let directory = f.engine.open_file("/d", true, true, false).unwrap();
+        f.engine.close(directory).unwrap();
+        f.phone.mark(FOLDER, &f.id("/d"), true).unwrap();
+        let bytes = distinct(1, CHUNKS);
+        f.write("/d/later", &bytes);
+        f.on_the_pc(&["/d/later"]);
+        let supplier = Supplier::of(&f, &bytes);
+        f.evicted("/d/later");
+        f.engine.working.content().set_fetcher(supplier);
+        f.phone.hydrate_kept(FOLDER, &f.engine, &|| false).unwrap();
+        assert!(f.is_whole("/d/later"));
+    }
+
+    #[test]
+    fn a_cancel_stops_a_hydrate_between_steps_and_what_came_stays() {
+        let f = fixture();
+        let bytes = distinct(1, CHUNKS);
+        f.write("/kept", &bytes);
+        f.on_the_pc(&["/kept"]);
+        let supplier = Supplier::of(&f, &bytes);
+        f.evicted("/kept");
+        f.engine.working.content().set_fetcher(supplier.clone());
+        f.phone.mark(FOLDER, &f.id("/kept"), true).unwrap();
+        assert_eq!(
+            f.phone.hydrate_kept(FOLDER, &f.engine, &|| true).unwrap(),
+            0
+        );
+        assert_eq!(supplier.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(f.here("/kept"), 0);
+        assert_eq!(
+            f.phone.hydrate_kept(FOLDER, &f.engine, &|| false).unwrap(),
+            FILE_BYTES
+        );
+    }
+
+    #[test]
+    fn with_the_pc_away_a_hydrate_fails_and_says_why_after_a_few_tries() {
+        let f = fixture();
+        for index in 0..HYDRATE_FAILURES + 2 {
+            let path = format!("/kept-{index}");
+            f.write(&path, &distinct(index as u8 + 1, 1));
+            f.phone.mark(FOLDER, &f.id(&path), true).unwrap();
+        }
+        let paths: Vec<String> = (0..HYDRATE_FAILURES + 2)
+            .map(|i| format!("/kept-{i}"))
+            .collect();
+        f.on_the_pc(&paths.iter().map(String::as_str).collect::<Vec<_>>());
+        let supplier = Supplier::of(&f, &[]);
+        supplier.away.store(true, Ordering::SeqCst);
+        for path in &paths {
+            f.evicted(path);
+        }
+        f.engine.working.content().set_fetcher(supplier.clone());
+        let failed = f
+            .phone
+            .hydrate_kept(FOLDER, &f.engine, &|| false)
+            .unwrap_err();
+        assert!(
+            format!("{failed:#}").contains("the PC is away"),
+            "{failed:#}"
+        );
+        assert_eq!(supplier.fetches.load(Ordering::SeqCst), HYDRATE_FAILURES);
+    }
+
+    #[test]
+    fn marks_and_times_survive_reopening_the_database() {
+        let f = fixture();
+        f.write("/a", &distinct(1, 1));
+        let id = f.id("/a");
+        f.phone.mark(FOLDER, &id, true).unwrap();
+        f.phone.opened(FOLDER, &id, 7).unwrap();
+        let reopened = Phone::open(&f._home.path().join("phone.sqlite")).unwrap();
+        assert!(reopened.is_kept(FOLDER, &id, &[]).unwrap());
+        assert_eq!(reopened.opened_times(FOLDER).unwrap()[&id], 7);
+        assert!(!reopened.is_kept("another folder", &id, &[]).unwrap());
     }
 
     fn catalog_with(journal: &str) -> (tempfile::TempDir, Arc<Catalog>) {

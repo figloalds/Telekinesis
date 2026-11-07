@@ -10,6 +10,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs::File,
+    ops::Bound,
     path::Path,
     sync::{
         Arc, Mutex, RwLock,
@@ -1136,9 +1137,31 @@ impl Engine {
     pub fn collect(&self) -> Result<usize> {
         self.flush(None)?;
         let _publication = lock(&self.publication);
+        // Before the store: a draft is locked first, as the sealer does.
+        let bases = self.working.draft_bases();
         let store = lock(&self.store);
-        let live = store.live_objects(32)?;
+        let mut live = store.live_objects(32)?;
+        // Not only what `live_objects` names: a draft's basis may be no head any more.
+        live.extend(self.draft_objects(bases, &store)?);
         store.content.packs.collect(&live, 0.7)
+    }
+    /// What the drafts with these `bases` and those a start could not seal were made from, which no
+    /// pin holds for the latter. Taken with the publication lock, to keep their retries out.
+    fn draft_objects(
+        &self,
+        mut bases: Vec<FileContentRef>,
+        store: &Store,
+    ) -> Result<BTreeSet<Digest>> {
+        for record in self.working.waiting_records()? {
+            // A draft found with a receipt goes on from that version, not the one on its record.
+            if let Some((event, _)) = store.receipt(&record.operation)?
+                && let Some(version) = store.version(&event)?
+            {
+                bases.extend(version.state.content);
+            }
+            bases.push(record.basis.content);
+        }
+        store.content_closure(&bases)
     }
     pub fn basic(&self, token: u64, attributes: u32, times: [u64; 4]) -> Result<()> {
         let h = self.handle(token)?;
@@ -1282,6 +1305,17 @@ pub struct Evicted {
     pub refused: usize,
 }
 
+/// Heads looked at by one call of [`Engine::deleted_heads`].
+pub const DELETED_HEADS_SCAN: usize = 4096;
+
+/// One page of [`Engine::deleted_heads`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeletedHeads {
+    pub entities: Vec<String>,
+    /// Where the next page starts, or `None` at the end of the list.
+    pub next: Option<String>,
+}
+
 /// How many chunks one step of [`Engine::hydrate`] asks for: what one read-ahead window holds.
 const HYDRATE_WINDOW: usize = (READ_AHEAD / CHUNK_SIZE) as usize;
 
@@ -1297,18 +1331,9 @@ impl Engine {
         let _publication = lock(&self.publication);
         self.working.reap_released()?;
         // Before the store: a draft is locked first, as the sealer does.
-        let mut bases = self.working.draft_bases();
+        let bases = self.working.draft_bases();
         let mut store = lock(&self.store);
-        for record in self.working.waiting_records()? {
-            // A draft found with a receipt goes on from that version, not the one on its record.
-            if let Some((event, _)) = store.receipt(&record.operation)?
-                && let Some(version) = store.version(&event)?
-            {
-                bases.extend(version.state.content);
-            }
-            bases.push(record.basis.content);
-        }
-        let mut protected = store.content_closure(&bases)?;
+        let mut protected = self.draft_objects(bases, &store)?;
         protected.extend(store.unresolved_conflict_objects()?);
 
         let packs = &self.working.content().packs;
@@ -1425,30 +1450,50 @@ impl Engine {
         chunks.retain(|digest| seen.insert(*digest));
         Ok(Some(chunks))
     }
-    /// At most `limit` entities whose only head is a delete with some of its chunks still here:
+    /// One page of the entities whose only head is a delete with some of its chunks still here:
     /// bytes no file shows, for [`Self::head_chunks`] and [`Self::evict`] to free. A delete beside
     /// another head is a conflict, not one of these. It asks no one for anything, and one freed
     /// leaves this list.
-    pub fn deleted_heads(&self, limit: usize) -> Result<Vec<String>> {
-        let deleted: Vec<(String, FileContentRef)> = {
+    ///
+    /// One that stays, for what it shares with a live file or because evict refuses it, stays on the
+    /// list, so a caller goes on from [`DeletedHeads::next`] to reach what comes after it. A call looks
+    /// at no more than `limit` deleted files and [`DELETED_HEADS_SCAN`] heads, which holds the store
+    /// only briefly and reads only so many manifests, and may so find none on a page that has a next.
+    pub fn deleted_heads(&self, after: Option<&str>, limit: usize) -> Result<DeletedHeads> {
+        let (deleted, next) = {
             let store = lock(&self.store);
             let projection = store.projection();
-            projection
-                .heads
-                .iter()
-                .filter(|(_, heads)| heads.len() == 1)
-                .filter_map(|(entity, _)| {
-                    let entry = projection.entries.get(entity).filter(|e| e.deleted)?;
-                    Some((entity.clone(), entry.content.clone()?))
-                })
-                .collect()
+            let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+            let mut deleted: Vec<(String, FileContentRef)> = Vec::new();
+            let mut next = None;
+            let mut scanned = 0;
+            if limit > 0 {
+                let mut last = None;
+                for (entity, heads) in projection
+                    .heads
+                    .range::<str, _>((start, Bound::<&str>::Unbounded))
+                {
+                    if deleted.len() == limit || scanned == DELETED_HEADS_SCAN {
+                        next = last.map(str::to_owned);
+                        break;
+                    }
+                    scanned += 1;
+                    last = Some(entity.as_str());
+                    if heads.len() != 1 {
+                        continue;
+                    }
+                    if let Some(entry) = projection.entries.get(entity).filter(|e| e.deleted)
+                        && let Some(reference) = &entry.content
+                    {
+                        deleted.push((entity.clone(), reference.clone()));
+                    }
+                }
+            }
+            (deleted, next)
         };
         let content = self.working.content();
-        let mut found = Vec::new();
+        let mut entities = Vec::new();
         for (entity, reference) in deleted {
-            if found.len() == limit {
-                break;
-            }
             // The empty file's one chunk is pinned for good, and freeing it frees nothing.
             if reference.total_len == 0 {
                 continue;
@@ -1458,12 +1503,29 @@ impl Engine {
             };
             for digest in chunks {
                 if content.packs.contains(digest)? {
-                    found.push(entity);
+                    entities.push(entity);
                     break;
                 }
             }
         }
-        Ok(found)
+        Ok(DeletedHeads { entities, next })
+    }
+    /// What the heads that are not deletes name, on any branch: what a deleted file's chunks may
+    /// share with a file that is still there, and which may be the only copy. It asks no one, so
+    /// what an absent manifest would name is not in it.
+    pub fn live_head_objects(&self) -> Result<BTreeSet<Digest>> {
+        lock(&self.store).live_head_objects()
+    }
+    /// Takes back every edit in this handle's draft since its last seal, for a writer that was told
+    /// a write failed and whose replacement of the file is over: the file stays as that seal left it,
+    /// and nothing is on disk for a flush or a start to seal. It does nothing if another writer is
+    /// writing to the same draft, whose answered writes are not this one's to take back.
+    pub fn abandon_draft(&self, token: u64) -> Result<()> {
+        let handle = self.handle(token)?;
+        ensure!(handle.writable, "ACCESS_DENIED");
+        let scratch = handle.scratch.as_ref().context("IS_A_DIRECTORY")?;
+        self.working.abandon(scratch)?;
+        Ok(())
     }
     /// The file `entity` as it shows now, with what it holds.
     fn file_head(&self, entity: &str) -> Result<(Entry, FileContentRef)> {
@@ -3230,6 +3292,116 @@ mod tests {
         Ok(())
     }
 
+    /// Every page of [`Engine::deleted_heads`], with room for a few at a time.
+    fn every_deleted_head(engine: &Engine) -> Result<BTreeSet<String>> {
+        let mut found = BTreeSet::new();
+        let mut after = None;
+        loop {
+            let page = engine.deleted_heads(after.as_deref(), 2)?;
+            assert!(page.entities.len() <= 2);
+            found.extend(page.entities);
+            match page.next {
+                Some(next) => after = Some(next),
+                None => return Ok(found),
+            }
+        }
+    }
+
+    /// What cannot be freed keeps being listed, so with nowhere to go on from, it would hide whatever
+    /// comes after it for good.
+    #[test]
+    fn deleted_heads_go_on_past_what_stays() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let mut all = BTreeSet::new();
+        for seed in 0..7u8 {
+            let path = format!("file-{seed}");
+            written(&engine, &path, seed + 1, 1)?;
+            let id = engine.lookup(&path)?.id;
+            lock(&engine.store).delete(&id)?;
+            all.insert(id);
+        }
+        let first = engine.deleted_heads(None, 3)?;
+        assert_eq!(first.entities.len(), 3);
+        let next = first.next.clone().expect("there are more");
+        let second = engine.deleted_heads(Some(&next), 3)?;
+        assert_eq!(second.entities.len(), 3);
+        assert!(
+            first
+                .entities
+                .iter()
+                .all(|id| !second.entities.contains(id))
+        );
+        let third = engine.deleted_heads(second.next.as_deref(), 3)?;
+        assert_eq!(third.entities.len(), 1);
+        assert_eq!(third.next, None);
+        let seen: BTreeSet<String> = first
+            .entities
+            .into_iter()
+            .chain(second.entities)
+            .chain(third.entities)
+            .collect();
+        assert_eq!(seen, all);
+        // A cursor past the end, as when what it named has gone, is just the end.
+        let past = engine.deleted_heads(Some("\u{10FFFF}"), 3)?;
+        assert!(past.entities.is_empty() && past.next.is_none());
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// A long list of live files costs one call a bounded look, and the next call goes on.
+    #[test]
+    fn deleted_heads_stop_looking_after_a_page_of_live_files() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        written(&engine, "gone", 1, 1)?;
+        let gone = engine.lookup("gone")?.id;
+        lock(&engine.store).delete(&gone)?;
+        {
+            let mut store = lock(&engine.store);
+            for index in 0..2 * DELETED_HEADS_SCAN {
+                store.create(&format!("empty-{index}"), EntryKind::File)?;
+            }
+        }
+        let mut after: Option<String> = None;
+        let mut calls = 0;
+        let mut found = BTreeSet::new();
+        loop {
+            let page = engine.deleted_heads(after.as_deref(), 10)?;
+            calls += 1;
+            found.extend(page.entities);
+            match page.next {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        assert!(calls >= 2, "one call looked at all of them");
+        assert_eq!(found, BTreeSet::from([gone]));
+        engine.shutdown()?;
+        Ok(())
+    }
+
+    /// A copy that was then deleted shares its chunks with the copy that stays, which may be the only
+    /// one anywhere.
+    #[test]
+    fn live_head_objects_name_what_a_live_file_shares_with_a_deleted_one() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let engine = Engine::open(home.path(), None)?;
+        let (bytes, chunks) = written(&engine, "copy", 1, 2)?;
+        seed_cached_file(&engine, "original", &bytes)?;
+        let (_, only_deleted) = written(&engine, "gone", 2, 2)?;
+        for path in ["copy", "gone"] {
+            let id = engine.lookup(path)?.id;
+            lock(&engine.store).delete(&id)?;
+        }
+        let live = engine.live_head_objects()?;
+        assert!(chunks.is_subset(&live), "the original's chunks are named");
+        assert!(only_deleted.is_disjoint(&live), "a delete's are not");
+        assert!(live.contains(&head_of(&engine, "original")?.digest));
+        engine.shutdown()?;
+        Ok(())
+    }
+
     /// A delete leaves the content on its head, and `live_objects` keeps what that names. If
     /// nothing could name it to evict, these bytes would never leave the phone.
     #[test]
@@ -3262,21 +3434,22 @@ mod tests {
         lock(&engine.store).create("directory", EntryKind::Directory)?;
         delete("directory")?;
 
-        let listed: BTreeSet<String> = engine.deleted_heads(100)?.into_iter().collect();
+        let listed = every_deleted_head(&engine)?;
         assert_eq!(
             listed,
             BTreeSet::from([whole.clone(), small.clone(), partly.clone()])
         );
-        assert_eq!(engine.deleted_heads(2)?.len(), 2);
-        assert!(engine.deleted_heads(0)?.is_empty());
+        assert!(engine.deleted_heads(None, 0)?.entities.is_empty());
         assert_eq!(engine.head_chunks(&never)?, None);
 
         // What it names can be freed, which takes it off the list and leaves its manifest.
         let named: BTreeSet<Digest> = engine.head_chunks(&whole)?.unwrap().into_iter().collect();
         assert_eq!(named, chunks);
         assert_eq!(engine.evict(&named)?.removed, named.len());
-        let listed: BTreeSet<String> = engine.deleted_heads(100)?.into_iter().collect();
-        assert_eq!(listed, BTreeSet::from([small, partly]));
+        assert_eq!(
+            every_deleted_head(&engine)?,
+            BTreeSet::from([small, partly])
+        );
         let manifest = lock(&engine.store).entry(&whole)?.content.unwrap().digest;
         assert!(engine.working.content().packs.contains(manifest)?);
         assert!(peer.fetched().is_empty(), "it asked a peer for something");
@@ -3312,7 +3485,7 @@ mod tests {
         assert_eq!(lock(&engine.store).projection().heads[&id].len(), 2);
         assert!(lock(&engine.store).entry(&id)?.deleted, "the delete shows");
 
-        assert!(engine.deleted_heads(10)?.is_empty());
+        assert!(every_deleted_head(&engine)?.is_empty());
         let named: BTreeSet<Digest> = engine.head_chunks(&id)?.unwrap().into_iter().collect();
         assert_eq!(named, first);
         assert_eq!(
@@ -3324,9 +3497,9 @@ mod tests {
         );
         // Settled for the delete, they are a deleted file's like any other.
         engine.resolve(&id, &deletion.id)?;
-        assert_eq!(engine.deleted_heads(10)?, vec![id.clone()]);
+        assert_eq!(every_deleted_head(&engine)?, BTreeSet::from([id.clone()]));
         assert_eq!(engine.evict(&named)?.removed, named.len());
-        assert!(engine.deleted_heads(10)?.is_empty());
+        assert!(every_deleted_head(&engine)?.is_empty());
         engine.shutdown()?;
         Ok(())
     }

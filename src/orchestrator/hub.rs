@@ -651,10 +651,21 @@ impl Daemon {
 
     /// Which of `digests` the peer `installation` durably holds for `folder`
     /// (`objects.have`, paged by [`HAVE_BATCH`]). A peer that is not Ready on
-    /// a bulk lane is `Unreachable`, and one that predates the op `NoFeature`:
-    /// neither says anything of the digests. A digest the peer lacks is simply
-    /// not in `Known`.
+    /// a bulk lane, or that has not answered every page in [`HELD_BY_WITHIN`],
+    /// is `Unreachable`, and one that predates the op `NoFeature`: neither says
+    /// anything of the digests. A digest the peer lacks is simply not in `Known`.
     pub fn held_by(&self, folder: &str, installation: &str, digests: &[Digest]) -> Result<Held> {
+        self.held_by_within(folder, installation, digests, HELD_BY_WITHIN)
+    }
+
+    /// [`Self::held_by`], for an answer within `within`, or else `Unreachable`.
+    pub fn held_by_within(
+        &self,
+        folder: &str,
+        installation: &str,
+        digests: &[Digest],
+        within: Duration,
+    ) -> Result<Held> {
         let repo = self.catalog.resolve(folder)?.repo;
         let network = self.network()?;
         let endpoint = match network
@@ -680,15 +691,22 @@ impl Daemon {
         if !lane.peer().has_feature(features::CONTENT_HAVE) {
             return Ok(Held::NoFeature);
         }
+        let end = Instant::now() + within;
         let mut known = BTreeSet::new();
         for page in digests.chunks(HAVE_BATCH) {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(Held::Unreachable(format!(
+                    "objects.have: no whole answer within {within:?}"
+                )));
+            }
             let body = serde_json::to_vec(page)?;
             let reply = lane.call(
                 "objects.have",
                 json!({"repo": repo}),
                 body,
                 Priority::Data,
-                CALL_DEADLINE,
+                left.min(CALL_DEADLINE),
             );
             let reply = match reply {
                 Ok(reply) => reply,
@@ -698,7 +716,8 @@ impl Daemon {
             let reply: HaveReply = serde_json::from_slice(&reply.body)
                 .context("PROTOCOL_VIOLATION: malformed objects.have reply")?;
             // Only what was asked about counts.
-            known.extend(reply.held.into_iter().filter(|held| page.contains(held)));
+            let asked: BTreeSet<&Digest> = page.iter().collect();
+            known.extend(reply.held.into_iter().filter(|held| asked.contains(held)));
         }
         Ok(Held::Known(known))
     }
@@ -1335,6 +1354,9 @@ impl Timings {
         }
     }
 }
+
+/// How long one [`Daemon::held_by`] waits for all of its pages, each of which has its own deadline.
+const HELD_BY_WITHIN: Duration = Duration::from_secs(30);
 
 /// What a peer answered to "which of these do you hold".
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,6 +7,7 @@ mod support;
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -21,6 +22,7 @@ use tkfs::{
     orchestrator::{
         embedded::Host,
         hub::{Daemon, Held},
+        sync::HAVE_BATCH,
         sync::MissingPage,
     },
     session::{ConnOptions, Priority},
@@ -2182,6 +2184,49 @@ fn held_by_confirms_a_pushed_file_and_not_an_unknown_digest() -> Result<()> {
         Ok(matches!(phone.held(&asked)?, Held::Known(held)
             if held == chunks.iter().copied().collect()))
     })?;
+    phone.stop()?;
+    pc.shutdown()
+}
+
+/// More digests than one `objects.have` takes: asked page by page, and only what was asked counts.
+#[test]
+fn held_by_answers_for_more_digests_than_one_page_holds() -> Result<()> {
+    let pc = TestDaemon::start()?;
+    let phone = Dialer::pair_with(&pc)?;
+    let chunks = phone.write("/from-phone.bin", &text(200 * 1024, 311))?;
+    let synced = phone
+        .daemon
+        .execute("sync-now", &json!({"state": phone.folder}))?;
+    ensure!(synced["folders"][0]["error"].is_null(), "{synced}");
+    let held: BTreeSet<Digest> = chunks.iter().copied().collect();
+    // What the PC holds at both ends, so that the last of them is on a page of its own.
+    let mut asked: Vec<Digest> = chunks[..1].to_vec();
+    asked.extend((0..2 * HAVE_BATCH).map(|index| Digest::bytes(&index.to_le_bytes())));
+    asked.extend(&chunks[1..]);
+    ensure!(asked.len() > 2 * HAVE_BATCH);
+    wait_until(
+        REPLICATED,
+        "the PC to confirm the chunks on every page",
+        || Ok(matches!(phone.held(&asked)?, Held::Known(known) if known == held)),
+    )?;
+    phone.stop()?;
+    pc.shutdown()
+}
+
+/// However slowly each page is answered, the question as a whole has an end.
+#[test]
+fn held_by_out_of_time_says_the_peer_is_unreachable() -> Result<()> {
+    let pc = TestDaemon::start()?;
+    let phone = Dialer::pair_with(&pc)?;
+    let digest = Digest::bytes(b"anything");
+    ensure!(matches!(phone.held(&[digest])?, Held::Known(_)));
+    let held = phone
+        .daemon
+        .held_by_within(&phone.folder, &phone.pc, &[digest], Duration::ZERO)?;
+    ensure!(
+        matches!(&held, Held::Unreachable(why) if why.contains("objects.have")),
+        "{held:?}"
+    );
     phone.stop()?;
     pc.shutdown()
 }

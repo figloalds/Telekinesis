@@ -4,8 +4,9 @@ import java.util.Locale
 
 /**
  * What a file row says of one file, the first that applies: waiting to send, kept, on this
- * phone, or not downloaded. `kept` is true only for a file the owner asked to keep; until then
- * it is always false. `name` is the file's, for a caller that words the line for it.
+ * phone, or not downloaded. `kept` is true for a file the owner asked to keep, or in a folder they
+ * did, and until all of it is here it says it is not downloaded. `name` is the file's, for a caller
+ * that words the line for it.
  */
 @Suppress("unused")
 fun rowLine(name: String, size: Long, localBytes: Long, waiting: Boolean, kept: Boolean): Line {

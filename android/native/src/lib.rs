@@ -5,13 +5,15 @@ mod phone;
 use anyhow::{Result, anyhow, ensure};
 use jni::{
     JNIEnv,
-    objects::{JByteArray, JClass, JString},
-    sys::{JNI_FALSE, jboolean, jint, jlong, jstring},
+    objects::{JByteArray, JClass, JObject, JString},
+    sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong, jstring},
 };
-use phone::{DaemonPeers, Phone};
+use phone::{DaemonPeers, Freed, Phone, ReachingPeers, ancestors_of};
 use serde_json::{Value, json};
 use std::{
     any::Any,
+    cell::{Cell, RefCell},
+    collections::BTreeSet,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Once, OnceLock, PoisonError},
@@ -93,6 +95,141 @@ fn confirm(folder: &str) -> Result<Value> {
 
 fn engine(folder: &str) -> Result<Arc<Engine>> {
     host()?.engine(folder)
+}
+
+fn freed_json(freed: &Freed) -> Value {
+    json!({"bytes": freed.bytes, "blocked": freed.blocked})
+}
+
+/// The device of the folder's store: the journal its cursors go by.
+fn journal_of(engine: &Engine) -> String {
+    engine
+        .store
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .device
+        .clone()
+}
+
+/// Asks the PCs about one file of `folder`, and frees what they hold of it.
+fn remove_download(folder: &str, entity: &str) -> Result<Value> {
+    let daemon = host()?.daemon()?;
+    let record = daemon.catalog.resolve(folder)?;
+    let engine = engine(&record.id)?;
+    let journal = journal_of(&engine);
+    let peers = DaemonPeers {
+        daemon: &daemon,
+        folder: &record.id,
+        journal: &journal,
+    };
+    let peers = ReachingPeers::new(peers, REACH_WITHIN);
+    let freed = phone()?.remove_download(&record.id, &record.repo, entity, &engine, &peers)?;
+    Ok(freed_json(&freed))
+}
+
+/// Gives back about `need` bytes, folder by folder until it has. What one folder could not do is
+/// said once, and does not stop the next.
+fn free_space(need: u64) -> Result<Value> {
+    let daemon = host()?.daemon()?;
+    let phone = phone()?;
+    let mut total = Freed::default();
+    let mut failure = None;
+    for record in daemon.catalog.folders()? {
+        if need > 0 && total.bytes >= need {
+            break;
+        }
+        let freed = engine(&record.id).and_then(|engine| {
+            let journal = journal_of(&engine);
+            let peers = DaemonPeers {
+                daemon: &daemon,
+                folder: &record.id,
+                journal: &journal,
+            };
+            let peers = ReachingPeers::new(peers, REACH_WITHIN);
+            let left = need.saturating_sub(total.bytes);
+            phone.free_oldest(&record.id, &record.repo, &engine, &peers, left)
+        });
+        match freed {
+            Ok(freed) => {
+                total.bytes += freed.bytes;
+                total.blocked = total.blocked.take().or(freed.blocked);
+            }
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    match failure {
+        Some(error) if total.bytes == 0 && total.blocked.is_none() => Err(error),
+        _ => Ok(freed_json(&total)),
+    }
+}
+
+/// Downloads what is kept in every folder that has marks. What came stays, whatever comes after it.
+fn hydrate_kept(cancel: &dyn Fn() -> bool) -> Result<u64> {
+    let daemon = host()?.daemon()?;
+    let phone = phone()?;
+    let mut brought = 0;
+    let mut failure = None;
+    for record in daemon.catalog.folders()? {
+        if cancel() {
+            break;
+        }
+        if phone.marks(&record.id)?.is_empty() {
+            continue;
+        }
+        match engine(&record.id).and_then(|engine| phone.hydrate_kept(&record.id, &engine, cancel))
+        {
+            Ok(count) => brought += count,
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    match failure {
+        Some(error) if brought == 0 => Err(error),
+        _ => Ok(brought),
+    }
+}
+
+fn kept_missing() -> Result<bool> {
+    let daemon = host()?.daemon()?;
+    let phone = phone()?;
+    for record in daemon.catalog.folders()? {
+        if !phone.marks(&record.id)?.is_empty()
+            && phone.kept_missing(&record.id, &*engine(&record.id)?)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Says of each row of a listing whether it is `marked` itself, and whether it is `kept`, by that or
+/// because `covered` says the listed directory is.
+fn with_marks(rows: &mut Value, marks: &BTreeSet<String>, covered: bool) {
+    for row in rows.as_array_mut().into_iter().flatten() {
+        let marked = row["id"].as_str().is_some_and(|id| marks.contains(id));
+        row["marked"] = json!(marked);
+        row["kept"] = json!(marked || covered);
+    }
+}
+
+/// [`list`], with what the owner asked to keep. Not being able to say is no reason to fail a listing.
+fn list_marked(folder: &str, path: &str) -> Result<Value> {
+    let engine = engine(folder)?;
+    let mut rows = list(&engine, path)?;
+    let (marks, covered) = phone()
+        .and_then(|phone| {
+            let marks = phone.marks(folder)?;
+            let directory = engine.lookup(path)?;
+            let covered = !marks.is_empty()
+                && phone.is_kept(folder, &directory.id, &ancestors_of(&engine, &directory.id))?;
+            Ok((marks, covered))
+        })
+        .unwrap_or_default();
+    with_marks(&mut rows, &marks, covered);
+    Ok(rows)
 }
 
 /// How long opening a file the phone lacks waits for a PC before saying there is none. The
@@ -325,7 +462,7 @@ pub extern "system" fn Java_dev_tkfs_Native_list(
     guard_string(&mut env, |env| {
         let folder = text(env, &folder)?;
         let path = text(env, &path)?;
-        Ok(list(&*engine(&folder)?, &path)?.to_string())
+        Ok(list_marked(&folder, &path)?.to_string())
     })
 }
 
@@ -570,6 +707,117 @@ pub extern "system" fn Java_dev_tkfs_Native_reachPeer(mut env: JNIEnv, _: JClass
     guard(&mut env, (), |env| {
         let folder = text(env, &folder)?;
         host()?.daemon()?.reach_a_peer(&folder, REACH_WITHIN)
+    })
+}
+
+/// Takes back what this handle's draft holds since its last seal, for a writer told a write failed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_abandon(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    token: jlong,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        engine(&folder)?.abandon_draft(token as u64)
+    })
+}
+
+/// Keeps a file or directory on this phone, by its entity, or stops.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_mark(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    entity: JString,
+    keep: jboolean,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        let entity = text(env, &entity)?;
+        let record = host()?.daemon()?.catalog.resolve(&folder)?;
+        phone()?.mark(&record.id, &entity, keep != JNI_FALSE)
+    })
+}
+
+/// The owner opened the file at `path` now.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_opened(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    path: JString,
+) {
+    guard(&mut env, (), |env| {
+        let folder = text(env, &folder)?;
+        let path = text(env, &path)?;
+        let record = host()?.daemon()?.catalog.resolve(&folder)?;
+        let entity = engine(&record.id)?.lookup(&path)?.id;
+        phone()?.opened(&record.id, &entity, tkfs::util::time::now_ms())
+    })
+}
+
+/// `{bytes, blocked}`: frees one file's bytes here if a PC says it holds them.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_removeDownload(
+    mut env: JNIEnv,
+    _: JClass,
+    folder: JString,
+    entity: JString,
+) -> jstring {
+    guard_string(&mut env, |env| {
+        let folder = text(env, &folder)?;
+        let entity = text(env, &entity)?;
+        Ok(remove_download(&folder, &entity)?.to_string())
+    })
+}
+
+/// `{bytes, blocked}`: gives back about `need` bytes of the packs, folder by folder.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_freeSpace(
+    mut env: JNIEnv,
+    _: JClass,
+    need: jlong,
+) -> jstring {
+    guard_string(&mut env, |_| {
+        ensure!(need >= 0, "INVALID_PARAMETER: freeing {need} bytes");
+        Ok(free_space(need as u64)?.to_string())
+    })
+}
+
+/// Downloads what is kept, and returns how many bytes came. Each step looks at `stop`, an
+/// `AtomicBoolean`, first.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_hydrateKept<'local>(
+    mut env: JNIEnv<'local>,
+    _: JClass<'local>,
+    stop: JObject<'local>,
+) -> jlong {
+    guard(&mut env, -1, |env| {
+        let env = RefCell::new(env);
+        // No JNI call may follow a failed one, whose exception stays pending for the guard.
+        let failed = Cell::new(false);
+        let cancel = || {
+            if failed.get() {
+                return true;
+            }
+            let answer = env
+                .borrow_mut()
+                .call_method(&stop, "get", "()Z", &[])
+                .and_then(|value| value.z());
+            failed.set(answer.is_err());
+            answer.unwrap_or(true)
+        };
+        Ok(hydrate_kept(&cancel)? as jlong)
+    })
+}
+
+/// Whether anything kept is not all here. It asks no PC.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_tkfs_Native_keptMissing(mut env: JNIEnv, _: JClass) -> jboolean {
+    guard(&mut env, JNI_FALSE, |_| {
+        Ok(if kept_missing()? { JNI_TRUE } else { JNI_FALSE })
     })
 }
 
@@ -958,6 +1206,93 @@ mod tests {
                 assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
             }
         });
+    }
+
+    #[test]
+    fn keeping_and_freeing_fail_through_the_guard_with_no_host() {
+        with_env(|env| {
+            let class = env.find_class("java/lang/Object").unwrap();
+            let folder = env.new_string("F").unwrap();
+            let entity = env.new_string("E").unwrap();
+            Java_dev_tkfs_Native_mark(unsafe { env.unsafe_clone() }, class, folder, entity, 1);
+            assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+
+            let class = env.find_class("java/lang/Object").unwrap();
+            let folder = env.new_string("F").unwrap();
+            let path = env.new_string("/p").unwrap();
+            Java_dev_tkfs_Native_opened(unsafe { env.unsafe_clone() }, class, folder, path);
+            assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+
+            let class = env.find_class("java/lang/Object").unwrap();
+            let folder = env.new_string("F").unwrap();
+            let entity = env.new_string("E").unwrap();
+            let value = Java_dev_tkfs_Native_removeDownload(
+                unsafe { env.unsafe_clone() },
+                class,
+                folder,
+                entity,
+            );
+            assert!(value.is_null());
+            assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+
+            let class = env.find_class("java/lang/Object").unwrap();
+            let value = Java_dev_tkfs_Native_freeSpace(unsafe { env.unsafe_clone() }, class, 1);
+            assert!(value.is_null());
+            assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+
+            let class = env.find_class("java/lang/Object").unwrap();
+            let value = Java_dev_tkfs_Native_keptMissing(unsafe { env.unsafe_clone() }, class);
+            assert_eq!(value, JNI_FALSE);
+            assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+
+            let class = env.find_class("java/lang/Object").unwrap();
+            let folder = env.new_string("F").unwrap();
+            Java_dev_tkfs_Native_abandon(unsafe { env.unsafe_clone() }, class, folder, 1);
+            assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+        });
+    }
+
+    #[test]
+    fn freeing_a_negative_amount_is_refused_before_anything_else() {
+        with_env(|env| {
+            let class = env.find_class("java/lang/Object").unwrap();
+            let value = Java_dev_tkfs_Native_freeSpace(unsafe { env.unsafe_clone() }, class, -1);
+            assert!(value.is_null());
+            let pending = thrown(env);
+            assert!(
+                pending.starts_with("java.io.IOException: INVALID_PARAMETER"),
+                "{pending}"
+            );
+        });
+    }
+
+    /// What it looks at between steps is a real `AtomicBoolean` of the caller's, here with no host
+    /// to get as far as a step. The guard takes it from there.
+    #[test]
+    fn hydrating_what_is_kept_fails_through_the_guard_with_no_host() {
+        with_env(|env| {
+            let class = env.find_class("java/lang/Object").unwrap();
+            let stop = env
+                .new_object("java/util/concurrent/atomic/AtomicBoolean", "()V", &[])
+                .unwrap();
+            let value =
+                Java_dev_tkfs_Native_hydrateKept(unsafe { env.unsafe_clone() }, class, stop);
+            assert_eq!(value, -1);
+            assert_eq!(thrown(env), "java.io.IOException: ORCHESTRATOR_NOT_READY");
+        });
+    }
+
+    #[test]
+    fn a_listing_says_what_is_marked_and_what_a_marked_directory_covers() {
+        let mut rows = json!([{"id": "a"}, {"id": "b"}]);
+        with_marks(&mut rows, &BTreeSet::from(["a".to_owned()]), false);
+        assert_eq!(rows[0]["marked"], true);
+        assert_eq!(rows[0]["kept"], true);
+        assert_eq!(rows[1]["marked"], false);
+        assert_eq!(rows[1]["kept"], false);
+        with_marks(&mut rows, &BTreeSet::new(), true);
+        assert_eq!(rows[1]["marked"], false);
+        assert_eq!(rows[1]["kept"], true);
     }
 
     #[test]

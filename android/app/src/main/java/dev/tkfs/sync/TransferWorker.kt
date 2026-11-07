@@ -13,11 +13,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Sends what the owner just made. It repeats full bursts until nothing remains, it is stopped,
  * or a burst makes no progress. What is left waits for the next `onLocalChange`, foreground or
- * periodic trigger, so every end of this job is a success.
+ * periodic trigger, so every end of this job is a success. With nothing left to send, it downloads
+ * what the owner marked to keep, under the same network.
  *
  * The foreground notification is what matters most: a cached app is frozen and its network is
  * cut, and a job without it would not reach the PC. Android may refuse to start the service
@@ -37,7 +39,7 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
         var stopped = false
         try {
             becomeForeground("Starting")
-            withContext(Dispatchers.IO) { send(gate) }
+            withContext(Dispatchers.IO) { if (send(gate)) download() }
         } catch (stop: CancellationException) {
             // A stop (constraints, quota, `onTimeout`). The rest is for the next trigger.
             stopped = true
@@ -50,12 +52,33 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
         return Result.success()
     }
 
-    private suspend fun send(gate: TransferGate) {
+    /** What is kept and not all here. A stop ends it between steps, and what came stays. */
+    private suspend fun download() {
+        val missing = try {
+            Native.keptMissing()
+        } catch (error: IOException) {
+            Log.i(TAG, "transfer: ${error.message}")
+            false
+        }
+        if (!missing) return
+        becomeForeground("Downloading kept files")
+        val stop = AtomicBoolean(false)
+        val hydrating = SyncCoordinator.hydrateKept(applicationContext, stop)
+        try {
+            hydrating.await()
+        } catch (cancelled: CancellationException) {
+            stop.set(true)
+            throw cancelled
+        }
+    }
+
+    /** Whether it ended with nothing left to send. */
+    private suspend fun send(gate: TransferGate): Boolean {
         try {
             Native.ensureStarted(applicationContext)
         } catch (error: IOException) {
             Log.i(TAG, "transfer: the orchestrator did not start: ${error.message}")
-            return
+            return false
         }
         // A burst the owner's change asked for, 5 s after the last of them.
         while (true) {
@@ -78,7 +101,7 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
             }
             if (result.dropped) {
                 // Another burst is on its way to the PC; ask again once it is done.
-                if (++dropped > MAX_DROPPED) return
+                if (++dropped > MAX_DROPPED) return false
                 delay(DROPPED_WAIT_MS)
                 continue
             }
@@ -86,10 +109,10 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
             Log.i(TAG, "transfer: burst pushed=${result.folders.sumOf { it.pushed }} " +
                 "remaining=${result.folders.map { it.remaining }} -> $next")
             when {
-                next is Next.Stop && next.why != Why.Done -> return
+                next is Next.Stop && next.why != Why.Done -> return false
                 next is Next.Again -> becomeForeground("Still sending")
                 // Nothing remains, but only a burst that began after the last change says so.
-                gate.finish(claimed) -> return
+                gate.finish(claimed) -> return true
             }
         }
     }

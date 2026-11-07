@@ -467,6 +467,7 @@ fn recover_draft(
         base_visible_len,
         hydrated,
         hydration_pending: false,
+        torn: Default::default(),
         record,
         path: path.to_owned(),
         file: Some(file),

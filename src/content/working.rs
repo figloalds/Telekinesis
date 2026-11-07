@@ -97,6 +97,9 @@ pub struct Scratch {
     /// every small write to an already fully recorded draft.
     pub(crate) hydration_pending: bool,
     pub base_visible_len: u64,
+    /// Chunks a write of the whole of them failed on, which may have left its bytes in the file. They
+    /// read as they did for as long as they are not `hydrated`.
+    pub(crate) torn: BTreeSet<u64>,
     pub pin: Pin,
 }
 impl Scratch {
@@ -130,9 +133,22 @@ impl Scratch {
             .read(true)
             .write(true)
             .open(&self.path)?;
-        file.set_len(length)?;
-        self.record.modified_ns = modified_ns(&file)?;
-        self.create_record()?;
+        let started = file
+            .set_len(length)
+            .map_err(anyhow::Error::from)
+            .and_then(|()| modified_ns(&file))
+            .and_then(|modified| {
+                self.record.modified_ns = modified;
+                self.create_record()
+            });
+        if let Err(error) = started {
+            // On a full disk the file can be made and its record not. Nothing has been edited, and
+            // left here it would refuse the next try, once there is room, and be found at a start.
+            drop(file);
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(self.path.with_extension("json"));
+            return Err(error);
+        }
         self.file = Some(file);
         Ok(true)
     }
@@ -162,12 +178,24 @@ impl Scratch {
     }
     /// Writes `record` where nothing reads it, until [`Self::replace_record`].
     fn write_record_aside(&self, record: &ScratchRecord, durable: bool) -> Result<()> {
-        let mut file = File::create(self.path.with_extension("json.tmp"))?;
-        file.write_all(&serde_json::to_vec(record)?)?;
-        if durable {
-            file.sync_all()?;
+        let path = self.path.with_extension("json.tmp");
+        let mut file = File::create(&path)?;
+        let written = serde_json::to_vec(record)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| Ok(file.write_all(&bytes)?))
+            .and_then(|()| {
+                if durable {
+                    Ok(file.sync_all()?)
+                } else {
+                    Ok(())
+                }
+            });
+        if written.is_err() {
+            // On a full disk this is nothing anyone will come back for.
+            drop(file);
+            let _ = fs::remove_file(&path);
         }
-        Ok(())
+        written
     }
     fn replace_record(&self, durable: bool) -> Result<()> {
         let path = self.path.with_extension("json");
@@ -203,16 +231,25 @@ impl Scratch {
             return Ok(());
         }
         let start = index * CHUNK_SIZE;
+        let end = (start + CHUNK_SIZE).min(self.len()?);
         let count = self
             .base_visible_len
             .saturating_sub(start)
-            .min(CHUNK_SIZE)
-            .min(self.len()?.saturating_sub(start));
+            .min(end.saturating_sub(start));
         if count > 0 {
             let mut bytes = vec![0; count as usize];
             content.read_range(&self.record.basis.content, start, &mut bytes)?;
             write_at(self.file()?, &bytes, start)?;
         }
+        // Past what the base shows this chunk has read as zeros, and it must go on doing so from the
+        // draft, where a write that failed may have left its bytes. Where the cut falls inside the
+        // chunk that may be from before a restart, so it is not left to `torn`. Elsewhere this would
+        // fill in every hole a file was extended by, and those cost no disk until written.
+        let rest = end.saturating_sub(start + count);
+        if rest > 0 && (count > 0 || self.torn.contains(&index)) {
+            write_at(self.file()?, &vec![0; rest as usize], start + count)?;
+        }
+        self.torn.remove(&index);
         self.hydrated.insert(index);
         self.hydration_pending |= start < self.base_visible_len;
         Ok(())
@@ -274,6 +311,7 @@ impl Scratch {
     fn accept_whole_chunks(&mut self, whole: &[u64], durable: bool) -> Result<()> {
         for index in whole {
             self.hydrated.insert(*index);
+            self.torn.remove(index);
             self.hydration_pending |= index * CHUNK_SIZE < self.base_visible_len;
         }
         let published = self.publish_hydration(durable);
@@ -376,6 +414,7 @@ impl Scratch {
             .map_err(anyhow::Error::from)
             .and_then(|()| self.accept_whole_chunks(&whole, durable));
         if let Err(error) = written {
+            self.torn.extend(whole);
             // What reached past the end is no part of the file, here or at a restart.
             if end > old_len {
                 let _ = self.file()?.set_len(old_len);
@@ -452,6 +491,7 @@ impl Scratch {
         self.length = size;
         self.base_visible_len = boundary;
         self.hydrated = hydrated;
+        self.torn.retain(|index| *index * CHUNK_SIZE < size);
         self.dirty.mark(old.min(size), old.abs_diff(size));
         self.changed = true;
         self.revision = self.revision.wrapping_add(1);
@@ -662,6 +702,7 @@ impl WorkingLayer {
             hydrated,
             hydration_pending: false,
             base_visible_len: basis.content.total_len,
+            torn: BTreeSet::new(),
             pin,
         };
         let scratch = Arc::new(Mutex::new(scratch));
@@ -764,6 +805,40 @@ impl WorkingLayer {
     /// no edit goes now, and what it pins with it. It is only kept in case the file opens again.
     pub fn reap_released(&self) -> Result<()> {
         self.reap(true)
+    }
+    /// Takes back every edit in this draft since its last seal, for a writer whose replacement of
+    /// the file failed: it reads as that seal left it again, and nothing is on disk for a flush or a
+    /// start to seal. False, with nothing done, if another writer holds it too, as what that one
+    /// wrote was answered. Taken with the seal lock: a seal in flight has let go of the draft and
+    /// goes on to write back what it took from it.
+    pub fn abandon(&self, file: &Arc<Mutex<Scratch>>) -> Result<bool> {
+        let _sealing = self.seal_guard();
+        let mut scratch = lock(file);
+        if scratch.writers > 1 {
+            return Ok(false);
+        }
+        let total = scratch.record.basis.content.total_len;
+        scratch.changed = false;
+        scratch.dirty.clear();
+        scratch.length = total;
+        scratch.base_visible_len = total;
+        scratch.record.base_visible_len = Some(total);
+        scratch.hydrated.clear();
+        scratch.record.hydrated.clear();
+        scratch.torn.clear();
+        scratch.hydration_pending = false;
+        scratch.revision = scratch.revision.wrapping_add(1);
+        scratch.modified_time = None;
+        scratch.explicit_modified_time = false;
+        scratch.automatic_time_current = false;
+        scratch.closed_at = None;
+        let on_disk = scratch.file.take().is_some();
+        if on_disk {
+            // In this order: a start passes over a record with no draft.
+            fs::remove_file(&scratch.path)?;
+            fs::remove_file(scratch.path.with_extension("json"))?;
+        }
+        Ok(true)
     }
     fn reap(&self, at_once: bool) -> Result<()> {
         let retired = self.retire(at_once);
@@ -1373,6 +1448,154 @@ mod tests {
         }
         Ok(())
     }
+    /// A draft over `base`, on its own store.
+    fn draft_over(base: &[u8]) -> Result<(tempfile::TempDir, LocalContent, WorkingLayer, Basis)> {
+        let root = tempfile::tempdir()?;
+        let content = LocalContent::open(root.path())?;
+        let basis = Basis {
+            entity: "file".into(),
+            branch: "main".into(),
+            version: "v1".into(),
+            anchor: "v1".into(),
+            content: content.import(base)?,
+        };
+        let layer = WorkingLayer::new(root.path(), content.clone())?;
+        Ok((root, content, layer, basis))
+    }
+
+    /// A whole-chunk write that fails can leave its bytes in the draft. Past a cut in the middle of
+    /// that chunk the file reads as zeros, and it still must once the chunk reads from the draft.
+    #[test]
+    fn a_failed_whole_chunk_write_does_not_read_back_behind_a_mid_chunk_cut() -> Result<()> {
+        let base = vec![37; 2 * CHUNK_SIZE as usize];
+        let (_root, content, layer, basis) = draft_over(&base)?;
+        let file = layer.open(basis, true)?;
+        let mut scratch = lock(&file);
+        let kept = 100;
+        scratch.truncate(CHUNK_SIZE + kept)?;
+        scratch.truncate(3 * CHUNK_SIZE)?;
+        // Its bytes land, and the record that says so does not.
+        let temporary = scratch.path.with_extension("json.tmp");
+        fs::create_dir(&temporary)?;
+        let whole = vec![9; CHUNK_SIZE as usize];
+        assert!(
+            scratch
+                .write(&content, CHUNK_SIZE, &whole, false, false)
+                .is_err()
+        );
+        fs::remove_dir(&temporary)?;
+
+        let mut expected = vec![0; CHUNK_SIZE as usize];
+        expected[..kept as usize].fill(37);
+        let mut chunk = vec![0; CHUNK_SIZE as usize];
+        scratch.read(&content, CHUNK_SIZE, &mut chunk)?;
+        assert!(chunk == expected, "the failed write shows before the edit");
+        // A small write makes the chunk read from the draft.
+        scratch.write(&content, CHUNK_SIZE + 10, b"edit", false, false)?;
+        expected[10..14].copy_from_slice(b"edit");
+        scratch.read(&content, CHUNK_SIZE, &mut chunk)?;
+        assert!(chunk == expected, "the failed write shows after the edit");
+        Ok(())
+    }
+
+    /// The same past the whole chunk: the base shows none of it, and neither may a failed write.
+    #[test]
+    fn a_failed_write_past_what_the_base_shows_does_not_read_back() -> Result<()> {
+        let (_root, content, layer, basis) = draft_over(&vec![37; CHUNK_SIZE as usize])?;
+        let file = layer.open(basis, true)?;
+        let mut scratch = lock(&file);
+        scratch.truncate(CHUNK_SIZE)?;
+        scratch.truncate(3 * CHUNK_SIZE)?;
+        scratch.write(&content, 0, b"x", false, false)?;
+        // A write that stopped short: its first bytes are there, and it fails.
+        let writable = scratch.file.take().unwrap();
+        write_at(&writable, b"stopped short", CHUNK_SIZE)?;
+        scratch.file = Some(File::open(&scratch.path)?);
+        let whole = vec![9; CHUNK_SIZE as usize];
+        assert!(
+            scratch
+                .write(&content, CHUNK_SIZE, &whole, false, false)
+                .is_err()
+        );
+        scratch.file = Some(writable);
+
+        scratch.write(&content, CHUNK_SIZE + 50, b"edit", false, false)?;
+        let mut expected = vec![0; CHUNK_SIZE as usize];
+        expected[50..54].copy_from_slice(b"edit");
+        let mut chunk = vec![0; CHUNK_SIZE as usize];
+        scratch.read(&content, CHUNK_SIZE, &mut chunk)?;
+        assert!(chunk == expected, "the failed write shows after the edit");
+        Ok(())
+    }
+
+    /// A full disk can let a draft's file be made and not its record. What it made must not stand in
+    /// the way once there is room, or be there for a start to find.
+    #[test]
+    fn a_draft_that_could_not_start_starts_once_it_can() -> Result<()> {
+        let (_root, content, layer, basis) = draft_over(b"")?;
+        let file = layer.open(basis, true)?;
+        let mut scratch = lock(&file);
+        let sidecar = scratch.path.with_extension("json");
+        fs::create_dir(&sidecar)?;
+        assert!(scratch.write(&content, 0, b"edit", false, false).is_err());
+        assert!(!scratch.path.exists(), "its file stayed behind");
+        fs::remove_dir(&sidecar)?;
+        scratch.write(&content, 0, b"edit", false, false)?;
+        let mut bytes = [0; 4];
+        scratch.read(&content, 0, &mut bytes)?;
+        assert_eq!(&bytes, b"edit");
+        Ok(())
+    }
+
+    #[test]
+    fn abandoning_a_replacement_puts_the_draft_back_as_it_was() -> Result<()> {
+        let base = b"the bytes this file has".to_vec();
+        let (_root, content, layer, basis) = draft_over(&base)?;
+        let file = layer.open_to_replace(basis)?;
+        {
+            let mut scratch = lock(&file);
+            scratch.truncate(0)?;
+            scratch.write(&content, 0, b"half of", false, false)?;
+            assert!(scratch.path.exists());
+        }
+        assert!(layer.abandon(&file)?, "it held the only writer");
+        {
+            let mut scratch = lock(&file);
+            assert!(!scratch.changed);
+            assert_eq!(scratch.len()?, base.len() as u64);
+            assert_eq!(scratch.base_visible_len, base.len() as u64);
+            assert!(!scratch.path.exists(), "a start would seal this");
+            assert!(!scratch.path.with_extension("json").exists());
+            let mut bytes = vec![0; base.len()];
+            scratch.read(&content, 0, &mut bytes)?;
+            assert_eq!(bytes, base);
+        }
+        assert!(layer.pending(true).is_empty(), "nothing is left to seal");
+        assert!(layer.records()?.is_empty());
+        // And it can start again, with nothing left over.
+        let mut scratch = lock(&file);
+        scratch.write(&content, 0, b"THE", false, false)?;
+        let mut head = [0; 9];
+        scratch.read(&content, 0, &mut head)?;
+        assert_eq!(&head, b"THE bytes");
+        Ok(())
+    }
+
+    /// Another writer's answered writes are in the same draft. They are not this one's to take back.
+    #[test]
+    fn a_draft_another_writer_shares_is_not_abandoned() -> Result<()> {
+        let (_root, content, layer, basis) = draft_over(b"base")?;
+        let first = layer.open_to_replace(basis.clone())?;
+        let second = layer.open(basis, true)?;
+        assert!(Arc::ptr_eq(&first, &second));
+        lock(&first).truncate(0)?;
+        lock(&second).write(&content, 0, b"answered", false, false)?;
+        assert!(!layer.abandon(&first)?);
+        assert!(lock(&first).changed);
+        assert_eq!(lock(&first).len()?, 8);
+        Ok(())
+    }
+
     #[test]
     fn scratch_passthrough_append_truncate_and_version_isolation() -> Result<()> {
         let root = tempfile::tempdir()?;

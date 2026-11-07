@@ -3,6 +3,7 @@ package dev.tkfs.sync
 import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Uri
+import android.os.StatFs
 import android.provider.DocumentsContract
 import android.util.Log
 import androidx.work.Constraints
@@ -32,6 +33,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** A burst that ran for `trigger`; `serial` tells two equal results apart. */
 data class Finished(val serial: Long, val trigger: Trigger, val result: BurstResult)
@@ -51,11 +53,17 @@ object SyncCoordinator {
 
     private val confirmed = MutableStateFlow<Map<String, Confirmed>>(emptyMap())
 
+    private val lowSpace = MutableStateFlow<String?>(null)
+    private val freeing = Any()
+
     val running: StateFlow<Boolean> get() = bursts.isRunning
     val finished: StateFlow<Finished?> get() = done
 
     /** What the PCs last said of each folder's waiting files, by folder id. */
     val confirmations: StateFlow<Map<String, Confirmed>> get() = confirmed
+
+    /** Why free space stays below the floor, when only a PC could change that: `PC_UNREACHABLE`, `PC_TOO_OLD`, or null. */
+    val spaceBlocked: StateFlow<String?> get() = lowSpace
 
     fun onForeground(ctx: Context) = launch(ctx, Trigger.Foreground)
 
@@ -92,6 +100,87 @@ object SyncCoordinator {
             gate.notQueued()
             throw error
         }
+    }
+
+    /** A mark changed, or a burst brought files into a marked folder: the transfer job downloads what is kept. */
+    fun onKeptChanged(ctx: Context) {
+        val missing = try {
+            Native.keptMissing()
+        } catch (error: IOException) {
+            Log.i(TAG, "kept: ${error.message}")
+            false
+        }
+        if (missing) wantTransfer(ctx.applicationContext)
+    }
+
+    /** Asks for the transfer job with no change to send, unless it is on its way. */
+    private fun wantTransfer(app: Context) {
+        if (!gate.wanted()) return
+        try {
+            enqueueTransfer(app, ExistingWorkPolicy.APPEND_OR_REPLACE)
+        } catch (error: RuntimeException) {
+            gate.notQueued()
+            throw error
+        }
+    }
+
+    /**
+     * Downloads what is kept for the transfer job, under its network and its stop, which ends the
+     * call between steps. It is not interruptible, so the job can stop waiting for it. Then the floor
+     * is checked again, as what came took room.
+     */
+    internal fun hydrateKept(ctx: Context, stop: AtomicBoolean): Deferred<Unit> {
+        val app = ctx.applicationContext
+        return scope.async {
+            try {
+                val brought = Native.hydrateKept(stop)
+                Log.i(TAG, "kept: brought $brought bytes")
+            } catch (error: IOException) {
+                // What came stays, and the next job asks again for the rest.
+                Log.i(TAG, "kept: ${error.message}")
+            }
+            if (!stop.get()) checkFloor(app)
+        }
+    }
+
+    /**
+     * Frees space if the volume is below the floor. It is a look at the volume and nothing else above
+     * it, so it can follow every burst.
+     */
+    internal fun checkFloor(ctx: Context) {
+        val app = ctx.applicationContext
+        if (spaceNeededNow(app) == 0L) {
+            lowSpace.value = null
+            return
+        }
+        freeUp(app)
+    }
+
+    /** "Free up space now", on this thread: up to the floor, or if it is met only what nothing needs. Null if it could not ask. */
+    fun freeUp(ctx: Context): Freed? {
+        val app = ctx.applicationContext
+        return synchronized(freeing) {
+            val freed = try {
+                Native.ensureStarted(app)
+                parseFreed(Native.freeSpace(spaceNeededNow(app)))
+            } catch (error: IOException) {
+                Log.i(TAG, "free: ${error.message}")
+                return@synchronized null
+            } catch (error: JSONException) {
+                Log.i(TAG, "free: unreadable answer: ${error.message}")
+                return@synchronized null
+            }
+            val stillLow = spaceNeededNow(app) > 0
+            lowSpace.value = if (stillLow) freed.blocked else null
+            Log.i(TAG, "free: ${freed.bytes} bytes, blocked ${freed.blocked}, still low: $stillLow")
+            freed
+        }
+    }
+
+    /** How far the volume is below the floor. */
+    fun spaceNeededNow(ctx: Context): Long {
+        val volume = StatFs(ctx.filesDir.path)
+        return spaceNeeded(volume.availableBytes, volume.totalBytes)
     }
 
     /** "Sync on mobile data" changed: a job still waiting for a network takes the new requirement. */
@@ -166,6 +255,12 @@ object SyncCoordinator {
         val result = burst(app, mode)
         if (!result.dropped) done.value = Finished((done.value?.serial ?: 0) + 1, trigger, result)
         if (mode == Mode.Full && (trigger == Trigger.Foreground || trigger == Trigger.Periodic)) sendWhatIsLeft(app, result)
+        // Not after a burst a stop ended: that network may be gone, and the job that stopped is going too.
+        if (!result.dropped && !result.ended) {
+            checkFloor(app)
+            // The job's own burst goes on to this by itself.
+            if (trigger != Trigger.LocalChange) onKeptChanged(app)
+        }
         return result
     }
 
@@ -176,13 +271,7 @@ object SyncCoordinator {
      */
     private fun sendWhatIsLeft(app: Context, result: BurstResult) {
         if (result.dropped || Progress().after(result) != Next.Again) return
-        if (!gate.wanted()) return
-        try {
-            enqueueTransfer(app, ExistingWorkPolicy.APPEND_OR_REPLACE)
-        } catch (error: RuntimeException) {
-            gate.notQueued()
-            throw error
-        }
+        wantTransfer(app)
     }
 
     /** The transfer job ended with changes it did not cover. */
