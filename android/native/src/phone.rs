@@ -29,7 +29,7 @@ use tkfs::{
         hub::{Daemon, Held},
         sync::HAVE_BATCH,
     },
-    runtime::{Engine, Presence},
+    runtime::{Engine, Presence, engine::Evicted},
 };
 
 /// The working name a shared-in file has until it is complete (`PART_PREFIX` in the share code).
@@ -773,7 +773,7 @@ impl Phone {
             return Ok(not_on_pc());
         }
         let mut failure = None;
-        let bytes = evict_counted(engine, &named.into_iter().collect(), &mut failure)?;
+        let bytes = evict_counted(engine, &named.into_iter().collect(), deadline, &mut failure)?;
         match failure {
             Some(error) if bytes == 0 => Err(error),
             _ => Ok(Freed {
@@ -963,7 +963,7 @@ impl Phone {
                 .flatten()
                 .collect();
             if !named.is_empty() {
-                evict_counted(engine, &named, failure)?;
+                evict_counted(engine, &named, deadline, failure)?;
             }
             if blocked.is_some() {
                 return Ok(blocked.map(str::to_owned));
@@ -1113,19 +1113,40 @@ fn presence_of(engine: &Engine, entity: &str) -> Result<Presence> {
     engine.entry_presence(&entry)
 }
 
-/// Evicts `named` once and says what left the disk. An evict that fails may still have freed other
+/// Evicts `named` and says what left the disk. An evict that fails may still have freed other
 /// segments, so its failure goes in `failure` and the bytes are counted all the same.
 fn evict_counted(
     engine: &Engine,
     named: &BTreeSet<Digest>,
+    deadline: Instant,
     failure: &mut Option<anyhow::Error>,
 ) -> Result<u64> {
     let packs = &engine.working.content().packs;
     let before = packs.disk_bytes()?;
-    if let Err(error) = engine.evict(named) {
-        failure.get_or_insert(error);
-    }
+    evict_in_turns(|| engine.evict(named), deadline, failure);
     Ok(before.saturating_sub(packs.disk_bytes()?))
+}
+
+/// One evict stops at so many segments, and everything else waits for it while it runs, so it goes
+/// in turns with the locks let go between them. Out of time, or once a turn removes nothing, what is
+/// left stays for the next batch.
+fn evict_in_turns(
+    evict: impl FnMut() -> Result<Evicted>,
+    deadline: Instant,
+    failure: &mut Option<anyhow::Error>,
+) {
+    let mut evict = evict;
+    loop {
+        match evict() {
+            Ok(evicted)
+                if evicted.removed > 0 && evicted.refused > 0 && Instant::now() < deadline => {}
+            Ok(_) => return,
+            Err(error) => {
+                failure.get_or_insert(error);
+                return;
+            }
+        }
+    }
 }
 
 /// Frees what only deleted files hold, up to about `need_bytes`, with one evict for each batch. The
@@ -1171,7 +1192,7 @@ fn free_deleted(
             }
         };
         if !named.is_empty() {
-            evict_deleted(engine, &named, failure);
+            evict_deleted(engine, &named, deadline, failure);
         }
         let freed = before.saturating_sub(packs.disk_bytes()?);
         if !more || freed >= need_bytes || Instant::now() >= deadline {
@@ -1182,10 +1203,13 @@ fn free_deleted(
 
 /// One evict of what only deleted files hold. What `named` was worked out from may be out of date by
 /// now, and no PC has been asked about any of it, so this goes by what is live as it runs.
-fn evict_deleted(engine: &Engine, named: &BTreeSet<Digest>, failure: &mut Option<anyhow::Error>) {
-    if let Err(error) = engine.evict_unless_live(named) {
-        failure.get_or_insert(error);
-    }
+fn evict_deleted(
+    engine: &Engine,
+    named: &BTreeSet<Digest>,
+    deadline: Instant,
+    failure: &mut Option<anyhow::Error>,
+) {
+    evict_in_turns(|| engine.evict_unless_live(named), deadline, failure);
 }
 
 /// The peers `repo`'s cursors name that count for this folder now: the cursor is of the
@@ -1369,6 +1393,50 @@ mod tests {
             phone,
             peers: FakePeers::default(),
         }
+    }
+
+    /// One evict stops at so many segments. What it left goes in the next turn, with the locks let go
+    /// between them, as long as each turn gets somewhere.
+    #[test]
+    fn an_evict_goes_on_in_turns_while_each_gets_somewhere() {
+        let far = Instant::now() + Duration::from_secs(60);
+        let turns = |answers: Vec<Evicted>, deadline: Instant| {
+            let left = RefCell::new(answers);
+            let mut failure = None;
+            let mut taken = 0;
+            evict_in_turns(
+                || {
+                    taken += 1;
+                    Ok(left.borrow_mut().remove(0))
+                },
+                deadline,
+                &mut failure,
+            );
+            assert!(failure.is_none());
+            taken
+        };
+        let evicted = |removed, refused| Evicted { removed, refused };
+        assert_eq!(turns(vec![evicted(5, 0)], far), 1, "all of it went");
+        assert_eq!(
+            turns(vec![evicted(5, 3), evicted(3, 0)], far),
+            2,
+            "the rest went in the next"
+        );
+        assert_eq!(
+            turns(vec![evicted(5, 3), evicted(1, 2), evicted(0, 2)], far),
+            3,
+            "what stays is what this store keeps"
+        );
+        assert_eq!(turns(vec![evicted(0, 3)], far), 1, "nothing went");
+        assert_eq!(
+            turns(vec![evicted(5, 3)], Instant::now()),
+            1,
+            "out of time, what is left stays for the next batch"
+        );
+
+        let mut failure = None;
+        evict_in_turns(|| Err(anyhow::anyhow!("NO_ROOM")), far, &mut failure);
+        assert!(failure.is_some());
     }
 
     /// One large file the PC does not hold, as a waiting file usually is: one small question.
@@ -2872,7 +2940,12 @@ mod tests {
             .collect();
         f.write("/saved", &bytes);
         let mut failure = None;
-        evict_deleted(&f.engine, &named, &mut failure);
+        evict_deleted(
+            &f.engine,
+            &named,
+            Instant::now() + Duration::from_secs(60),
+            &mut failure,
+        );
         assert!(failure.is_none(), "{failure:?}");
         assert!(f.is_whole("/saved"));
         assert!(f.read("/saved") == bytes);

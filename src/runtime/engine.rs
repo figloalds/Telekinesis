@@ -183,6 +183,9 @@ impl PresenceCache {
 }
 pub struct Engine {
     pub store: Mutex<Store>,
+    /// The store's, which never change: `hello` answers with them whatever holds the store.
+    repo: String,
+    device: String,
     pub working: WorkingLayer,
     namespace_changes: Arc<NamespaceChanges>,
     namespace_cache: Mutex<NamespaceCache>,
@@ -247,11 +250,14 @@ impl Engine {
         }
         let store = Store::open(root, repo)?;
         let working = WorkingLayer::new(root, store.content.clone())?;
+        let (repo, device) = (store.repo.clone(), store.device.clone());
         let store = Mutex::new(store);
         seal::recover(&store, &working)?;
         let namespace_changes = lock(&store).namespace_changes.clone();
         let engine = Arc::new(Self {
             store,
+            repo,
+            device,
             working,
             namespace_changes,
             namespace_cache: Mutex::new(NamespaceCache::default()),
@@ -324,6 +330,12 @@ impl Engine {
                 }
             })?;
         Ok(engine)
+    }
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+    pub fn device(&self) -> &str {
+        &self.device
     }
     /// Drafts [`seal::recover`] could not seal at the start. This asks again for what they need,
     /// and what it does not wait for: a hint lasts longer than [`WAITING_DRAFT_RETRY`].
@@ -1357,7 +1369,11 @@ impl Engine {
     /// version of an unresolved conflict, what a draft was made from, and what an open handle pins.
     /// Deciding that the rest can be got back is the caller's. Only segments that lose one of
     /// `digests` are touched. What else is dead in one of those is not copied, and what is dead
-    /// anywhere else waits for [`Self::collect`].
+    /// anywhere else waits for [`Self::collect`]. It holds the store and the packs while it rewrites,
+    /// so it stops at [`MAX_NAMED_SEGMENTS`], and what it left of `digests` counts as refused for now:
+    /// a caller that wants the rest calls this again.
+    ///
+    /// [`MAX_NAMED_SEGMENTS`]: crate::content::local::MAX_NAMED_SEGMENTS
     pub fn evict(&self, digests: &BTreeSet<Digest>) -> Result<Evicted> {
         self.evict_keeping(digests, false)
     }

@@ -110,15 +110,12 @@ pub fn mounts() -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// `hello` → `{repo, device, instance, pid, version, ipc, mounts}`.
+/// `hello` → `{repo, device, instance, pid, version, ipc, mounts}`. It takes no lock of the store: it
+/// is what tells a worker that is busy, as with a long evict, from one that is dead.
 pub fn hello(engine: &Engine, instance: &str) -> Value {
-    let (repo, device) = {
-        let store = lock(&engine.store);
-        (store.repo.clone(), store.device.clone())
-    };
     json!({
-        "repo": repo,
-        "device": device,
+        "repo": engine.repo(),
+        "device": engine.device(),
         "instance": instance,
         "pid": std::process::id(),
         "version": env!("CARGO_PKG_VERSION"),

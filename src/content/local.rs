@@ -71,6 +71,10 @@ impl Manifest {
     }
 }
 
+/// At most how many segments one [`PackStore::collect_named`] rewrites, as its caller holds what
+/// everything else needs for that long. The rest stays for the next call.
+pub const MAX_NAMED_SEGMENTS: usize = 8;
+
 /// Which old segments a rewrite takes.
 #[derive(Clone, Copy)]
 enum Rewriting<'a> {
@@ -425,13 +429,7 @@ impl PackStore {
         let mut bytes = vec![0; location.len];
         let read = read_exact_at(&file, &mut bytes, location.offset);
         if read.is_err() || Digest::bytes(&bytes) != digest {
-            state.locations.clear();
-            state.location_order.clear();
-            state
-                .db
-                .execute_cached("DELETE FROM objects WHERE digest=?1", [&digest.0[..]])?;
-            state.pending.remove(&digest);
-            self.bump_generation();
+            self.forget_corrupt(&mut state, digest)?;
             anyhow::bail!("OBJECT_CORRUPT: {digest}");
         }
         state.verified_reads += 1;
@@ -491,6 +489,18 @@ impl PackStore {
         self.inner
             .generation
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    /// An object whose bytes are not what its digest says is not here: whoever wants it next asks
+    /// for it again.
+    fn forget_corrupt(&self, state: &mut State, digest: Digest) -> Result<()> {
+        state.locations.clear();
+        state.location_order.clear();
+        state
+            .db
+            .execute_cached("DELETE FROM objects WHERE digest=?1", [&digest.0[..]])?;
+        state.pending.remove(&digest);
+        self.bump_generation();
+        Ok(())
     }
     fn bump_generation(&self) {
         self.inner
@@ -625,6 +635,9 @@ impl PackStore {
         // Least to copy first: with little room left, what needs none is freed whatever comes of
         // the rest, and it makes room for them.
         rewrites.sort_by_key(|(kept, segment, _)| (*kept, *segment));
+        if matches!(which, Rewriting::Losing(_)) {
+            rewrites.truncate(MAX_NAMED_SEGMENTS);
+        }
         let mut removed = 0;
         let mut failure = None;
         for (_, segment, entries) in rewrites {
@@ -665,8 +678,12 @@ impl PackStore {
             let mut updates = Vec::with_capacity(keeping.len());
             for (digest, loc) in &keeping {
                 let mut bytes = vec![0; loc.len];
-                read_exact_at(&old, &mut bytes, loc.offset)?;
-                ensure!(Digest::bytes(&bytes) == *digest, "OBJECT_CORRUPT_DURING_GC");
+                let read = read_exact_at(&old, &mut bytes, loc.offset);
+                if read.is_err() || Digest::bytes(&bytes) != *digest {
+                    // As a read does, or this segment fails every rewrite until one comes along.
+                    self.forget_corrupt(state, *digest)?;
+                    anyhow::bail!("OBJECT_CORRUPT_DURING_GC: {digest}");
+                }
                 updates.push((*digest, self.append(state, &bytes)?, *loc));
             }
             state.writer.sync_all()?;
@@ -1188,6 +1205,68 @@ mod tests {
         assert!(!store.contains(dead)?, "the failure stopped the rest");
         assert_eq!(store.get(fine)?.as_slice(), b"fine one");
         assert!(store.contains(dead_beside)?);
+        Ok(())
+    }
+    /// As with a read that finds one: the row goes, so the next to want the object asks for it again.
+    /// Left there, its segment would fail every gc and evict until something happened to read it.
+    #[test]
+    fn a_corrupt_live_object_fails_one_rewrite_and_not_the_next() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 16)?;
+        let spoiled = store.put(Kind::Chunk, b"spoiled!")?;
+        let dead = store.put(Kind::Chunk, b"dead one")?;
+        store.put(Kind::Chunk, b"rolls on")?;
+        store.flush()?;
+        corrupt(&store, spoiled)?;
+        let live = BTreeSet::from([spoiled]);
+        let failed = store.collect(&live, 1.0).unwrap_err();
+        assert!(
+            failed.to_string().contains("OBJECT_CORRUPT_DURING_GC"),
+            "{failed:#}"
+        );
+        assert!(!store.contains(spoiled)?, "its row stayed");
+        store.collect(&live, 1.0)?;
+        assert!(!store.contains(dead)?, "the segment still fails");
+        assert!(!segment_path(&store.inner.root, 0).exists());
+        assert_eq!(store.put(Kind::Chunk, b"spoiled!")?, spoiled);
+        assert_eq!(store.get(spoiled)?.as_slice(), b"spoiled!");
+        Ok(())
+    }
+    /// One evict holds the store and the packs for as long as it rewrites, so it stops at so many
+    /// segments, with what is named in the rest still here for the next.
+    #[test]
+    fn collecting_what_is_named_rewrites_a_few_segments_at_a_time() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = PackStore::with_limits(root.path(), 0, 8)?;
+        let many = MAX_NAMED_SEGMENTS + 3;
+        let named: Vec<Digest> = (0..many)
+            .map(|index| store.put(Kind::Chunk, format!("named {index:02}").as_bytes()))
+            .collect::<Result<_>>()?;
+        store.put(Kind::Chunk, b"rolls on")?;
+        store.flush()?;
+        let names: BTreeSet<Digest> = named.iter().copied().collect();
+        let before = store.close_segment_holding(&names)?;
+        let live = BTreeSet::new();
+        assert_eq!(
+            store.collect_named(&names, &live, before)?,
+            MAX_NAMED_SEGMENTS
+        );
+        let left = named
+            .iter()
+            .filter(|digest| store.contains(**digest).unwrap())
+            .count();
+        assert_eq!(left, 3);
+        assert_eq!(store.collect_named(&names, &live, before)?, 3);
+        assert!(!named.iter().any(|digest| store.contains(*digest).unwrap()));
+
+        // A gc has no such limit: it has no caller to go back to it.
+        let dead: Vec<Digest> = (0..many)
+            .map(|index| store.put(Kind::Chunk, format!("dead! {index:02}").as_bytes()))
+            .collect::<Result<_>>()?;
+        store.put(Kind::Chunk, b"rolls 2!")?;
+        store.flush()?;
+        store.collect(&BTreeSet::new(), 1.0)?;
+        assert!(!dead.iter().any(|digest| store.contains(*digest).unwrap()));
         Ok(())
     }
     /// Three objects in a closed segment, of which the first two are to be kept.

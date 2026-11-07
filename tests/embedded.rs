@@ -16,6 +16,7 @@ use support::{
     daemon::{TestDaemon, run_tkfs},
 };
 use tempfile::TempDir;
+use tkfs::orchestrator::folder::{HEARTBEAT_LOST, PROBE_DEADLINE};
 use tkfs::{
     model::{content::Digest, errors::code_of},
     orchestrator::{control, demand::Demand, embedded::Host, sync::OBJECT_BATCH},
@@ -614,6 +615,40 @@ fn until_unreachable(daemon: &tkfs::orchestrator::hub::Daemon, folder: &str) -> 
         std::thread::sleep(Duration::from_millis(100));
     }
     Ok(())
+}
+
+/// A long evict holds the store while it rewrites. That is a busy worker and not a dead one, and
+/// killing it would fail any writer it has open.
+#[test]
+fn a_store_held_busy_past_heartbeat_lost_is_not_a_dead_worker() -> Result<()> {
+    let phone = Phone::with(&[("a.txt", "bytes")])?;
+    let daemon = phone.host.daemon()?;
+    let worker = |daemon: &tkfs::orchestrator::hub::Daemon| -> Result<Value> {
+        let phase = daemon.execute("inspect", &json!({"state": phone.id}))?["phase"].clone();
+        ensure!(phase["phase"] == "Running", "{phase}");
+        Ok(json!({"instance": phase["instance"], "since_ms": phase["since_ms"]}))
+    };
+    let before = worker(&daemon)?;
+    let writer = phone.engine.open_file("new.txt", true, false, true)?;
+    {
+        let _busy = phone.engine.store.lock().unwrap();
+        // Long enough for the watch to go quiet, and for what follows that to have run.
+        std::thread::sleep(HEARTBEAT_LOST + PROBE_DEADLINE + Duration::from_secs(4));
+    }
+    // What it would have done comes before this, and a restart takes a while to show.
+    std::thread::sleep(Duration::from_secs(2));
+    let after = worker(&daemon)?;
+    ensure!(after == before, "{before} became {after}");
+    let engine = phone.host.engine(&phone.id)?;
+    ensure!(
+        Arc::ptr_eq(&engine, &phone.engine),
+        "another engine serves the folder"
+    );
+    drop(engine);
+    phone.engine.write(writer, 0, b"still open", false, false)?;
+    phone.engine.flush(Some(writer))?;
+    phone.engine.close(writer)?;
+    phone.stop()
 }
 
 #[test]
