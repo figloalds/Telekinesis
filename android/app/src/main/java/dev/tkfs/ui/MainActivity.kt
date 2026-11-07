@@ -35,6 +35,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Native.ensureStarted(this)
         SyncCoordinator.schedulePeriodic(this)
+        SyncCoordinator.onAppStart(this)
         // A kill mid-copy left a report and working files; the provider does the same when it starts first.
         ShareImports.recoverInBackground(this)
         setContent {

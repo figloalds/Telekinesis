@@ -255,6 +255,12 @@ a file always works, because the owner asked for that file, and "Sync now" runs 
 the same reason. Whether the connection counts as metered is Android's call. `sync-now` gains a
 `metadata_only` option for this.
 
+A network can turn metered while files are moving. So while a burst or the transfer job runs, the
+app watches the default network. When it turns metered with the setting off, or the setting goes off
+on a metered network, the app calls `end-bursts`, drops full bursts waiting their turn, and puts a
+running job back to waiting for an unmetered network. Only "Sync now" goes on. The job takes its current
+network requirement again whenever the setting changes and when the app starts.
+
 ### Keeping a burst light
 
 A background check is only light if it does not replay the log, so a passive dialer's feed

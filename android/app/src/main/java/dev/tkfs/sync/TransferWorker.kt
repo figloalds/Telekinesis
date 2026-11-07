@@ -37,6 +37,7 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
         gate.started()
         claimed = gate.claim()
         var stopped = false
+        SyncCoordinator.watchNetwork(applicationContext)
         try {
             becomeForeground("Starting")
             withContext(Dispatchers.IO) {
@@ -47,6 +48,7 @@ class TransferWorker(context: Context, params: WorkerParameters) : CoroutineWork
             stopped = true
             Log.i(TAG, "transfer: stopped (${stopReason})")
         } finally {
+            SyncCoordinator.stopWatchingNetwork(applicationContext)
             gate.stopped()
         }
         // Ended by itself, with a change that came while it ran: nothing else would send it.

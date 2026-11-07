@@ -58,6 +58,71 @@ class BurstsTest {
         assertFalse(bursts.isRunning.value)
     }
 
+    private fun waitsInRequest(thread: Thread) {
+        val end = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (thread.state != Thread.State.WAITING && System.nanoTime() < end) Thread.sleep(5)
+        assertEquals(Thread.State.WAITING, thread.state)
+    }
+
+    /** It would otherwise start after `end-bursts`, on a network that may not carry it. */
+    @Test fun holdingBackDropsAFullBurstThatWaits() {
+        val bursts = bursts()
+        val first = async(bursts, Mode.MetadataOnly)
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        val waiting = async(bursts, Mode.Full)
+        waitsInRequest(waiting)
+        assertFalse("a metadata-only burst moves no files, so it is not ended", bursts.holdBack())
+        waiting.join(5_000)
+        assertFalse("it was let go at once", waiting.isAlive)
+        release.countDown()
+        first.join(5_000)
+        assertEquals(listOf(Mode.MetadataOnly), started.toList())
+    }
+
+    @Test fun holdingBackLeavesAFullBurstTheOwnerAskedFor() {
+        val bursts = bursts()
+        val first = async(bursts, Mode.MetadataOnly)
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        val asked = Thread { bursts.request(Mode.Full, asked = true) }.also { it.start() }
+        waitsInRequest(asked)
+        assertFalse(bursts.holdBack())
+        release.countDown()
+        listOf(first, asked).forEach { it.join(5_000) }
+        assertEquals(listOf(Mode.MetadataOnly, Mode.Full), started.toList())
+    }
+
+    @Test fun holdingBackSaysToEndARunningFullBurstUnlessTheOwnerAskedForIt() {
+        val bursts = bursts()
+        val unasked = async(bursts, Mode.Full)
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        assertTrue(bursts.holdBack())
+        release.countDown()
+        unasked.join(5_000)
+        assertFalse("nothing runs by now", bursts.holdBack())
+
+        val theirs = CountDownLatch(1)
+        val letGo = CountDownLatch(1)
+        val owners = Bursts {
+            theirs.countDown()
+            assertTrue(letGo.await(5, TimeUnit.SECONDS))
+            BurstResult()
+        }
+        val asked = Thread { owners.request(Mode.Full, asked = true) }.also { it.start() }
+        assertTrue(theirs.await(5, TimeUnit.SECONDS))
+        assertFalse(owners.holdBack())
+        letGo.countDown()
+        asked.join(5_000)
+    }
+
+    /** What is asked for after the network changed is for the caller to judge, by the network as it is now. */
+    @Test fun holdingBackDoesNotDropWhatComesAfterIt() {
+        val bursts = bursts()
+        bursts.holdBack()
+        release.countDown()
+        assertFalse(bursts.request(Mode.Full).dropped)
+        assertEquals(listOf(Mode.Full), started.toList())
+    }
+
     @Test fun skipRunsNothing() {
         assertTrue(Bursts { error("no burst") }.request(Mode.Skip).dropped)
     }

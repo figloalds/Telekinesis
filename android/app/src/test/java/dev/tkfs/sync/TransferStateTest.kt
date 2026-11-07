@@ -7,6 +7,17 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TransferStateTest {
+    @Test fun theGateSaysWhenAJobIsRunning() {
+        val gate = TransferGate()
+        assertFalse(gate.working())
+        gate.changed(1)
+        assertFalse("queued is not running", gate.working())
+        gate.started()
+        assertTrue(gate.working())
+        gate.stopped()
+        assertFalse(gate.working())
+    }
+
     private fun folder(id: String, remaining: Int?, pushed: Long = 0, error: String? = null) =
         FolderBurst(id, exchanged = 1, remaining = remaining, error = error?.let { BurstError(it, null) }, pushed = pushed)
 

@@ -42,6 +42,13 @@ class SyncPolicyTest {
         assertEquals(Mode.Full, policy.decide(Trigger.Periodic, now, now, metered = false, syncOnMobile = false))
     }
 
+    @Test fun onlyAMeteredNetworkWithTheSettingOffHoldsFilesBack() {
+        assertEquals(true, holdsFilesBack(metered = true, syncOnMobile = false))
+        assertEquals(false, holdsFilesBack(metered = true, syncOnMobile = true))
+        assertEquals(false, holdsFilesBack(metered = false, syncOnMobile = false))
+        assertEquals(false, holdsFilesBack(metered = false, syncOnMobile = true))
+    }
+
     @Test fun aLocalChangeWaitsForAnUnmeteredNetworkWhenTheSettingIsOff() {
         assertEquals(Mode.Skip, policy.decide(Trigger.LocalChange, now, now, metered = true, syncOnMobile = false))
         assertEquals(Mode.Full, policy.decide(Trigger.LocalChange, now, now, metered = false, syncOnMobile = false))

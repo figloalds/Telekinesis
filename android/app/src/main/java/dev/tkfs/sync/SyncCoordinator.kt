@@ -13,6 +13,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import dev.tkfs.Native
 import dev.tkfs.Settings
@@ -33,6 +34,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.function.BooleanSupplier
 
 /** A burst that ran for `trigger`; `serial` tells two equal results apart. */
@@ -57,6 +59,11 @@ object SyncCoordinator {
     private val belowFloor = MutableStateFlow(false)
     private val keptShort = MutableStateFlow(false)
     private val freeing = Any()
+
+    private val network = NetworkWatch { app, metered ->
+        if (holdsFilesBack(metered, Settings.of(app).syncOnMobile)) scope.launch { stopMovingFiles(app) }
+    }
+    private val appStarted = AtomicBoolean(false)
 
     val running: StateFlow<Boolean> get() = bursts.isRunning
     val finished: StateFlow<Finished?> get() = done
@@ -226,10 +233,50 @@ object SyncCoordinator {
         return spaceNeeded(volume.availableBytes, volume.totalBytes)
     }
 
-    /** "Sync on mobile data" changed: a job still waiting for a network takes the new requirement. */
+    /**
+     * "Sync on mobile data" changed: a job there is, running or waiting for a network, takes the new
+     * requirement. Turned off on a metered network, nothing goes on moving files either.
+     */
     fun onMobileSettingChanged(ctx: Context) {
-        if (gate.waiting()) enqueueTransfer(ctx.applicationContext, ExistingWorkPolicy.REPLACE)
+        val app = ctx.applicationContext
+        scope.launch {
+            if (holdsFilesBack(metered(app), Settings.of(app).syncOnMobile)) stopMovingFiles(app)
+            requeueTransfer(app) { !it.isFinished }
+        }
     }
+
+    /**
+     * Once a process, when the app starts. A job waiting for a network keeps the requirement it was
+     * queued with, and the setting may have changed since: nothing in memory says so after a restart.
+     */
+    fun onAppStart(ctx: Context) {
+        if (!appStarted.compareAndSet(false, true)) return
+        val app = ctx.applicationContext
+        scope.launch { requeueTransfer(app) { it == WorkInfo.State.ENQUEUED || it == WorkInfo.State.BLOCKED } }
+    }
+
+    /** Queues the job again with the requirement it should have now, if it has a state that `needs` that. Blocking. */
+    private fun requeueTransfer(app: Context, needs: (WorkInfo.State) -> Boolean) {
+        val jobs = WorkManager.getInstance(app).getWorkInfosForUniqueWork(TRANSFER).get()
+        if (jobs.none { needs(it.state) }) return
+        gate.wanted()
+        enqueueTransfer(app, ExistingWorkPolicy.REPLACE)
+    }
+
+    /**
+     * This network must not carry files, with no one having asked for them to move. What waits does
+     * not start, what runs ends, and a running job goes back to waiting for a network it may use.
+     */
+    private fun stopMovingFiles(app: Context) {
+        Log.i(TAG, "network: held back, so files stop moving")
+        if (bursts.holdBack()) endBursts()
+        if (gate.working()) requeueTransfer(app) { !it.isFinished }
+    }
+
+    /** While it runs, the transfer job has the network watched, with or without a burst. */
+    internal fun watchNetwork(app: Context) = network.hold(app.applicationContext)
+
+    internal fun stopWatchingNetwork(app: Context) = network.release(app.applicationContext)
 
     private fun enqueueTransfer(app: Context, policy: ExistingWorkPolicy) {
         val network = if (Settings.of(app).syncOnMobile) NetworkType.CONNECTED else NetworkType.UNMETERED
@@ -246,17 +293,25 @@ object SyncCoordinator {
         return scope.async { runTrigger(app, Trigger.LocalChange, Mode.Full) }
     }
 
-    /** One burst in `mode`, now, on this thread. */
-    fun burst(ctx: Context, mode: Mode): BurstResult {
+    /**
+     * One burst in `mode`, now, on this thread. `asked` is the owner asking, which goes on whatever
+     * the network: otherwise a network that will not carry files gets no full burst, and one it stops
+     * being able to carry is ended.
+     */
+    fun burst(ctx: Context, mode: Mode, asked: Boolean = false): BurstResult {
         val app = ctx.applicationContext
+        val settings = Settings.of(app)
+        if (mode == Mode.Full && !asked && holdsFilesBack(metered(app), settings.syncOnMobile)) return BurstResult.DROPPED
+        network.hold(app)
         val result = try {
             Native.ensureStarted(app)
-            bursts.request(mode)
+            bursts.request(mode, asked)
         } catch (error: IOException) {
             BurstResult(failure = error.message ?: "The burst failed.")
+        } finally {
+            network.release(app)
         }
         if (result.dropped) return result
-        val settings = Settings.of(app)
         val now = System.currentTimeMillis()
         for (folder in result.folders) if (folder.error == null) settings.setLastSyncMs(folder.id, now)
         if (result.exchanged > 0) notifyChange(app)
@@ -295,7 +350,7 @@ object SyncCoordinator {
         val mode = decided ?: policy.decide(
             trigger, System.currentTimeMillis(), settings.lastSyncMs(), metered(app), settings.syncOnMobile,
         )
-        val result = burst(app, mode)
+        val result = burst(app, mode, asked = trigger == Trigger.Manual)
         if (!result.dropped) done.value = Finished((done.value?.serial ?: 0) + 1, trigger, result)
         if (mode == Mode.Full && (trigger == Trigger.Foreground || trigger == Trigger.Periodic)) sendWhatIsLeft(app, result)
         // Not after a burst a stop ended: that network may be gone, and the job that stopped is going too.

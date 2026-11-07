@@ -1263,6 +1263,42 @@ def scenario_metered(s: Session) -> None:
     deliver(s, folder, "metered-share.bin", shared, "the file shared on a metered network",
             nudge=lambda: trigger_foreground(device))
     check_nothing_waits(s, folder, "the shared file once the network allows it")
+    check_a_transfer_when_the_network_turns_metered(s, folder, rng)
+
+
+# How long the call in flight may take to finish after a burst is ended, whatever is under way.
+IN_FLIGHT_SETTLE = 10
+# How long the PC's packs then have to stay as they are.
+HELD_BACK_WATCH = 20
+FLIP_FILE_BYTES = 512 * MIB
+
+
+def check_a_transfer_when_the_network_turns_metered(s: Session, folder: Folder, rng: random.Random) -> None:
+    """A push under way on Wi-Fi stops when the network turns metered, with the setting off, and goes on
+    by itself when it is unmetered again."""
+    device = s.device
+    content = random_bytes(rng, FLIP_FILE_BYTES)
+    before = pc_pack_bytes(folder)
+    device.clear_logcat()
+    share_one(s, "flip.bin", content)
+    device.home()
+    poll(SHARE_BOUND, "the push under way", lambda: pc_pack_bytes(folder) - before >= 8 * MIB, interval=1)
+    device.set_metered(True)
+    try:
+        time.sleep(IN_FLIGHT_SETTLE)
+        logged = [line for line in device.provider_log() if line.startswith("network:")]
+        s.check("the app hears the network turn metered, and stops", bool(logged), logged)
+        stopped = pc_pack_bytes(folder)
+        s.check("the file is only partly on the PC", stopped - before < FLIP_FILE_BYTES, f"{stopped - before} pack bytes")
+        time.sleep(HELD_BACK_WATCH)
+        s.check("and no more bytes reach the PC on a metered network", pc_pack_bytes(folder) == stopped,
+                f"{stopped} -> {pc_pack_bytes(folder)}")
+        s.check("the file is waiting to send", "/flip.bin" in [row["path"] for row in device.waiting_files(folder.id)],
+                device.waiting_files(folder.id))
+    finally:
+        device.set_metered(False)
+    deliver(s, folder, "flip.bin", content, "the file whose push was held back", bound=SHARE_BOUND)
+    check_nothing_waits(s, folder, "that file")
 
 
 def scenario_transfer_timeout(s: Session) -> None:
