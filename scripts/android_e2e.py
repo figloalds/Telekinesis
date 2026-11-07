@@ -1287,20 +1287,46 @@ def scenario_metered(s: Session) -> None:
             nudge=lambda: trigger_foreground(device))
     check_nothing_waits(s, folder, "the shared file once the network allows it")
     check_a_transfer_when_the_network_turns_metered(s, folder, rng)
+    check_a_transfer_when_the_setting_turns_off(s, folder, rng)
 
 
 # How long the call in flight may take to finish after a burst is ended, whatever is under way.
 IN_FLIGHT_SETTLE = 10
 # How long the PC's packs then have to stay as they are.
 HELD_BACK_WATCH = 20
-FLIP_FILE_BYTES = 512 * MIB
+FLIP_FILE_BYTES = 128 * MIB
+# The screens take a while while a push is under way, and it must still be under way after them.
+SETTING_FILE_BYTES = 256 * MIB
+
+
+def reference_of(s: Session, label: str, content: bytes) -> Folder:
+    """A PC folder holding these bytes, as `pc_has_whole` compares a file too large to read back."""
+    repo, state = s.pc.create_folder(label, {"large.bin": content})
+    return Folder("", label, repo, "", state, {"large.bin": content})
+
+
+def check_a_push_stops_and_waits(s: Session, folder: Folder, name: str, size: int, before: int) -> None:
+    """The push of `name` stops, and it waits to send."""
+    device = s.device
+    time.sleep(IN_FLIGHT_SETTLE)
+    stopped = pc_pack_bytes(folder)
+    s.check(f"{name} is only partly on the PC", stopped - before < size, f"{stopped - before} pack bytes")
+    time.sleep(HELD_BACK_WATCH)
+    s.check("and no more bytes reach the PC on a metered network", pc_pack_bytes(folder) == stopped,
+            f"{stopped} -> {pc_pack_bytes(folder)}")
+    device.confirm(folder.id)  # What fills the table: the burst it stopped did not get to it.
+    s.check("it is waiting to send", f"/{name}" in [row["path"] for row in device.waiting_files(folder.id)],
+            device.waiting_files(folder.id))
 
 
 def check_a_transfer_when_the_network_turns_metered(s: Session, folder: Folder, rng: random.Random) -> None:
     """A push under way on Wi-Fi stops when the network turns metered, with the setting off, and goes on
-    by itself when it is unmetered again."""
+    by itself when it is unmetered again. On this emulator a Wi-Fi network marked metered drops and comes
+    back, so here the job's own network requirement may be what stops it first: the app's listening to
+    the network is seen by the next check, where nothing drops."""
     device = s.device
     content = random_bytes(rng, FLIP_FILE_BYTES)
+    reference = reference_of(s, "Flip", content)
     before = pc_pack_bytes(folder)
     device.clear_logcat()
     share_one(s, "flip.bin", content)
@@ -1308,20 +1334,47 @@ def check_a_transfer_when_the_network_turns_metered(s: Session, folder: Folder, 
     poll(SHARE_BOUND, "the push under way", lambda: pc_pack_bytes(folder) - before >= 8 * MIB, interval=1)
     device.set_metered(True)
     try:
-        time.sleep(IN_FLIGHT_SETTLE)
-        logged = [line for line in device.provider_log() if line.startswith("network:")]
-        s.check("the app hears the network turn metered, and stops", bool(logged), logged)
-        stopped = pc_pack_bytes(folder)
-        s.check("the file is only partly on the PC", stopped - before < FLIP_FILE_BYTES, f"{stopped - before} pack bytes")
-        time.sleep(HELD_BACK_WATCH)
-        s.check("and no more bytes reach the PC on a metered network", pc_pack_bytes(folder) == stopped,
-                f"{stopped} -> {pc_pack_bytes(folder)}")
-        s.check("the file is waiting to send", "/flip.bin" in [row["path"] for row in device.waiting_files(folder.id)],
-                device.waiting_files(folder.id))
+        check_a_push_stops_and_waits(s, folder, "flip.bin", FLIP_FILE_BYTES, before)
+        logged = device.transfer_log()
+        s.check("the job was stopped", any(line.startswith("transfer: stopped") for line in logged), logged)
     finally:
         device.set_metered(False)
-    deliver(s, folder, "flip.bin", content, "the file whose push was held back", bound=SHARE_BOUND)
+    deliver(s, folder, "flip.bin", reference, "the file whose push was held back", ref_path="large.bin", packs_before=before)
     check_nothing_waits(s, folder, "that file")
+    device.shell("rm", "-f", "/sdcard/Download/flip.bin")
+
+
+def check_a_transfer_when_the_setting_turns_off(s: Session, folder: Folder, rng: random.Random) -> None:
+    """On a metered network with "Sync on mobile data" on, a push runs. Turning the setting off stops
+    it, and the job goes back to waiting for a network it may use, which it finds by itself."""
+    device = s.device
+    device.set_metered(True)
+    try:
+        to_folders(s)
+        device.tap_text("Settings")
+        device.wait_screen("the Settings screen", lambda t: "Sync on mobile data" in t)
+        device.tap_switch()
+        content = random_bytes(rng, SETTING_FILE_BYTES)
+        reference = reference_of(s, "Setting", content)
+        before = pc_pack_bytes(folder)
+        device.clear_logcat()
+        share_one(s, "setting.bin", content)
+        poll(SHARE_BOUND, "the push on a metered network, with the setting on",
+             lambda: pc_pack_bytes(folder) - before >= 8 * MIB, interval=1)
+        s.check("with the setting on, a push goes on a metered network", True, f"{pc_pack_bytes(folder) - before} pack bytes")
+        # The share screen went back to Settings.
+        device.wait_screen("the Settings screen", lambda t: "Sync on mobile data" in t)
+        device.tap_switch()
+        check_a_push_stops_and_waits(s, folder, "setting.bin", SETTING_FILE_BYTES, before)
+        logged = device.provider_log()
+        s.check("the app ended the burst for it", any(line.startswith("network: held back") for line in logged), logged[-20:])
+        s.check("and queued the job again", any(line.startswith("transfer: queued again") for line in logged), logged[-20:])
+        s.check("which stopped", any(line.startswith("transfer: stopped") for line in logged), logged[-20:])
+    finally:
+        device.set_metered(False)
+    deliver(s, folder, "setting.bin", reference, "the file whose setting went off", ref_path="large.bin", packs_before=before)
+    check_nothing_waits(s, folder, "that file too")
+    device.shell("rm", "-f", "/sdcard/Download/setting.bin")
 
 
 def scenario_transfer_timeout(s: Session) -> None:

@@ -593,6 +593,18 @@ class Device:
         self.shell("input", "tap", x, y).require_success()
         return x, y
 
+    def tap_switch(self, bound: float = UI_BOUND) -> None:
+        """Taps the one switch on the screen, whose row says what it is."""
+
+        def find():
+            for node in self.ui_dump(bound).iter("node"):
+                if node.get("checkable") == "true":
+                    return bounds_center(node.get("bounds"))
+            raise HarnessError("not on screen")
+
+        x, y = poll(bound, "a switch", find, interval=1)
+        self.shell("input", "tap", x, y).require_success()
+
     def tap_button(self, text: str, bound: float = UI_BOUND) -> None:
         """Taps `text` inside an enabled button, once there is one: a dialog's title and its button can say the same.
         A button's text is its own view, with the clickable view above it."""

@@ -59,7 +59,12 @@ object SyncCoordinator {
     private val freeing = Any()
 
     private val network = NetworkWatch { app, metered ->
-        if (holdsFilesBack(metered, Settings.of(app).syncOnMobile)) scope.launch { stopMovingFiles(app) }
+        if (holdsFilesBack(metered, Settings.of(app).syncOnMobile)) {
+            scope.launch {
+                endBurstsThatMoveFiles()
+                if (gate.working()) requeueTransfer(app) { !it.isFinished }
+            }
+        }
     }
     private val appStarted = AtomicBoolean(false)
 
@@ -238,7 +243,7 @@ object SyncCoordinator {
     fun onMobileSettingChanged(ctx: Context) {
         val app = ctx.applicationContext
         scope.launch {
-            if (holdsFilesBack(metered(app), Settings.of(app).syncOnMobile)) stopMovingFiles(app)
+            if (holdsFilesBack(metered(app), Settings.of(app).syncOnMobile)) endBurstsThatMoveFiles()
             requeueTransfer(app) { !it.isFinished }
         }
     }
@@ -257,18 +262,19 @@ object SyncCoordinator {
     private fun requeueTransfer(app: Context, needs: (WorkInfo.State) -> Boolean) {
         val jobs = WorkManager.getInstance(app).getWorkInfosForUniqueWork(TRANSFER).get()
         if (jobs.none { needs(it.state) }) return
+        Log.i(TAG, "transfer: queued again for the network it may use now")
         gate.wanted()
         enqueueTransfer(app, ExistingWorkPolicy.REPLACE)
     }
 
     /**
      * This network must not carry files, with no one having asked for them to move. What waits does
-     * not start, what runs ends, and a running job goes back to waiting for a network it may use.
+     * not start, and what runs ends.
      */
-    private fun stopMovingFiles(app: Context) {
-        Log.i(TAG, "network: held back, so files stop moving")
-        if (bursts.holdBack()) endBursts()
-        if (gate.working()) requeueTransfer(app) { !it.isFinished }
+    private fun endBurstsThatMoveFiles() {
+        if (!bursts.holdBack()) return
+        Log.i(TAG, "network: held back, so the burst ends")
+        endBursts()
     }
 
     /** While it runs, the transfer job has the network watched, with or without a burst. */
